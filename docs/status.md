@@ -111,3 +111,5 @@ Rough priority order; reorder freely.
 - Fonts: CCM/CCF reader (`acvd-formats::ccm`); versions 0x10000/1 (24-byte glyphs) and 0x10002
   (28-byte). `acvd-game` draws `fontdef.xml` ID 1 (`e1_ext`) plus `partsname_en.fmg` as a HUD
   overlay. DRB: `acvd-formats::drb` reads the section run (`tag,u32 size,u32 count,0`; tags reversed, e.g. IXET=TEXI), RTS UTF-16BE strings, textures, SHAP/CTRL/OGLD tables on all 69 files. Shape and property record layouts are still undecoded (staffroll.drb: RPHS 0x120 bytes, 13 SHAP entries).
+
+- Animation timing: clips play at 60 fps (was 30, too slow) and acanimhokan blend values are read as milliseconds (was 60 Hz frames, 2-20 s fades). User-confirmed walking looks right; still unverified against the 360 code.

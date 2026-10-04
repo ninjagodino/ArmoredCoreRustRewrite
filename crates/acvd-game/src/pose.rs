@@ -21,17 +21,17 @@ use bevy::prelude::*;
 
 use crate::assemble::Placement;
 
-/// `.ani` headers store no frame rate; FromSoftware's 30 fps is assumed (`sheets/systems.csv`).
-pub const FRAME_RATE: f32 = 30.0;
+/// `.ani` headers store no frame rate; the game's 60 Hz tick is assumed (30 fps played far too slow).
+pub const FRAME_RATE: f32 = 60.0;
 
 /// Bone-group columns of `param/acanimhokan.bin` after GeneralFrame, by skeleton bone name
 /// (`sheets/anim_blend.csv`). A joint takes the column of its nearest ancestor-or-self in the
 /// list, GeneralFrame otherwise; `momo` and `sune` name the `l_`/`r_` thigh and shin bones.
 const HOKAN_GROUPS: [&str; 7] = ["center", "c_center", "k_center", "core", "kosi", "momo", "sune"];
 
-/// Hokan frames per second: assumed the game's 60 Hz tick, as for the camera's
-/// `*InterpolateFrame` fields (`sheets/anim_blend.csv`, unverified).
-const HOKAN_FRAME_RATE: f32 = 60.0;
+/// Hokan values per second: milliseconds (at 60 Hz, 2 s idle and 20 s tank fades were far too slow;
+/// ms gives 60 ms walk, ~1 s landing, `sheets/anim_blend.csv`, unverified).
+const HOKAN_FRAME_RATE: f32 = 1000.0;
 
 /// A joint the clip drives: clip bone `bone`; `absolute` joints take the clip's translation
 /// (scaled to the legs), the others keep `bind` (their part's bone length) plus the clip's
@@ -378,8 +378,8 @@ mod tests {
     #[test]
     fn fade_converts_hokan_frames_to_seconds() {
         let walk = find_hokan(2);
-        assert_eq!(Fade::of(&walk)[0], 1.0);
-        assert_eq!(Fade::of(&walk)[3], 5.0);
+        assert_eq!(Fade::of(&walk)[0], 0.06);
+        assert_eq!(Fade::of(&walk)[3], 0.3);
     }
 
     fn find_hokan(id: u32) -> AcanimHokanparamSt {
