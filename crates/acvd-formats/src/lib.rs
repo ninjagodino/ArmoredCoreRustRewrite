@@ -7,6 +7,7 @@ pub mod bnd3;
 pub mod ccm;
 pub mod dbp;
 pub mod dcx;
+pub mod drb;
 pub mod edge;
 pub mod flver;
 pub mod fmg;

@@ -14,7 +14,7 @@ animation,Animation event timelines (TAE) and skeletal animation in binders,tae/
 ai,AI behaviour scripts,airesource/**/*.lc; scene/*.lc; script/*.lc,in progress: all 1300 chunks decompiled with unluac to private/lua; no sheet yet,todo
 events,Mission event scripts,event/mission/*.evd,todo: EVD reader,todo
 missions,Mission definitions and sub-missions,mission/**/*.xml; mission params,todo,todo
-ui,Menu and HUD layouts plus menu images,lang/**/*.drb.dcx; image/**/*.tpf.dcx; PNG,todo: DRB reader,todo
+ui,Menu and HUD layouts plus menu images,lang/**/*.drb.dcx; image/**/*.tpf.dcx; PNG,in progress: DRB container + name tables read (acvd-formats::drb); shape/property records undecoded,todo
 effects,Particle and visual effects,sfx/*.ffxbnd; sfx/*.ffx; menusfx/*.ffxbnd,todo: FFX reader (binders done),todo
 shaders,PS3 RSX shader binaries in binders,shader/*.bnd,todo: replace with WGSL equivalents,todo
 sound,Sound banks and event projects,sound/**/*.fsb; *.fev; magicorchestra.ini,todo: FSB4 + FEV1 readers,todo

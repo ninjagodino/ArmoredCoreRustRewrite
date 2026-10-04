@@ -53,7 +53,7 @@ Rough priority order; reorder freely.
     drain, missiles (`bulletmissile`), blades, shoulder weapons (category 12 bullet ids at
     +356/+360), weapon modes, bay shift, core aim (shots follow the camera pitch, not a posed
     upper body), ammo HUD.
-- **UI**: DRB reader (menu/HUD layouts). **Param enums**: TDF reader.
+- **UI**: decode DRB shape (RPHS, kind 0x1e/0x3e/0x84/0xae/0x14e) and control property (RPTC) records, then draw a layout. **Param enums**: TDF reader.
 - **Effects** (FFX), **sound** (FSB4/FEV1), **movies** (PAMF), **mission events** (EVD),
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
@@ -110,4 +110,4 @@ Rough priority order; reorder freely.
 - Text: FMG reader (`acvd-formats::fmg`); 1250 UTF-16BE banks, 15 Shift-JIS `partsname_*.fmg`.
 - Fonts: CCM/CCF reader (`acvd-formats::ccm`); versions 0x10000/1 (24-byte glyphs) and 0x10002
   (28-byte). `acvd-game` draws `fontdef.xml` ID 1 (`e1_ext`) plus `partsname_en.fmg` as a HUD
-  overlay. DRB layouts are still unread.
+  overlay. DRB: `acvd-formats::drb` reads the section run (`tag,u32 size,u32 count,0`; tags reversed, e.g. IXET=TEXI), RTS UTF-16BE strings, textures, SHAP/CTRL/OGLD tables on all 69 files. Shape and property record layouts are still undecoded (staffroll.drb: RPHS 0x120 bytes, 13 SHAP entries).
