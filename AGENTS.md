@@ -8,6 +8,11 @@ disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
 - **One task per chat.** Pick one item from `docs/status.md`, finish it, then update that file
   (status, findings, 360 addresses, open questions) before the chat ends. The next chat starts
   from that file, not from chat history.
+- **Commit and push at the end of every task**, after updating `docs/status.md` and with the
+  build and tests passing: stage only the files this task touched (other chats may be editing
+  in parallel), one commit describing the task, then `git pull --rebase` and `git push`. The
+  GitHub repo is public: never `git add -f` or commit anything under the gitignored disc-derived
+  paths (`ACVD Unbound/`, `private/`, `external/`, `crates/acvd-data/src/generated/`).
 - Spreadsheet-first: game facts live in `sheets/*.csv`, each row with its evidence (360 address,
   disc file, or breakpoint). Code reads sheets or generated data; don't hard-code constants
   without a sheet row or a comment citing the 360 address.
