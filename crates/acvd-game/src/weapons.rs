@@ -1,0 +1,202 @@
+//! Hand-weapon fire: each arm slot reads its `acvparts.bin` firing fields
+//! (`sheets/ac_part_fields.csv` category 10) and spawns a tracer that flies with the matching
+//! `bullet/bulletrigid.bin` or `bullet/bulletenergy.bin` row. Blades and missiles are not fired
+//! yet. Shots leave the weapon-root joint along `Pilot::aim_direction` (no upper-body aim).
+
+use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
+use acvd_data::generated::bullet::{BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN};
+use acvd_data::{find, part_field};
+use bevy::prelude::*;
+
+use crate::assemble::Placement;
+use crate::collision::Collision;
+use crate::control::{Held, Pilot, Piloting};
+
+/// Game ticks per second. `reload_time` is read as ticks and `BulletRigidSt.gravity` as metres
+/// per second added each tick; both units are unconfirmed (see `docs/status.md`, Weapons).
+const TICK_RATE: f32 = 60.0;
+/// `init_speed` is read as km/h, the unit of the bullet rows' max/min speeds; unconfirmed.
+const KMH_PER_MS: f32 = 3.6;
+/// Tracer lifetime in seconds; not game data.
+const MAX_LIFE: f32 = 5.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Hand {
+    Right,
+    Left,
+}
+
+/// The two hand weapons of the shown design, with magazine and fire cooldown.
+#[derive(Component)]
+pub struct Armament {
+    pub hands: [Gun; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Gun {
+    pub remaining: u16,
+    pub reload_time: f32,
+    pub cooldown: f32,
+    pub init_speed: f32,
+    pub kind: Kind,
+    pub gravity: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Rigid,
+    Energy,
+    Skip,
+}
+
+/// Weapon-root joint the shot leaves from.
+#[derive(Component)]
+pub struct Hardpoint {
+    pub hand: Hand,
+}
+
+#[derive(Component)]
+pub struct Projectile {
+    velocity: Vec3,
+    gravity: f32,
+    life: f32,
+}
+
+#[derive(Resource)]
+pub(crate) struct Tracers {
+    mesh: Handle<Mesh>,
+    rigid: Handle<StandardMaterial>,
+    energy: Handle<StandardMaterial>,
+}
+
+impl Armament {
+    pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
+        Self { hands: [gun(design.armwep_r as i64), gun(design.armwep_l as i64)] }
+    }
+}
+
+pub fn hardpoint(placement: &Placement) -> Option<Hardpoint> {
+    Some(Hardpoint {
+        hand: match placement.column {
+            "armwep_r" => Hand::Right,
+            "armwep_l" => Hand::Left,
+            _ => return None,
+        },
+    })
+}
+
+pub fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
+    commands.insert_resource(Tracers {
+        mesh: meshes.add(Cuboid::new(0.2, 0.2, 1.6)),
+        rigid: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.85, 0.35),
+            emissive: LinearRgba::rgb(8.0, 5.0, 1.0),
+            unlit: true,
+            ..default()
+        }),
+        energy: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.4, 0.85, 1.0),
+            emissive: LinearRgba::rgb(1.0, 4.0, 10.0),
+            unlit: true,
+            ..default()
+        }),
+    });
+}
+
+pub fn fire(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    held: Res<Held>,
+    piloting: Res<Piloting>,
+    assets: Res<Tracers>,
+    collision: Res<Collision>,
+    pads: Query<&Gamepad>,
+    mut commands: Commands,
+    mut acs: Query<(&Pilot, &mut Armament, &Transform)>,
+    hardpoints: Query<(&Hardpoint, &GlobalTransform)>,
+    mut shots: Query<(Entity, &mut Projectile, &mut Transform), Without<Armament>>,
+) {
+    if !piloting.0 {
+        return;
+    }
+    let dt = time.delta_secs();
+    let Ok((pilot, mut arms, ac_tf)) = acs.single_mut() else {
+        return;
+    };
+    let down = |k: KeyCode| keys.pressed(k) || held.0.contains(&k);
+    let mut want = [down(KeyCode::KeyF) || mouse.pressed(MouseButton::Left), down(KeyCode::KeyC) || mouse.pressed(MouseButton::Right)];
+    // Manual (lang/en/text/menu/manual.fmg): R2 right arm weapon, L2 left.
+    for pad in &pads {
+        want[0] |= pad.pressed(GamepadButton::RightTrigger2);
+        want[1] |= pad.pressed(GamepadButton::LeftTrigger2);
+    }
+    let aim = pilot.aim_direction();
+    for (i, gun) in arms.hands.iter_mut().enumerate() {
+        gun.cooldown = (gun.cooldown - dt * TICK_RATE).max(0.0);
+        if !want[i] || gun.kind == Kind::Skip || gun.remaining == 0 || gun.cooldown > 0.0 {
+            continue;
+        }
+        let hand = if i == 0 { Hand::Right } else { Hand::Left };
+        let origin = hardpoints.iter().find(|(h, _)| h.hand == hand).map_or(ac_tf.translation, |(_, t)| t.translation());
+        let velocity = aim * gun.init_speed.max(1.0) / KMH_PER_MS;
+        gun.remaining = gun.remaining.saturating_sub(1);
+        gun.cooldown = gun.reload_time.max(1.0);
+        let material = match gun.kind {
+            Kind::Energy => assets.energy.clone(),
+            _ => assets.rigid.clone(),
+        };
+        commands.spawn((
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(material),
+            Transform::from_translation(origin).looking_to(aim, Vec3::Y),
+            Projectile { velocity, gravity: gun.gravity, life: MAX_LIFE },
+        ));
+    }
+    for (e, mut shot, mut transform) in &mut shots {
+        shot.life -= dt;
+        let next = transform.translation + shot.velocity * dt;
+        shot.velocity.y -= shot.gravity * TICK_RATE * dt;
+        if shot.life <= 0.0 || (shot.velocity.y < 0.0 && collision.ground_below(transform.translation).is_some_and(|g| next.y <= g)) {
+            commands.entity(e).despawn();
+            continue;
+        }
+        transform.translation = next;
+        if shot.velocity.length_squared() > 0.0 {
+            transform.look_to(shot.velocity.normalize(), Vec3::Y);
+        }
+    }
+}
+
+fn gun(id: i64) -> Gun {
+    let magazine = part_field(id, 10, "magazine").max(0.0) as u16;
+    let init_speed = part_field(id, 10, "init_speed");
+    let (kind, gravity, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
+    Gun { remaining: magazine, reload_time: part_field(id, 10, "reload_time"), cooldown: 0.0, init_speed: speed, kind, gravity }
+}
+
+fn flight(id: u32, init_speed: f32) -> (Kind, f32, f32) {
+    if let Some(row) = find(BULLET_BULLETRIGID_BIN, id) {
+        return (Kind::Rigid, row.data.gravity, speed(init_speed, row.data.max_speed_km_h));
+    }
+    if let Some(row) = find(BULLET_BULLETENERGY_BIN, id) {
+        return (Kind::Energy, 0.0, speed(init_speed, row.data.max_speed_km_h));
+    }
+    (Kind::Skip, 0.0, init_speed)
+}
+
+fn speed(init: f32, max_km_h: u16) -> f32 {
+    if init > 0.0 { init } else { max_km_h as f32 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starter_rifle_is_rigid() {
+        let g = gun(1720);
+        assert_eq!(g.kind, Kind::Rigid, "part 1720 bullet_id should be rigid 10002");
+        assert!(g.remaining > 0 && g.init_speed > 0.0 && g.reload_time > 0.0, "{g:?}");
+    }
+}

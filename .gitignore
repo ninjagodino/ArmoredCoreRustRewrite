@@ -1,0 +1,12 @@
+# Retail disc dump and anything derived from it never leaves this machine.
+/ACVD Unbound/
+/armoredcoredumps/
+/private/
+/crates/acvd-data/src/generated/
+
+# Downloaded third-party tooling (Ghidra, ghidra-cli, Paramdex snapshot).
+/external/
+
+/target/
+*.gpr
+*.rep/

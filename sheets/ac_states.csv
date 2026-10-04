@@ -1,0 +1,32 @@
+state,direction,row,name,evidence
+idle,,0,停止,Standing still.
+walk,0,9,歩き中( 前 ),"Walking loop per direction; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+walk,1,10,歩き中(右前),"Walking loop per direction; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+walk,2,11,歩き中( 右 ),"Walking loop per direction; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+walk,3,12,歩き中(右後),"Walking loop per direction; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+walk,4,13,歩き中( 後 ),"Walking loop per direction; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+walk,5,14,歩き中(左後),"Walking loop per direction; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+walk,6,15,歩き中( 左 ),"Walking loop per direction; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+walk,7,16,歩き中(左前),"Walking loop per direction; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+dash,0,17,ダッシュ( 前 ),"Boosting along the ground, without the turn variants (the next two rows add left/right turning); directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+dash,1,20,ダッシュ(右前),"Boosting along the ground, without the turn variants (the next two rows add left/right turning); directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+dash,2,23,ダッシュ( 右 ),"Boosting along the ground, without the turn variants (the next two rows add left/right turning); directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+dash,3,26,ダッシュ(右後),"Boosting along the ground, without the turn variants (the next two rows add left/right turning); directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+dash,4,29,ダッシュ( 後 ),"Boosting along the ground, without the turn variants (the next two rows add left/right turning); directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+dash,5,32,ダッシュ(左後),"Boosting along the ground, without the turn variants (the next two rows add left/right turning); directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+dash,6,35,ダッシュ( 左 ),"Boosting along the ground, without the turn variants (the next two rows add left/right turning); directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+dash,7,38,ダッシュ(左前),"Boosting along the ground, without the turn variants (the next two rows add left/right turning); directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+turn_left,,57,地上旋回(左),Turning left on the spot.
+turn_right,,58,地上旋回(右),Turning right on the spot.
+jump,,59,ジャンプ,Take-off.
+land,,60,着地,Touchdown.
+rise,,62,上昇(ニュートラル),"Airborne and rising, no input."
+fall,,65,落下(ニュートラル),"Airborne and falling, no input."
+air_move,0,68,空中移動( 前 ),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+air_move,1,71,空中移動(右前),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+air_move,2,74,空中移動( 右 ),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+air_move,3,77,空中移動(右後),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+air_move,4,80,空中移動( 後 ),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+air_move,5,83,空中移動(左後),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+air_move,6,86,空中移動( 左 ),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+air_move,7,89,空中移動(左前),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."

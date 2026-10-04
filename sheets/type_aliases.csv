@@ -1,0 +1,3 @@
+param_type,def_type,evidence
+ACCAM_RAMBLE_PARAM_ST,AC_CAMERA_RAMBLE_PARAM_ST,param/accamerarambleparam.bin pairs with param/def/accamerarambleparam.def by file name; Paramdex ACVD/accamerarambleparam.xml uses the PARAM type string
+SHAKED_NOIZE_FILTER,FILTER_SHAKED_NOIZE_PARAM_ST,param/shakednoizefilterparam.bin pairs with param/def/shakednoizeparam.def; Paramdex ACVD/shakednoizeparam.xml uses the PARAM type string

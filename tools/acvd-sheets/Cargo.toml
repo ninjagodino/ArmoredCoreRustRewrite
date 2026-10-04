@@ -1,0 +1,13 @@
+[package]
+name = "acvd-sheets"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+acvd-formats = { path = "../../crates/acvd-formats" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+roxmltree.workspace = true

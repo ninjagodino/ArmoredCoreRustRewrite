@@ -1,0 +1,7 @@
+kind,width,translation,rotation_tangents,scale,row_size,evidence
+9,2,false,false,false,4,"rotation key per row; acv_2_ver0000 a01_000 keys equal the rest-pose euler (Ry*Rz*Rx) to 3e-5 on 9 bones"
+4,2,false,true,false,8,"16-bit indices reach 0x062c (acv_2r_ow0710 a00_200 bone 41); every rotation in tangent repeats the previous row's out tangent"
+7,2,true,false,true,12,"acv_2_ver0000 a01_062 l_kata translation key = rest (0.997 0.943 0.147); trailing field is a scale-like key in 987 of 987 sampled rows"
+2,2,true,true,true,16,"kind 7 plus rotation in/out tangents; trailing field is a scale-like key in 7939 of 7939 sampled rows"
+6,1,true,false,false,8,"8-bit indices; bytes 6-7 zero in 277 of 277 sampled rows; acv_2_ver0000 a01_002 center: in tangent at frame 3 = per-frame velocity from frame 1"
+1,1,true,true,false,8,"8-bit indices; rotation tangents non-zero in 32 of 402 sampled rows; acv_2_ow0210 a01_210 allocates value/in/out triples consecutively"

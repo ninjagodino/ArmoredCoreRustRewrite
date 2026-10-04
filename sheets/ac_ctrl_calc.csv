@@ -1,0 +1,53 @@
+name,param,unit,expr,evidence
+tank,-,flag,"if legs.leg_type == 3 { 1 } else { 0 }",AcCtrlParamCalc.lua line 835: Scr_IsTank picks the booster stats from the legs
+boost_power,-,booster stat,"if tank > 0 { legs.tank_boost_power } else { booster.power }",Lua lines 823/838 BOOST_POWER
+std_burn_eff,-,booster stat,"if tank > 0 { legs.tank_std_burn_eff } else { booster.std_burn_eff }",Lua lines 825/840 BST__STD_BURN_EFF
+hi_output,-,booster stat,"if tank > 0 { legs.tank_hi_output } else { booster.hi_output }",Lua lines 826/841 BST__HI_OUTPUT
+hi_burn_eff,-,booster stat,"if tank > 0 { legs.tank_hi_burn_eff } else { booster.hi_burn_eff }",Lua lines 827/842 BST__HI_BURN_EFF
+total_weight,71,weight,head.weight + core.weight + arms.weight + legs.weight + fcs.weight + gene.weight + booster.weight + armwep_r.weight + armwep_l.weight + hanger_r.weight + hanger_l.weight + back_r.weight + shoulder.weight,Lua lines 851-864: Scr_GetPartsParam slots 0-6 10 11 15 16 12 14 id 101
+leg_capability,83,weight,total_weight - legs.weight,Lua lines 867-868: the build weight the legs carry
+weight_ratio,84,ratio,leg_capability / legs.payload,Lua lines 871-873 weight_capability_radito
+weight_correct_rate,85,multiplier,"(if weight_ratio < 1 { 1 - (1 - legs.max_load_downer) * weight_ratio * weight_ratio } else { legs.max_load_downer + legs.max_load_downer / legs.move_limit * (1 - weight_ratio) }).max(0.01)","Lua lines 876-887: falls with the square of the load ratio up to the payload, then linearly past it"
+move_stability,86,multiplier,(new_ac_behavior.stability_base + legs.stability / 10000) * (new_ac_behavior.stability_raise - (new_ac_behavior.stability_reference - head.balance) / 10000),Lua lines 891-895
+stability_from_leg,87,multiplier,move_stability * (0.95 + legs.move_stab_eff / 10000),Lua lines 898-900
+fly_eff_a,-,per weight,(1 - new_ac_behavior.fly_weight_10000) / -8000,Lua line 910
+fly_eff_b,-,multiplier,1 - 5000 * fly_eff_a,Lua line 913
+fly_eff,88,multiplier,fly_eff_a * total_weight + fly_eff_b,Lua lines 917-918 totalweight_fly_eff
+friction_eff,110,multiplier,1 + (1 - fly_eff) * new_ac_behavior.fly_friction_rate,Lua lines 921-922 totalWeigthFrictionEff
+walk_speed,1,km/h,(legs.walk / 100 * weight_correct_rate * stability_from_leg).max(15),Lua lines 934-937 (MIN_WALK_SPEED 15)
+turn_speed,2,deg/s,(legs.turn / 100 * stability_from_leg * weight_correct_rate).max(10),Lua lines 940-943 (MIN_TURN_SPEED 10)
+walk_acc,3,(m/frame)/s,legs.torque / new_ac_behavior.torque_to_walk_accel * weight_correct_rate * stability_from_leg,Lua lines 946-947
+lospeed_brake,4,multiplier,new_ac_behavior.brake_low_speed + legs.brake * friction_eff / 20000,Lua lines 950-953
+hispeed_brake,5,multiplier,new_ac_behavior.brake_high_speed + legs.brake * friction_eff / 13000,Lua lines 956-957
+brake_sw_speed,6,km/h,walk_speed * (1 + legs.brake / 10000),Lua lines 960-961
+jump_v_base,-,(m/frame)/s,legs.jump / new_ac_behavior.jump_to_vertical * stability_from_leg * weight_correct_rate * fly_eff,Lua line 964
+jump_v_speed,7,(m/frame)/s,"if tank > 0 { jump_v_base / 30 } else { jump_v_base.max(20) }",Lua lines 967-972 (MIN_JUMP_SPEED 20)
+jump_h_acc,8,(m/frame)/s,legs.jump / new_ac_behavior.jump_to_horizontal * stability_from_leg * weight_correct_rate * fly_eff,Lua lines 975-976
+boost_speed_scale,-,multiplier,1 + (legs.walk / 100 - 50) / 120,Lua line 979 boostMoveMaxSpeedScale
+boost_max_speed,9,km/h,(boost_speed_scale * boost_power * fly_eff * weight_correct_rate * move_stability / 100).max(20),Lua lines 982-984 (MIN_BOOST_SPEED 20)
+boost_acc,10,(m/frame)/s,core.en_conductivity / 100 * fly_eff * std_burn_eff / 10000,Lua lines 987-989
+boost_gravity,11,gravity multiplier,(legs.std_gravity - boost_acc * 1000 * legs.std_gravity / new_ac_behavior.boost_zero_gravity_accel).max(0.001),"Lua lines 992-994. FUN_00a7f5d4 struct[0x18]; the air boost (movement vtable slot 12 FUN_00a84920, also slot 20, the kicks and the quick boost) copies it to +0x284, which FUN_00a7cb18 multiplies gravity by while airborne until landing (slot 3 FUN_00a8362c resets it to 1)"
+glide_max_speed,12,km/h,(boost_speed_scale * (hi_output / 150) * fly_eff * weight_correct_rate * move_stability).max(100),Lua lines 997-999 levitate_max_speed (MIN_LEVITATE_SPEED 100)
+glide_acc,13,(m/frame)/s,core.en_conductivity / 100 * fly_eff * hi_burn_eff / 800,Lua lines 1002-1003 levitate_acc
+air_drag_boost,69,fraction,2 * (core.en_conductivity / 100) * fly_eff * std_burn_eff / 300000 + new_ac_behavior.air_drag_base,Lua lines 1050-1051 airRegistance_BoostOn
+boost_accel_divisor,48,divisor,legs.boost_accel_divisor,Lua line 1108
+walk_max_tick,-,m/frame,walk_speed * 1000 / 216000,FUN_00a7f5d4 struct[2] = param 1 x1000/216000 (km/h to m per 1/60 s frame); FUN_00a7b860 compares the horizontal speed (+0x260/+0x268) with it directly
+walk_acc_tick,-,m/frame per tick,walk_acc / 60,FUN_00a7f5d4 struct[0] = param 3 / 60
+turn_rate,-,rad/s,turn_speed.to_radians(),FUN_00a7f5d4 struct[3] = param 2 x deg-to-rad (x FUN_00aebe44 which is 1 without a modifier)
+brake_switch_tick,-,m/frame,brake_sw_speed * 1000 / 216000,FUN_00a7f5d4 struct[0x1d]; FUN_00a7b898 tests speed >= it for the high-speed brake
+lospeed_brake_tick,-,m/frame per tick,lospeed_brake / 60,"FUN_00a7f5d4 struct[0x20] = param 4 (+0x84), picked by FUN_00a7ab24 below brake_switch_tick. The friction step FUN_00a822fc, run only on frames without a move action, decelerates on the ground by it x surface x slope (1 on flat ground) / 60, which FUN_00a79bb8 takes off the horizontal speed x 60 x dt per tick"
+hispeed_brake_tick,-,m/frame per tick,hispeed_brake / 60,"FUN_00a7f5d4 struct[0x1f] = param 5 (+0x80), picked by FUN_00a7ab44 and by every frame start (FUN_00a7b9f0); applied as lospeed_brake_tick"
+air_drag_tick,-,fraction per tick,new_ac_behavior.air_drag,"FUN_00a7f5d4 struct[0x17]; FUN_00a822fc applies it in the air with boost mode off, as air_drag_boost_tick with it on"
+over_max_decel_tick,-,fraction per tick,new_ac_behavior.over_max_decel,"360 movement +0x88; 0x82822ea0 applies it while moving above the current max (walk, boost, air boost), else adds the acceleration and clamps the speed to that max"
+jump_rise_tick,-,m/frame per tick,jump_v_speed / 60,FUN_00a7f5d4 struct[0x6a] = param 7 / 60 (x FUN_00aec638 which is 1 without a modifier)
+jump_accel_tick,-,m/frame per tick,jump_rise_tick * 0.5,"The jumps (movement vtable slots 9-11, FUN_00a850c8 ..) call slot 7 FUN_00a7b564 with dt x 0.5 / dt, which adds that times struct[0x6a] to the vertical acceleration; FUN_00a7cb18 adds the acceleration x 60 x dt per tick for jump_frames ticks, with no cap"
+jump_h_acc_tick,-,m/frame per tick,jump_h_acc / 60,FUN_00a7f5d4 struct[4] = param 8 / 60
+jump_frames,-,ticks,"if tank > 0 { new_ac_behavior.jump_accel_frames_tank } else { new_ac_behavior.jump_accel_frames }",NewAcBehavior 403/404 labels: jump acceleration frames for non-tank and tank legs
+boost_max_tick,-,m/frame,boost_max_speed * 1000 / 216000,FUN_00a7f5d4 struct[1] (and struct[0xe]/[0x12] through FUN_00aec1d8) = param 9 x1000/216000
+boost_acc_tick,-,m/frame per tick,boost_acc / 60,FUN_00aec1d8 struct[0xd] and FUN_00a7f5d4 struct[0x11] = param 10 / 60
+air_drag_boost_tick,-,fraction per tick,air_drag_boost / boost_accel_divisor,"FUN_00a7f5d4 struct[0x16] = param 69 / param 48; the friction step FUN_00a822fc, run only on frames without a move action, takes it in the air with boost mode on and FUN_00a79d68 scales the horizontal speed by 1 - it per tick"
+glide_max_tick,-,m/frame,glide_max_speed * 1000 / 216000,"FUN_00a7f5d4 struct[0x24] = param 12 x1000/216000; the glide (movement vtable slot 14 FUN_00a7b580, state 4) copies struct[0x22..0x2a] into its working block for FUN_00a7a098"
+glide_acc_tick,-,m/frame per tick,glide_acc / 60,FUN_00a7f5d4 struct[0x28] = param 13 / 60; FUN_00a7a098 adds it x 60 x dt per tick along the stick while the EN check of struct[0x29] (Lua param 56) x dt passes
+gravity_tick,-,m/frame per tick,new_ac_behavior.gravity / 60,FUN_00a7f5d4 struct[0x69]; FUN_00a7cb18 subtracts it once per tick
+boost_gravity_tick,-,m/frame per tick,gravity_tick * boost_gravity,FUN_00a7cb18 gravity x +0x284 after an air boost (see boost_gravity)
+fall_max_tick,-,m/frame,new_ac_behavior.fall_max_speed * 1000 / 216000,FUN_00a7f5d4 struct[0x19]

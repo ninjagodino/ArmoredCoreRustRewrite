@@ -1,0 +1,11 @@
+[package]
+name = "acvd-render"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+acvd-formats = { path = "../acvd-formats" }
+acvd-data = { path = "../acvd-data" }
+anyhow.workspace = true
+bevy.workspace = true

@@ -1,0 +1,4 @@
+code,name,block_bytes,evidence
+0,bc1,8,"31024 textures; every stored size equals the 4x4 x 8-byte mip chain; first block of image/authenticate/authenticate00.tpf reads as little-endian RGB565 endpoints"
+5,bc3,16,"3200 textures; stored sizes equal the 4x4 x 16-byte mip chain; font sheets (font/*_t.bnd) start with alpha endpoints 00 01 and zero indices, the BC3 layout for transparent texels"
+33,bc3,16,"1928 textures (model *_gt.tpf.dcx, all with a float block); stored sizes equal the 4x4 x 16-byte mip chain"

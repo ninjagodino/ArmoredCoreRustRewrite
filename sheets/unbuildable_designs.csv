@@ -1,0 +1,21 @@
+id,name,evidence
+7190,ガウォーク,"test design (Gerwalk); its weapons and shoulder 8530/8531/8532 are records of no catalogue on the disc: param/acvparts.bin, param/acparts.bin, param/trial_acparts.bin and the AcParts.bin of every param/regulation.bin version (1.00 1.10 1.15 1.20)"
+7191,ガウォーク（小）,as 7190
+9002,DEFテスト,test design; shoulder 4020 is not an acvparts.bin record (only the older acparts.bin and trial_acparts.bin have it)
+9004,２／８テスト,as 9002
+9750,PS3_クローズドβ初期機体,"PS3 closed-beta starter; its x1-numbered part ids (head 121, core 211 ..) are not acvparts.bin records, and most (331 341 521 611 731 931 1211 1341 ..) are in no catalogue on the disc, as 7190"
+9751,PS3_クローズドβ中2脚,as 9750
+9752,PS3_クローズドβ軽2脚,as 9750
+9753,PS3_クローズドβ重2脚,as 9750
+9754,PS3_クローズドβ軽逆脚,as 9750
+9755,PS3_クローズドβ重逆脚,as 9750
+9756,PS3_クローズドβ四脚,as 9750
+9757,PS3_クローズドβタンク,as 9750
+9760,Xbox_クローズドβ初期機体,"Xbox closed-beta starter, as 9750"
+9761,Xbox_クローズドβ中2脚,as 9760
+9762,Xbox_クローズドβ軽2脚,as 9760
+9763,Xbox_クローズドβ重2脚,as 9760
+9764,Xbox_クローズドβ軽逆脚,as 9760
+9765,Xbox_クローズドβ重逆脚,as 9760
+9766,Xbox_クローズドβ四脚,as 9760
+9767,Xbox_クローズドβタンク,as 9760

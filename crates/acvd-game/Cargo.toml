@@ -1,0 +1,12 @@
+[package]
+name = "acvd-game"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+acvd-formats = { path = "../acvd-formats" }
+acvd-data = { path = "../acvd-data" }
+acvd-render = { path = "../acvd-render" }
+anyhow.workspace = true
+bevy.workspace = true

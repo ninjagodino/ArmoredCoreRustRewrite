@@ -1,0 +1,45 @@
+category,offset,type,name,evidence
+3,317,u8,legs_motion_id,"byte 0x13d is the only record byte whose 91 values all name a motioncollate.bin legs_motion_id (10 11 12 13 14 15 16 18 25), and it follows the model id ranges: lg01xx-03xx -> 10/11 (acv_2, acv_2l), 04xx-06xx -> 12 (acv_2h), 07xx-08xx -> 13 (acv_2r), 09xx-10xx -> 14 (acv_2rh), 11xx-12xx -> 18 (acv_4), 13xx-14xx -> 15 (acv_t), lg9935 -> 25"
+0,8,u16,weight,"Scr_GetPartsParam id 101 (AcCtrlParamCalc.lua weight sum): FUN_00437b28 routes ids 100-108 through the member table at TOC 0x1d9ca50+0x221c; entry 101 is 0x42d018, which returns the u16 at record+8 for every category"
+1,8,u16,weight,same getter as head weight (id 101)
+2,8,u16,weight,same getter as head weight (id 101)
+3,8,u16,weight,same getter as head weight (id 101)
+4,8,u16,weight,same getter as head weight (id 101)
+5,8,u16,weight,same getter as head weight (id 101)
+6,8,u16,weight,same getter as head weight (id 101)
+10,8,u16,weight,same getter as head weight (id 101)
+11,8,u16,weight,same getter as head weight (id 101)
+12,8,u16,weight,same getter as head weight (id 101)
+0,316,u16,balance,"Scr_GetPartsParam id 1000 (Lua head_balance): the head handler 0x4348a4 indexes ids 1000+ in the member table at TOC 0x1d9ec64; entry 1000 is 0x42d238 (u16 at +0x13c)"
+1,36,f32,en_conductivity,"Scr_GetACVParam(1, float 4) (Lua en_conductivity): FUN_00429f18 returns the float at record+0x14+4n"
+3,322,u16,payload,"Scr_GetPartsParam id 1300 (Lua leg_payload): the legs handler 0x4344fc indexes ids 1300-1321 in the member table at TOC 0x1d9ec58; entry 1300 is 0x42dfa4 (u16 at +0x142)"
+3,328,u32,walk,Scr_GetPartsParam id 1302 (Lua walk_perf): legs table entry 0x42e04c (u32 at +0x148)
+3,332,u32,turn,Scr_GetPartsParam id 1303 (Lua turn_perf): legs table entry 0x42e0a0 (u32 at +0x14c)
+3,336,u32,brake,Scr_GetPartsParam id 1304 (Lua leg_brake_perf): legs table entry 0x42e0f4 (u32 at +0x150)
+3,340,u32,jump,Scr_GetPartsParam id 1305 (Lua leg_jump_perf): legs table entry 0x42e148 (u32 at +0x154)
+3,344,u32,stability,Scr_GetPartsParam id 1306 (Lua leg_parts_stability): legs table entry 0x42e19c (u32 at +0x158)
+3,316,u8,leg_type,"Scr_IsTank (registered with descriptor 0x1d29188 -> 0x3f8b08 -> 0x42a658) is byte +0x13c == 3; 1311/1312 test the same byte. By model: 0 = lg01xx-06xx, 1 = lg07xx-10xx, 2 = lg11xx-12xx, 3 = lg13xx-14xx (the acv_t motion set), with the x2xx/x6xx/x8xx variants following their base"
+3,356,u32,tank_boost_power,"Scr_GetPartsParam id 1311 (Lua BOOST_POWER for tanks): legs table entry 0x42e478 returns the u32 at +0x164 when leg_type is 3, else 0"
+3,256,i16,torque,"Scr_GetACVParam(3, int16 6) (Lua leg_torque): FUN_00429f44 returns the i16 at record+0xf4+2n"
+3,266,i16,move_stab_eff,Scr_GetACVParam(3 int16 11) (Lua leg_move_stab_eff): i16 at record+0xf4+2n
+3,68,f32,tank_std_burn_eff,Scr_GetACVParam(3 float 12) (Lua BST__STD_BURN_EFF for tanks): float at record+0x14+4n
+3,72,f32,tank_hi_output,Scr_GetACVParam(3 float 13) (Lua BST__HI_OUTPUT for tanks)
+3,76,f32,tank_hi_burn_eff,Scr_GetACVParam(3 float 14) (Lua BST__HI_BURN_EFF for tanks)
+3,80,f32,std_gravity,Scr_GetACVParam(3 float 15) (Lua leg_std_gravity)
+3,84,f32,max_load_downer,Scr_GetACVParam(3 float 16) (Lua max_load_downer_rate)
+3,88,f32,move_limit,Scr_GetACVParam(3 float 17) (Lua move_limit_rate)
+3,164,f32,boost_accel_divisor,Scr_GetACVParam(3 float 36) (Lua Scr_SetParam 48); 10 on every legs record
+6,308,u32,power,"Scr_GetPartsParam id 600 (Lua BOOST_POWER): the booster handler 0x4342b0 indexes ids 600+ in the member table at TOC 0x1d9ec4c; entry 600 is 0x42dec4 (u32 at +0x134)"
+6,32,f32,std_burn_eff,Scr_GetACVParam(6 float 3) (Lua BST__STD_BURN_EFF): float at record+0x14+4n
+6,36,f32,hi_output,Scr_GetACVParam(6 float 4) (Lua BST__HI_OUTPUT)
+6,44,f32,hi_burn_eff,Scr_GetACVParam(6 float 6) (Lua BST__HI_BURN_EFF)
+10,312,u16,magazine,"unconfirmed name: no getter traced. u16 at +0x138 next to missile_lock_time, 188 distinct values (part 1010 = 520, 410 = 535, 810 = 215, 6010 = 514); could be total ammo rather than one magazine"
+10,314,u16,missile_lock_time,"growpartsarmunitparam.bin missile_lock_time_org equals this u16 on 177 of 222 category-10 records (part 1010 = 52)"
+10,316,u32,bullet_id,"u32 at +0x13c names a bullet/* param row on 215 of 222 records (part 1010 = 10003 BULLET_RIGID_ST マシンガン, 810 = 10006 BULLET_ENERGY_ST レーザー)"
+10,320,u32,hit_id,"u32 at +0x140 names a bullethit/bulletdecal row on 215 of 222 records (part 1010 = 51010 Shotgun, 410 = 50410 Burst hand gun)"
+10,328,f32,init_speed,"growpartsarmunitparam.bin init_speed_org equals this f32 on 196 of 222 records (part 1010 = 335, 410 = 434); unit not traced (km/h or m/s)"
+10,332,f32,en_drain,"growpartsarmunitparam.bin en_drain_org equals this f32 on 69 of 222 records, the energy guns (part 810 = 1101); 0 on kinetic"
+10,344,u16,reload_time,"growpartsarmunitparam.bin reload_time_org equals this u16 on 215 of 222 records (part 1010 = 116, 810 = 10, 6010 = 204); unit not traced (read as 60 Hz ticks between shots)"
+10,380,u16,no_decay_range,"growpartsarmunitparam.bin no_decay_range_org equals this u16 on 215 of 222 records (part 1010 = 14, 410 = 138)"
+10,396,f32,damage_power,"growpartsarmunitparam.bin damage_power_org equals this f32 on 215 of 222 records (part 1010 = 722, 410 = 1164)"
+10,400,f32,damage_recoil,"growpartsarmunitparam.bin damage_recoil_org equals this f32 on 171 of 222 records (part 1010 = 1002, 410 = 791); 0 on energy guns"

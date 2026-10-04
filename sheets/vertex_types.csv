@@ -1,0 +1,10 @@
+kind,semantic,name,size,evidence
+0x02,0,position float3,12,27689 members; float x/y/z; drives every mesh bounding box
+0x10,3,normal byte4 (b-127)/127 + w,4,27666 members; all 6644 am0010 mesh 0 triangles wind clockwise around these normals; w is the vertex's bone (through the mesh bone table) when there are no bone indices and non-dynamic meshes store positions relative to it: after the rest-pose transform 8807 of 8827 models fit their header bounding box
+0x10,6,tangent byte4 (b-127)/127,4,3855 members; meshes whose materials carry normal maps
+0x10,10,color byte4 rgba/255,4,27689 members
+0x15,5,uv i16x2 / 2048,4,25844 members (1930 as a second uv); version >= 0x2000F scale
+0x16,5,uv pair i16x4 / 2048,8,1527 members; two uv sets
+0x2f,2,bone indices byte4,4,76 members in dynamic meshes
+0x1a,1,bone weights i16x4 / 32767,8,53 members in dynamic meshes
+0xf0,0,edge stream 1 byte per vertex (not decoded),1,27689 members; Edge SPU vertex data; positions are in the float3 buffer

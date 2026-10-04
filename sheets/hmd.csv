@@ -1,0 +1,21 @@
+field,offset,type,evidence
+magic,0x00,u32 0x10000117,all 45 m3100 *_h.hmd; formats.csv .hmd
+version,0x04,u32 0x4A9,all 45 m3100 *_h.hmd
+file_size,0x08,u32,equals the file length on all 45
+material_count,0x0C,u32,1-3 on m3100; two string offsets each (name + empty)
+unk10,0x10,u32 1,all 45
+vertex_count,0x14,u32,vertices at the mesh record's vertex offset are f32x3
+unk18,0x18,u32 0,all 45
+node_count,0x1C,u32,nodes are 0x34 bytes at triangle_offset - count*0x34
+triangle_count,0x20,u32,triangles are 10 bytes at +0x2C
+string_table,0x24,u32 0x40,all 45; nmat x (u32 name offset, u32 empty offset)
+strings_end,0x28,u32,first byte after the material strings
+triangle_offset,0x2C,u32,then 2-byte pad when nt*10 is odd; vertices follow
+node_count_field,node+0x00,i16,triangle count owned by this node; 0 on internal nodes
+node_first,node+0x02,i16,first triangle index; v>>1 of every corner is inside the AABB (0 bad of 177 on m0001_h.hmd)
+node_left,node+0x04,i16,child index or -1
+node_right,node+0x06,i16,child index or -1
+node_aabb,node+0x08,f32x3 min + f32x3 max,local space
+tri_vert,tri+0x00,u16x3,vertex = value>>1; low bit kept (27150 set bits across m3100)
+tri_unk,tri+0x06,u16,unique count close to nt; not a vertex index
+tri_material,tri+0x08,u16,0 or 1 on two-material files; indexes the name table (sand/concrete/iron/clay/plyerhit/ackickrhit/camera.tga)

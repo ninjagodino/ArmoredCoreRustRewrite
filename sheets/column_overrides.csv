@@ -1,0 +1,67 @@
+param_type,index,name,bits,drop,evidence
+AC_ACT_RESTRICTION_PARAM_ST,7,reserved,,false,disc internal name is reserved[8] but byte_count is 1 and param/acactrestrictionparam.bin rows are 8 bytes apart (7 u8 flags + 1)
+HOMETOWN_INFO,1,,,true,def adds dummy8 reserved[2] but all 15 lang/*/param/hometowninfo*.bin files have rows 2 bytes apart and hometownInfo.bin ends exactly at the last row (0x4fe+2 = 0x500)
+ACTEST_DATA_ST,0,layerName,,false,translation of disc display name レイヤー名
+ACTEST_DATA_ST,1,targetModelName,,false,translation of disc display name ターゲットモデル名
+ACTEST_DATA_ST,2,targetCount,,false,translation of disc display name ターゲット数
+ACTEST_DATA_ST,3,reserved,,false,translation of disc display name 予約
+AC_DATA_INFO,1,acTextId,,false,translation of disc display name ACテキストID
+AC_DATA_INFO,2,dummy,,false,translation of disc display name ダミー
+AC_DATA_INFO,3,assemblyId,,false,translation of disc display name 機体構成ID
+AC_PROFILE_INFO,1,dummy,,false,translation of disc display name ダミー
+AC_PROFILE_INFO,2,description,,false,translation of disc display name 説明
+AC_TEXT_INFO,1,dummy,,false,translation of disc display name ダミー
+AC_TEXT_INFO,2,pilotName,,false,translation of disc display name 搭乗者名
+AC_TEXT_INFO,3,acName,,false,translation of disc display name 機体名
+AC_TEXT_INFO,4,affiliation,,false,translation of disc display name 所属勢力 (description says currently unused)
+TUTORIAL_DATA_ST,0,layerName,,false,translation of disc display name レイヤー名
+TUTORIAL_DATA_ST,1,scriptName,,false,translation of disc display name スクリプト名
+TUTORIAL_DATA_ST,2,playerEventId,,false,translation of disc display name 自機のイベントID
+TUTORIAL_DATA_ST,3,playerAssemblyId,,false,translation of disc display name 自機機体構成ID
+TUTORIAL_DATA_ST,4,playerStartPointId,,false,translation of disc display name 自機初期位置ポイントID
+TUTORIAL_DATA_ST,5,reserved,,false,translation of disc display name 予約
+TUTORIAL_OPERATION_TEXT,0,operationMessageId,,false,translation of disc display name 操作説明メッセージID
+TUTORIAL_OPERATION_TEXT,1,keyFont1,,false,translation of disc display name キーフォント１
+TUTORIAL_OPERATION_TEXT,2,keyFont2,,false,translation of disc display name キーフォント２
+TUTORIAL_OPERATION_TEXT,3,reserved,,false,translation of disc display name 予約
+TUTORIAL_PROGRESS_TEXT,0,textId1,,false,translation of disc display name テキストID１
+TUTORIAL_PROGRESS_TEXT,1,textId2,,false,translation of disc display name テキストID２
+TUTORIAL_TASK_DATA,0,taskId,,false,translation of disc display name 課題ID
+TUTORIAL_TASK_DATA,1,capEventId,,false,translation of disc display name CAPイベントID
+TUTORIAL_TASK_DATA,2,taskTextId,,false,translation of disc display name 課題テキストID
+TUTORIAL_TASK_DATA,3,operationTextId,,false,translation of disc display name 操作説明テキストID
+TUTORIAL_TASK_TEXT,0,taskMessageId,,false,translation of disc display name 課題メッセージID
+TUTORIAL_TASK_TEXT,1,supplementMessageId,,false,translation of disc display name 補足メッセージID
+TUTORIAL_TASK_TEXT,2,supplementMessageId2,,false,translation of disc display name 補足メッセージID2
+TUTORIAL_TASK_TEXT,3,reserved,,false,translation of disc display name 予約
+ARENA_AC_INFO,1,arenaId,,false,translation of disc display name 所属アリーナID
+ARENA_AC_INFO,2,acDataId,,false,translation of disc display name ACのデータID
+ARENA_AC_INFO,3,profileDataId,,false,translation of disc display name プロフィールデータID
+ARENA_AC_INFO,4,aiName,,false,translation of disc display name AIの名前
+ARENA_AC_INFO,5,rewardAmount,,false,translation of disc display name 報酬金額
+ARENA_AC_INFO,6,contributionGa,,false,translation of disc display name GA貢献度
+ARENA_AC_INFO,7,contributionInterior,,false,translation of disc display name インテリオル貢献度
+ARENA_AC_INFO,8,contributionOmer,,false,translation of disc display name オーメル貢献度
+ARENA_AC_INFO,9,contributionLeague,,false,translation of disc display name 企業連貢献度
+ARENA_AC_INFO,10,contributionOrca,,false,translation of disc display name ORCA貢献度
+ARENA_AC_INFO,11,contributionColony,,false,translation of disc display name 自治都市貢献度
+ARENA_AC_INFO,12,contributionSpare1,,false,translation of disc display name 貢献度予備1
+ARENA_AC_INFO,13,contributionSpare2,,false,translation of disc display name 貢献度予備2
+CHAPTER_INFO,0,chapterId,,false,translation of disc display name チャプターID
+CHAPTER_INFO,1,clearMissionCount,,false,translation of disc display name クリアミッション数
+CHAPTER_INFO,2,nextChapterId,,false,translation of disc display name 遷移先チャプターID
+CHAPTER_INFO,3,dummy,,false,translation of disc display name ダミー
+CLASS_PARAM_ST,0,matchBonus,,false,translation of disc display name クラス別の対戦ボーナス
+CLASS_PARAM_ST,1,classDownThreshold,,false,translation of disc display name クラスダウンする基準ポイント
+CLASS_PARAM_ST,2,classUpThreshold,,false,translation of disc display name クラスアップする基準ポイント
+FILTER_DAMAGENOISE_PARAM_ST,0,maxAmplitude,,false,translation of disc display name 最大振幅
+FILTER_DAMAGENOISE_PARAM_ST,1,minInterval,,false,translation of disc display name 最小インターバル
+FILTER_DAMAGENOISE_PARAM_ST,2,maxInterval,,false,translation of disc display name 最大インターバル
+FILTER_DAMAGENOISE_PARAM_ST,3,amplitudeGrowthSpeed,,false,translation of disc display name 振幅増幅速度
+FILTER_DAMAGENOISE_PARAM_ST,4,noiseScroll,,false,translation of disc display name ノイズスクロール
+FILTER_DAMAGENOISE_PARAM_ST,5,persistence,,false,translation of disc display name 固執性 (noise persistence)
+FILTER_DAMAGENOISE_PARAM_ST,6,lacunarity,,false,translation of disc display name 空隙性 (noise lacunarity)
+FILTER_DAMAGENOISE_PARAM_ST,7,smoothness,,false,translation of disc display name 滑らかさ
+FILTER_DAMAGENOISE_PARAM_ST,8,amplitude,,false,translation of disc display name 振幅
+FILTER_DAMAGENOISE_PARAM_ST,9,animationStatus,,false,translation of disc display name アニメーションステータス
+FILTER_DAMAGENOISE_PARAM_ST,10,reserved,,false,disc display name 要約 on a dummy8[27] padding column; read as 予約 (reserved)

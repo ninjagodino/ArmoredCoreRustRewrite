@@ -1,0 +1,55 @@
+---
+description: Read and decompile the Xbox 360 build through ghidra-cli; touch PS3 addresses only for RPCS3 breakpoints
+alwaysApply: true
+---
+
+# Decompile view: Xbox 360 first
+
+All static reading of game code uses the Xbox 360 executable `private/x360/vd/ACV2.pe`
+(base 0x82000000). It has no TOC or function descriptors, so constants and call targets are
+plain addresses and Ghidra's output is cleaner than the PS3 build's.
+
+## ghidra-cli first (sub-second, names persist)
+
+`external/ghidra-cli/ghidra.exe` drives a resident Ghidra bridge on the writable project
+`private/ghidra360cli` (defaults set in its config: project `ACV2`, program `ACV2.pe`). Every
+`.pdata` function exists with exact bounds (`tools/ghidra/X360Pdata.java`), plus leaf call targets.
+
+```powershell
+$g = "$PWD\external\ghidra-cli\ghidra.exe"
+& $g status                      # if no bridge: start it detached, never inline
+Start-Process $g start -WindowStyle Hidden -RedirectStandardOutput private\tmp\bridge.out -RedirectStandardError private\tmp\bridge.err
+& $g decompile 0x82bf7878        # or by name: CamFx_sideMoving
+& $g x-ref to 0x8285cf68         # calls and data refs (lis/addi pairs included)
+& $g rename FUN_82bf7878 CamFx_sideMoving
+```
+
+- An inline `& $g start` (or the first command auto-starting it) holds the shell's output pipe
+  open and the call never returns; start the bridge as above.
+- Rename functions once their role is known (`CamCtrl_*` camera controller, `CamFx_*` camera
+  effects, ...), so later decompiles read with names. Output is JSON; `\r\n` in `code` is literal.
+- The bridge locks `private/ghidra360cli`: `& $g stop` before any headless run against it.
+- Ignore its ".NET managed code" warning (PE heuristic). VMX128 code still decompiles badly
+  ("bad instruction data"): use the disassembler for those.
+
+## Raw-image scripts (fallback, `private/tmp/`)
+
+- Function bounds: `py private/tmp/x360func.py ADDR`
+- Disassembly: `py private/tmp/x360dis.py LO HI`
+- Callers / address refs / virtual calls / field users: `x360calls.py`, `x360refs.py`,
+  `x360vcall.py`, `x360fields.py`
+- Old one-shot headless decompile on the read-only project `private/ghidra360` (~12 s each,
+  output in `private/ghidra360/out/ADDR.c`):
+
+```powershell
+& external\ghidra_12.1.4_PUBLIC\support\analyzeHeadless.bat private\ghidra360 ACV2 -process ACV2.pe -noanalysis -readOnly -scriptPath tools\ghidra -postScript DecompileRefs.java "@START-END"
+```
+
+The PS3 EBOOTs (`private/exe/` disc, `private/exe102/` 01.02) are only for questions that need
+the game running: the user sets RPCS3 breakpoints on 01.02. When one is needed, translate that
+single address from the 360 function by matching its instruction bytes, verify it with
+`$env:EBOOT='private/exe102/EBOOT.elf'; py private/tmp/ppcdis.py LO HI`, and hand it over.
+
+Sheet evidence cites the 360 address first; add a PS3 address only where a breakpoint was used.
+Runtime questions (who triggers something, which path fires) go to the user's RPCS3 debugger
+rather than long static hunts.

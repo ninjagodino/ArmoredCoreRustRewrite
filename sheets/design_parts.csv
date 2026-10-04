@@ -1,0 +1,14 @@
+slot,table,column,category,evidence
+0,AC_ASSEMBLY_DESIGN_ST,head,0,"Scr_GetPartsParam (0x3f2b60) switches on the slot through a 39-entry jump table (0x3f2c24), one entry per part column of AC_ASSEMBLY_DESIGN_ST (head .. legs_l_lb), so slot n is column n; AcCtrlParamCalc.lua reads slot 0 with head ids (1000)"
+1,AC_ASSEMBLY_DESIGN_ST,core,1,slot 1; Lua reads Scr_GetACVParam(1 ..) as the core's en_conductivity
+2,AC_ASSEMBLY_DESIGN_ST,arms,2,slot 2
+3,AC_ASSEMBLY_DESIGN_ST,legs,3,slot 3; Lua reads the leg ids 1300-1312 here
+4,AC_ASSEMBLY_DESIGN_ST,fcs,4,slot 4
+5,AC_ASSEMBLY_DESIGN_ST,gene,5,slot 5
+6,AC_ASSEMBLY_DESIGN_ST,booster,6,slot 6; Lua reads the booster ids 600/601 here
+10,AC_ASSEMBLY_DESIGN_ST,armwep_r,10,slot 10
+11,AC_ASSEMBLY_DESIGN_ST,armwep_l,10,slot 11
+12,AC_ASSEMBLY_DESIGN_ST,back_r,11,"slot 12; every preset's back_r is an overed weapon id (110, 610, 810)"
+14,AC_ASSEMBLY_DESIGN_ST,shoulder,12,slot 14
+15,AC_ASSEMBLY_DESIGN_ST,hanger_r,10,slot 15
+16,AC_ASSEMBLY_DESIGN_ST,hanger_l,10,slot 16

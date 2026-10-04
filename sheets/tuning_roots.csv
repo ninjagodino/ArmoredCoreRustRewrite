@@ -1,0 +1,3 @@
+variable,directory,evidence
+$(Data),.,system/paramlist.xml names $(Data)\Param\NewAcBehavior.bin and $(Data)\DBmenu\NewAcBehavior.dbp; the disc has param/newacbehavior.bin and dbmenu/newacbehavior.dbp under USRDIR
+$(Common),.,system/paramlist.xml names $(Common)\Param\MissionEstimateCommon.bin; the disc has param/missionestimatecommon.bin under USRDIR

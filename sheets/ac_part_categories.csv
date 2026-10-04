@@ -1,0 +1,12 @@
+category,name,model_dir,prefixes,record_size,evidence
+0,head,head,hd,324,"param/acvparts.bin: 47 records from 0x34; every record opens with its id twice and the second id names an hd model"
+1,core,core,cr,324,"42 records from 0x3bb0; second ids name cr models"
+2,arms,arm,am,328,"72 records from 0x70d8; the second id is the model (part 5110 draws am0115)"
+3,legs,leg,lg,372,"91 records from 0xcd18; second ids name lg models"
+4,fcs,fcs,fs,328,"17 records from 0x15154; second ids name fs models"
+5,generator,gene,gn,324,"17 records from 0x1671c; second ids name gn models"
+6,booster,boost,bs,336,"14 records from 0x17ca0; second ids name bs models"
+10,weapon,hand,hr;hl,416,"222 records from 0x18f00; second ids name hr (right) and hl (left) models"
+11,overed_weapon,ow,ow,428,"6 records from 0x2f7c0; second ids name ow models"
+12,shoulder,shoul,sh,452,"85 records from 0x301c8; second ids name sh models"
+13,recon,recon,rc,308,"9 records from 0x397dc; second ids name rc models; the header counts end here at 0x3a2b0"

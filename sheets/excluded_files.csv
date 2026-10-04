@@ -1,0 +1,5 @@
+file,reason
+lang/jp/param/acassemblydrawing.bin,"older PARAM format 101 (flags 00 00 65) with 210-byte rows; the shipped AC_ASSEMBLY_DESIGN_ST def gives 96 and param/acassemblydrawing.bin matches it"
+lang/jp/menu/emblemcategory.bin,"older PARAM format 101 with 12-byte rows; the shipped EMBLEM_CATEGORY_INFO_ST def gives 32 and param/emblemcategory.bin matches it"
+lang/jp/param/arenaacinfo.bin,"PARAM format 101 with 640-byte rows; the shipped ARENA_AC_INFO def gives 36 and param/arenaacinfo.bin matches it"
+lang/jp/param/trialmissioninfo.bin,"PARAM format 101 with 400-byte rows and a last row past end of file; the shipped MISSION_INFO def gives 484 and lang/jp/param/missioninfo.bin matches it"

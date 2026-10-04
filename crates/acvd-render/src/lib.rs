@@ -1,0 +1,253 @@
+//! Disc -> Bevy assets: FLVER meshes and TPF block-compressed textures, shared by the viewer
+//! and the game.
+//!
+//! FLVER triangles wind clockwise around their normals in a left-handed frame; mirroring X
+//! turns them into Bevy's right-handed, counter-clockwise front faces without touching indices.
+
+pub mod app;
+pub mod text;
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use acvd_data::TextureRef;
+use acvd_formats::{flver, tpf, vfs};
+use anyhow::{bail, ensure, Context, Result};
+use bevy::asset::{Assets, RenderAssetUsages};
+use bevy::color::Color;
+use bevy::pbr::StandardMaterial;
+use bevy::image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::mesh::{Indices, Mesh, PrimitiveTopology, VertexAttributeValues};
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+pub struct LoadedMesh {
+    pub mesh: Mesh,
+    pub diffuse: Option<String>,
+    /// Bounds of the vertices the main face set uses, already mirrored.
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+const DIFFUSE_TYPES: &[&str] = &["g_DiffuseTexture", "g_Diffuse"];
+
+fn mirror(v: [f32; 3]) -> [f32; 3] {
+    [-v[0], v[1], v[2]]
+}
+
+pub fn texture_stem(path: &str) -> String {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    file.split('.').next().unwrap_or(file).to_owned()
+}
+
+pub fn model(usrdir: &Path, asset: &str) -> Result<Vec<LoadedMesh>> {
+    model_with_offsets(usrdir, asset, &|_| [0.0; 3])
+}
+
+/// Like [`model`], moving every vertex by `offset(root)` once it is in model space, in FLVER
+/// axes: `root` names the root bone above the vertex's bone, `None` when it has no bone.
+pub fn model_with_offsets(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3]) -> Result<Vec<LoadedMesh>> {
+    Ok(load(usrdir, asset, offset, false)?.0)
+}
+
+/// One FLVER bone at rest, in FLVER axes. `bind` is its model-space transform with its root's
+/// offset applied.
+pub struct RigBone {
+    pub name: String,
+    pub parent: Option<usize>,
+    pub bind: flver::Xform,
+}
+
+/// The skeleton a [`rigged_model`]'s meshes are skinned to: joint `i < bones.len()` is bone `i`;
+/// joint `bones.len()` carries vertices without a bone and rests at `unboned`.
+pub struct Rig {
+    pub bones: Vec<RigBone>,
+    pub unboned: [f32; 3],
+    /// `(socket id, bone carrying the dummy)` for every dummy with a socket id.
+    pub sockets: Vec<(u8, Option<usize>)>,
+}
+
+/// Like [`model_with_offsets`], with joint indices and weights on every mesh for GPU skinning.
+pub fn rigged_model(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3]) -> Result<(Vec<LoadedMesh>, Rig)> {
+    let (meshes, f) = load(usrdir, asset, offset, true)?;
+    let world = f.bone_transforms()?;
+    let roots = f.bone_roots();
+    let bones = f
+        .bones
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let d = offset(Some(&f.bones[roots[i]].name));
+            let mut bind = world[i];
+            (0..3).for_each(|a| bind.t[a] += d[a]);
+            RigBone { name: b.name.clone(), parent: usize::try_from(b.parent).ok().filter(|&p| p < f.bones.len()), bind }
+        })
+        .collect();
+    let sockets = f
+        .dummies
+        .iter()
+        .filter(|d| d.color[0] != 0)
+        .map(|d| (d.color[0], usize::try_from(d.parent_bone).ok().or(usize::try_from(d.attach_bone).ok()).filter(|&b| b < f.bones.len())))
+        .collect();
+    Ok((meshes, Rig { bones, unboned: offset(None), sockets }))
+}
+
+fn load(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3], rig: bool) -> Result<(Vec<LoadedMesh>, flver::Flver)> {
+    let data = vfs::open(usrdir, asset)?;
+    let f = flver::read(&data)?;
+    let world = f.bone_transforms()?;
+    let by_bone: Vec<[f32; 3]> = f.bone_roots().into_iter().map(|r| offset(Some(&f.bones[r].name))).collect();
+    let unboned = offset(None);
+    let mut out = Vec::new();
+    for (i, m) in f.meshes.iter().enumerate() {
+        let Some(fs) = f.main_face_set(m) else { continue };
+        let tris = f.triangles(&data, fs).with_context(|| format!("mesh {i}"))?;
+        let mut v = f.vertices(&data, m).with_context(|| format!("mesh {i}"))?;
+        if tris.is_empty() || v.positions.is_empty() {
+            continue;
+        }
+        let bones = f.vertex_bones(m, &v);
+        let joints = rig.then(|| vertex_joints(&f, m, &v, &bones));
+        f.to_model_space(m, &mut v, &bones, &world);
+        for (p, bone) in v.positions.iter_mut().zip(&bones) {
+            let d = bone.and_then(|b| by_bone.get(b)).copied().unwrap_or(unboned);
+            (0..3).for_each(|a| p[a] += d[a]);
+        }
+        let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for &i in tris.iter().flatten() {
+            let p = v.positions.get(i as usize).copied().map(mirror).context("index past the mesh's vertices")?;
+            for k in 0..3 {
+                min[k] = min[k].min(p[k]);
+                max[k] = max[k].max(p[k]);
+            }
+        }
+        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, v.positions.iter().copied().map(mirror).collect::<Vec<_>>());
+        if v.normals.len() == v.positions.len() {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, v.normals.iter().copied().map(mirror).collect::<Vec<_>>());
+        }
+        match v.uvs.first().filter(|u| u.len() == v.positions.len()) {
+            Some(uv) => mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv.clone()),
+            None => mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; v.positions.len()]),
+        }
+        mesh.insert_indices(Indices::U32(tris.into_iter().flatten().collect()));
+        if v.normals.len() != v.positions.len() {
+            mesh.compute_smooth_normals();
+        }
+        if let Some((index, weight)) = joints {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_INDEX, VertexAttributeValues::Uint16x4(index));
+            mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, weight);
+        }
+        let diffuse = f.materials.get(m.material.max(0) as usize).and_then(|mat| {
+            let start = mat.texture_index.max(0) as usize;
+            f.textures
+                .iter()
+                .skip(start)
+                .take(mat.texture_count.max(0) as usize)
+                .find(|t| DIFFUSE_TYPES.contains(&t.kind.as_str()) && !t.path.is_empty())
+                .map(|t| texture_stem(&t.path))
+        });
+        out.push(LoadedMesh { mesh, diffuse, min, max });
+    }
+    Ok((out, f))
+}
+
+/// Joint indices and weights per vertex. Dynamic meshes keep all four weighted bones (their
+/// vertices are already in model space); the others follow their single bone. Vertices without
+/// a bone use the extra joint `bones.len()`.
+fn vertex_joints(f: &flver::Flver, m: &flver::Mesh, v: &flver::Vertices, bones: &[Option<usize>]) -> (Vec<[u16; 4]>, Vec<[f32; 4]>) {
+    let extra = f.bones.len() as u16;
+    let global = |l: u8| -> Option<u16> {
+        let b = if m.bone_indices.is_empty() { i32::from(l) } else { *m.bone_indices.get(usize::from(l))? };
+        usize::try_from(b).ok().filter(|&b| b < f.bones.len()).map(|b| b as u16)
+    };
+    bones
+        .iter()
+        .enumerate()
+        .map(|(k, bone)| {
+            if m.dynamic != 0 {
+                if let (Some(ix), Some(w)) = (v.bone_indices.get(k), v.bone_weights.get(k)) {
+                    let (mut index, mut weight) = ([0u16; 4], [0f32; 4]);
+                    for j in 0..4 {
+                        if let Some(g) = global(ix[j]).filter(|_| w[j] > 0.0) {
+                            (index[j], weight[j]) = (g, w[j]);
+                        }
+                    }
+                    let sum: f32 = weight.iter().sum();
+                    if sum > 0.0 {
+                        return (index, weight.map(|x| x / sum));
+                    }
+                }
+            }
+            ([bone.map_or(extra, |b| b as u16), 0, 0, 0], [1.0, 0.0, 0.0, 0.0])
+        })
+        .unzip()
+}
+
+/// The material for `part`: its diffuse texture, or flat grey when it has none, `flat` is set,
+/// or the texture fails to load (reported to stderr and counted in `missing`).
+pub fn material(usrdir: &Path, part: &LoadedMesh, packs: &mut Packs, images: &mut Assets<Image>, flat: bool, missing: &mut usize) -> StandardMaterial {
+    let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| match packs.image(usrdir, name) {
+        Ok(img) => Some(images.add(img)),
+        Err(e) => {
+            *missing += 1;
+            eprintln!("{e:#}");
+            None
+        }
+    });
+    StandardMaterial {
+        base_color: if texture.is_some() { Color::WHITE } else { Color::srgb(0.6, 0.6, 0.62) },
+        base_color_texture: texture,
+        perceptual_roughness: 0.7,
+        ..Default::default()
+    }
+}
+
+/// Decoded TPF packs, keyed by pack asset path, so a model's textures open each pack once.
+#[derive(Default)]
+pub struct Packs(HashMap<&'static str, Vec<u8>>);
+
+impl Packs {
+    pub fn image(&mut self, usrdir: &Path, name: &str) -> Result<Image> {
+        let t: &TextureRef = acvd_data::textures_named(name).next().with_context(|| format!("no texture named `{name}`"))?;
+        self.texture(usrdir, t)
+    }
+
+    pub fn texture(&mut self, usrdir: &Path, t: &TextureRef) -> Result<Image> {
+        let name = t.name;
+        let format = match t.format().map(|f| f.name) {
+            Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,
+            Some("bc3") => TextureFormat::Bc3RgbaUnormSrgb,
+            other => bail!("texture `{name}` format {other:?}"),
+        };
+        ensure!(t.faces == 1, "texture `{name}` is a cube map");
+        ensure!(t.width % 4 == 0 && t.height % 4 == 0, "texture `{name}` is {}x{}", t.width, t.height);
+        let pack = match self.0.entry(t.pack) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(vfs::open(usrdir, t.pack)?),
+        };
+        let header = tpf::read(pack)?;
+        let tex = header.textures.get(t.index).context("texture index past the pack")?;
+        let bytes = tex.data(pack)?;
+        let block = t.format().map_or(16, |f| f.block_bytes);
+        let mut levels = t.levels;
+        let (start, last) = tpf::block_level_span(t.width, t.height, levels, 1, bytes.len() as u64, 0, levels - 1, block);
+        let mut end = (start + last) as usize;
+        if end > bytes.len() {
+            levels = 1;
+            end = tpf::block_level_span(t.width, t.height, 1, 1, bytes.len() as u64, 0, 0, block).1 as usize;
+            ensure!(end <= bytes.len(), "texture `{name}` is shorter than its first level");
+        }
+        let mut image = Image::default();
+        image.texture_descriptor.size = Extent3d { width: t.width as u32, height: t.height as u32, depth_or_array_layers: 1 };
+        image.texture_descriptor.dimension = TextureDimension::D2;
+        image.texture_descriptor.format = format;
+        image.texture_descriptor.mip_level_count = levels;
+        image.data = Some(bytes[..end].to_vec());
+        image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            ..ImageSamplerDescriptor::linear()
+        });
+        Ok(image)
+    }
+}

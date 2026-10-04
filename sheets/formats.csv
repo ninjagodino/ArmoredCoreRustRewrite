@@ -1,0 +1,45 @@
+extension,magic,format,system,parser,evidence
+(none),07 00 00 00 (327) / other (16),unidentified,unclassified,todo,_unknown/_unknown: 343 hash-named files; 1056-byte samples begin 07 00 00 00 then FF padding
+.ani,20 05 10 14 / A0 10 09 10 / 60 10 09 10,animation clip (proprietary),animation,done,acvd-formats::ani reads 23368 of 23410 clips (track kinds in ani_track_kinds.csv; 42 excused in container_exceptions.csv: kind 3 camera rows and 33 older-magic enemy clips); inside binders only: model/**/*_a.bnd.dcx; 13614 zlib-compressed in the binder
+.bin,mixed,PARAM tables (809); SCE SELF executable (EBOOT.BIN); other binaries,params;executable;unclassified,partial: PARAM done; SELF decrypted via RPCS3; param/acvparts.bin record catalogue read by acvd-formats::acv_parts (tail pending); headerless tuning binaries listed in system/paramlist.xml read through their .dbp; remaining binaries unidentified,PARAM header type string at 0x0C and 0xFF at 0x2C; EBOOT.BIN magic SCE\0; 92 more inside param/regulation.bin binders
+.bnd,BND3,BND3 binder (uncompressed),models;shaders;animation,done,acvd-formats::bnd3 reads all 387; every non-data byte rebuilt from header/table/names (2 template exceptions in container_exceptions.csv)
+.bnd.dcx,DCX,DCX(EDGE)-compressed BND3 binder,models;animation,done,acvd-formats::dcx expands all 3482 (every chunk to its declared size); contents read by acvd-formats::bnd3
+.ccf,00 01 00 00,font glyph table (CCM padded to 0x20),fonts,done,acvd-formats::ccm; same body as the sibling .ccm (e10; e12; s1_ps3)
+.ccm,00 01 00 0x,font character map,fonts,done,"acvd-formats::ccm reads every .ccm/.ccf: versions 0x10000/0x10001 (24-byte glyphs) and 0x10002 (28-byte; e14_ext j1_16_ext k1_ext); code groups then UV + pre_space/width/advance/texture"
+.dbp,count u32,debug-menu layout of a headerless tuning binary,debug_menu,done,acvd-formats::dbp: u32 count; records (u32 type 0-6 = s8 u8 s16 u16 s32 u32 f32; 8 zero bytes; value step min max); Shift-JIS (label; printf format) pairs. system/paramlist.xml pairs each with param/<name>.bin = the values packed at natural alignment (sizes match exactly)
+.def,PARAMDEF header,PARAMDEF (formats 101/103/104),params,done,acvd-formats::paramdef reads all 163
+.drb.dcx,DCX,DCX(EDGE)-compressed DRB menu layout,ui,todo: DRB reader (DCX layer done),lang/**/*.drb.dcx (69); expanded contents begin \0BRD
+.emtm,PARAM header,PARAM (EVENT_MESSAGE_TEXT_MAP_ST),params;events,done,type string EVENT_MESSAGE_TEXT_MAP_ST at 0x0C
+.evd,EVD\0,event script data,events,todo,event/mission/*.evd (52)
+.fev,FEV1,FMOD Ex event project,sound,todo,sound/**/*.fev (167)
+.ffx,DLsE,FFX particle effect,effects,todo,sfx/f0004092.ffx; f0004226.ffx; 1891 more inside .ffxbnd binders (1871 DLsE; 20 empty)
+.ffxbnd,BND3,BND3 binder of FFX effects,effects,done,sfx/acv_commoneffects.ffxbnd; menusfx/acv_commoneffects.ffxbnd; read by acvd-formats::bnd3
+.flv,FLVER\0 B\0 0002000F,FLVER model (big-endian; versions 0x2000F/0x20009/0x2000E),models,done,acvd-formats::flver reads 8820 of 8828 (am0010.flv; e0210.flv + _l1.._l3 LODs); EDGE-compressed indices decoded by acvd-formats::edge with every index in range; 8 pending (0x20007 and FLVER0) in container_exceptions.csv; rendered by acvd-viewer
+.fmg,00 01 00 00,FMG message bank,text,done,"acvd-formats::fmg: 1265 banks; encoding byte 1 = UTF-16BE (1250) or 0 = Shift-JIS (15 partsname_*.fmg); id groups then string offsets"
+.fpo,FF 0F 0F 11,RSX fragment program object,shaders,todo,inside binders only: shader/*.bnd (Font.fpo ...); 727 entries
+.fsb,FSB4,FMOD Ex sound bank,sound,todo,sound/**/*.fsb (94; 879 MB)
+.hmd,10 00 01 17,hit model (*_h.hmd),models;maps,done,acvd-formats::hmd: nodes 0x34 / triangles 10 bytes (vertex = u16>>1) / f32x3 verts; sheets/hmd.csv; 45/45 m3100 *_h.hmd; 2993 entries on disc
+.hnav,HNAV,navigation mesh,navigation,todo,model/map/ch_nav/*.hnav (59)
+.htr,HTR\0 + '0001',height/terrain route data,navigation,todo,model/map/ch_nav/*.htr (59)
+.ini,text,INI configuration,config;sound,todo,system/acv.ini [PATH]; sound/magicorchestra.ini
+.lc,1B 4C 75 61 50,Lua 5.0 compiled chunk,ai,todo,airesource/script (1269); scene (18); script (11); param (2)
+.list,text,install file list,config,todo,system/install.list
+.mlb,00 00 00 10,unidentified model companion (*_m.mlb),models,todo,inside binders only: first entry of every model/**/*_m.bnd.dcx (am0010_m.mlb 5832 bytes); 2182 entries
+.mqb,MQB ,MQB cutscene sequence,events,todo,inside binders only: model/poly/*.bnd (s100_100.mqb); 163 entries; all zlib-compressed in the binder
+.msb,0098 9a6a,MSB map layout (param-based sections),maps,partial: PARTS_PARAM_ST,acvd-formats::msb::parts reads placements (name model kind translation rotation-deg scale); MODEL/EVENT/POINT/ROUTE/LAYER/TREE unread; magic 0x00989a6a on every map msb
+.mtd,00 00 00 00,MTD material definition,models;shaders,todo,inside binders only: material/*.bnd (Map_Sky.mtd ...); 588 entries; material/mtd.bnd repeats 45 names with distinct ids
+.pam,PAMF,PlayStation movie (PAMF),movies,todo,movie/**/*.pam (25)
+.param,PARAM header,PARAM table,params,done,_unknown/param/<hash>.param (972) + param/ (3)
+.pem,-----,PEM certificate,online,n/a,license/*.pem
+.png,89 PNG,PNG image,ui,n/a,standard PNG; readable with the png crate
+.properties,text,Java-style properties (logging/config),config,todo,system/*.properties (Shift-JIS comments)
+.sdat,NPD\0,NPDRM SDAT license data,online,n/a,license/*.sdat
+.smd,SMD4,unidentified model companion (*_s.smd),models,todo,inside binders only: model/**/*_m.bnd.dcx (am0010_s.smd 24576 bytes); 2257 entries
+.tae,TAE\0,TAE animation event timeline,animation,todo,tae/*.tae (621)
+.tdf,text,TDF enum definition (Shift-JIS CSV),param_enums,todo,"param/tdf/*.tdf begin with ""ENUM_NAME"" then base type"
+.tpf,TPF\0,TPF texture pack (uncompressed),textures,done,acvd-formats::tpf reads all; magic TPF on all 1139; 55 more inside binders (51 zlib-compressed)
+.tpf.dcx,DCX,DCX(EDGE)-compressed TPF texture pack,textures;fonts;ui,done,acvd-formats::dcx + acvd-formats::tpf; DCX EDGE on all 5875 on disc (expanded contents begin TPF\0) and 4210 inside model/map/*_htdcx.bnd
+.tsmap,PARAM header,PARAM (AI_MESSAGE_SOUND_MAP),params;sound,done,type string AI_MESSAGE_SOUND_MAP at 0x0C
+.txt,text,plain text lists,config,todo,system/deletechar.txt (UTF-16LE); oneshotsfxlist.txt
+.vpo,FF 0F 00 11,RSX vertex program object,shaders,todo,inside binders only: shader/*.bnd (Font.vpo ...); 806 entries
+.xml,<?xml,XML definitions,missions;config;fonts,todo,mission (154); model (131); param (4); font (2); system (2); shader/flver_shader.bnd FlverShader.xml

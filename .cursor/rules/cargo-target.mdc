@@ -1,0 +1,21 @@
+---
+description: Build into the project's own target/ instead of the sandbox's per-session Temp folder
+alwaysApply: true
+---
+
+# Cargo target directory
+
+The command sandbox sets `CARGO_TARGET_DIR` to a fresh folder under
+`%TEMP%\cursor-sandbox-cache\<hash>\cargo-target` each session. Every one becomes a full
+6-23 GB build, and they piled up to 48 GB and filled the disk mid-build.
+
+Before any `cargo` command in a shell session, point it back at the project's `target/`
+(gitignored, reused across sessions):
+
+```powershell
+$env:CARGO_TARGET_DIR = "$PWD\target"; $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+cargo build -p acvd-game
+```
+
+If a build fails with "not enough space on the disk", check `%TEMP%\cursor-sandbox-cache`
+for leftover `cargo-target` folders before anything else.
