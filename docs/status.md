@@ -78,6 +78,13 @@ Rough priority order; reorder freely.
     scale argument (or one RPCS3 breakpoint on it).
   - Hits always use `default2`: the collision mesh keeps no material.
   - The `hit_sfx_type` to `bullethitsfxparam.bin` row mapping is assumed.
+- **Static fact index and sheet audit** (planned, not built): one script pass over `ACV2.pe`
+  writing per-function facts (bounds, direct callers / callees, the table slots that point at it,
+  including leaf functions missing from `.pdata`, loaded strings / constants, struct offsets read
+  and written) plus every vtable and switch table (548 `lwzx` + `mtctr` + `bctr` sites), joined
+  to names from PARAMDEF, TDF (198 files, reader still todo), `.dbp` labels and Lua param ids.
+  Then an audit that checks each sheet row's 360 addresses, offsets and constants against it.
+  54 sheet rows cite only PS3 addresses and need byte-matched 360 equivalents.
 - **Movies** (PAMF), **mission events** (EVD),
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
@@ -180,3 +187,14 @@ Rough priority order; reorder freely.
 - Lean command RE (360): ground dash start builder 0x82883870 (called from vtable fn 0x8284b210; turn arg 0/1/2 adds 0/1/2 to the row id, ids 0x11,0x14,... = acmotion rows 17,20,..), quick-boost 360 builder 0x828844f0 (row 218), air-float 0x82883d30 (row 222), dash-jump charge 0x828839d0 (rows 49-56). Each takes the move vec2, angle = atan2 (0x823a5d20) wrapped to +-pi, fraction = angle/2pi (+1 if negative), start time = 1 - fraction (mirrored left/right, matching the by-eye swap), sent via 0x82883370 -> cmd struct (+4 start, +8) -> 0x82854060 -> clip time at 0x8289a750. Not yet found: whether the command is re-issued each frame, which vec2 it is (stick or velocity), and any smoothing.
 
 - Armored Core V (retail 360, no Verdict Day extras) unpacked to private/x360/v/ACV.pe (xdvdfs + xexunpack from armoredcoredumps), Ghidra project private/ghidraV (ACV, PowerPC:BE:64:A2ALT-32addr base 0x82000000, .pdata 0x82215c00 size 0x8f2b0, 88,788 functions; start the bridge with --project <abs>/private/ghidraV/ACV --program ACV.pe, pass both flags on every command). The lean command builders are identical there: dash 0x827fbba0 (called by 0x827bc190, which also stores the move vec2 at this+8/+0xc), quick-boost 0x827fc938, air-float 0x827fbfa8, jump/charge tables; helper atan 0x823433d8, command 0x827fb5f8. Callers that pass the vec2 not found yet.
+
+- Runtime probes on the 360 build (`tools/xenia`). The project's Xenia Canary fork
+  (`external/xenia-canary`, branch `acvd-debug` = upstream `0b0d57a1b` + `acvd-probe.patch`)
+  logs registers and guest memory before chosen guest instructions, so runtime checks use the
+  Ghidra addresses directly (no PS3 translation, no hand-set breakpoints). `setup.ps1` builds it
+  (VS 2022, Python, Vulkan SDK); `run.ps1 <probes> [-Seconds N]` boots the 360 ISO with
+  `protect_zero=false`, `readback_resolve=full` and no game patches, and writes one JSON line per
+  hit (syntax in `probes.example.txt`). Smoke test at boot: entry `0x82d1ef30` hit once;
+  `TextMgr_getMessage` `0x82b1a8b0` is called from `0x824ac358` (inside `DrbShape_createText`)
+  with r4 = 1 (bank) and r5 = message id, matching the DRB Text notes. Xenia's compatibility
+  issue #278 lists Verdict Day as gameplay; not yet run inside a mission.

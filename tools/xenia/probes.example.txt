@@ -1,0 +1,11 @@
+# One probe per line: ADDRESS LABEL [max=N] READ...
+# The probe runs before the instruction at ADDRESS (a 360 address from ACV2.pe) executes.
+# READ: rN (hex) | fN (double) | lr | ctr | [BASE+OFF]:TYPE, TYPE u8 u16 u32 s8 s16 s32 f32 f64,
+# BASE a register or another [..] (pointer chase). max=N caps the logged hits (default 200).
+
+# Boot check: the XEX entry point, and DRB text lookups (r4 bank, r5 message id).
+0x82d1ef30 entry_point r1 r13
+0x82b1a8b0 TextMgr_getMessage max=40 r4 r5
+
+# Movement: over-max decay rate (newacbehavior field 438) as the integrator sees it.
+0x82822ea0 move_integrate max=120 r3 [r3+0x88]:f32 [r3+0x1bc]:u32 [r3+0x1c0]:u32

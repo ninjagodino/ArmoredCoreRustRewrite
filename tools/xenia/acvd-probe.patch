@@ -1,0 +1,509 @@
+From 8ab7777edfe540f053a68f87699f40222fdf2036 Mon Sep 17 00:00:00 2001
+From: acvd <acvd@local>
+Date: Mon, 5 Oct 2026 12:44:41 -0700
+Subject: [PATCH] ACVD guest-address probes (--acvd_probes): log registers and
+ memory before chosen instructions
+
+---
+ src/xenia/cpu/ppc/acvd_probe.cc      | 406 +++++++++++++++++++++++++++
+ src/xenia/cpu/ppc/acvd_probe.h       |  29 ++
+ src/xenia/cpu/ppc/ppc_frontend.cc    |   2 +
+ src/xenia/cpu/ppc/ppc_hir_builder.cc |   6 +
+ 4 files changed, 443 insertions(+)
+ create mode 100644 src/xenia/cpu/ppc/acvd_probe.cc
+ create mode 100644 src/xenia/cpu/ppc/acvd_probe.h
+
+diff --git a/src/xenia/cpu/ppc/acvd_probe.cc b/src/xenia/cpu/ppc/acvd_probe.cc
+new file mode 100644
+index 000000000..7f2c5693b
+--- /dev/null
++++ b/src/xenia/cpu/ppc/acvd_probe.cc
+@@ -0,0 +1,406 @@
++/**
++ ******************************************************************************
++ * ACVD rewrite: guest-address probes that log register and memory values.     *
++ ******************************************************************************
++ *
++ * --acvd_probes names a text file, one probe per line:
++ *
++ *   ADDRESS LABEL [max=N] READ...
++ *
++ *   0x82826058 over_max r3 f1 [r3+0x88]:f32 [[r3+0x4]+0x1bc]:u32
++ *
++ * Before the guest instruction at ADDRESS executes, each hit appends one JSON
++ * line to --acvd_probe_log with the hit number, host time, guest thread, pc,
++ * lr and every READ. READ forms:
++ *
++ *   rN fN lr ctr          register (GPRs as 32-bit hex, FPRs as doubles)
++ *   [BASE+OFF]:TYPE       big-endian load, TYPE u8 u16 u32 s8 s16 s32 f32 f64
++ *                         BASE is a register or another [..] (pointer chase)
++ *
++ * '#' starts a comment. Unreadable guest memory logs null.
++ */
++
++#include "xenia/cpu/ppc/acvd_probe.h"
++
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <memory>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "third_party/fmt/include/fmt/format.h"
++
++#include "xenia/base/byte_order.h"
++#include "xenia/base/cvar.h"
++#include "xenia/base/filesystem.h"
++#include "xenia/base/logging.h"
++#include "xenia/cpu/ppc/ppc_context.h"
++#include "xenia/cpu/processor.h"
++#include "xenia/memory.h"
++
++DEFINE_path(acvd_probes, "",
++            "Probe list: one 'ADDRESS LABEL [max=N] READ...' per line "
++            "(see src/xenia/cpu/ppc/acvd_probe.cc).",
++            "ACVD");
++DEFINE_path(acvd_probe_log, "acvd_probes.jsonl",
++            "Where probe hits are written, one JSON object per line.", "ACVD");
++DEFINE_uint32(acvd_probe_max_hits, 200,
++              "Hits logged per probe unless its line sets max=N (0 = no limit).",
++              "ACVD");
++
++namespace xe {
++namespace cpu {
++namespace ppc {
++
++namespace {
++
++enum class ReadType { kU8, kU16, kU32, kS8, kS16, kS32, kF32, kF64 };
++
++// A register, or a load from (base value + offset).
++struct Operand {
++  enum class Kind { kGpr, kFpr, kLr, kCtr, kLoad } kind = Kind::kGpr;
++  int reg = 0;
++  std::unique_ptr<Operand> base;
++  int64_t offset = 0;
++  ReadType type = ReadType::kU32;
++};
++
++struct Read {
++  std::string text;
++  Operand operand;
++};
++
++struct Probe {
++  uint32_t address = 0;
++  std::string label;
++  uint32_t max_hits = 0;
++  uint32_t hits = 0;
++  std::vector<Read> reads;
++};
++
++struct State {
++  Memory* memory = nullptr;
++  std::vector<std::unique_ptr<Probe>> probes;
++  std::unordered_map<uint32_t, Function*> builtins;
++  std::mutex mutex;
++  std::FILE* log = nullptr;
++  uint64_t total_hits = 0;
++  std::chrono::steady_clock::time_point start;
++};
++
++State* state_ = nullptr;
++
++bool ParseNumber(const std::string& s, int64_t* out) {
++  if (s.empty()) return false;
++  try {
++    size_t used = 0;
++    *out = std::stoll(s, &used, 0);
++    return used == s.size();
++  } catch (...) {
++    return false;
++  }
++}
++
++bool ParseRegister(const std::string& s, Operand* out) {
++  if (s == "lr") {
++    out->kind = Operand::Kind::kLr;
++    return true;
++  }
++  if (s == "ctr") {
++    out->kind = Operand::Kind::kCtr;
++    return true;
++  }
++  if (s.size() < 2 || (s[0] != 'r' && s[0] != 'f')) return false;
++  int64_t n;
++  if (!ParseNumber(s.substr(1), &n) || n < 0 || n > 31) return false;
++  out->kind = s[0] == 'r' ? Operand::Kind::kGpr : Operand::Kind::kFpr;
++  out->reg = static_cast<int>(n);
++  return true;
++}
++
++bool ParseType(const std::string& s, ReadType* out) {
++  static const std::pair<const char*, ReadType> kTypes[] = {
++      {"u8", ReadType::kU8},   {"u16", ReadType::kU16}, {"u32", ReadType::kU32},
++      {"s8", ReadType::kS8},   {"s16", ReadType::kS16}, {"s32", ReadType::kS32},
++      {"f32", ReadType::kF32}, {"f64", ReadType::kF64}};
++  for (auto& [name, type] : kTypes) {
++    if (s == name) {
++      *out = type;
++      return true;
++    }
++  }
++  return false;
++}
++
++// Parses s[pos..] as a register or "[BASE+OFF]"; loads inside a chase are u32.
++bool ParseOperand(const std::string& s, size_t* pos, Operand* out) {
++  if (*pos < s.size() && s[*pos] == '[') {
++    ++*pos;
++    out->kind = Operand::Kind::kLoad;
++    out->base = std::make_unique<Operand>();
++    if (!ParseOperand(s, pos, out->base.get())) return false;
++    size_t close = s.find(']', *pos);
++    // The matching ']' for this level is the first one after the base.
++    if (close == std::string::npos) return false;
++    std::string off = s.substr(*pos, close - *pos);
++    *pos = close + 1;
++    if (off.empty()) {
++      out->offset = 0;
++    } else {
++      bool negative = off[0] == '-';
++      if (off[0] != '+' && !negative) return false;
++      int64_t value;
++      if (!ParseNumber(off.substr(1), &value)) return false;
++      out->offset = negative ? -value : value;
++    }
++    out->type = ReadType::kU32;
++    return true;
++  }
++  size_t end = *pos;
++  while (end < s.size() && s[end] != ']' && s[end] != '+' && s[end] != '-' &&
++         s[end] != ':') {
++    ++end;
++  }
++  std::string name = s.substr(*pos, end - *pos);
++  *pos = end;
++  return ParseRegister(name, out);
++}
++
++bool ParseRead(const std::string& text, Read* out) {
++  out->text = text;
++  size_t colon = text.rfind(':');
++  std::string body = text;
++  if (!text.empty() && text[0] == '[') {
++    if (colon == std::string::npos || colon < text.rfind(']')) return false;
++    body = text.substr(0, colon);
++  }
++  size_t pos = 0;
++  if (!ParseOperand(body, &pos, &out->operand) || pos != body.size()) {
++    return false;
++  }
++  if (out->operand.kind == Operand::Kind::kLoad) {
++    return ParseType(text.substr(colon + 1), &out->operand.type);
++  }
++  return true;
++}
++
++bool Readable(uint32_t address, uint32_t size) {
++  auto heap = state_->memory->LookupHeap(address);
++  if (!heap) return false;
++  return heap->QueryRangeAccess(address, address + size - 1) !=
++         xe::memory::PageAccess::kNoAccess;
++}
++
++uint32_t TypeSize(ReadType type) {
++  switch (type) {
++    case ReadType::kU8:
++    case ReadType::kS8:
++      return 1;
++    case ReadType::kU16:
++    case ReadType::kS16:
++      return 2;
++    case ReadType::kF64:
++      return 8;
++    default:
++      return 4;
++  }
++}
++
++// Evaluates an operand to its raw 64-bit value; false if memory is unreadable.
++bool Evaluate(PPCContext* ctx, const Operand& op, uint64_t* out) {
++  switch (op.kind) {
++    case Operand::Kind::kGpr:
++      *out = ctx->r[op.reg];
++      return true;
++    case Operand::Kind::kFpr:
++      std::memcpy(out, &ctx->f[op.reg], 8);
++      return true;
++    case Operand::Kind::kLr:
++      *out = ctx->lr;
++      return true;
++    case Operand::Kind::kCtr:
++      *out = ctx->ctr;
++      return true;
++    case Operand::Kind::kLoad: {
++      uint64_t base;
++      if (!Evaluate(ctx, *op.base, &base)) return false;
++      uint32_t address = static_cast<uint32_t>(base + op.offset);
++      uint32_t size = TypeSize(op.type);
++      if (!Readable(address, size)) return false;
++      auto p = state_->memory->TranslateVirtual<const uint8_t*>(address);
++      switch (size) {
++        case 1:
++          *out = *p;
++          break;
++        case 2:
++          *out = xe::load_and_swap<uint16_t>(p);
++          break;
++        case 8:
++          *out = xe::load_and_swap<uint64_t>(p);
++          break;
++        default:
++          *out = xe::load_and_swap<uint32_t>(p);
++          break;
++      }
++      return true;
++    }
++  }
++  return false;
++}
++
++std::string Format(PPCContext* ctx, const Operand& op) {
++  uint64_t raw;
++  if (!Evaluate(ctx, op, &raw)) return "null";
++  if (op.kind == Operand::Kind::kFpr) {
++    double d;
++    std::memcpy(&d, &raw, 8);
++    return fmt::format("{:.9g}", d);
++  }
++  if (op.kind != Operand::Kind::kLoad) {
++    return fmt::format("\"0x{:08X}\"", static_cast<uint32_t>(raw));
++  }
++  switch (op.type) {
++    case ReadType::kU8:
++    case ReadType::kU16:
++      return fmt::format("{}", raw);
++    case ReadType::kU32:
++      return fmt::format("\"0x{:08X}\"", static_cast<uint32_t>(raw));
++    case ReadType::kS8:
++      return fmt::format("{}", static_cast<int8_t>(raw));
++    case ReadType::kS16:
++      return fmt::format("{}", static_cast<int16_t>(raw));
++    case ReadType::kS32:
++      return fmt::format("{}", static_cast<int32_t>(raw));
++    case ReadType::kF32: {
++      float f;
++      uint32_t bits = static_cast<uint32_t>(raw);
++      std::memcpy(&f, &bits, 4);
++      return fmt::format("{:.9g}", f);
++    }
++    case ReadType::kF64: {
++      double d;
++      std::memcpy(&d, &raw, 8);
++      return fmt::format("{:.9g}", d);
++    }
++  }
++  return "null";
++}
++
++std::string JsonString(const std::string& s) {
++  std::string out = "\"";
++  for (char c : s) {
++    if (c == '"' || c == '\\') out += '\\';
++    out += c;
++  }
++  return out + "\"";
++}
++
++void OnProbeHit(PPCContext* ctx, void* arg0, void* arg1) {
++  auto probe = static_cast<Probe*>(arg0);
++  std::lock_guard<std::mutex> lock(state_->mutex);
++  if (!state_->log) return;
++  if (probe->max_hits && probe->hits >= probe->max_hits) return;
++  ++probe->hits;
++  ++state_->total_hits;
++  auto ms = std::chrono::duration<double, std::milli>(
++                std::chrono::steady_clock::now() - state_->start)
++                .count();
++  std::string line = fmt::format(
++      "{{\"n\":{},\"hit\":{},\"ms\":{:.3f},\"tid\":{},\"pc\":\"0x{:08X}\","
++      "\"label\":{},\"lr\":\"0x{:08X}\"",
++      state_->total_hits, probe->hits, ms, ctx->thread_id, probe->address,
++      JsonString(probe->label), static_cast<uint32_t>(ctx->lr));
++  for (auto& read : probe->reads) {
++    line += fmt::format(",{}:{}", JsonString(read.text),
++                        Format(ctx, read.operand));
++  }
++  line += "}\n";
++  std::fputs(line.c_str(), state_->log);
++  std::fflush(state_->log);
++}
++
++}  // namespace
++
++void InitializeAcvdProbes(Processor* processor) {
++  if (state_ || cvars::acvd_probes.empty()) return;
++  std::ifstream file(cvars::acvd_probes);
++  if (!file) {
++    XELOGE("ACVD probes: cannot open {}", xe::path_to_utf8(cvars::acvd_probes));
++    return;
++  }
++  state_ = new State();
++  state_->memory = processor->memory();
++  state_->start = std::chrono::steady_clock::now();
++
++  std::string line;
++  int line_number = 0;
++  while (std::getline(file, line)) {
++    ++line_number;
++    if (auto hash = line.find('#'); hash != std::string::npos) {
++      line.resize(hash);
++    }
++    std::istringstream words(line);
++    std::string address_text, label;
++    if (!(words >> address_text)) continue;
++    int64_t address;
++    if (!ParseNumber(address_text, &address) || !(words >> label)) {
++      XELOGE("ACVD probes line {}: expected 'ADDRESS LABEL ...'", line_number);
++      continue;
++    }
++    auto probe = std::make_unique<Probe>();
++    probe->address = static_cast<uint32_t>(address);
++    probe->label = label;
++    probe->max_hits = cvars::acvd_probe_max_hits;
++    std::string word;
++    bool ok = true;
++    while (words >> word) {
++      if (word.rfind("max=", 0) == 0) {
++        int64_t max;
++        if (!ParseNumber(word.substr(4), &max) || max < 0) ok = false;
++        probe->max_hits = static_cast<uint32_t>(max);
++        continue;
++      }
++      Read read;
++      if (!ParseRead(word, &read)) {
++        XELOGE("ACVD probes line {}: cannot parse '{}'", line_number, word);
++        ok = false;
++        break;
++      }
++      probe->reads.push_back(std::move(read));
++    }
++    if (!ok) continue;
++    if (state_->builtins.count(probe->address)) {
++      XELOGE("ACVD probes line {}: 0x{:08X} is already probed", line_number,
++             probe->address);
++      continue;
++    }
++    auto function = processor->DefineBuiltin(
++        fmt::format("AcvdProbe_{}", probe->label), OnProbeHit, probe.get(),
++        nullptr);
++    state_->builtins.emplace(probe->address, function);
++    XELOGI("ACVD probe 0x{:08X} {} ({} reads, max {})", probe->address,
++           probe->label, probe->reads.size(), probe->max_hits);
++    state_->probes.push_back(std::move(probe));
++  }
++
++  state_->log = xe::filesystem::OpenFile(cvars::acvd_probe_log, "wb");
++  if (!state_->log) {
++    XELOGE("ACVD probes: cannot write {}",
++           xe::path_to_utf8(cvars::acvd_probe_log));
++  }
++}
++
++Function* LookupAcvdProbe(uint32_t address) {
++  if (!state_) return nullptr;
++  auto it = state_->builtins.find(address);
++  return it == state_->builtins.end() ? nullptr : it->second;
++}
++
++}  // namespace ppc
++}  // namespace cpu
++}  // namespace xe
+diff --git a/src/xenia/cpu/ppc/acvd_probe.h b/src/xenia/cpu/ppc/acvd_probe.h
+new file mode 100644
+index 000000000..39115368e
+--- /dev/null
++++ b/src/xenia/cpu/ppc/acvd_probe.h
+@@ -0,0 +1,29 @@
++/**
++ ******************************************************************************
++ * ACVD rewrite: guest-address probes that log register and memory values.     *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_CPU_PPC_ACVD_PROBE_H_
++#define XENIA_CPU_PPC_ACVD_PROBE_H_
++
++#include <cstdint>
++
++namespace xe {
++namespace cpu {
++class Function;
++class Processor;
++namespace ppc {
++
++// Reads --acvd_probes and defines one builtin per probe address. Call once
++// from the frontend before any guest code is translated.
++void InitializeAcvdProbes(Processor* processor);
++
++// The builtin to call before the guest instruction at `address`, or nullptr.
++Function* LookupAcvdProbe(uint32_t address);
++
++}  // namespace ppc
++}  // namespace cpu
++}  // namespace xe
++
++#endif  // XENIA_CPU_PPC_ACVD_PROBE_H_
+diff --git a/src/xenia/cpu/ppc/ppc_frontend.cc b/src/xenia/cpu/ppc/ppc_frontend.cc
+index 666bd7b79..7145bd0c0 100644
+--- a/src/xenia/cpu/ppc/ppc_frontend.cc
++++ b/src/xenia/cpu/ppc/ppc_frontend.cc
+@@ -12,6 +12,7 @@
+ #include "xenia/base/atomic.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/mutex.h"
++#include "xenia/cpu/ppc/acvd_probe.h"
+ #include "xenia/cpu/ppc/ppc_context.h"
+ #include "xenia/cpu/ppc/ppc_emit.h"
+ #include "xenia/cpu/ppc/ppc_opcode_info.h"
+@@ -102,6 +103,7 @@ bool PPCFrontend::Initialize() {
+       processor_->DefineBuiltin("LeaveGlobalLock", LeaveGlobalLock, arg0, arg1);
+   builtins_.syscall_handler = processor_->DefineBuiltin(
+       "SyscallHandler", SyscallHandler, nullptr, nullptr);
++  InitializeAcvdProbes(processor_);
+   return true;
+ }
+ 
+diff --git a/src/xenia/cpu/ppc/ppc_hir_builder.cc b/src/xenia/cpu/ppc/ppc_hir_builder.cc
+index 42d996cba..cc58ef2e2 100644
+--- a/src/xenia/cpu/ppc/ppc_hir_builder.cc
++++ b/src/xenia/cpu/ppc/ppc_hir_builder.cc
+@@ -22,6 +22,7 @@
+ #include "xenia/base/string.h"
+ #include "xenia/cpu/cpu_flags.h"
+ #include "xenia/cpu/hir/label.h"
++#include "xenia/cpu/ppc/acvd_probe.h"
+ #include "xenia/cpu/ppc/ppc_context.h"
+ #include "xenia/cpu/ppc/ppc_decode_data.h"
+ #include "xenia/cpu/ppc/ppc_frontend.h"
+@@ -174,6 +175,11 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
+ 
+     MaybeBreakOnInstruction(address);
+ 
++    if (Function* probe = LookupAcvdProbe(address)) {
++      ContextBarrier();
++      CallExtern(probe);
++    }
++
+     InstrData i;
+     i.address = address;
+     i.code = code;
+-- 
+2.53.0.windows.2
+

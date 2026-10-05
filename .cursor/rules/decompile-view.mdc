@@ -45,11 +45,24 @@ Start-Process $g start -WindowStyle Hidden -RedirectStandardOutput private\tmp\b
 & external\ghidra_12.1.4_PUBLIC\support\analyzeHeadless.bat private\ghidra360 ACV2 -process ACV2.pe -noanalysis -readOnly -scriptPath tools\ghidra -postScript DecompileRefs.java "@START-END"
 ```
 
-The PS3 EBOOTs (`private/exe/` disc, `private/exe102/` 01.02) are only for questions that need
-the game running: the user sets RPCS3 breakpoints on 01.02. When one is needed, translate that
+## Runtime: Xenia probes on the same addresses
+
+Questions that need the game running (who triggers something, which path fires, a value's unit
+or tick rate) go to the project's Xenia build, which runs this same executable, so the addresses
+are the Ghidra ones with no translation. List the probes (syntax in
+`tools/xenia/probes.example.txt`) and run them:
+
+```powershell
+.\tools\xenia\run.ps1 private\xenia\mytask.txt -Seconds 90 # hits -> private\xenia\mytask.jsonl
+```
+
+With `-Seconds` the run is scripted end to end. Anything that needs gameplay (a mission, firing,
+boosting) needs the user at the controls: hand them the command and read the `.jsonl` after.
+`tools\xenia\setup.ps1` rebuilds the emulator if `external/xenia-canary` is missing.
+
+RPCS3 on PS3 01.02 is the fallback only when Xenia cannot reach the state. Then translate that
 single address from the 360 function by matching its instruction bytes, verify it with
 `$env:EBOOT='private/exe102/EBOOT.elf'; py private/tmp/ppcdis.py LO HI`, and hand it over.
 
-Sheet evidence cites the 360 address first; add a PS3 address only where a breakpoint was used.
-Runtime questions (who triggers something, which path fires) go to the user's RPCS3 debugger
-rather than long static hunts.
+Sheet evidence cites the 360 address first (a probe log line is evidence: cite the probe file);
+add a PS3 address only where an RPCS3 breakpoint was used.
