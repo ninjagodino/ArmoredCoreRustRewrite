@@ -19,8 +19,12 @@ Rough priority order; reorder freely.
     `sheets/anim_blend.csv` row `blend`.
 - **Camera leftovers**: impact / foot-step shake and the ready-position first-person view (both
   need triggers free play doesn't produce: RPCS3 breakpoints on the 0x68 / 0x69 handlers never
-  fired; ready position waits on weapons). Speed blur open points: whether the per-call ease
-  (not dt-scaled) runs at 1/60 or 1/30 s, the zoom-blur source width (taken as 1280), the
+  fired; ready position waits on weapons). Speed blur: the per-call ease runs once per 1/30 s
+  game frame (Xenia probe, `frame_time` / `speed_blur` in `sheets/camera_follow.csv`); the
+  runtime (`blur.rs`) still steps it per 60 Hz tick and needs to step per 1/30 s. A camera action
+  with BlurRate 2 (seen for about 0.8 s in a run that included firing) is not mapped: probe the
+  row id controller slot `0x48` (`0x8285e500`) returns to name it. Speed blur open points: the
+  zoom-blur source width (taken as 1280), the
   filter fade at +0x54 (taken as 1), and the vertex program `ZoomBlur_ScreenSpaceQuadShaderVS`
   (TEX1 assumed to be the vertex NDC; `private/tmp/rsxvp.py` is a first, still wrong, decoder).
   Follow-camera open points: which base-transform factor carries the waist offset (the dump
@@ -34,6 +38,11 @@ Rough priority order; reorder freely.
     above the glide max.
   - Per-state current max (`0x82822af0`): switch on +0x1bc, x terrain/slope scale +0x334, x +0x324.
   - Dash / air-boost acceleration multiplier (field 406, also the default divisor at `0x5c4`).
+  - Tick rate: the game frame is 1/30 s, and a Xenia probe saw the integrator `0x82822ea0` run
+    once per frame (one object, `f1` = 1.0 every call). The sheets read the movement values per
+    1/60 s tick; if the integrator steps only once per frame, speeds and decay rates are off by
+    a factor of two. Probe whether it steps twice inside one call (velocity before and after),
+    or whether its caller scales by the frame time.
 - **Paint**: map `_c` mask regions to accolor channels via the ACColor fragment programs in
   `shader/flver_shader.bnd`.
 - **Assembly gaps**: socket rotation, recon/hanger mounts, LOD switching; 8 pending FLVERs
