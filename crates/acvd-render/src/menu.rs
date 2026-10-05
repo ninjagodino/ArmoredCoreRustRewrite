@@ -7,12 +7,18 @@
 //!
 //! Drawn: `Sprite` (texel rect, tint, flip and quarter-turn flags), `MonoRect`, `MonoFrame`,
 //! `GouraudRect` (top-to-bottom gradient of its left corner colors), `GouraudFrame` (first
-//! color), and nested `Dialog`s. Not yet: `Text` (strings come from the controls), additive blend
+//! color), nested `Dialog`s, and `Text` with its `fontdef.xml` font, aligned in its rect: static
+//! strings and bank-1 messages (`lang/<lang>/text/menu/menu.fmg`). Runtime texts are blank unless
+//! [`Layout::placeholders`] is set (then they show the object name, or `000` in fonts without
+//! its letters). Not yet: additive blend
 //! (sprite blend 2 draws as alpha), runtime image slots (emblems, maps, movies), `NoiseSprite`.
 
 use std::path::Path;
 
-use acvd_formats::drb::{self, Drb, Shape};
+use std::collections::HashMap;
+
+use acvd_formats::drb::{self, Drb, Shape, TextSource};
+use acvd_formats::fmg::Fmg;
 use anyhow::{Context, Result};
 use bevy::asset::{Assets, Handle};
 use bevy::color::Color;
@@ -21,12 +27,17 @@ use bevy::math::{Rect, Rot2, Vec2};
 use bevy::prelude::{BackgroundColor, BorderColor, ChildOf, Commands, Component, Entity, ImageNode, Node, PositionType};
 use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient, UiRect, UiTransform};
 
+use crate::text::{self, Font};
 use crate::Packs;
 
-/// A parsed layout plus one GPU image per `IXET` texture (None when the pack lacks it).
+/// A parsed layout plus one GPU image per `IXET` texture (None when the pack lacks it), the
+/// fonts its texts use (by `fontdef.xml` ID) and the menu message bank.
 pub struct Layout {
     pub drb: Drb,
     pub textures: Vec<Option<Handle<Image>>>,
+    pub fonts: HashMap<u8, Font>,
+    pub messages: Option<Fmg>,
+    pub placeholders: bool,
 }
 
 pub fn load(usrdir: &Path, path: &str, images: &mut Assets<Image>) -> Result<Layout> {
@@ -60,7 +71,35 @@ pub fn load(usrdir: &Path, path: &str, images: &mut Assets<Image>) -> Result<Lay
             }
         })
         .collect();
-    Ok(Layout { drb, textures })
+    let fontdefs = acvd_formats::vfs::open(usrdir, "font/fontdef.xml").and_then(|d| acvd_formats::fontdef::read(&d));
+    let mut fonts = HashMap::new();
+    match fontdefs {
+        Ok(defs) => {
+            for o in drb.dialogs.iter().flat_map(|d| &d.objects) {
+                let Shape::Text { font, .. } = o.shape else { continue };
+                if fonts.contains_key(&font) {
+                    continue;
+                }
+                let loaded = defs.file(font as u32).with_context(|| format!("font {font} not in fontdef.xml")).and_then(|(name, file)| text::load_file(usrdir, name, file, images));
+                match loaded {
+                    Ok(f) => {
+                        fonts.insert(font, f);
+                    }
+                    Err(e) => eprintln!("{path}: font {font}: {e:#}"),
+                }
+            }
+        }
+        Err(e) => eprintln!("font/fontdef.xml: {e:#}"),
+    }
+    let menu_fmg = path.split_once("/menu/").map(|(lang, _)| format!("{lang}/text/menu/menu.fmg"));
+    let messages = menu_fmg.and_then(|p| match acvd_formats::vfs::open(usrdir, &p).and_then(|d| acvd_formats::fmg::read(&d)) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("{p}: {e:#}");
+            None
+        }
+    });
+    Ok(Layout { drb, textures, fonts, messages, placeholders: false })
 }
 
 /// Marker on the root node of a spawned layout.
@@ -145,6 +184,32 @@ fn spawn_dialog(commands: &mut Commands, layout: &Layout, index: usize, parent: 
                 let mut n = node(rect, scale);
                 n.border = UiRect::all(px((flags & 0xff).max(1) as f32 * scale));
                 commands.spawn((n, BorderColor::all(rgba(colors[0])), ChildOf(parent)));
+            }
+            Shape::Text { rect, color, font, align, source, .. } => {
+                let string = match source {
+                    TextSource::Static(s) => Some(s.clone()),
+                    TextSource::Message { bank: 1, id } => layout.messages.as_ref().and_then(|m| m.get(*id as i32)).map(str::to_string),
+                    _ => layout.placeholders.then(|| o.name.clone()),
+                };
+                let (Some(mut string), Some(f)) = (string, layout.fonts.get(font)) else { continue };
+                if layout.placeholders && string == o.name && string.encode_utf16().any(|c| f.ccm.glyph(c).is_none()) {
+                    string = "000".into();
+                }
+                let (quads, size) = text::layout(&f.ccm, &f.sheet_size, &string, scale);
+                let n = node(*rect, scale);
+                let (w, h) = ((rect[2] - rect[0]).abs() as f32 * scale, (rect[3] - rect[1]).abs() as f32 * scale);
+                let x = match align & 3 {
+                    1 => w - size.x,
+                    2 => (w - size.x) / 2.0,
+                    _ => 0.0,
+                };
+                let y = match align & 0xc {
+                    8 => (h - size.y) / 2.0,
+                    4 => h - size.y,
+                    _ => 0.0,
+                };
+                let boxed = commands.spawn((n, ChildOf(parent))).id();
+                text::spawn_glyphs(commands, f, &quads, Vec2::new(x, y), boxed, rgba(*color));
             }
             &Shape::Dialog { rect, dialog: Some(d), .. } => {
                 let child = commands.spawn((node(rect, scale), ChildOf(parent))).id();

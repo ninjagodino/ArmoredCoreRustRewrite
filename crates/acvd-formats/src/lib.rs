@@ -10,6 +10,7 @@ pub mod dcx;
 pub mod drb;
 pub mod edge;
 pub mod flver;
+pub mod fontdef;
 pub mod fmg;
 pub mod hmd;
 pub mod layout;

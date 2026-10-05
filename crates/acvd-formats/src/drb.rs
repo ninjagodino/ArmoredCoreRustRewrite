@@ -28,7 +28,7 @@
 //! | `Sprite` | `i16 u0, v0, u1, v1` (texel rect), `u16 texture` (`IXET` index; 0xffff = none; >= 1000 = runtime image slot, e.g. emblems 10000+, movies 101xx, maps 102xx), `u16 flags`, `u32 0`, `color` |
 //! | `MonoRect`, `MonoFrame` | `u32 flags`, `u32 0`, `color` |
 //! | `GouraudRect`, `GouraudFrame` | `u32 flags`, four corner colors |
-//! | `Text` | `u32 flags`, `u32 0`, `color`, three words not decoded |
+//! | `Text` | `u32 flags`, `u32 unk`, `color`, `u8 0, u8 font, u8 align, u8 mode`, `u32 0x1c`, then by mode: 0 `u32 string`; 1 `u32 bank, u32 id` (36 bytes); 2 `u32 capacity` |
 //! | `Dialog` | `u16 dialog` (`GLD` index drawn at the rect, 0xffff = set at runtime), `u16 flags`, `u32 0`, `color` |
 //!
 //! Sprite flags: low byte = blend (1, 2), 0x100 flip X, 0x200 flip Y, bits 0xc00 = quarter turns
@@ -80,6 +80,20 @@ pub struct Object {
 
 pub type Rect = [i16; 4];
 
+/// Where a `Text` shape's string comes from (record byte +0x17; 360 factory `0x824ac270`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum TextSource {
+    /// Mode 0: the `RTS` string at +0x1c.
+    Static(String),
+    /// Mode 1: message `id` (+0x20) of text bank `bank` (+0x1c), looked up by `0x82b1a8b0`.
+    /// Bank 1 is `lang/<lang>/text/menu/menu.fmg`; bank 2 is filled by code (ids 1-3, 100, 101).
+    Message { bank: u32, id: u32 },
+    /// Mode 2: set by game code; +0x1c is the buffer length in characters.
+    Runtime { capacity: u32 },
+    /// Mode 3: one of four special text classes picked by +0x1c (unused in the en layouts read).
+    Special { mode: u8, kind: u32 },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub enum Shape {
     Null { rect: Rect },
@@ -88,7 +102,8 @@ pub enum Shape {
     MonoFrame { rect: Rect, flags: u32, color: u32 },
     GouraudRect { rect: Rect, flags: u32, colors: [u32; 4] },
     GouraudFrame { rect: Rect, flags: u32, colors: [u32; 4] },
-    Text { rect: Rect, flags: u32, color: u32 },
+    /// `font` is a `fontdef.xml` ID; `align` low two bits = 0 left, 1 right, 2 center; bit 0x8 = vertical center (bit 0x4, likely bottom, is unverified).
+    Text { rect: Rect, flags: u32, color: u32, font: u8, align: u8, source: TextSource, unk: u32 },
     Dialog { rect: Rect, dialog: Option<u16>, flags: u16, color: u32 },
     Other { class: String, rect: Rect },
 }
@@ -177,7 +192,15 @@ impl<'a> Ctx<'a> {
                     Shape::GouraudFrame { rect, flags, colors }
                 }
             }
-            "Text" => Shape::Text { rect, flags: r.u32(o + 8)?, color: r.u32(o + 16)? },
+            "Text" => {
+                let source = match r.u8(o + 0x17)? {
+                    0 => TextSource::Static(self.string(r.u32(o + 0x1c)?)?),
+                    1 => TextSource::Message { bank: r.u32(o + 0x1c)?, id: r.u32(o + 0x20)? },
+                    2 => TextSource::Runtime { capacity: r.u32(o + 0x1c)? },
+                    m => TextSource::Special { mode: m, kind: r.u32(o + 0x1c)? },
+                };
+                Shape::Text { rect, flags: r.u32(o + 8)?, color: r.u32(o + 16)?, font: r.u8(o + 0x15)?, align: r.u8(o + 0x16)?, source, unk: r.u32(o + 12)? }
+            }
             "Dialog" => Shape::Dialog { rect, dialog: Some(r.u16(o + 8)?).filter(|&d| d != 0xffff), flags: r.u16(o + 10)?, color: r.u32(o + 16)? },
             _ => Shape::Other { class, rect },
         })
@@ -320,5 +343,13 @@ mod tests {
         let base = &d.dialogs[0];
         assert_eq!((base.name.as_str(), base.size, base.objects.len()), ("@StaffRollBase", [1280, 720], 2));
         assert!(matches!(base.objects[1].shape, Shape::Sprite { rect: [1024, 0, 1280, 720], uv: [0, 736, 720, 992], texture: Some(0), flags: 0x0c01, .. }));
+        let text = |file: &str, dialog: &str, object: &str| {
+            let d = read(&crate::dcx::decompress(&std::fs::read(lang.join(file)).unwrap()).unwrap()).unwrap();
+            let o = d.dialog(dialog).unwrap().objects.iter().find(|o| o.name == object).unwrap().shape.clone();
+            let Shape::Text { font, align, source, .. } = o else { panic!("{object} is not Text") };
+            (font, align, source)
+        };
+        assert_eq!(text("en/menu/staffroll.drb.dcx", "@TermOfServiceItem", "@Text_1"), (0, 0x09, TextSource::Runtime { capacity: 0x80 }));
+        assert_eq!(text("en/menu/vssortie.drb.dcx", "SelfScore Ex", "Slash"), (0x0c, 0x09, TextSource::Static("/".into())));
     }
 }

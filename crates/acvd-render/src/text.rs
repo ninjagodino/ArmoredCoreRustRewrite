@@ -35,16 +35,23 @@ pub struct GlyphQuad {
 }
 
 pub fn load(usrdir: &Path, name: &str, images: &mut Assets<Image>) -> Result<Font> {
-    let dir = format!("font/{name}");
-    let map = ["ccm", "ccf"].iter().find_map(|ext| acvd_formats::vfs::open(usrdir, &format!("{dir}/{name}.{ext}")).ok());
-    let data = map.with_context(|| format!("no {dir}/{name}.ccm or .ccf"))?;
+    let file = ["ccm", "ccf"].iter().map(|ext| format!("{name}.{ext}")).find(|f| usrdir.join("font").join(name).join(f).is_file());
+    load_file(usrdir, name, &file.with_context(|| format!("no font/{name}/{name}.ccm or .ccf"))?, images)
+}
+
+/// Like [`load`] with the glyph map named explicitly (`fontdef.xml` `CcmFile`).
+pub fn load_file(usrdir: &Path, name: &str, file: &str, images: &mut Assets<Image>) -> Result<Font> {
+    let data = acvd_formats::vfs::open(usrdir, &format!("font/{name}/{file}"))?;
     let ccm = ccm::read(&data)?;
     let mut packs = Packs::default();
     let mut sheets = Vec::with_capacity(ccm.texture_count as usize);
     let mut sheet_size = Vec::with_capacity(ccm.texture_count as usize);
     for i in 0..ccm.texture_count {
         let tex = format!("{name}_{i:04}");
-        let t = acvd_data::textures_named(&tex).next().with_context(|| format!("no texture `{tex}`"))?;
+        let t = acvd_data::textures_named(&tex)
+            .next()
+            .or_else(|| acvd_data::textures_named(&tex.to_lowercase()).next())
+            .with_context(|| format!("no texture `{tex}`"))?;
         let mut image = packs.texture(usrdir, t)?;
         image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
             address_mode_u: ImageAddressMode::ClampToEdge,
@@ -104,22 +111,27 @@ pub fn spawn(commands: &mut Commands, font: &Font, text: &str, origin: Vec2, sca
             },
         ))
         .id();
+    spawn_glyphs(commands, font, &quads, Vec2::ZERO, root, color);
+    root
+}
+
+/// Spawns `quads` as children of `parent`, offset by `origin` (logical pixels).
+pub fn spawn_glyphs(commands: &mut Commands, font: &Font, quads: &[GlyphQuad], origin: Vec2, parent: Entity, color: Color) {
     for q in quads {
         let Some(image) = font.sheets.get(q.texture).cloned() else { continue };
         commands.spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: px(q.pos.x),
-                top: px(q.pos.y),
+                left: px(origin.x + q.pos.x),
+                top: px(origin.y + q.pos.y),
                 width: px(q.size.x),
                 height: px(q.size.y),
                 ..Default::default()
             },
             ImageNode { image, color, rect: Some(q.uv), ..Default::default() },
-            ChildOf(root),
+            ChildOf(parent),
         ));
     }
-    root
 }
 
 #[cfg(test)]

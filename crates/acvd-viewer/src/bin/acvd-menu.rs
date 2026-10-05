@@ -1,8 +1,9 @@
 //! Menu layout viewer: draws one DRB dialog with its disc textures.
 //!
-//! `acvd-menu [layout] [dialog] [--lang en] [--disc <dump root>] [--shot <png>]`
+//! `acvd-menu [layout] [dialog] [--lang en] [--disc <dump root>] [--shot <png>] [--placeholders]`
 //! `layout` is a `lang/<lang>/menu/` name (`staffroll`) or a full `.drb.dcx` asset path; `dialog`
-//! is a dialog name, defaulting to the first one no other dialog nests.
+//! is a dialog name, defaulting to the first one no other dialog nests. `--placeholders` shows
+//! texts the game fills at runtime as their object names.
 //! Left/Right: previous/next dialog, Up/Down: previous/next layout in the folder.
 
 use std::path::PathBuf;
@@ -21,16 +22,18 @@ struct Viewer {
     wanted_dialog: Option<String>,
     shown: Option<(usize, usize, [u32; 2])>,
     layout: Option<Layout>,
+    placeholders: bool,
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut positional, mut lang, mut disc, mut shot) = (Vec::new(), "en".to_string(), None, None);
+    let (mut positional, mut lang, mut disc, mut shot, mut placeholders) = (Vec::new(), "en".to_string(), None, None, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--lang" => lang = args.next().unwrap_or(lang),
             "--disc" => disc = args.next().map(PathBuf::from),
             "--shot" => shot = args.next().map(|p| Shot::new(PathBuf::from(p))),
+            "--placeholders" => placeholders = true,
             _ => positional.push(a),
         }
     }
@@ -54,7 +57,7 @@ fn main() {
         ..default()
     }))
     .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.07)))
-    .insert_resource(Viewer { usrdir, layouts, current, dialog: 0, wanted_dialog: positional.get(1).cloned(), shown: None, layout: None })
+    .insert_resource(Viewer { usrdir, layouts, current, dialog: 0, wanted_dialog: positional.get(1).cloned(), shown: None, layout: None, placeholders })
     .add_systems(Startup, |mut commands: Commands| {
         commands.spawn(Camera2d);
     })
@@ -94,7 +97,8 @@ fn show(
     if viewer.layout.is_none() {
         let path = viewer.layouts[viewer.current].clone();
         match menu::load(&viewer.usrdir, &path, &mut images) {
-            Ok(layout) => {
+            Ok(mut layout) => {
+                layout.placeholders = viewer.placeholders;
                 let wanted = viewer.wanted_dialog.take();
                 viewer.dialog = wanted
                     .and_then(|w| layout.drb.dialogs.iter().position(|d| d.name == w))

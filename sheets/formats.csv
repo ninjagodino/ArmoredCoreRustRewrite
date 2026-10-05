@@ -8,7 +8,7 @@ extension,magic,format,system,parser,evidence
 .ccm,00 01 00 0x,font character map,fonts,done,"acvd-formats::ccm reads every .ccm/.ccf: versions 0x10000/0x10001 (24-byte glyphs) and 0x10002 (28-byte; e14_ext j1_16_ext k1_ext); code groups then UV + pre_space/width/advance/texture"
 .dbp,count u32,debug-menu layout of a headerless tuning binary,debug_menu,done,acvd-formats::dbp: u32 count; records (u32 type 0-6 = s8 u8 s16 u16 s32 u32 f32; 8 zero bytes; value step min max); Shift-JIS (label; printf format) pairs. system/paramlist.xml pairs each with param/<name>.bin = the values packed at natural alignment (sizes match exactly)
 .def,PARAMDEF header,PARAMDEF (formats 101/103/104),params,done,acvd-formats::paramdef reads all 163
-.drb.dcx,DCX,DCX(EDGE)-compressed DRB menu layout,ui,"done: acvd-formats::drb (all 69): dialogs, objects, shapes (Sprite/Mono*/Gouraud*/Text/Dialog/Null), textures; RPTC control properties, Text extras and animation tables undecoded",lang/**/*.drb.dcx (69); expanded contents begin \0BRD
+.drb.dcx,DCX,DCX(EDGE)-compressed DRB menu layout,ui,"done: acvd-formats::drb (all 69): dialogs, objects, shapes (Sprite/Mono*/Gouraud*/Text/Dialog/Null), textures; Text font/align/source (static RTS string, menu.fmg bank-1 message, runtime) from 360 DrbShape_createText 0x824ac270; Text word +0x0c, RPTC control properties and animation tables undecoded",lang/**/*.drb.dcx (69); expanded contents begin \0BRD
 .emtm,PARAM header,PARAM (EVENT_MESSAGE_TEXT_MAP_ST),params;events,done,type string EVENT_MESSAGE_TEXT_MAP_ST at 0x0C
 .evd,EVD\0,event script data,events,todo,event/mission/*.evd (52)
 .fev,FEV1,FMOD Ex event project,sound,todo,sound/**/*.fev (167)
@@ -42,4 +42,4 @@ extension,magic,format,system,parser,evidence
 .tsmap,PARAM header,PARAM (AI_MESSAGE_SOUND_MAP),params;sound,done,type string AI_MESSAGE_SOUND_MAP at 0x0C
 .txt,text,plain text lists,config,todo,system/deletechar.txt (UTF-16LE); oneshotsfxlist.txt
 .vpo,FF 0F 00 11,RSX vertex program object,shaders,todo,inside binders only: shader/*.bnd (Font.vpo ...); 806 entries
-.xml,<?xml,XML definitions,missions;config;fonts,todo,mission (154); model (131); param (4); font (2); system (2); shader/flver_shader.bnd FlverShader.xml
+.xml,<?xml,XML definitions,missions;config;fonts,partial: font/fontdef.xml read by acvd-formats::fontdef (ID -> CcmFile, RefFontID); others todo,mission (154); model (131); param (4); font (2); system (2); shader/flver_shader.bnd FlverShader.xml
