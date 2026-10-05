@@ -6,6 +6,7 @@
 //! [--water <y>]`
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump;
 //! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left (see `weapons`);
+//! M toggles mouselook (mouse turns and pitches, cursor grabbed);
 //! P switches to the clip browser: Up/Down previous/next clip, Space pause. Left/Right: previous/next design,
 //! drag left mouse: orbit, wheel: zoom, R: reframe. `--clip`/`--frame` start in the browser,
 //! `--frame` paused on that frame. `--hold w,shift,space,f` holds keys for the whole run, and

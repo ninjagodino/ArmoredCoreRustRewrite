@@ -138,6 +138,10 @@ struct FollowCam {
     /// AC+0x234 +0x5c and its velocity at +0x60.
     pitch: f32,
     pitch_vel: f32,
+    /// Mouselook: camera yaw relative to the AC (positive left); the AC turns to close it.
+    yaw_off: f32,
+    /// Camera yaw (body + offset) last frame, so mouse swings can rotate the eased points rigidly.
+    cam_yaw: f32,
     /// Roll from sideways speed: ZTiltStart/MaxXSpeed (km/h), MaxZTiltAngle (rad), the seconds to
     /// tilt and to level out, and the -1..1 tilt in use.
     tilt_speeds: (f32, f32),
@@ -364,6 +368,8 @@ impl FollowCam {
             at_forward: behavior.at_forward_length,
             pitch: 0.0,
             pitch_vel: 0.0,
+            yaw_off: 0.0,
+            cam_yaw: 0.0,
             tilt_speeds: (behavior.z_tilt_start_x_speed, behavior.z_tilt_max_x_speed),
             tilt_max: behavior.max_z_tilt_angle.to_radians(),
             tilt_secs: (f32::from(behavior.z_tilt_interpolate_frame) / TICK_RATE, f32::from(behavior.z_tilt_end_interpolate_frame) / TICK_RATE),
@@ -395,6 +401,17 @@ impl FollowCam {
         let alpha = ((b.blur_alpha as f32 * i) as i32).clamp(0, 255) as u8;
         let alpha = if alpha > BLUR_MIN_ALPHA { alpha } else { 0 };
         ZoomBlur::new(b.blur_offset * i, alpha, b.blur_thin_pow * i, Vec2::new(b.blur_no_effect_size_x, b.blur_no_effect_size_y))
+    }
+
+    /// Rotates the eased camera points about pivot by delta (yaw), so freelook turns the view
+    /// rigidly instead of lagging behind it; only movement is left to the follow easing.
+    fn swing(&mut self, pivot: Vec3, delta: f32) {
+        if let Some(s) = self.shown.as_mut() {
+            let r = Quat::from_rotation_y(delta);
+            for v in [&mut s.eye, &mut s.look_at, &mut s.eye_target, &mut s.look_at_target] {
+                *v = pivot + r * (*v - pivot);
+            }
+        }
     }
 
     /// Camera roll this frame from the AC's velocity (m/tick) along its local -X.
@@ -562,9 +579,13 @@ impl Pilot {
     /// Fire direction: the follow camera's pitched forward (`FollowCam::place`); core aim is not
     /// posed yet.
     pub fn aim_direction(&self) -> Vec3 {
-        Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(self.cam.pitch) * FORWARD
+        Quat::from_rotation_y(self.yaw + self.cam.yaw_off) * Quat::from_rotation_x(self.cam.pitch) * FORWARD
     }
 }
+
+/// Mouselook (M): camera yaw / pitch radians per pixel of mouse motion.
+const MOUSE_YAW: f32 = 0.003;
+const MOUSE_PITCH: f32 = 0.003;
 
 struct Input {
     /// x: right, y: forward, length at most 1.
@@ -633,7 +654,8 @@ fn integrate(v: Vec2, accel: Vec2, max: f32, decel: f32) -> Vec2 {
 fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision) {
     let c = p.ctrl;
     p.yaw += input.turn * c.turn_rate / TICK_RATE;
-    let facing = Quat::from_rotation_y(p.yaw);
+    // Mouselook: move relative to where the camera looks, not where the body faces.
+    let facing = Quat::from_rotation_y(p.yaw + p.cam.yaw_off);
     let forward = facing * FORWARD;
     let right = forward.cross(Vec3::Y);
     let wish3 = right * input.stick.x + forward * input.stick.y;
@@ -749,9 +771,30 @@ pub fn pilot(
     mut cams: Query<(&mut Orbit, &mut Transform, &mut Projection, &mut ZoomBlur), Without<Pilot>>,
     joints: Query<(&Driven, &GlobalTransform)>,
     mut window: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
+    mut cursor: Query<&mut bevy::window::CursorOptions, With<bevy::window::PrimaryWindow>>,
+    mouse: Res<bevy::input::mouse::AccumulatedMouseMotion>,
+    mut mouselook: Local<bool>,
 ) {
     if keys.just_pressed(KeyCode::KeyP) {
         piloting.0 = !piloting.0;
+    }
+    // M toggles mouselook: the grabbed mouse turns the AC (like Q/E) and pitches the camera.
+    if keys.just_pressed(KeyCode::KeyM) {
+        *mouselook = !*mouselook;
+    }
+    if !piloting.0 {
+        *mouselook = false;
+    }
+    if let Ok(mut c) = cursor.single_mut() {
+        let (grab, visible) = if *mouselook {
+            (bevy::window::CursorGrabMode::Locked, false)
+        } else {
+            (bevy::window::CursorGrabMode::None, true)
+        };
+        if c.grab_mode != grab {
+            c.grab_mode = grab;
+            c.visible = visible;
+        }
     }
     let (Some(mut motion), Ok((mut p, mut transform, ac_global))) = (motion, acs.single_mut()) else { return };
     if motion.in_place != piloting.0 {
@@ -761,6 +804,7 @@ pub fn pilot(
         p.cam.shown = None;
         p.cam.pitch = 0.0;
         p.cam.pitch_vel = 0.0;
+        p.cam.yaw_off = 0.0;
         p.cam.eye_rate = [Blend::default(); 4];
         p.cam.look_at_rate = [Blend::default(); 4];
         p.cam.tilt = Blend::default();
@@ -774,7 +818,15 @@ pub fn pilot(
         }
         return;
     }
-    let input = read_input(&keys, &held.0, &pads);
+    let mut input = read_input(&keys, &held.0, &pads);
+    if !*mouselook {
+        p.cam.yaw_off = 0.0;
+    }
+    if *mouselook {
+        // AC6-style: the mouse moves the camera freely; the AC turns toward it at its turn rate.
+        p.cam.yaw_off = (p.cam.yaw_off - mouse.delta.x * MOUSE_YAW).clamp(-std::f32::consts::PI, std::f32::consts::PI);
+        p.cam.pitch = (p.cam.pitch - mouse.delta.y * MOUSE_PITCH).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
     if input.boost_toggle {
         p.boost = !p.boost;
     }
@@ -787,14 +839,28 @@ pub fn pilot(
         p.accumulator -= 1.0 / TICK_RATE;
         p.cam.aim(input.look);
         let before = p.velocity;
-        step(&mut p, &input, &mut transform.translation, &collision);
+        if *mouselook {
+            let per_tick = (p.ctrl.turn_rate / TICK_RATE).max(1e-4);
+            input.turn = (p.cam.yaw_off / per_tick).clamp(-1.0, 1.0);
+            let yaw_before = p.yaw;
+            step(&mut p, &input, &mut transform.translation, &collision);
+            p.cam.yaw_off -= p.yaw - yaw_before;
+        } else {
+            step(&mut p, &input, &mut transform.translation, &collision);
+        }
         p.cam.accel = (p.velocity - before).with_y(0.0).length() * TICK_TO_KMH;
         let velocity = p.velocity;
         p.cam.blur_tick(velocity);
     }
     transform.rotation = Quat::from_rotation_y(p.yaw);
 
-    let next = state(&p, &input, &motion);
+    // The walk / dash clip direction is relative to the body, the stick to the camera.
+    let (sin, cos) = p.cam.yaw_off.sin_cos();
+    let body = Input {
+        stick: Vec2::new(input.stick.x * cos - input.stick.y * sin, input.stick.x * sin + input.stick.y * cos),
+        ..input
+    };
+    let next = state(&p, &body, &motion);
     p.landed = false;
     let changed = p.state != Some(next);
     if changed {
@@ -817,19 +883,49 @@ pub fn pilot(
         p.state = Some(next);
     }
 
+    // Dash / air-move lean: one 360-frame clip whose frame is the heading in degrees (a key per
+    // 45 degrees = the eight directions), so it blends smoothly between them.
+    if matches!(next.0, "dash" | "air_move") && motion.clip.frames == 360 && p.clip_ok {
+        // Mirrored: the clip's 90 degree key leans the way the stick's left does (checked by eye).
+        // Heading of the actual velocity (m/tick) against the body, not the stick: the AC's
+        // acceleration (its weight) then sets how fast the lean swings between directions.
+        // Falls back to the stick while nearly still.
+        let forward = Quat::from_rotation_y(p.yaw) * FORWARD;
+        let right = forward.cross(Vec3::Y);
+        let v = Vec2::new(p.velocity.dot(right), p.velocity.dot(forward));
+        let local = if v.length() > 0.02 { v } else { body.stick };
+        let target = (-local.x).atan2(local.y).to_degrees().rem_euclid(360.0);
+        if motion.wheel.is_none() {
+            motion.frame = target;
+        }
+        motion.wheel = Some(target);
+        // The lean builds with speed: 0 at a standstill, full at the boost top speed.
+        motion.lean = (p.velocity.with_y(0.0).length() / p.ctrl.boost_max_tick.max(1e-4)).clamp(0.0, 1.0);
+    }
+
     if let Ok((mut o, mut cam, mut proj, mut blur)) = cams.single_mut() {
         o.follow = true;
         o.yaw += p.yaw - yaw;
         let airborne = p.airborne;
         let action = camera_action(next.0, p.boost, airborne);
         p.cam.act(action);
-        p.cam.blend_eye(input.turn, time.delta_secs());
+        // Mouselook turning is auto-generated and jittery near zero: ignore small values so the
+        // side shift only flips for a real turn (the blend itself smooths the move).
+        let cam_turn = if *mouselook && input.turn.abs() < 0.25 { 0.0 } else { input.turn };
+        p.cam.blend_eye(cam_turn, time.delta_secs());
         let root = transform.translation;
         let center = motion.skeleton.bones.iter().position(|b| b.rest.as_ref().is_some_and(|r| r.name == WAIST_BONE));
         let waist = joints.iter().find(|(d, _)| Some(d.bone) == center).map_or(Vec3::ZERO, |(_, g)| g.translation() - ac_global.translation());
         let water = collision.ray_down(Vec3::new(root.x, root.y + RAY_HALF, root.z), root.y - RAY_HALF, Layer::Water);
-        let (eye, look_at) = p.cam.place(root + waist, transform.rotation, water);
-        let (eye, look_at) = p.cam.follow(eye, look_at, transform.rotation, airborne, time.delta_secs());
+        let cam_rot = transform.rotation * Quat::from_rotation_y(p.cam.yaw_off);
+        let total_yaw = p.yaw + p.cam.yaw_off;
+        if *mouselook {
+            let delta = total_yaw - p.cam.cam_yaw;
+            p.cam.swing(root + waist, delta);
+        }
+        p.cam.cam_yaw = total_yaw;
+        let (eye, look_at) = p.cam.place(root + waist, cam_rot, water);
+        let (eye, look_at) = p.cam.follow(eye, look_at, cam_rot, airborne, time.delta_secs());
         o.focus = look_at;
         let velocity = p.velocity;
         let roll = p.cam.roll(velocity, transform.rotation, time.delta_secs());

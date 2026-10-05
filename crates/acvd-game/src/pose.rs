@@ -24,6 +24,9 @@ use crate::assemble::Placement;
 /// `.ani` headers store no frame rate; the game's 60 Hz tick is assumed (30 fps played far too slow).
 pub const FRAME_RATE: f32 = 60.0;
 
+/// How fast the lean follows the heading, degrees per second (assumed; the 360 rate is unread).
+const WHEEL_RATE: f32 = 540.0;
+
 /// Bone-group columns of `param/acanimhokan.bin` after GeneralFrame, by skeleton bone name
 /// (`sheets/anim_blend.csv`). A joint takes the column of its nearest ancestor-or-self in the
 /// list, GeneralFrame otherwise; `momo` and `sune` name the `l_`/`r_` thigh and shin bones.
@@ -96,6 +99,13 @@ pub struct Motion {
     pub looping: bool,
     /// Playback rate relative to `FRAME_RATE`.
     pub speed: f32,
+    /// Direction-wheel clips (dash / air-move lean, 360 frames, a key every 45 = one of the eight
+    /// directions, frame = heading in degrees clockwise from forward): the heading to pose, which
+    /// replaces time playback. Cleared by select.
+    pub wheel: Option<f32>,
+    /// Wheel clips: 0..1 weight of the lean pose over the pose shown at the clip change (set from
+    /// the AC's speed, so the lean builds up as it accelerates) instead of the timed crossfade.
+    pub lean: f32,
     /// Hold the clip's root bone (`master`) at rest: its motion (the turn clips yaw it) is
     /// applied by whoever moves the AC instead.
     pub in_place: bool,
@@ -124,7 +134,7 @@ impl Motion {
         };
         let old = std::mem::replace(&mut self.clip, clip);
         self.cache.insert(self.index, old);
-        (self.index, self.frame, self.looping, self.speed) = (index, 0.0, true, 1.0);
+        (self.index, self.frame, self.looping, self.speed, self.wheel) = (index, 0.0, true, 1.0, None);
         self.fade = Fade { generation: self.fade.generation.wrapping_add(1), secs: [0.0; 8], t: 0.0 };
         Ok(())
     }
@@ -196,7 +206,7 @@ fn motion(usrdir: &Path, parts: &[Loaded]) -> Result<Option<Motion>> {
     let index = clips.iter().position(|a| a.entry == m.skeleton).unwrap_or(0);
     let clip = skeleton.clone();
     let prefix = m.skeleton.split('_').next().unwrap_or_default();
-    Ok(Some(Motion { set: m.set, skeleton, prefix, clips, index, clip, frame: 0.0, playing: true, looping: true, speed: 1.0, in_place: false, scale: 1.0, fade: Fade::default(), cache: HashMap::new() }))
+    Ok(Some(Motion { set: m.set, skeleton, prefix, clips, index, clip, frame: 0.0, playing: true, looping: true, speed: 1.0, wheel: None, lean: 0.0, in_place: false, scale: 1.0, fade: Fade::default(), cache: HashMap::new() }))
 }
 
 pub fn build(usrdir: &Path, parts: &[Loaded]) -> Result<Built> {
@@ -329,12 +339,17 @@ pub fn spawn(commands: &mut Commands, ac: Entity, built: &Built, parts: &[Loaded
 pub fn animate(time: Res<Time>, motion: Option<ResMut<Motion>>, mut joints: Query<(&mut Driven, &mut Transform)>) {
     let Some(mut m) = motion else { return };
     let frames = m.clip.frames.max(1) as f32;
-    if m.playing {
+    if let Some(target) = m.wheel {
+        let diff = (target - m.frame + 540.0).rem_euclid(360.0) - 180.0;
+        let step = WHEEL_RATE * time.delta_secs();
+        m.frame = (m.frame + diff.clamp(-step, step)).rem_euclid(360.0);
+    } else if m.playing {
         let next = m.frame + time.delta_secs() * FRAME_RATE * m.speed;
         m.frame = if m.looping { next % frames } else { next.min(frames - 1.0) };
     }
     m.fade.t += time.delta_secs();
     let (f, scale, fade) = (m.frame, m.scale, m.fade);
+    let (wheel, lean) = (m.wheel.is_some(), m.lean);
     for (mut d, mut transform) in &mut joints {
         if d.generation != fade.generation {
             (d.from, d.generation) = (*transform, fade.generation);
@@ -347,7 +362,7 @@ pub fn animate(time: Res<Time>, motion: Option<ResMut<Motion>>, mut joints: Quer
         let translation = if d.absolute { t * scale } else { d.bind + (t - Vec3::from(rest.translation)) * scale };
         let target = to_transform(translation, rotation, s);
         let secs = fade.secs[d.group];
-        let w = if secs > 0.0 { (fade.t / secs).min(1.0) } else { 1.0 };
+        let w = if wheel { lean } else if secs > 0.0 { (fade.t / secs).min(1.0) } else { 1.0 };
         *transform = if w >= 1.0 {
             target
         } else {
