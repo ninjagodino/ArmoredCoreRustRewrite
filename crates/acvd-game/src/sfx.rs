@@ -920,6 +920,11 @@ impl Cx<'_, '_, '_> {
     }
 }
 
+/// Uniform scale of an effect's world transform (its [`Sfx`] entity's scale).
+fn scale_of(world: Affine3A) -> f32 {
+    world.matrix3.x_axis.length()
+}
+
 fn srgba(c: Vec4) -> Color {
     Color::srgba(c.x, c.y, c.z, c.w)
 }
@@ -1006,6 +1011,7 @@ impl NodeRt {
 
     fn draw(&mut self, look: &Look, t: f32, world: Affine3A, cx: &mut Cx) {
         let (_, rot, pos) = world.to_scale_rotation_translation();
+        let k = scale_of(world);
         match look {
             Look::Billboard { texture, blend, width, height, color, frames, spin, .. } => {
                 if self.visual.is_none() {
@@ -1016,7 +1022,7 @@ impl NodeRt {
                 }
                 let v = self.visual.as_ref().unwrap();
                 let roll = self.roll + spin.at(t) * t;
-                let scale = Vec3::new(width.at(t), height.at(t), 1.0);
+                let scale = Vec3::new(width.at(t) * k, height.at(t) * k, 1.0);
                 let tf = Transform { translation: pos, rotation: cx.camera_rot * Quat::from_rotation_z(roll), scale };
                 if let Some(mut m) = cx.materials.get_mut(&v.material) {
                     m.base_color = srgba(color.at(t));
@@ -1034,7 +1040,7 @@ impl NodeRt {
                     self.visual = Some(Visual { entities, material, mesh: None });
                 }
                 let v = self.visual.as_ref().unwrap();
-                let tf = Transform { translation: pos, rotation: rot, scale: Vec3::new(scale[0].at(t), scale[1].at(t), scale[2].at(t)) };
+                let tf = Transform { translation: pos, rotation: rot, scale: Vec3::new(scale[0].at(t), scale[1].at(t), scale[2].at(t)) * k };
                 if let Some(mut m) = cx.materials.get_mut(&v.material) {
                     m.base_color = srgba(color.at(t));
                     let (o, s) = frames.rect(t, 0.0);
@@ -1046,7 +1052,7 @@ impl NodeRt {
             }
             Look::Light { color, radius } => {
                 let c = color.at(t);
-                let light = PointLight { color: Color::srgb(c.x, c.y, c.z), intensity: LIGHT_LUMENS * c.w.max(0.0), range: radius.at(t).max(0.01), shadow_maps_enabled: false, ..default() };
+                let light = PointLight { color: Color::srgb(c.x, c.y, c.z), intensity: LIGHT_LUMENS * c.w.max(0.0), range: (radius.at(t) * k).max(0.01), shadow_maps_enabled: false, ..default() };
                 let tf = Transform::from_translation(pos);
                 match &self.visual {
                     Some(v) => cx.moves.push((v.entities[0], tf, Some(light))),
@@ -1073,7 +1079,7 @@ impl NodeRt {
                 self.emit = if c.interval > 0.0 { self.emit + c.interval } else { f32::INFINITY };
             }
         }
-        let down = if c.look.follow { world.inverse().transform_vector3(Vec3::NEG_Y) } else { Vec3::NEG_Y };
+        let down = scale_of(world) * if c.look.follow { world.inverse().transform_vector3(Vec3::NEG_Y) } else { Vec3::NEG_Y };
         for p in &mut self.particles {
             p.age += dt;
             p.vel += down * c.gravity.0.at(p.age) * p.gravity * dt;
@@ -1123,9 +1129,10 @@ impl NodeRt {
         };
         let mut b = Batch::default();
         let (right, up) = (cx.camera_rot * Vec3::X, cx.camera_rot * Vec3::Y);
+        let k = scale_of(world);
         for p in &self.particles {
             let l = &c.look;
-            let size = Vec3::new(l.size[0].at(p.age), l.size[1].at(p.age), l.size[2].at(p.age)) * p.size * l.scale;
+            let size = Vec3::new(l.size[0].at(p.age), l.size[1].at(p.age), l.size[2].at(p.age)) * p.size * l.scale * k;
             let color = (l.color.at(p.age) * p.tint).to_array();
             let rect = l.frames.rect(p.age, p.frame);
             let (center, vel) = if l.follow { (world.transform_point3(p.pos), world.transform_vector3(p.vel)) } else { (p.pos, p.vel) };

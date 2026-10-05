@@ -72,6 +72,10 @@ Rough priority order; reorder freely.
     backward on leg points 25-28, foot 301 rising.
   - Not wired: quick boost (303-305), booster light 299, ground dust (`groundsfxparam.bin`
     walk/landing rows), water splashes, cartridges (`cartridge_sfx_id`).
+  - Muzzle scale: f0001218 as stored is a 16 m flash and a 20 m sprite (user: far too
+    large), so the game scales weapon effects at spawn. `weapons::MUZZLE_SCALE` 0.25 is a
+    guess; find the spawn call that reads `muzzle_sfx_id` (+0x02 of the weaponsfx row) and its
+    scale argument (or one RPCS3 breakpoint on it).
   - Hits always use `default2`: the collision mesh keeps no material.
   - The `hit_sfx_type` to `bullethitsfxparam.bin` row mapping is assumed.
 - **Sound** (FSB4/FEV1), **movies** (PAMF), **mission events** (EVD),

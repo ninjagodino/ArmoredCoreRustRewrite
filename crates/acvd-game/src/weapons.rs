@@ -20,6 +20,10 @@ use crate::sfx::{EffectPoint, Sfx};
 
 /// Hand-weapon muzzle effect point (FLVER dummy colour byte 1 on the arm weapons).
 const MUZZLE_POINT: u8 = 101;
+/// Uniform scale the muzzle effect plays at. Not game data: f0001218 as stored is a 16 m
+/// flash (s4021 × 8 × 9.5) and a 20 m sprite, so the game must scale it at spawn; the scale's
+/// source is not traced.
+const MUZZLE_SCALE: f32 = 0.25;
 
 /// Game ticks per second. `reload_time` is read as ticks and `BulletRigidSt.gravity` as metres
 /// per second added each tick; both units are unconfirmed (see `docs/status.md`, Weapons).
@@ -165,8 +169,8 @@ pub fn fire(
         let column = if hand == Hand::Right { "armwep_r" } else { "armwep_l" };
         if gun.fx.muzzle > 0 {
             match points.iter().find(|(_, p)| p.column == column && p.id == MUZZLE_POINT) {
-                Some((point, _)) => commands.spawn((Sfx::new(gun.fx.muzzle), Transform::default(), Visibility::default(), ChildOf(point))),
-                None => commands.spawn((Sfx::new(gun.fx.muzzle), Transform::from_translation(origin).looking_to(-aim, Vec3::Y))),
+                Some((point, _)) => commands.spawn((Sfx::new(gun.fx.muzzle), Transform::from_scale(Vec3::splat(MUZZLE_SCALE)), Visibility::default(), ChildOf(point))),
+                None => commands.spawn((Sfx::new(gun.fx.muzzle), Transform::from_translation(origin).looking_to(-aim, Vec3::Y).with_scale(Vec3::splat(MUZZLE_SCALE)))),
             };
         }
         let shot = (Transform::from_translation(origin).looking_to(aim, Vec3::Y), Projectile { velocity, gravity: gun.gravity, life: MAX_LIFE, hit: gun.fx.hit });
