@@ -14,8 +14,8 @@
 //! picks another `model/map` folder, `--plane` is the old infinite floor, `--water` adds a test
 //! water plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
 //! Boosters, muzzle flashes, tracers and hits play FFX effects (see `sfx`); `--sfx <id>` keeps
-//! effect `id` playing in front of the AC. `--burst <n>` makes `--shot` save `n` frames 0.05 s
-//! apart (`<stem>_<i>.png`).
+//! effect `id` playing in front of the AC. Shots, boost and jump play their FMOD cues (see
+//! `sound`). `--burst <n>` makes `--shot` save `n` frames 0.05 s apart (`<stem>_<i>.png`).
 
 mod assemble;
 mod blur;
@@ -24,6 +24,7 @@ mod control;
 mod hud;
 mod pose;
 mod sfx;
+mod sound;
 mod weapons;
 
 use std::path::PathBuf;
@@ -135,6 +136,7 @@ fn main() {
     }))
     .add_plugins((blur::BlurPlugin, acvd_render::menu::MenuPlugin))
     .add_plugins(sfx::SfxPlugin { usrdir: usrdir.clone() })
+    .add_plugins(sound::SoundPlugin { usrdir: usrdir.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(Garage { usrdir, designs, current, shown: None, flat, bounds: (Vec3::ZERO, Vec3::ONE), clip, frame, status: String::new() })
     .insert_resource(StartYaw(yaw))

@@ -9,4 +9,5 @@ acvd-formats = { path = "../acvd-formats" }
 acvd-data = { path = "../acvd-data" }
 acvd-render = { path = "../acvd-render" }
 anyhow.workspace = true
-bevy.workspace = true
+bevy = { workspace = true, features = ["wav"] }
+symphonia = { version = "0.5", default-features = false, features = ["mp3"] }

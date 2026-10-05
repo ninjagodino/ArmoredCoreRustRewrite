@@ -5,18 +5,22 @@
 //! Effects come from the `param/acweaponsfxparam.bin` row named by the part's `hit_id` (row 1
 //! when it has none): the muzzle flash at the weapon's effect point 101, the bullet effect on
 //! the shot, and the `param/bullethitsfxparam.bin` `default2` effect where it hits the ground
-//! (collision triangles keep no material).
+//! (collision triangles keep no material). The shot sound is the `acweaponsoundparam` row with
+//! that same `hit_id` (`w%08d`); a missing row plays cue 299, and a shoot id ≤ 0 is silent.
 
 use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
 use acvd_data::generated::bullet::{BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN, PARAM_BULLETHITSFXPARAM_BIN};
 use acvd_data::generated::sfx::PARAM_ACWEAPONSFXPARAM_BIN;
+use acvd_data::generated::sound::PARAM_ACWEAPONSOUNDPARAM_BIN;
 use acvd_data::{find, part_field};
+use bevy::audio::AudioSource;
 use bevy::prelude::*;
 
 use crate::assemble::Placement;
 use crate::collision::Collision;
 use crate::control::{Held, Pilot, Piloting};
 use crate::sfx::{EffectPoint, Sfx};
+use crate::sound::{self, Cues};
 
 /// Hand-weapon muzzle effect point (FLVER dummy colour byte 1 on the arm weapons).
 const MUZZLE_POINT: u8 = 101;
@@ -32,6 +36,8 @@ const TICK_RATE: f32 = 60.0;
 const KMH_PER_MS: f32 = 3.6;
 /// Tracer lifetime in seconds; not game data.
 const MAX_LIFE: f32 = 5.0;
+/// Shoot id `FUN_82891e18` writes when the weapon has no `acweaponsoundparam` row.
+const DEFAULT_SHOOT: i16 = 0x12B;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Hand {
@@ -54,6 +60,8 @@ pub struct Gun {
     pub kind: Kind,
     pub gravity: f32,
     pub fx: Fx,
+    /// `acweaponsoundparam.shoot`. `≤ 0` plays nothing.
+    pub shoot: i16,
 }
 
 /// FFX effect ids of a weapon; 0 plays nothing.
@@ -135,6 +143,8 @@ pub fn fire(
     assets: Res<Tracers>,
     collision: Res<Collision>,
     pads: Query<&Gamepad>,
+    mut cues: ResMut<Cues>,
+    mut sources: ResMut<Assets<AudioSource>>,
     mut commands: Commands,
     mut acs: Query<(&Pilot, &mut Armament, &Transform)>,
     hardpoints: Query<(&Hardpoint, &GlobalTransform)>,
@@ -166,6 +176,7 @@ pub fn fire(
         let velocity = aim * gun.init_speed.max(1.0) / KMH_PER_MS;
         gun.remaining = gun.remaining.saturating_sub(1);
         gun.cooldown = gun.reload_time.max(1.0);
+        sound::shot(&mut commands, &mut cues, &mut sources, gun.shoot);
         let column = if hand == Hand::Right { "armwep_r" } else { "armwep_l" };
         if gun.fx.muzzle > 0 {
             match points.iter().find(|(_, p)| p.column == column && p.id == MUZZLE_POINT) {
@@ -208,7 +219,12 @@ fn gun(id: i64) -> Gun {
     let magazine = part_field(id, 10, "magazine").max(0.0) as u16;
     let init_speed = part_field(id, 10, "init_speed");
     let (kind, gravity, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
-    Gun { remaining: magazine, reload_time: part_field(id, 10, "reload_time"), cooldown: 0.0, init_speed: speed, kind, gravity, fx: fx(id) }
+    Gun { remaining: magazine, reload_time: part_field(id, 10, "reload_time"), cooldown: 0.0, init_speed: speed, kind, gravity, fx: fx(id), shoot: shoot_of(id) }
+}
+
+fn shoot_of(id: i64) -> i16 {
+    let hit_id = part_field(id, 10, "hit_id") as u32;
+    find(PARAM_ACWEAPONSOUNDPARAM_BIN, hit_id).map(|r| r.data.shoot).unwrap_or(DEFAULT_SHOOT)
 }
 
 fn fx(id: i64) -> Fx {
@@ -243,5 +259,14 @@ mod tests {
         let g = gun(1720);
         assert_eq!(g.kind, Kind::Rigid, "part 1720 bullet_id should be rigid 10002");
         assert!(g.remaining > 0 && g.init_speed > 0.0 && g.reload_time > 0.0, "{g:?}");
+    }
+
+    #[test]
+    fn starter_rifle_uses_its_sound_row() {
+        let g = gun(1720);
+        let hit = part_field(1720, 10, "hit_id") as u32;
+        let row = find(PARAM_ACWEAPONSOUNDPARAM_BIN, hit).expect("part 1720 hit_id has an acweaponsoundparam row");
+        assert_eq!(g.shoot, row.data.shoot);
+        assert!(g.shoot > 0, "rifle shoot cue");
     }
 }

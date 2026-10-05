@@ -78,10 +78,29 @@ Rough priority order; reorder freely.
     scale argument (or one RPCS3 breakpoint on it).
   - Hits always use `default2`: the collision mesh keeps no material.
   - The `hit_sfx_type` to `bullethitsfxparam.bin` row mapping is assumed.
-- **Sound** (FSB4/FEV1), **movies** (PAMF), **mission events** (EVD),
+- **Movies** (PAMF), **mission events** (EVD),
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
 ## Done
+
+- Sound, the first free-play cues (`acvd-formats::fsb` / `::fev`, `acvd-game::sound`,
+  `sheets/sound_cues.csv`). PS3 banks are FSB4 MPEG; the 360 build names the cue.
+  - **Names**: `FUN_82b47758` sprintfs from the table at `0x8371c688` (`%03d`, `c%08d`,
+    `a%08d`, `b%08d`, `w%08d`, …). Play only when the id is > 0.
+  - **Shoot**: `FUN_828995d0` formats category 4. The id is `acweaponsoundparam.shoot` of the
+    part's category-10 `hit_id` (`FUN_82892790` / `FUN_82891e68`). No row: `FUN_82891e18`
+    writes shoot `0x12B`. `≤ 0` is silent. `w00000034` is two `se_weapon` layers, both played.
+  - **Boost**: `AcSfxCtrl` vtable `0x82098C84`, slot `0x82098cb0` = `FUN_82899280` plays
+    `b00000000` (boost start). The sustain loop is `b00000010` (`main_boost11`), chosen because
+    it is the single-layer main boost; which state calls which slot is not traced. Gate matches
+    the booster VFX (boost and horizontal speed > 0.05 m/tick).
+  - **Jump**: `FUN_82899168` formats category 1 from `AC_SOUNDPARAM_ST +0xA` (`se_jump`). Every
+    `acsoundparam` row is 24, so the cue is `c00000024`. Rising edge of airborne with `vy > 0`.
+  - **Playback**: symphonia decodes the MPEG payload to a WAV (Bevy's default audio feature
+    has no MP3 decoder). FMOD pads each MPEG frame to a multiple of 4 bytes; that pad is
+    stripped first. Not positional — `FUN_82b46df0` takes a position, left for later.
+  - **Left**: reload / charge / fly loop, footsteps (`se_walk` is 0), `b00000003` speed
+    crossfade, `b00000006` dash (`FUN_828992d0`), 3D, reverb, FFX action 68, XMA.
 
 - FFX effects. `acvd-formats::ffx` reads the DLsE tree (layout in the module doc) and all
   1871 effects of `sfx/acv_commoneffects.ffxbnd`.
