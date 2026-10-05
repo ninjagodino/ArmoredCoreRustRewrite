@@ -11,12 +11,13 @@
 //! `--frame` paused on that frame. `--hold w,shift,space,f` holds keys for the whole run, and
 //! `--wait` delays `--shot` that long. Default collision is map `m3100` from the disc; `--map`
 //! picks another `model/map` folder, `--plane` is the old infinite floor, `--water` adds a test
-//! water plane at that height.
+//! water plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
 
 mod assemble;
 mod blur;
 mod collision;
 mod control;
+mod hud;
 mod pose;
 mod weapons;
 
@@ -124,7 +125,7 @@ fn main() {
         primary_window: Some(Window { title: "acvd-game".into(), ..default() }),
         ..default()
     }))
-    .add_plugins(blur::BlurPlugin)
+    .add_plugins((blur::BlurPlugin, acvd_render::menu::MenuPlugin))
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(Garage { usrdir, designs, current, shown: None, flat, bounds: (Vec3::ZERO, Vec3::ONE), clip, frame, status: String::new() })
     .insert_resource(StartYaw(yaw))
@@ -132,7 +133,8 @@ fn main() {
     .insert_resource(control::Piloting(piloting))
     .insert_resource(control::Held(held))
     .add_systems(Startup, (setup, weapons::setup))
-    .add_systems(Update, (browse, show, clips, control::pilot, pose::animate, weapons::fire, orbit).chain());
+    .add_systems(Update, (browse, show, clips, control::pilot, pose::animate, weapons::fire, orbit).chain())
+    .add_systems(Update, (hud::layout, hud::readouts).chain().after(weapons::fire));
     if let Some(shot) = shot {
         app.insert_resource(ShotDelay(wait, false)).insert_resource(shot).add_systems(Update, (delay_shot, take_shot).chain().after(pose::animate));
     }
@@ -218,6 +220,10 @@ fn setup(
     match load_hud(&garage.usrdir, &mut images) {
         Ok(hud) => commands.insert_resource(hud),
         Err(e) => warn!("hud: {e:#}"),
+    }
+    match hud::load(&garage.usrdir, &mut images) {
+        Ok(sortie) => commands.insert_resource(sortie),
+        Err(e) => warn!("sortie hud: {e:#}"),
     }
 }
 

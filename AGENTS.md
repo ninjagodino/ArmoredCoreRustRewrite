@@ -28,7 +28,7 @@ disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
 | `crates/acvd-data` | generated structs/rows from the sheets (`src/generated/` is never committed) |
 | `crates/acvd-render` | disc → Bevy meshes/textures, orbit camera, `--shot` screenshot mode |
 | `crates/acvd-viewer` | FLVER model browser |
-| `crates/acvd-game` | runtime: AC assembly (`assemble`), posing/motion (`pose`), piloting + follow camera (`control`), map `.hmd` collision (`collision`) |
+| `crates/acvd-game` | runtime: AC assembly (`assemble`), posing/motion (`pose`), piloting + follow camera (`control`), map `.hmd` collision (`collision`), DRB lock-sight HUD (`hud`) |
 | `tools/acvd-sheets` | `extract` → `preflight` → `gen` (`all` runs every step); preflight errors block gen |
 | `tools/ghidra` | Ghidra scripts (`X360Pdata.java`, `DecompileRefs.java`, ...) |
 | `sheets/` | committed source-of-truth CSVs (`systems.csv` = per-system status) |
