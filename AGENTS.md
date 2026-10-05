@@ -42,6 +42,7 @@ $env:CARGO_TARGET_DIR = "$PWD\target"; $env:PATH = "$env:USERPROFILE\.cargo\bin;
 cargo run --release -p acvd-sheets -- all          # after editing sheets
 cargo run -p acvd-game -- [design id] [--shot private\shots\x.png --wait 2] [--water <y>] [--hold w,shift]
 cargo run -p acvd-viewer -- [model name]
+cargo run -p acvd-viewer --bin acvd-menu -- [layout] [dialog] # DRB menu/HUD layouts
 .\demo.bat                               # manual-test menu: rebuilds, then launches a scenario
 ```
 

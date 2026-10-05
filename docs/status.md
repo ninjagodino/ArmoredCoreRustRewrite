@@ -53,7 +53,7 @@ Rough priority order; reorder freely.
     drain, missiles (`bulletmissile`), blades, shoulder weapons (category 12 bullet ids at
     +356/+360), weapon modes, bay shift, core aim (shots follow the camera pitch, not a posed
     upper body), ammo HUD.
-- **UI**: decode DRB shape (RPHS, kind 0x1e/0x3e/0x84/0xae/0x14e) and control property (RPTC) records, then draw a layout. **Param enums**: TDF reader.
+- **UI**: DRB `Text` objects (decode RPTC control properties for the string / FMG id and the three Text words, draw with the CCM fonts); sprite blend 2 as additive; animation tables (PINA/KINA/OINA/MINA...); then show a layout in `acvd-game`. **Param enums**: TDF reader.
 - **Effects** (FFX), **sound** (FSB4/FEV1), **movies** (PAMF), **mission events** (EVD),
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
@@ -110,6 +110,6 @@ Rough priority order; reorder freely.
 - Text: FMG reader (`acvd-formats::fmg`); 1250 UTF-16BE banks, 15 Shift-JIS `partsname_*.fmg`.
 - Fonts: CCM/CCF reader (`acvd-formats::ccm`); versions 0x10000/1 (24-byte glyphs) and 0x10002
   (28-byte). `acvd-game` draws `fontdef.xml` ID 1 (`e1_ext`) plus `partsname_en.fmg` as a HUD
-  overlay. DRB: `acvd-formats::drb` reads the section run (`tag,u32 size,u32 count,0`; tags reversed, e.g. IXET=TEXI), RTS UTF-16BE strings, textures, SHAP/CTRL/OGLD tables on all 69 files. Shape and property record layouts are still undecoded (staffroll.drb: RPHS 0x120 bytes, 13 SHAP entries).
+  overlay. DRB: `acvd-formats::drb` decodes dialogs (GLD), objects (OGLD), shapes (Sprite, MonoRect/Frame, GouraudRect/Frame, Text, Dialog, Null) and textures on all 69 layouts; the module doc has every record layout. Sprite texture ids >= 1000 are runtime slots (emblems 10000+, movies 101xx, maps 102xx). `acvd-render::menu` + the `acvd-menu` viewer (`cargo run -p acvd-viewer --bin acvd-menu -- staffroll`) draw a dialog tree with its sibling `.tpf.dcx` textures; verified on staffroll (rotated strip seamless) and vssortie timer / Data_Rule (flipped corners and arrows).
 
 - Animation timing: clips play at 60 fps (was 30, too slow) and acanimhokan blend values are read as milliseconds (was 60 Hz frames, 2-20 s fades). User-confirmed walking looks right; still unverified against the 360 code.

@@ -8,7 +8,7 @@ extension,magic,format,system,parser,evidence
 .ccm,00 01 00 0x,font character map,fonts,done,"acvd-formats::ccm reads every .ccm/.ccf: versions 0x10000/0x10001 (24-byte glyphs) and 0x10002 (28-byte; e14_ext j1_16_ext k1_ext); code groups then UV + pre_space/width/advance/texture"
 .dbp,count u32,debug-menu layout of a headerless tuning binary,debug_menu,done,acvd-formats::dbp: u32 count; records (u32 type 0-6 = s8 u8 s16 u16 s32 u32 f32; 8 zero bytes; value step min max); Shift-JIS (label; printf format) pairs. system/paramlist.xml pairs each with param/<name>.bin = the values packed at natural alignment (sizes match exactly)
 .def,PARAMDEF header,PARAMDEF (formats 101/103/104),params,done,acvd-formats::paramdef reads all 163
-.drb.dcx,DCX,DCX(EDGE)-compressed DRB menu layout,ui,"in progress: acvd-formats::drb reads sections, strings, textures, shape/control/object tables (all 69 parse); shape records (RPHS) and RPTC properties undecoded",lang/**/*.drb.dcx (69); expanded contents begin \0BRD
+.drb.dcx,DCX,DCX(EDGE)-compressed DRB menu layout,ui,"done: acvd-formats::drb (all 69): dialogs, objects, shapes (Sprite/Mono*/Gouraud*/Text/Dialog/Null), textures; RPTC control properties, Text extras and animation tables undecoded",lang/**/*.drb.dcx (69); expanded contents begin \0BRD
 .emtm,PARAM header,PARAM (EVENT_MESSAGE_TEXT_MAP_ST),params;events,done,type string EVENT_MESSAGE_TEXT_MAP_ST at 0x0C
 .evd,EVD\0,event script data,events,todo,event/mission/*.evd (52)
 .fev,FEV1,FMOD Ex event project,sound,todo,sound/**/*.fev (167)

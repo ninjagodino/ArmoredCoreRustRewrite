@@ -5,6 +5,7 @@
 //! turns them into Bevy's right-handed, counter-clockwise front faces without touching indices.
 
 pub mod app;
+pub mod menu;
 pub mod text;
 
 use std::collections::HashMap;
