@@ -85,6 +85,12 @@ Rough priority order; reorder freely.
   to names from PARAMDEF, TDF (198 files, reader still todo), `.dbp` labels and Lua param ids.
   Then an audit that checks each sheet row's 360 addresses, offsets and constants against it.
   54 sheet rows cite only PS3 addresses and need byte-matched 360 equivalents.
+  - Output lives only on disk: the script writes the index sheets, and chats query the rows
+    they need (by address, slot or id). Never read the whole index into a chat.
+  - The script does the reading; model tokens go to writing it and spot-checking samples
+    against known rows (movement vtable `0x8208fea0` slot `+0xec` = `0x82826058`).
+  - Budget: about a day and 200-400k tokens for the function and vtable index, about a day
+    more for switch tables (only runs read by an `lwzx` / `mtctr` / `bctr` sequence count).
 - **Movies** (PAMF), **mission events** (EVD),
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
