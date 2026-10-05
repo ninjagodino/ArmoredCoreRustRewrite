@@ -38,11 +38,18 @@ Rough priority order; reorder freely.
     above the glide max.
   - Per-state current max (`0x82822af0`): switch on +0x1bc, x terrain/slope scale +0x334, x +0x324.
   - Dash / air-boost acceleration multiplier (field 406, also the default divisor at `0x5c4`).
-  - Tick rate: the game frame is 1/30 s, and a Xenia probe saw the integrator `0x82822ea0` run
-    once per frame (one object, `f1` = 1.0 every call). The sheets read the movement values per
-    1/60 s tick; if the integrator steps only once per frame, speeds and decay rates are off by
-    a factor of two. Probe whether it steps twice inside one call (velocity before and after),
-    or whether its caller scales by the frame time.
+  - Tick rate (Xenia probes `private/xenia/move_tick.txt`, `vertical.txt`; evidence in
+    `sheets/ac_ctrl_calc.csv`): the game frame is 1/30 s and velocities are m per 1/60 s (the
+    position, height at entity `+0x104`, moves 2 x velocity per frame). The horizontal
+    integrator `0x82822ea0` adds the acceleration once per frame (0.073 per frame from a stop;
+    caller scales `0x82820ef0` and `+0x328` are 1.0). Gravity is applied twice per frame
+    (-0.050 m/frame per frame = 2 x 1.5 / 60). The boost gravity multiplier (movement `+0x284`,
+    0.022 with boosters on, 1.0 once they are off) applies only while falling, not while rising.
+    A full jump leaves at 0.714 m/frame within one frame (about 11 m high), a quick tap at 0.159.
+    Open: whether 0.073 is `walk_acc_tick` or twice it for that AC, and 0.714 against
+    `jump_rise_tick`; whether jump height scales smoothly with hold time (only the two extremes
+    seen); the fall cap (not reached). Runtime: step acceleration and decay once per 1/30 s
+    frame, gravity per tick, and apply boost gravity only while descending.
 - **Paint**: map `_c` mask regions to accolor channels via the ACColor fragment programs in
   `shader/flver_shader.bnd`.
 - **Assembly gaps**: socket rotation, recon/hanger mounts, LOD switching; 8 pending FLVERs

@@ -1,8 +1,8 @@
 From 8ab7777edfe540f053a68f87699f40222fdf2036 Mon Sep 17 00:00:00 2001
 From: acvd <acvd@local>
 Date: Mon, 5 Oct 2026 12:44:41 -0700
-Subject: [PATCH] ACVD guest-address probes (--acvd_probes): log registers and
- memory before chosen instructions
+Subject: [PATCH 1/2] ACVD guest-address probes (--acvd_probes): log registers
+ and memory before chosen instructions
 
 ---
  src/xenia/cpu/ppc/acvd_probe.cc      | 406 +++++++++++++++++++++++++++
@@ -504,6 +504,66 @@ index 42d996cba..cc58ef2e2 100644
      InstrData i;
      i.address = address;
      i.code = code;
+-- 
+2.53.0.windows.2
+
+
+From b4c90185ef71a61bbdebb9ed553f82c4b10b57c9 Mon Sep 17 00:00:00 2001
+From: acvd <acvd@local>
+Date: Mon, 5 Oct 2026 16:19:12 -0700
+Subject: [PATCH 2/2] ACVD probes: write non-finite floats as null
+
+---
+ src/xenia/cpu/ppc/acvd_probe.cc | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/xenia/cpu/ppc/acvd_probe.cc b/src/xenia/cpu/ppc/acvd_probe.cc
+index 7f2c5693b..f3a65832a 100644
+--- a/src/xenia/cpu/ppc/acvd_probe.cc
++++ b/src/xenia/cpu/ppc/acvd_probe.cc
+@@ -23,6 +23,7 @@
+ #include "xenia/cpu/ppc/acvd_probe.h"
+ 
+ #include <chrono>
++#include <cmath>
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
+@@ -253,13 +254,18 @@ bool Evaluate(PPCContext* ctx, const Operand& op, uint64_t* out) {
+   return false;
+ }
+ 
++// JSON has no NaN or infinity.
++std::string FormatFloat(double d) {
++  return std::isfinite(d) ? fmt::format("{:.9g}", d) : "null";
++}
++
+ std::string Format(PPCContext* ctx, const Operand& op) {
+   uint64_t raw;
+   if (!Evaluate(ctx, op, &raw)) return "null";
+   if (op.kind == Operand::Kind::kFpr) {
+     double d;
+     std::memcpy(&d, &raw, 8);
+-    return fmt::format("{:.9g}", d);
++    return FormatFloat(d);
+   }
+   if (op.kind != Operand::Kind::kLoad) {
+     return fmt::format("\"0x{:08X}\"", static_cast<uint32_t>(raw));
+@@ -280,12 +286,12 @@ std::string Format(PPCContext* ctx, const Operand& op) {
+       float f;
+       uint32_t bits = static_cast<uint32_t>(raw);
+       std::memcpy(&f, &bits, 4);
+-      return fmt::format("{:.9g}", f);
++      return FormatFloat(f);
+     }
+     case ReadType::kF64: {
+       double d;
+       std::memcpy(&d, &raw, 8);
+-      return fmt::format("{:.9g}", d);
++      return FormatFloat(d);
+     }
+   }
+   return "null";
 -- 
 2.53.0.windows.2
 
