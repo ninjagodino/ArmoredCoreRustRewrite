@@ -65,6 +65,16 @@ pub struct Rig {
     pub unboned: [f32; 3],
     /// `(socket id, bone carrying the dummy)` for every dummy with a socket id.
     pub sockets: Vec<(u8, Option<usize>)>,
+    /// Every dummy with an effect point id (colour byte 1).
+    pub effects: Vec<RigEffect>,
+}
+
+/// An FFX effect point, in FLVER axes: `position` relative to `bone` and `forward` in its frame.
+pub struct RigEffect {
+    pub id: u8,
+    pub bone: Option<usize>,
+    pub position: [f32; 3],
+    pub forward: [f32; 3],
 }
 
 /// Like [`model_with_offsets`], with joint indices and weights on every mesh for GPU skinning.
@@ -89,7 +99,18 @@ pub fn rigged_model(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) ->
         .filter(|d| d.color[0] != 0)
         .map(|d| (d.color[0], usize::try_from(d.parent_bone).ok().or(usize::try_from(d.attach_bone).ok()).filter(|&b| b < f.bones.len())))
         .collect();
-    Ok((meshes, Rig { bones, unboned: offset(None), sockets }))
+    let effects = f
+        .dummies
+        .iter()
+        .filter(|d| d.color[1] != 0)
+        .map(|d| RigEffect {
+            id: d.color[1],
+            bone: usize::try_from(d.parent_bone).ok().filter(|&b| b < f.bones.len()),
+            position: d.position,
+            forward: d.forward,
+        })
+        .collect();
+    Ok((meshes, Rig { bones, unboned: offset(None), sockets, effects }))
 }
 
 fn load(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3], rig: bool) -> Result<(Vec<LoadedMesh>, flver::Flver)> {

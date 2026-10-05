@@ -12,6 +12,9 @@
 //! `--wait` delays `--shot` that long. Default collision is map `m3100` from the disc; `--map`
 //! picks another `model/map` folder, `--plane` is the old infinite floor, `--water` adds a test
 //! water plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
+//! Boosters, muzzle flashes, tracers and hits play FFX effects (see `sfx`); `--sfx <id>` keeps
+//! effect `id` playing in front of the AC. `--burst <n>` makes `--shot` save `n` frames 0.05 s
+//! apart (`<stem>_<i>.png`).
 
 mod assemble;
 mod blur;
@@ -19,6 +22,7 @@ mod collision;
 mod control;
 mod hud;
 mod pose;
+mod sfx;
 mod weapons;
 
 use std::path::PathBuf;
@@ -70,6 +74,7 @@ fn main() {
     let (mut wanted, mut disc, mut shot, mut flat, mut yaw) = (None, None, None, false, None);
     let (mut clip, mut frame, mut held, mut wait) = (None, None, Vec::new(), 0.0);
     let (mut map, mut plane, mut water) = (Some("m3100".to_string()), false, None);
+    let (mut preview, mut burst) = (None, 1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -83,6 +88,8 @@ fn main() {
             "--map" => map = args.next().filter(|s| s != "none"),
             "--plane" => plane = true,
             "--water" => water = args.next().and_then(|s| s.parse::<f32>().ok()),
+            "--sfx" => preview = args.next().and_then(|s| s.parse::<i32>().ok()),
+            "--burst" => burst = args.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1),
             _ => wanted = a.parse::<u32>().ok(),
         }
     }
@@ -126,6 +133,7 @@ fn main() {
         ..default()
     }))
     .add_plugins((blur::BlurPlugin, acvd_render::menu::MenuPlugin))
+    .add_plugins(sfx::SfxPlugin { usrdir: usrdir.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(Garage { usrdir, designs, current, shown: None, flat, bounds: (Vec3::ZERO, Vec3::ONE), clip, frame, status: String::new() })
     .insert_resource(StartYaw(yaw))
@@ -135,7 +143,11 @@ fn main() {
     .add_systems(Startup, (setup, weapons::setup))
     .add_systems(Update, (browse, show, clips, control::pilot, pose::animate, weapons::fire, orbit).chain())
     .add_systems(Update, (hud::layout, hud::readouts).chain().after(weapons::fire));
-    if let Some(shot) = shot {
+    if let Some(id) = preview {
+        app.insert_resource(sfx::Preview(id));
+    }
+    if let Some(mut shot) = shot {
+        shot.burst = burst;
         app.insert_resource(ShotDelay(wait, false)).insert_resource(shot).add_systems(Update, (delay_shot, take_shot).chain().after(pose::animate));
     }
     app.run();
@@ -326,6 +338,7 @@ fn show(
                 commands.entity(root).insert(h);
             }
         }
+        sfx::effect_points(&mut commands, &part.rig, &joints, part.placement.column);
         for mesh in part.meshes {
             min = min.min(Vec3::from(mesh.min));
             max = max.max(Vec3::from(mesh.max));

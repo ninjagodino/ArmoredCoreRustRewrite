@@ -54,10 +54,48 @@ Rough priority order; reorder freely.
     +356/+360), weapon modes, bay shift, core aim (shots follow the camera pitch, not a posed
     upper body). The lock-sight HUD shows the hand-weapon ammo counts (`acvd-game::hud`).
 - **UI**: in-game HUD next steps: AP / energy state for the hidden `AP*` / `EN*` digits, the `AlphaAnimSprite` gauges (`Gauge_LWeapon` ...; record layout unread), the side `Weapon` panels (part name + `CurAmmo` runtime text at the `ACV_FE_Normal` LeftArm / Shoulder / RightArm anchors); trace the Dialog color tint (inferred, see Notes); animation tables (PINA/KINA/OINA/MINA...). Open: Text word +0x0c (0, 502, 1000-1004, 1030, 1200-1204; not a scale), Text flags byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0). **Param enums**: TDF reader.
-- **Effects** (FFX), **sound** (FSB4/FEV1), **movies** (PAMF), **mission events** (EVD),
+- **Effects leftovers** (FFX player done, see Done): every slot meaning in
+  `sheets/ffx_actions.csv` is inferred from the effect files. The 360 action-id to class map
+  is still missing. Class names (`FXClusterEmitter_Cone`, `FXClusterAppearance_Model`,
+  `Sfx_PointSprite` ...) are in the executable, each source-path string followed by its
+  vtable (near 0x82172a40 and 0x82230e80); `FXBasicActionHandler` is referenced at 0x83121988
+  and 0x83121c10. Open questions:
+  - Blend values other than 2 (alpha) and 4 (additive).
+  - Euler order of transform 36 (YXZ assumed).
+  - Whether particles follow the emitter: 108 models follow, 71/82 stay in the world.
+  - Point-sprite size unit (action 82).
+  - Light intensity (only colour and radius are stored).
+  - Not drawn: distortion (43), radial blur, tracer/line actions, actions 2031/2035/2118/3000.
+
+  Gameplay gaps:
+  - Which motion fires which booster is a guess: main 300 boosting forward, back 302 boosting
+    backward on leg points 25-28, foot 301 rising.
+  - Not wired: quick boost (303-305), booster light 299, ground dust (`groundsfxparam.bin`
+    walk/landing rows), water splashes, cartridges (`cartridge_sfx_id`).
+  - Hits always use `default2`: the collision mesh keeps no material.
+  - The `hit_sfx_type` to `bullethitsfxparam.bin` row mapping is assumed.
+- **Sound** (FSB4/FEV1), **movies** (PAMF), **mission events** (EVD),
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
 ## Done
+
+- FFX effects. `acvd-formats::ffx` reads the DLsE tree (layout in the module doc) and all
+  1871 effects of `sfx/acv_commoneffects.ffxbnd`.
+  - **Player** (`acvd-game::sfx`): static nodes draw billboards, sprites, sfx_m models and
+    point lights; clusters 2023/2032/2034 and the 10003 spark burst draw one batch mesh each,
+    with flipbooks, colour keys, cone emitters, gravity and drag. Slot readings are in
+    `sheets/ffx_actions.csv`.
+  - **Frame grids**: columns, then total frames. s5009 (1024×128) with (8, 8) is 8 cells of
+    128; s1020 (512×64) is 8 cells of 64; s4021 with (1, 4) is 4 rows.
+  - **Effect points**: FLVER dummy colour byte 1 gives the effect point (`Rig::effects`),
+    spawned as `EffectPoint`s with +Z along the dummy's forward.
+  - **Boosters**: `mapsfxparam.bin` row 0 (main 300, back 302, foot 301) plays on bs nozzles
+    31-34 and leg points 25-28 / 21, 23.
+  - **Weapons**: the `acweaponsfxparam.bin` row is the part's `hit_id` (fallback row 1). The
+    muzzle effect plays at weapon point 101, the bullet effect on the shot, and the
+    `bullethitsfxparam.bin` `default2` effect at ground hits.
+  - **Testing**: `--sfx <id>` previews one effect; `--burst <n>` saves `n` shots 0.05 s apart.
+    The user confirmed boosters, muzzle flash and hits on screen.
 
 - Hand-weapon fire (`acvd-game::weapons`): `acvparts.bin` category 10 fields `magazine`,
   `missile_lock_time`, `bullet_id`, `hit_id`, `init_speed`, `en_drain`, `reload_time`,

@@ -9,6 +9,7 @@ pub mod dbp;
 pub mod dcx;
 pub mod drb;
 pub mod edge;
+pub mod ffx;
 pub mod flver;
 pub mod fontdef;
 pub mod fmg;

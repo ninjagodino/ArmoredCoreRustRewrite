@@ -12,7 +12,7 @@ extension,magic,format,system,parser,evidence
 .emtm,PARAM header,PARAM (EVENT_MESSAGE_TEXT_MAP_ST),params;events,done,type string EVENT_MESSAGE_TEXT_MAP_ST at 0x0C
 .evd,EVD\0,event script data,events,todo,event/mission/*.evd (52)
 .fev,FEV1,FMOD Ex event project,sound,todo,sound/**/*.fev (167)
-.ffx,DLsE,FFX particle effect,effects,todo,sfx/f0004092.ffx; f0004226.ffx; 1891 more inside .ffxbnd binders (1871 DLsE; 20 empty)
+.ffx,DLsE,FFX particle effect,effects,done,"acvd-formats::ffx reads all 1871 DLsE entries of sfx/acv_commoneffects.ffxbnd (test disc_effects); action slots in sheets/ffx_actions.csv; sfx/f0004092.ffx; f0004226.ffx; 20 empty entries"
 .ffxbnd,BND3,BND3 binder of FFX effects,effects,done,sfx/acv_commoneffects.ffxbnd; menusfx/acv_commoneffects.ffxbnd; read by acvd-formats::bnd3
 .flv,FLVER\0 B\0 0002000F,FLVER model (big-endian; versions 0x2000F/0x20009/0x2000E),models,done,acvd-formats::flver reads 8820 of 8828 (am0010.flv; e0210.flv + _l1.._l3 LODs); EDGE-compressed indices decoded by acvd-formats::edge with every index in range; 8 pending (0x20007 and FLVER0) in container_exceptions.csv; rendered by acvd-viewer
 .fmg,00 01 00 00,FMG message bank,text,done,"acvd-formats::fmg: 1265 banks; encoding byte 1 = UTF-16BE (1250) or 0 = Shift-JIS (15 partsname_*.fmg); id groups then string offsets"

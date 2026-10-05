@@ -15,7 +15,7 @@ ai,AI behaviour scripts,airesource/**/*.lc; scene/*.lc; script/*.lc,in progress:
 events,Mission event scripts,event/mission/*.evd,todo: EVD reader,todo
 missions,Mission definitions and sub-missions,mission/**/*.xml; mission params,todo,todo
 ui,Menu and HUD layouts plus menu images,lang/**/*.drb.dcx; image/**/*.tpf.dcx; PNG,"done: acvd-formats::drb dialogs/objects/shapes on all 69 layouts","in progress: acvd-render::menu draws a dialog tree (sprites with sibling-TPF textures, flips, quarter turns, blend 2 additive; mono/gouraud rects and frames; nested dialogs tinted by their Dialog color) in the acvd-menu viewer; Text in its fontdef font, aligned, from static strings and menu.fmg messages (runtime texts as --placeholders); acvd-game draws the sortie.drb lock-sight HUD with live hand-weapon ammo digits (AP/EN hidden: no game state); runtime image slots (>= 1000), AlphaAnimSprite gauges, NoiseSprite and animations not drawn"
-effects,Particle and visual effects,sfx/*.ffxbnd; sfx/*.ffx; menusfx/*.ffxbnd,todo: FFX reader (binders done),todo
+effects,Particle and visual effects,sfx/*.ffxbnd; sfx/*.ffx; menusfx/*.ffxbnd,done: FFX reader; slots inferred (sheets/ffx_actions.csv),partial: acvd-game::sfx plays boosters / muzzle / tracer / hit effects; distortion and many actions not drawn
 shaders,PS3 RSX shader binaries in binders,shader/*.bnd,todo: replace with WGSL equivalents,todo
 sound,Sound banks and event projects,sound/**/*.fsb; *.fev; magicorchestra.ini,todo: FSB4 + FEV1 readers,todo
 movies,Pre-rendered video,movie/**/*.pam,todo: PAMF demux,todo

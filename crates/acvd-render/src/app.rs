@@ -51,18 +51,29 @@ pub fn orbit(
     }
 }
 
-/// `--shot <png>`: once `ready`, saves one frame and exits.
+/// `--shot <png>`: once `ready`, saves one frame and exits. With `burst > 1` it saves that many
+/// frames `interval` seconds apart as `<stem>_<i>.png`.
 #[derive(Resource)]
 pub struct Shot {
     pub path: PathBuf,
     pub ready: bool,
+    pub burst: u32,
+    pub interval: f32,
     waited: f32,
-    requested: bool,
+    requested: u32,
 }
 
 impl Shot {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, ready: false, waited: 0.0, requested: false }
+        Self { path, ready: false, burst: 1, interval: 0.05, waited: 0.0, requested: 0 }
+    }
+
+    fn file(&self, i: u32) -> PathBuf {
+        if self.burst <= 1 {
+            return self.path.clone();
+        }
+        let stem = self.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.path.with_file_name(format!("{stem}_{i}.png"))
     }
 }
 
@@ -74,11 +85,14 @@ pub fn take_shot(mut commands: Commands, mut shot: ResMut<Shot>, time: Res<Time>
         return;
     }
     shot.waited += time.delta_secs();
-    if shot.waited >= SHOT_DELAY && !shot.requested {
-        shot.requested = true;
-        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(shot.path.clone()));
+    let n = shot.burst.max(1);
+    if shot.requested < n && shot.waited >= SHOT_DELAY + shot.requested as f32 * shot.interval {
+        let file = shot.file(shot.requested);
+        let _ = std::fs::remove_file(&file);
+        shot.requested += 1;
+        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(file));
     }
-    if shot.waited >= SHOT_DELAY + 2.0 && shot.path.is_file() {
+    if shot.requested == n && shot.waited >= SHOT_DELAY + n as f32 * shot.interval + 2.0 && (0..n).all(|i| shot.file(i).is_file()) {
         std::process::exit(0);
     }
     if shot.waited > SHOT_DELAY + 30.0 {

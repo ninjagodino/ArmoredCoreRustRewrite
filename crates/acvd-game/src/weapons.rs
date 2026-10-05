@@ -2,15 +2,24 @@
 //! (`sheets/ac_part_fields.csv` category 10) and spawns a tracer that flies with the matching
 //! `bullet/bulletrigid.bin` or `bullet/bulletenergy.bin` row. Blades and missiles are not fired
 //! yet. Shots leave the weapon-root joint along `Pilot::aim_direction` (no upper-body aim).
+//! Effects come from the `param/acweaponsfxparam.bin` row named by the part's `hit_id` (row 1
+//! when it has none): the muzzle flash at the weapon's effect point 101, the bullet effect on
+//! the shot, and the `param/bullethitsfxparam.bin` `default2` effect where it hits the ground
+//! (collision triangles keep no material).
 
 use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
-use acvd_data::generated::bullet::{BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN};
+use acvd_data::generated::bullet::{BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN, PARAM_BULLETHITSFXPARAM_BIN};
+use acvd_data::generated::sfx::PARAM_ACWEAPONSFXPARAM_BIN;
 use acvd_data::{find, part_field};
 use bevy::prelude::*;
 
 use crate::assemble::Placement;
 use crate::collision::Collision;
 use crate::control::{Held, Pilot, Piloting};
+use crate::sfx::{EffectPoint, Sfx};
+
+/// Hand-weapon muzzle effect point (FLVER dummy colour byte 1 on the arm weapons).
+const MUZZLE_POINT: u8 = 101;
 
 /// Game ticks per second. `reload_time` is read as ticks and `BulletRigidSt.gravity` as metres
 /// per second added each tick; both units are unconfirmed (see `docs/status.md`, Weapons).
@@ -40,6 +49,15 @@ pub struct Gun {
     pub init_speed: f32,
     pub kind: Kind,
     pub gravity: f32,
+    pub fx: Fx,
+}
+
+/// FFX effect ids of a weapon; 0 plays nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Fx {
+    pub bullet: i32,
+    pub muzzle: i32,
+    pub hit: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +78,7 @@ pub struct Projectile {
     velocity: Vec3,
     gravity: f32,
     life: f32,
+    hit: i32,
 }
 
 #[derive(Resource)]
@@ -115,6 +134,7 @@ pub fn fire(
     mut commands: Commands,
     mut acs: Query<(&Pilot, &mut Armament, &Transform)>,
     hardpoints: Query<(&Hardpoint, &GlobalTransform)>,
+    points: Query<(Entity, &EffectPoint)>,
     mut shots: Query<(Entity, &mut Projectile, &mut Transform), Without<Armament>>,
 ) {
     if !piloting.0 {
@@ -142,22 +162,34 @@ pub fn fire(
         let velocity = aim * gun.init_speed.max(1.0) / KMH_PER_MS;
         gun.remaining = gun.remaining.saturating_sub(1);
         gun.cooldown = gun.reload_time.max(1.0);
-        let material = match gun.kind {
-            Kind::Energy => assets.energy.clone(),
-            _ => assets.rigid.clone(),
-        };
-        commands.spawn((
-            Mesh3d(assets.mesh.clone()),
-            MeshMaterial3d(material),
-            Transform::from_translation(origin).looking_to(aim, Vec3::Y),
-            Projectile { velocity, gravity: gun.gravity, life: MAX_LIFE },
-        ));
+        let column = if hand == Hand::Right { "armwep_r" } else { "armwep_l" };
+        if gun.fx.muzzle > 0 {
+            match points.iter().find(|(_, p)| p.column == column && p.id == MUZZLE_POINT) {
+                Some((point, _)) => commands.spawn((Sfx::new(gun.fx.muzzle), Transform::default(), Visibility::default(), ChildOf(point))),
+                None => commands.spawn((Sfx::new(gun.fx.muzzle), Transform::from_translation(origin).looking_to(-aim, Vec3::Y))),
+            };
+        }
+        let shot = (Transform::from_translation(origin).looking_to(aim, Vec3::Y), Projectile { velocity, gravity: gun.gravity, life: MAX_LIFE, hit: gun.fx.hit });
+        if gun.fx.bullet > 0 {
+            commands.spawn((shot, Visibility::default())).with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+        } else {
+            let material = match gun.kind {
+                Kind::Energy => assets.energy.clone(),
+                _ => assets.rigid.clone(),
+            };
+            commands.spawn((Mesh3d(assets.mesh.clone()), MeshMaterial3d(material), shot));
+        }
     }
     for (e, mut shot, mut transform) in &mut shots {
         shot.life -= dt;
         let next = transform.translation + shot.velocity * dt;
         shot.velocity.y -= shot.gravity * TICK_RATE * dt;
-        if shot.life <= 0.0 || (shot.velocity.y < 0.0 && collision.ground_below(transform.translation).is_some_and(|g| next.y <= g)) {
+        let ground = collision.ground_below(transform.translation).filter(|&g| shot.velocity.y < 0.0 && next.y <= g);
+        if shot.life <= 0.0 || ground.is_some() {
+            if let Some(y) = ground.filter(|_| shot.hit > 0) {
+                let at = Vec3::new(next.x, y, next.z);
+                commands.spawn((Sfx::new(shot.hit), Transform::from_translation(at).with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y))));
+            }
             commands.entity(e).despawn();
             continue;
         }
@@ -172,7 +204,16 @@ fn gun(id: i64) -> Gun {
     let magazine = part_field(id, 10, "magazine").max(0.0) as u16;
     let init_speed = part_field(id, 10, "init_speed");
     let (kind, gravity, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
-    Gun { remaining: magazine, reload_time: part_field(id, 10, "reload_time"), cooldown: 0.0, init_speed: speed, kind, gravity }
+    Gun { remaining: magazine, reload_time: part_field(id, 10, "reload_time"), cooldown: 0.0, init_speed: speed, kind, gravity, fx: fx(id) }
+}
+
+fn fx(id: i64) -> Fx {
+    let hit_id = part_field(id, 10, "hit_id") as u32;
+    let Some(row) = find(PARAM_ACWEAPONSFXPARAM_BIN, hit_id).or_else(|| find(PARAM_ACWEAPONSFXPARAM_BIN, 1)).map(|r| &r.data) else {
+        return Fx::default();
+    };
+    let hit = u32::try_from(row.hit_sfx_type).ok().and_then(|t| find(PARAM_BULLETHITSFXPARAM_BIN, t)).map_or(0, |r| r.data.default2);
+    Fx { bullet: row.bullet_sfx_id.into(), muzzle: row.muzzle_sfx_id.into(), hit: hit.into() }
 }
 
 fn flight(id: u32, init_speed: f32) -> (Kind, f32, f32) {
