@@ -69,8 +69,6 @@ pub struct Pilot {
     pub boost: bool,
     pub glide: bool,
     pub airborne: bool,
-    /// Boosted since leaving the ground: gravity falls to `boost_gravity_tick` until landing.
-    air_boosted: bool,
     /// Ticks of take-off acceleration left.
     takeoff: f32,
     jump_queued: bool,
@@ -564,7 +562,6 @@ impl Pilot {
             boost: false,
             glide: false,
             airborne: false,
-            air_boosted: false,
             takeoff: 0.0,
             jump_queued: false,
             landed: false,
@@ -688,7 +685,6 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         horizontal += wish * c.jump_h_acc_tick;
     } else if p.boost && moving {
         horizontal = integrate(horizontal, wish * c.boost_acc_tick, c.boost_max_tick, c.over_max_decel_tick);
-        p.air_boosted = true;
     } else {
         let drag = if p.boost { c.air_drag_boost_tick } else { c.air_drag_tick };
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
@@ -700,7 +696,9 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
             p.velocity.y += c.jump_accel_tick * p.takeoff.min(1.0);
             p.takeoff = (p.takeoff - 1.0).max(0.0);
         } else {
-            p.velocity.y -= if p.air_boosted { c.boost_gravity_tick } else { c.gravity_tick };
+            // Boost gravity (movement +0x284) only while boost mode is on and the AC falls; it
+            // rises under full gravity (Xenia probe private/xenia/vertical.txt).
+            p.velocity.y -= if p.boost && p.velocity.y < 0.0 { c.boost_gravity_tick } else { c.gravity_tick };
         }
         p.velocity.y = p.velocity.y.max(-c.fall_max_tick);
     }
@@ -712,7 +710,7 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     let ground = collision.ground_below(Vec3::new(position.x, position.y + lift, position.z));
     if p.airborne {
         if let Some(g) = ground.filter(|&g| position.y <= g && p.velocity.y <= 0.0) {
-            (position.y, p.velocity.y, p.airborne, p.air_boosted, p.landed) = (g, 0.0, false, false, true);
+            (position.y, p.velocity.y, p.airborne, p.landed) = (g, 0.0, false, true);
         }
     } else {
         match ground.filter(|&g| g >= position.y - lift) {
