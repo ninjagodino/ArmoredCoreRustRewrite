@@ -26,6 +26,11 @@ const BOOST_ON: &str = "b00000000";
 /// Single-layer sustain in `acv2_se_booster.fev` (sound def → `se_booster` `main_boost11`).
 /// Not a traced call: the speed-crossfade event `b00000003` is left unplayed.
 const BOOST_LOOP: &str = "b00000010";
+/// `AcSfxCtrl` slot +0x40 plays both (`boost_on06` + `boost11`, and `quick_boost03`): high boost.
+const QUICK_BOOST: [&str; 2] = ["b00000007", "b00000008"];
+/// `AcSfxCtrl` slots +0x30 / +0x3c (`dash00` + `boost_on06`), taken as the glide start; not traced
+/// to the glide caller.
+const GLIDE_ON: &str = "b00000006";
 
 /// Projects and the banks a cue has already pulled in.
 #[derive(Resource)]
@@ -176,10 +181,13 @@ impl Plugin for SoundPlugin {
 struct Heard {
     moving: bool,
     airborne: bool,
+    glide: bool,
+    quick_boosts: u32,
     sustain: Vec<Entity>,
 }
 
-/// Boost start, boost sustain, and jump. Runs after the pilot step that sets those flags.
+/// Boost start, boost sustain, high boost, glide start and jump. Runs after the pilot step that
+/// sets those flags.
 fn motion(
     mut commands: Commands,
     mut cues: ResMut<Cues>,
@@ -193,8 +201,18 @@ fn motion(
         stop(&mut commands, &mut heard.sustain);
         heard.moving = false;
         heard.airborne = pilot.airborne;
+        (heard.glide, heard.quick_boosts) = (pilot.glide, pilot.quick_boosts);
         return;
     }
+    if pilot.quick_boosts != heard.quick_boosts {
+        for cue in QUICK_BOOST {
+            cues.play(&mut commands, &mut assets, cue, false);
+        }
+    }
+    if pilot.glide && !heard.glide {
+        cues.play(&mut commands, &mut assets, GLIDE_ON, false);
+    }
+    (heard.glide, heard.quick_boosts) = (pilot.glide, pilot.quick_boosts);
     let flat = Vec2::new(pilot.velocity.x, pilot.velocity.z);
     let moving = pilot.boost && flat.length() > BOOST_MOVING;
     if moving && !heard.moving {
@@ -263,7 +281,7 @@ mod tests {
         let Ok(disc) = Disc::open(&iso) else { return };
         let mut cues = Cues::load(&disc);
         assert_eq!(cues.projects.len(), 3);
-        for cue in ["w00000034", BOOST_ON, BOOST_LOOP, "c00000024"] {
+        for cue in ["w00000034", BOOST_ON, BOOST_LOOP, "c00000024", QUICK_BOOST[0], QUICK_BOOST[1], GLIDE_ON] {
             let waves: Vec<fev::Wave> = cues.projects.iter().find_map(|p| p.event(cue).map(|_| p.waves(cue).into_iter().cloned().collect())).unwrap();
             let wave = &waves[0];
             let sample = cues.bank(&wave.bank).unwrap().samples[wave.index as usize].clone();

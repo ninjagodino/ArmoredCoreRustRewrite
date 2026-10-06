@@ -39,8 +39,11 @@ const POINT_SPRITE_STREAK: f32 = 0.02;
 /// Horizontal speed, metres per tick, above which a boosting AC fires its boosters; not game data.
 const BOOST_MOVING: f32 = 0.05;
 /// Booster effect points on the AC parts' FLVER dummies (colour byte 1): bs0010 nozzles 31-34,
-/// lg0010 foot boosters 21/23 and the `l_bb`/`r_bb` back boosters 25-28.
+/// lg0010 foot boosters 21/23 and the `l_bb`/`r_bb` back boosters 25-28. bs0010 41/42 sit on
+/// the `l_boost`/`l2_boost` bones without a flame of their own; the booster light goes there
+/// (inferred, not traced).
 const MAIN_NOZZLES: std::ops::RangeInclusive<u8> = 31..=34;
+const LIGHT_POINTS: [u8; 2] = [41, 42];
 const FOOT_NOZZLES: [u8; 2] = [21, 23];
 const BACK_NOZZLES: std::ops::RangeInclusive<u8> = 25..=28;
 
@@ -1744,13 +1747,15 @@ fn sweep(
 
 /// Lights the `param/mapsfxparam.bin` row 0 booster effects on the AC's effect points while
 /// boost mode moves it: main booster on the booster nozzles moving forward, back booster on
-/// the legs' back nozzles moving backward, foot booster on the feet while rising. Which motion
-/// fires which booster is not traced.
+/// the legs' back nozzles moving backward, foot booster on the feet while rising, and the
+/// booster light with either. Each high boost fires the one-shot QB burst once on the nozzles
+/// facing away from its direction. Which motion fires which booster is not traced.
 pub fn boosters(
     mut commands: Commands,
     pilots: Query<&Pilot>,
     mut points: Query<(Entity, &mut EffectPoint)>,
     mut effects: Query<&mut Sfx>,
+    mut quick_seen: Local<u32>,
 ) {
     let Ok(pilot) = pilots.single() else { return };
     let Some(row) = find(PARAM_MAPSFXPARAM_BIN, 0).map(|r| &r.data) else {
@@ -1760,8 +1765,25 @@ pub fn boosters(
     let facing = (Quat::from_rotation_y(pilot.yaw) * Vec3::NEG_Z).xz();
     let moving = pilot.boost && flat.length() > BOOST_MOVING;
     let ahead = flat.dot(facing) >= 0.0;
+    let quick = pilot.quick_boosts != *quick_seen;
+    *quick_seen = pilot.quick_boosts;
+    let quick_ahead = pilot.quick_dir.xz().dot(facing) >= 0.0;
     for (e, mut p) in &mut points {
+        let burst = match (p.column, p.id) {
+            ("booster", id) => MAIN_NOZZLES.contains(&id) && quick_ahead,
+            ("legs", id) => BACK_NOZZLES.contains(&id) && !quick_ahead,
+            _ => false,
+        };
+        if quick && burst && row.ac_qb_normal > 0 {
+            commands.spawn((
+                Sfx::new(row.ac_qb_normal.into()),
+                Transform::default(),
+                Visibility::default(),
+                ChildOf(e),
+            ));
+        }
         let want = match (p.column, p.id) {
+            ("booster", id) if LIGHT_POINTS.contains(&id) && moving => row.ac_booster_light,
             ("booster", id) if MAIN_NOZZLES.contains(&id) && moving && ahead => row.ac_main_booster,
             ("legs", id) if BACK_NOZZLES.contains(&id) && moving && !ahead => row.ac_back_booster,
             ("legs", id)

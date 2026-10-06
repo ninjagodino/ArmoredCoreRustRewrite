@@ -4,7 +4,8 @@
 //! `acvd-game [design id] [--disc <360 ISO>] [--shot <png>] [--flat] [--yaw <degrees>]
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
 //! [--water <y>]`
-//! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump;
+//! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump,
+//! V high boost (quick boost), Ctrl glide boost while boosting on the ground;
 //! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left (see `weapons`).
 //! A ready-position weapon (cannon, autocannon, and the other classes with `ready_position`)
 //! plays its deploy clip while fire is held and does not shoot until that clip ends; releasing
@@ -294,6 +295,7 @@ fn key(name: &str) -> Option<KeyCode> {
         "shift" => KeyCode::ShiftLeft,
         "space" => KeyCode::Space,
         "ctrl" => KeyCode::ControlLeft,
+        "v" => KeyCode::KeyV,
         "f" | "fire" => KeyCode::KeyF,
         "c" => KeyCode::KeyC,
         "up" => KeyCode::ArrowUp,

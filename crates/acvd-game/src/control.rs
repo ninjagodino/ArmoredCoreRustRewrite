@@ -1,7 +1,8 @@
 //! Piloting the shown AC, with the pad layout of the game's manual (`lang/en/text/menu/manual.fmg`):
 //! WASD / left stick move relative to its facing, Q/E / right stick X turn, Up/Down / right stick Y
 //! pitch the follow camera, Shift / L1 toggles boost mode, Space / South (×) jumps and turns boost
-//! mode on, Ctrl / L3 glides while boosting on the ground. Movement steps at the game's 60 Hz tick
+//! mode on, Ctrl / L3 glides while boosting on the ground, V / West (□) high-boosts (quick boost)
+//! along the stick, forward without one. Movement steps at the game's 60 Hz tick
 //! in metres per tick with the AC's `AcCtrlParam`
 //! (`sheets/ac_ctrl_calc.csv`: its parts and build weight through the game's
 //! `AcCtrlParamCalc.lua`), and every step plays the clip of the `sheets/ac_states.csv` state it
@@ -50,6 +51,10 @@ const NO_ACTION_SIDE_FRAMES: f32 = 120.0;
 const ACTION_DIST_MIN: f32 = 0.001;
 /// The zoom-blur filter draws only above this alpha (360 0x82c98368: `if (9 < alpha)`).
 const BLUR_MIN_ALPHA: u8 = 9;
+/// After a high boost, the speed above the boost max is kept at this fraction per tick until
+/// the burst is spent. Not game data: the 360 burst length and its deceleration are not traced
+/// (the per-state max 0x82822af0 case 4 blends +0x120 and +0x11c by the impulse's f1).
+const QUICK_BOOST_DECAY: f32 = 0.85;
 
 /// Whether input drives the AC (`P` toggles) instead of browsing clips.
 #[derive(Resource)]
@@ -72,6 +77,13 @@ pub struct Pilot {
     pub boost: bool,
     pub glide: bool,
     pub airborne: bool,
+    /// High boosts so far, and the world direction of the last one.
+    pub quick_boosts: u32,
+    pub quick_dir: Vec3,
+    /// The body-relative eighth of a high boost whose clip starts on the next state pick.
+    quick_pending: Option<u8>,
+    /// A high boost's burst is still above the boost max.
+    quick_burst: bool,
     /// Ticks of take-off acceleration left.
     takeoff: f32,
     jump_queued: bool,
@@ -273,13 +285,16 @@ fn shake_wave(phase: f32, ampl: Vec2, period: Vec2) -> Vec2 {
 }
 
 /// The `accameraaction` row id for a movement state (360 0x8285db68, AC action names): stop 0,
-/// walk 2, turn 3, flight 8, landing 9; boost mode turns the rest into 38 / 39 (in the air).
+/// walk 2, turn 3, flight 8, landing 9, glide 26 (急加速), high boost 50 (クイックブースト); boost
+/// mode turns the rest into 38 / 39 (in the air).
 fn camera_action(state: &str, boost: bool, airborne: bool) -> u32 {
     let base = match state {
         "idle" => 0,
         "walk" | "dash" => 2,
         "turn_left" | "turn_right" => 3,
         "land" => 9,
+        "glide_start" | "glide" => 0x1a,
+        "quick_boost" => 0x32,
         _ => 8,
     };
     if boost && !BOOST_KEEPS.contains(&base) {
@@ -599,6 +614,12 @@ impl FollowCam {
         let Some(row) = find(PARAM_ACCAMERAACTION_BIN, action).map(|r| &r.data) else {
             return;
         };
+        debug!(
+            "camera action {action}: eye follow {:?}, eye distance {}, fade-in {}",
+            [row.eye_follow_rate_x, row.eye_follow_rate_y, row.eye_follow_rate_f, row.eye_follow_rate_b],
+            row.eye_distance,
+            row.eye_fade_in_frame
+        );
         let secs = |frames: i16| f32::from(frames) / TICK_RATE;
         if let Some((_, old)) = self.action.filter(|(_, old)| old.fov_enable != 0) {
             self.fov.fade(secs(old.fov_fade_frame));
@@ -740,6 +761,10 @@ impl Pilot {
             boost: false,
             glide: false,
             airborne: false,
+            quick_boosts: 0,
+            quick_dir: FORWARD,
+            quick_pending: None,
+            quick_burst: false,
             takeoff: 0.0,
             jump_queued: false,
             landed: false,
@@ -792,6 +817,7 @@ struct Input {
     jump: bool,
     boost_toggle: bool,
     glide: bool,
+    quick_boost: bool,
 }
 
 fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamepad>) -> Input {
@@ -809,6 +835,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
     let mut boost_toggle =
         keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight);
     let mut glide = keys.just_pressed(KeyCode::ControlLeft) || held.contains(&KeyCode::ControlLeft);
+    let mut quick_boost = keys.just_pressed(KeyCode::KeyV) || held.contains(&KeyCode::KeyV);
     for pad in pads {
         let left = pad.left_stick();
         if left.length() > 0.2 {
@@ -824,6 +851,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
         jump |= pad.just_pressed(GamepadButton::South);
         boost_toggle |= pad.just_pressed(GamepadButton::LeftTrigger);
         glide |= pad.just_pressed(GamepadButton::LeftThumb);
+        quick_boost |= pad.just_pressed(GamepadButton::West);
     }
     Input {
         stick: stick.clamp_length_max(1.0),
@@ -832,7 +860,33 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
         jump,
         boost_toggle,
         glide,
+        quick_boost,
     }
+}
+
+/// `stick` (camera-relative) turned into the body's frame, for the directional clips.
+fn body_stick(stick: Vec2, yaw_off: f32) -> Vec2 {
+    let (sin, cos) = yaw_off.sin_cos();
+    Vec2::new(stick.x * cos - stick.y * sin, stick.x * sin + stick.y * cos)
+}
+
+/// High Boost (movement vtable 0x8208fea0 slot +0x68, 0x82822980, through 0x82820f38): the
+/// horizontal velocity becomes the stick direction (forward without one) times
+/// `quick_boost_max_tick`; the vertical speed is kept. Boost mode turns on and a glide ends. The
+/// move integrator then brings the speed back down to the boost or walk max.
+fn quick_boost(p: &mut Pilot, stick: Vec2) {
+    let stick = stick.try_normalize().unwrap_or(Vec2::Y);
+    let forward = Quat::from_rotation_y(p.yaw + p.cam.yaw_off) * FORWARD;
+    let world = forward.cross(Vec3::Y) * stick.x + forward * stick.y;
+    p.velocity = (world * p.ctrl.quick_boost_max_tick).with_y(p.velocity.y);
+    (p.boost, p.glide, p.quick_dir, p.quick_burst) = (true, false, world, true);
+    p.quick_boosts += 1;
+    p.quick_pending = Some(direction(body_stick(stick, p.cam.yaw_off)));
+    let c = p.ctrl;
+    debug!(
+        "high boost: {:.3} m/tick (boost max {:.3}, walk max {:.3}, hi brake {:.4}, over-max decel {:.4})",
+        c.quick_boost_max_tick, c.boost_max_tick, c.walk_max_tick, c.hispeed_brake_tick, c.over_max_decel_tick
+    );
 }
 
 /// Eighth of the circle `stick` points at, 0 forward, clockwise.
@@ -875,14 +929,18 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     let mut horizontal = Vec2::new(p.velocity.x, p.velocity.z);
     let speed = horizontal.length();
     let moving = wish != Vec2::ZERO;
-    p.glide &= p.boost && moving && !p.airborne;
+    // A glide starts on the ground (`pilot`) but carries on over a drop.
+    p.glide &= p.boost && moving;
     let brake = if speed >= c.brake_switch_tick {
         c.hispeed_brake_tick
     } else {
         c.lospeed_brake_tick
     };
 
-    if !p.airborne {
+    p.quick_burst &= speed > c.boost_max_tick;
+    if p.quick_burst {
+        horizontal *= (c.boost_max_tick + (speed - c.boost_max_tick) * QUICK_BOOST_DECAY) / speed;
+    } else if !p.airborne || p.glide {
         let (max, accel) = if p.glide {
             (c.glide_max_tick, c.glide_acc_tick)
         } else if p.boost {
@@ -901,9 +959,6 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         } else {
             approach(horizontal, Vec2::ZERO, brake)
         };
-        if p.jump_queued {
-            (p.airborne, p.takeoff, p.boost, p.glide) = (true, c.jump_frames, true, false);
-        }
     } else if p.takeoff > 0.0 {
         horizontal += wish * c.jump_h_acc_tick;
     } else if p.boost && moving {
@@ -921,12 +976,19 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         };
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     }
+    if p.jump_queued && !p.airborne {
+        (p.airborne, p.takeoff, p.boost, p.glide) = (true, c.jump_frames, true, false);
+    }
     p.jump_queued = false;
 
     if p.airborne {
         if p.takeoff > 0.0 {
             p.velocity.y += c.jump_accel_tick * p.takeoff.min(1.0);
             p.takeoff = (p.takeoff - 1.0).max(0.0);
+        } else if p.glide {
+            // The vertical update 0x82820168 skips the gravity loop (0x8281f960) in the glide
+            // states 4/5 (0x8281f3d0 at 0x828201b4): the vertical speed holds. 0x8281dd28 only
+            // caps rising (block +0x288), which a glide off the ground never does.
         } else {
             // Boost gravity (movement +0x284) only while boost mode is on and the AC falls; it
             // rises under full gravity (Xenia probe private/xenia/vertical.txt).
@@ -967,6 +1029,22 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
     let moving = input.stick != Vec2::ZERO;
     let dir = moving.then(|| direction(input.stick));
     let current = p.state.unwrap_or(("idle", None));
+    // A high boost plays its directional clip out, on the ground or in the air.
+    if let Some(d) = p.quick_pending {
+        return ("quick_boost", Some(d));
+    }
+    if current.0 == "quick_boost" && p.clip_ok && !motion.finished() {
+        return current;
+    }
+    // A glide keeps its clip over a drop too.
+    if p.glide {
+        return match current.0 {
+            "glide" => current,
+            "glide_start" if p.clip_ok && !motion.finished() => current,
+            "glide_start" => ("glide", None),
+            _ => ("glide_start", None),
+        };
+    }
     // Take-off and touchdown play out unless input moves the AC on.
     let holding = matches!(current.0, "jump" | "land") && p.clip_ok && !motion.finished();
     if p.airborne {
@@ -1083,6 +1161,13 @@ pub fn pilot(
     p.boost |= held.0.contains(&KeyCode::ShiftLeft);
     p.glide |= input.glide && p.boost && !p.airborne;
     p.jump_queued |= input.jump && !p.airborne;
+    // The re-fire interval is not traced: a new high boost waits for the last one's clip.
+    let quick_playing =
+        matches!(p.state, Some(("quick_boost", _))) && p.clip_ok && !motion.finished();
+    if input.quick_boost && !quick_playing {
+        quick_boost(&mut p, input.stick);
+        p.state = None;
+    }
     let yaw = p.yaw;
     p.accumulator = (p.accumulator + time.delta_secs()).min(10.0 / TICK_RATE);
     while p.accumulator >= 1.0 / TICK_RATE {
@@ -1105,16 +1190,12 @@ pub fn pilot(
     transform.rotation = Quat::from_rotation_y(p.yaw);
 
     // The walk / dash clip direction is relative to the body, the stick to the camera.
-    let (sin, cos) = p.cam.yaw_off.sin_cos();
     let body = Input {
-        stick: Vec2::new(
-            input.stick.x * cos - input.stick.y * sin,
-            input.stick.x * sin + input.stick.y * cos,
-        ),
+        stick: body_stick(input.stick, p.cam.yaw_off),
         ..input
     };
     let next = state(&p, &body, &motion);
-    p.landed = false;
+    (p.landed, p.quick_pending) = (false, None);
     let changed = p.state != Some(next);
     if changed {
         if !p.suppress_locomotion {
@@ -1159,9 +1240,9 @@ pub fn pilot(
         p.state = Some(next);
     }
 
-    // Dash / air-move lean: one 360-frame clip whose frame is the heading in degrees (a key per
-    // 45 degrees = the eight directions), so it blends smoothly between them.
-    if matches!(next.0, "dash" | "air_move") && motion.clip.frames == 360 && p.clip_ok {
+    // Dash / air-move / glide lean: one 360-frame clip whose frame is the heading in degrees (a
+    // key per 45 degrees = the eight directions), so it blends smoothly between them.
+    if matches!(next.0, "dash" | "air_move" | "glide") && motion.clip.frames == 360 && p.clip_ok {
         // Mirrored: the clip's 90 degree key leans the way the stick's left does (checked by eye).
         // Heading of the actual velocity (m/tick) against the body, not the stick: the AC's
         // acceleration (its weight) then sets how fast the lean swings between directions.

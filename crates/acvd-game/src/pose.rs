@@ -182,6 +182,8 @@ impl Motion {
         if index != self.index {
             self.select(disc, index)?;
             self.fade.secs = fade;
+        } else if !looping {
+            self.frame = 0.0;
         }
         (self.looping, self.speed, self.playing) = (looping, speed, true);
         Ok(())

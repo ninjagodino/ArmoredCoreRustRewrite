@@ -64,7 +64,27 @@ in order:
   `0x82822ea0`):
   - Non-boost air steering: struct index 0x14 (Lua param 50; not yet in `ac_ctrl_calc.csv`).
   - Glide: states 4/5 take a separate integrator path (`0x8281e408`); the runtime still brakes
-    above the glide max.
+    above the glide max. Done: the vertical update `0x82820168` skips the gravity loop
+    (`0x8281f960`) in states 4/5 (`0x8281f3d0` at `0x828201b4`), so a glide holds its height
+    and now carries on over a drop; `0x8281dd28` caps rising at glide block (+0x288) +0x0 +
+    +0x2c (not modelled, a glide never rises). Clips: `glide_start` (acmotion row 217) then
+    `glide` (row 218, 360-frame wheel), camera action 26, cue b00000006 (taken as the start).
+    What ends a glide in the air (EN, the 222 air-float / 223-230 transition rows) is open.
+  - High Boost (quick boost, manual id 20301, □; V / pad West): impulse = movement slot +0x68
+    `0x82822980` (velocity = direction x +0x118 x f2, +0x118 = `quick_boost_max_tick`, Lua
+    param 133 = glide max x 1.25); clips rows 285-292 by direction, camera action 50, cues
+    b00000007 + b00000008, FFX 303 on the nozzles opposite the direction. Open (Xenia re-check
+    pending): the burst length and deceleration (runtime stand-in `QUICK_BOOST_DECAY` 0.85 of
+    the excess per tick, not game data), the re-fire interval (runtime waits for the clip), EN,
+    and the player caller of slot +0x68 (only `0x82842dd8` found, f1 = f2 = 1, fixed
+    direction). Per-state max `0x82822af0` case 4 = lerp(+0x120, +0x11c, +0x220 = f1), +0x11c =
+    +0x118 x param 138 (booster float 11). Probe recipe (user at the controls, high-boosting
+    in a mission): hits on `0x82822980` logging f1, f2, r7, r8, and reads of movement +0x260 /
+    +0x268 (horizontal speed) and +0x1bc for the following 30 frames. Booster int16 fields
+    0/3-6 (18/15/10, 10/7/4, small frame counts) are unassigned candidates for the burst and
+    reload frames. The earlier note calling `0x828844f0` (row 218) a quick-boost builder is
+    wrong: row 218 is the glide (急加速) clip; quick-boost directions are `0x82884d28`
+    (picker `0x82884788`), the charge wind-up (row 284) `0x82884cd8`.
   - Per-state current max (`0x82822af0`): switch on +0x1bc, x terrain/slope scale +0x334, x +0x324.
   - Dash / air-boost acceleration multiplier (field 406, also the default divisor at `0x5c4`).
   - Tick rate (Xenia probes `private/xenia/move_tick.txt`, `vertical.txt`, flying design 5010;
@@ -165,8 +185,12 @@ in order:
   Gameplay gaps:
   - Which motion fires which booster is a guess: main 300 boosting forward, back 302 boosting
     backward on leg points 25-28, foot 301 rising.
-  - Not wired: quick boost (303-305), booster light 299, ground dust (`groundsfxparam.bin`
-    walk/landing rows), water splashes, cartridges (`cartridge_sfx_id`).
+  - Wired (inferred): high boost QB normal 303 one-shot on main nozzles 31-34 (boosting
+    ahead) or legs back 25-28; booster light 299 (a point light only, see
+    `crates/acvd-formats/examples/ffxtree.rs`) on bs0010 points 41/42 while the boosters fire.
+  - Not wired: QB shortage 304 / large 305 (EN shortage and Boost Charge, neither modelled),
+    ground dust (`groundsfxparam.bin` walk/landing rows), water splashes, cartridges
+    (`cartridge_sfx_id`). Boost Charge (□ held, row 284 wind-up) is not implemented.
   - Muzzle scale: f0001218 as stored is a 16 m flash and a 20 m sprite (user: far too
     large), so the game scales weapon effects at spawn. `weapons::MUZZLE_SCALE` 0.25 is a
     guess; find the spawn call that reads `muzzle_sfx_id` (+0x02 of the weaponsfx row) and its
