@@ -1,6 +1,6 @@
 //! Menu layout viewer: draws one DRB dialog with its disc textures.
 //!
-//! `acvd-menu [layout] [dialog] [--lang en] [--disc <360 ISO or dump root>] [--shot <png>] [--placeholders] [--atlas <texture>]`
+//! `acvd-menu [layout] [dialog] [--lang en] [--disc <360 ISO>] [--shot <png>] [--placeholders] [--atlas <texture>]`
 //! `layout` is a `lang/<lang>/menu/` name (`staffroll`) or a full `.drb.dcx` asset path; `dialog`
 //! is a dialog name, defaulting to the first one no other dialog nests. `--placeholders` shows
 //! texts the game fills at runtime as their object names. `--atlas` draws one of the layout's

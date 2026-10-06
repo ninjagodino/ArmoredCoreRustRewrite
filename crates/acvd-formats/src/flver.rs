@@ -1,23 +1,21 @@
-//! FLVER2 model, big-endian (`"FLVER\0B\0"`), as on the PS3 and 360 discs.
+//! FLVER2 model, big-endian (`"FLVER\0B\0"`), as on the 360 disc.
 //!
 //! Header (0x80 bytes): `"FLVER\0", "B\0", u32 version, u32 data_offset, u32 data_length,
 //! i32 dummy/material/bone/mesh/vertex_buffer counts, f32x3 bbox_min, f32x3 bbox_max,
-//! i32 true_faces, i32 total_faces, u8 index_size (8 = Edge, 16, 32), u8 unicode, u8 unk4a,
+//! i32 true_faces, i32 total_faces, u8 index_size (16, 32), u8 unicode, u8 unk4a,
 //! u8 unk4b, i32 unk4c, i32 face_set/layout/texture counts, u8 unk5c, u8 unk5d, u16 0, u32 0,
 //! u32 0, i32 unk68, 5 x u32 0`.
 //! Tables follow back to back: dummies 0x40, materials 0x20, bones 0x80, meshes 0x30,
 //! face sets 0x20, vertex buffers 0x20, layouts 0x10, textures 0x20. Index and vertex data
 //! offsets are relative to `data_offset`.
 //!
-//! PS3 models store Edge-compressed index groups (index size 8) and split vertex streams; 360
-//! models store big-endian 16-bit strips (0xFFFF restarts; `unk4c` = 0xFFFF, `unk4a` and
+//! Models store big-endian 16-bit strips (0xFFFF restarts; `unk4c` = 0xFFFF, `unk4a` and
 //! `unk4b` = 1) over one interleaved buffer per mesh, with normals and tangents as signed
 //! bytes ([`MemberKind::NormalS8`], [`MemberKind::TangentS8`]).
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
 
-use crate::edge;
 use crate::reader::{utf16be, Be};
 
 pub const MAGIC: &[u8; 8] = b"FLVER\0B\0";
@@ -152,7 +150,6 @@ pub struct Mesh {
 
 pub const FS_LOD1: u32 = 0x0100_0000;
 pub const FS_LOD2: u32 = 0x0200_0000;
-pub const FS_EDGE: u32 = 0x4000_0000;
 pub const FS_MOTION_BLUR: u32 = 0x8000_0000;
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,7 +243,7 @@ pub fn read(data: &[u8]) -> Result<Flver> {
     let n_meshes = count(r, 0x20, "mesh")?;
     let n_buffers = count(r, 0x24, "vertex buffer")?;
     let index_size = r.u8(0x48)?;
-    ensure!(matches!(index_size, 0 | 8 | 16 | 32), "header index size {index_size}");
+    ensure!(matches!(index_size, 0 | 16 | 32), "header index size {index_size}");
     let unicode = match r.u8(0x49)? {
         0 => false,
         1 => true,
@@ -476,10 +473,6 @@ impl Flver {
         let r = Be(data);
         let n = usize::try_from(fs.index_count).context("negative index count")?;
         match self.index_size(fs) {
-            8 => {
-                ensure!(fs.flags & FS_EDGE != 0, "index size 8 without the Edge flag");
-                edge::decode_group(r.bytes(at, data.len().saturating_sub(at))?)
-            }
             16 => (0..n).map(|i| r.u16(at + 2 * i).map(u32::from)).collect(),
             32 => (0..n).map(|i| r.u32(at + 4 * i)).collect(),
             s => bail!("index size {s}"),
@@ -644,16 +637,12 @@ impl Layout {
 pub enum MemberKind {
     /// 0x02 Float3 position.
     Position,
-    /// 0x10 Byte4A normal: `(b - 127) / 127` for x, y, z, raw w.
-    Normal,
-    /// 0x10 Byte4A tangent: `(b - 127) / 127` for x, y, z, w.
-    Tangent,
-    /// 0x12 360 normal: signed bytes stored w, z, y, x; `s / 127` for x, y, z, raw w (the bone,
-    /// as in [`Self::Normal`]). Checked on am0010 against the PS3 copy: mean dot 0.994.
+    /// 0x12 normal: signed bytes stored w, z, y, x; `s / 127` for x, y, z, raw w (the vertex's
+    /// bone on meshes without bone indices). Checked on am0010 against the PS3 copy: mean dot 0.994.
     NormalS8,
-    /// 0x14 360 tangent: signed bytes stored w, z, y, x, each `s / 127` (w = ±1 handedness).
+    /// 0x14 tangent: signed bytes stored w, z, y, x, each `s / 127` (w = ±1 handedness).
     TangentS8,
-    /// 0x12 360 bone indices: [`Self::BoneIndices`] with the four bytes in reverse order.
+    /// 0x12 bone indices: four bytes stored in reverse order.
     BoneIndicesRev,
     /// 0x10 Byte4A color: RGBA bytes / 255.
     Color,
@@ -661,37 +650,28 @@ pub enum MemberKind {
     Uv,
     /// 0x16 UVPair: two UVs.
     UvPair,
-    /// 0x2F Byte4E bone indices: four bytes.
-    BoneIndices,
     /// 0x1A Short4toFloat4A bone weights: i16 / 32767.
     BoneWeights,
-    /// 0xF0 Edge-compressed stream: opaque per-vertex byte, not decoded.
-    EdgeStream,
 }
 
 impl MemberKind {
     pub fn of(m: &Member) -> Result<Self> {
         Ok(match (m.kind, m.semantic) {
             (0x02, 0) => Self::Position,
-            (0x10, 3) => Self::Normal,
-            (0x10, 6) => Self::Tangent,
             (0x12, 2) => Self::BoneIndicesRev,
             (0x12, 3) => Self::NormalS8,
             (0x14, 6) => Self::TangentS8,
             (0x10, 10) => Self::Color,
             (0x15, 5) => Self::Uv,
             (0x16, 5) => Self::UvPair,
-            (0x2F, 2) => Self::BoneIndices,
             (0x1A, 1) => Self::BoneWeights,
-            (0xF0, 0) => Self::EdgeStream,
             (k, s) => bail!("layout member type {k:#x} semantic {s} is not supported"),
         })
     }
 
     pub fn size(self) -> usize {
         match self {
-            Self::EdgeStream => 1,
-            Self::Normal | Self::Tangent | Self::NormalS8 | Self::TangentS8 | Self::Color | Self::Uv | Self::BoneIndices | Self::BoneIndicesRev => 4,
+            Self::NormalS8 | Self::TangentS8 | Self::Color | Self::Uv | Self::BoneIndicesRev => 4,
             Self::UvPair | Self::BoneWeights => 8,
             Self::Position => 12,
         }
@@ -709,10 +689,6 @@ pub struct Vertices {
     pub bone_weights: Vec<[f32; 4]>,
     /// Fourth byte of each normal: the vertex's bone on meshes without bone indices.
     pub normal_w: Vec<u8>,
-}
-
-fn unorm(b: u8) -> f32 {
-    (b as f32 - 127.0) / 127.0
 }
 
 fn snorm(b: u8) -> f32 {
@@ -733,11 +709,6 @@ impl Vertices {
         let uv = |k: usize| -> Result<[f32; 2]> { Ok([r.i16(at + k)? as f32 / uv_scale, r.i16(at + k + 2)? as f32 / uv_scale]) };
         match kind {
             MemberKind::Position => self.positions.push(vec3(r, at)?),
-            MemberKind::Normal => {
-                self.normals.push([unorm(b(0)?), unorm(b(1)?), unorm(b(2)?)]);
-                self.normal_w.push(b(3)?);
-            }
-            MemberKind::Tangent => channel(&mut self.tangents, idx).push([unorm(b(0)?), unorm(b(1)?), unorm(b(2)?), unorm(b(3)?)]),
             MemberKind::NormalS8 => {
                 self.normals.push([snorm(b(3)?), snorm(b(2)?), snorm(b(1)?)]);
                 self.normal_w.push(b(0)?);
@@ -751,13 +722,11 @@ impl Vertices {
                 channel(&mut self.uvs, 2 * idx).push(uv(0)?);
                 channel(&mut self.uvs, 2 * idx + 1).push(uv(4)?);
             }
-            MemberKind::BoneIndices => self.bone_indices.push([b(0)?, b(1)?, b(2)?, b(3)?]),
             MemberKind::BoneIndicesRev => self.bone_indices.push([b(3)?, b(2)?, b(1)?, b(0)?]),
             MemberKind::BoneWeights => {
                 let w = |k: usize| -> Result<f32> { Ok(r.i16(at + 2 * k)? as f32 / 32767.0) };
                 self.bone_weights.push([w(0)?, w(1)?, w(2)?, w(3)?])
             }
-            MemberKind::EdgeStream => {}
         }
         Ok(())
     }

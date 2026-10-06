@@ -1,7 +1,7 @@
 # Armored Core: Verdict Day — Rust rewrite
 
-Source-only Rust/Bevy reconstruction of ACVD (PS3 BLUS31194), reverse-engineered from the owned
-disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
+Source-only Rust/Bevy reconstruction of ACVD (Xbox 360, title 4E4D0864), reverse-engineered from
+the owned 360 disc image. `README.md` covers the legal boundary and the sheet pipeline in full.
 
 ## Working style
 
@@ -12,7 +12,7 @@ disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
   build and tests passing: stage only the files this task touched (other chats may be editing
   in parallel), one commit describing the task, then `git pull --rebase` and `git push`. The
   GitHub repo is public: never `git add -f` or commit anything under the gitignored disc-derived
-  paths (`ACVD Unbound/`, `private/`, `external/`, `crates/acvd-data/src/generated/`).
+  paths (`armoredcoredumps/`, `ACVD Unbound/`, `private/`, `external/`, `crates/acvd-data/src/generated/`).
 - Spreadsheet-first: game facts live in `sheets/*.csv`, each row with its evidence (360 address,
   disc file, or breakpoint). Code reads sheets or generated data; don't hard-code constants
   without a sheet row or a comment citing the 360 address.
@@ -25,7 +25,7 @@ disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
 
 | path | what |
 |---|---|
-| `crates/acvd-formats` | disc format readers: DCX, BND3, FLVER (+ Edge indices), TPF, PARAM/PARAMDEF, `.ani`, `.dbp`, `acvparts.bin`, the 360 ISO (XDVDFS, BHD5/BDT, BHF3), VFS (`vfs::Disc`, `path|entry` asset paths) |
+| `crates/acvd-formats` | disc format readers: DCX, BND3, FLVER, TPF (+ Xenos untile), PARAM/PARAMDEF, `.ani`, `.dbp`, `acvparts.bin`, FSB/XMA, the 360 ISO (XDVDFS, BHD5/BDT, BHF3), VFS (`vfs::Disc`, `path|entry` asset paths) |
 | `crates/acvd-data` | generated structs/rows from the sheets (`src/generated/` is never committed) |
 | `crates/acvd-render` | disc → Bevy meshes/textures, orbit camera, `--shot` screenshot mode |
 | `crates/acvd-viewer` | FLVER model browser |
@@ -36,7 +36,7 @@ disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
 | `tools/xenia` | the project's Xenia Canary fork (`acvd-probe.patch`, built into `external/xenia-canary`): `setup.ps1` builds it, `run.ps1` boots the 360 disc and logs probe hits |
 | `sheets/` | committed source-of-truth CSVs (`systems.csv` = per-system status) |
 | `private/` | gitignored: disc-derived data, Ghidra projects, `x360/vd/ACV2.pe`, `lua/` (decompiled scripts), `tmp/` (RE helper scripts, debug shots) |
-| `ACVD Unbound/` | the PS3 disc dump (gitignored); `armoredcoredumps/` holds the PS3/360 ISOs |
+| `armoredcoredumps/` | the disc images (gitignored); every tool reads the 360 ISO in it. `ACVD Unbound/` (old PS3 dump, gitignored) is no longer read |
 
 ## Commands
 

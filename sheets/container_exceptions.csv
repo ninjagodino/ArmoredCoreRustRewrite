@@ -1,9 +1,7 @@
 path,check,evidence
 model/ene/ene_template/ene_template_m.bnd.dcx,binder.unexplained_byte,"header file_count is 0 and headers_end 0, but a stale 4-entry table (offsets 0, name offsets 0x80..0xB7: ene_template_m.mlb, ene_template.flv, ene_template_b.flv, ene_template_s.smd) and its names follow; the game reads it as an empty binder"
 model/obj/obj_template/obj_template_m.bnd.dcx,binder.unexplained_byte,"same stale 4-entry template table as ene_template_m.bnd.dcx with file_count 0"
-model/map/m7540/m7540_l.tpf.dcx#10,texture.size,"m0200_006: format code 0 (bc1) 128x128 x8 levels, but 21872 bytes stored = exactly the 16-byte-block chain; the bc1 chain is the first 10936 bytes"
-model/map/m7540/m7540_l.tpf.dcx#123,texture.size,"second copy of m0200_006 in the same pack with the same 21872-byte payload"
-model/map/m7770/m7770_l.tpf.dcx#8,texture.size,"m3230_env+c cube map: 4176 bytes = exactly 6 unpadded 696-byte faces; the other 65 cube maps pad faces to 128 bytes"
+model/ene/e4050/e4050.tpf.dcx#9,texture.truncated,"Global_env+c cube map (128x128 bc1, 8 levels): the entry gives 147456 bytes from 0x35A1E0, but the pack ends at 0x35C1E0, 8 KB in; the stored image is cut short (the PS3 disc copy is whole)"
 model/ac/parts/hand/hl0010/hl0010_m.bnd.dcx|hl0010.flv,model.unreadable,"pending: FLVER2 0x20007 (header index size 16, unicode 0, unk4c 0xFFFF): one 32-bit strip face set, vertex buffer with vertex_size 0, and the texture table sits where 0x2000F puts layouts; 3 files use this variant"
 model/ac/parts/hand/hr0010/hr0010_m.bnd.dcx|hr0010.flv,model.unreadable,"pending: FLVER2 0x20007 variant, same layout as hl0010.flv"
 model/ac/parts/leg/lg0411/lg0411_m.bnd.dcx|lg0411.flv,model.unreadable,"pending: FLVER2 0x20007 variant, same layout as hl0010.flv"
@@ -20,7 +18,6 @@ model/ac/parts/hand/hl0360/hl0360_a.bnd.dcx,motion.bone_count,"only a00_052.ani:
 model/ac/parts/hand/hl0363/hl0363_a.bnd.dcx,motion.bone_count,"only a00_052.ani: 2 bones against the 3-bone named skeleton (as hl0360)"
 model/ac/parts/hand/hr0360/hr0360_a.bnd.dcx,motion.bone_count,"only a00_052.ani: 2 bones against the 3-bone named skeleton (mirror of hl0360)"
 model/ac/parts/hand/hr0363/hr0363_a.bnd.dcx,motion.bone_count,"only a00_052.ani: 2 bones against the 3-bone named skeleton (mirror of hl0363)"
-model/ene/e9120/e9120_a.bnd.dcx,motion.bone_count,"one unnamed clip with 33 bones against the 34-bone named skeleton"
 model/ene/e4040/e4040_a.bnd.dcx,motion.skeleton_mismatch,"two named 167-bone clips disagree on names or parents; which one unnamed clips index is unknown"
 model/cam/cam_a.bnd,motion.unreadable,"cam035.ani bone Camera01 uses track kind 3 (16-byte rows, camera only); layout not yet derived"
 model/ene/e2080/e2080_a.bnd.dcx,motion.unreadable,"older 0x20051014 clip a00_048 keys frame 70 in a 60-frame clip"

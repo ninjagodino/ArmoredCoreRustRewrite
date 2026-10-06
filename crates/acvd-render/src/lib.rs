@@ -317,7 +317,7 @@ impl Packs {
     }
 
     /// `t` comes from the extracted sheets; the format, size and levels are read from the pack on
-    /// `disc` itself, since the 360 packs differ from the PS3 ones in all three.
+    /// `disc` itself.
     pub fn texture(&mut self, disc: &Disc, t: &TextureRef) -> Result<Image> {
         self.texture_at(disc, t.pack, t.index, t.name)
     }
@@ -339,11 +339,11 @@ impl Packs {
         let block = row.map_or(16, |f| f.block_bytes);
         let bytes = tex.linear(header.platform, pack, block)?;
         let mut levels = tex.levels();
-        let (start, last) = tpf::block_level_span(width, height, levels, 1, bytes.len() as u64, 0, levels - 1, block);
+        let (start, last) = tpf::block_level_span(width, height, levels, 0, levels - 1, block);
         let mut end = (start + last) as usize;
         if end > bytes.len() {
             levels = 1;
-            end = tpf::block_level_span(width, height, 1, 1, bytes.len() as u64, 0, 0, block).1 as usize;
+            end = tpf::block_level_span(width, height, 1, 0, 0, block).1 as usize;
             ensure!(end <= bytes.len(), "texture `{name}` is shorter than its first level");
         }
         let mut image = Image::default();

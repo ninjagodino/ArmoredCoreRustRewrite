@@ -1,5 +1,5 @@
-//! Disc -> sheets. Reads every PARAMDEF and PARAM on the owned disc (a dump directory or the
-//! 360 ISO, through [`Disc`]) and writes `private/sheets/{json,csv,schema}` plus the disc inventory.
+//! Disc -> sheets. Reads every PARAMDEF and PARAM on the owned 360 ISO (through [`Disc`]) and
+//! writes `private/sheets/{json,csv,schema}` plus the disc inventory.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;

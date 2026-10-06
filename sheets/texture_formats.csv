@@ -1,7 +1,7 @@
 code,name,block_bytes,evidence
-0,bc1,8,"31024 textures; every stored size equals the 4x4 x 8-byte mip chain; first block of image/authenticate/authenticate00.tpf reads as little-endian RGB565 endpoints"
-5,bc3,16,"3200 textures; stored sizes equal the 4x4 x 16-byte mip chain; font sheets (font/*_t.bnd) start with alpha endpoints 00 01 and zero indices, the BC3 layout for transparent texels"
-33,bc3,16,"1928 textures (model *_gt.tpf.dcx, all with a float block); stored sizes equal the 4x4 x 16-byte mip chain"
-23,dxn,16,"360 disc only: 162 textures, all normal maps (*_n; DXT5 on the PS3 disc); two BC4 blocks per 4x4, x then y: untiled lg3041_n tracks the PS3 copy's red and green at 0.75 and 0.95 correlation; every stored size equals the Xenos tiled 16-byte chain (crates/acvd-formats/examples/tpfscan.rs)"
-24,ctx1,8,"360 disc only: 234 textures, all normal maps (*_n; DXT1 on the PS3 disc), unk1 0; Xenos CTX1 blocks (u8 x/y endpoint pairs, then 2-bit DXT weights): untiled am9000_01_n tracks the PS3 copy's red and green at 0.93 correlation; every stored size equals the Xenos tiled 8-byte chain"
-25,ctx1,8,"360 disc only: 3536 textures, all normal maps (*_n; DXT1 on the PS3 disc), unk1 0x10000; decodes as CTX1 like code 24 (am0010_01_n: 0.90 and 0.84 against the PS3 copy); every stored size equals the Xenos tiled 8-byte chain"
+0,bc1,8,"25836 textures; every stored size equals the Xenos tiled 8-byte chain (tpf::xenos::size), or the linear chain in the 4 platform-2 packs; untiled image/authenticate/authenticate00.tpf reads as little-endian RGB565 endpoints"
+5,bc3,16,"2824 textures; stored sizes equal the Xenos tiled 16-byte chain (or the linear chain in the platform-2 packs); font sheets (font/*_t.bnd) start with alpha endpoints 00 01 and zero indices, the BC3 layout for transparent texels"
+33,bc3,16,"1928 textures (model *_gt.tpf.dcx, all with a float block); stored sizes equal the Xenos tiled 16-byte chain"
+23,dxn,16,"162 textures, all normal maps (*_n; DXT5 on the PS3 disc); two BC4 blocks per 4x4, x then y: untiled lg3041_n tracks the PS3 disc copy's red and green at 0.75 and 0.95 correlation; every stored size equals the Xenos tiled 16-byte chain"
+24,ctx1,8,"235 textures, all normal maps (*_n; DXT1 on the PS3 disc), unk1 0; Xenos CTX1 blocks (u8 x/y endpoint pairs, then 2-bit DXT weights): untiled am9000_01_n tracks the PS3 disc copy's red and green at 0.93 correlation; every stored size equals the Xenos tiled 8-byte chain"
+25,ctx1,8,"3536 textures, all normal maps (*_n; DXT1 on the PS3 disc), unk1 0x10000; decodes as CTX1 like code 24 (am0010_01_n: 0.90 and 0.84 against the PS3 disc copy); every stored size equals the Xenos tiled 8-byte chain"

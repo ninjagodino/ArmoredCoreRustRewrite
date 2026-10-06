@@ -310,41 +310,32 @@ mod tests {
 
     #[test]
     fn disc_layouts() {
-        let usrdir = crate::vfs::usrdir(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("ACVD Unbound"));
-        let lang = usrdir.join("lang");
-        if !lang.is_dir() {
-            return;
-        }
+        let Some(disc) = crate::vfs::test_disc() else { return };
         let mut n = 0;
-        for l in std::fs::read_dir(&lang).unwrap().flatten() {
-            let Ok(rd) = std::fs::read_dir(l.path().join("menu")) else { continue };
-            for f in rd.flatten() {
-                let name = f.file_name().to_string_lossy().into_owned();
-                if !name.ends_with(".drb.dcx") {
-                    continue;
-                }
-                let data = crate::dcx::decompress(&std::fs::read(f.path()).unwrap()).unwrap();
-                let d = read(&data).unwrap_or_else(|e| panic!("{}: {e:#}", f.path().display()));
-                for o in d.dialogs.iter().flat_map(|d| &d.objects) {
-                    match o.shape {
-                        Shape::Sprite { texture: Some(t), .. } => assert!((t as usize) < d.textures.len() || t >= 1000, "{name}: `{}` texture {t}", o.name),
-                        Shape::Dialog { dialog: Some(dialog), .. } => assert!((dialog as usize) < d.dialogs.len(), "{name}: `{}` dialog {dialog}", o.name),
-                        _ => {}
-                    }
-                }
-                assert!(d.roots().count() > 0, "{name}");
-                n += 1;
+        for name in disc.files() {
+            let lower = name.to_ascii_lowercase();
+            if !lower.starts_with("lang/") || !lower.contains("/menu/") || !lower.ends_with(".drb.dcx") {
+                continue;
             }
+            let d = read(&disc.asset(&name).unwrap()).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            for o in d.dialogs.iter().flat_map(|d| &d.objects) {
+                match o.shape {
+                    Shape::Sprite { texture: Some(t), .. } => assert!((t as usize) < d.textures.len() || t >= 1000, "{name}: `{}` texture {t}", o.name),
+                    Shape::Dialog { dialog: Some(dialog), .. } => assert!((dialog as usize) < d.dialogs.len(), "{name}: `{}` dialog {dialog}", o.name),
+                    _ => {}
+                }
+            }
+            assert!(d.roots().count() > 0, "{name}");
+            n += 1;
         }
         assert!(n >= 60, "{n} DRBs");
-        let staff = crate::dcx::decompress(&std::fs::read(lang.join("en/menu/staffroll.drb.dcx")).unwrap()).unwrap();
-        let d = read(&staff).unwrap();
+        let d = read(&disc.asset("lang/en/menu/staffroll.drb.dcx").unwrap()).unwrap();
         assert_eq!(d.textures[0].name, "Titleback");
         let base = &d.dialogs[0];
         assert_eq!((base.name.as_str(), base.size, base.objects.len()), ("@StaffRollBase", [1280, 720], 2));
         assert!(matches!(base.objects[1].shape, Shape::Sprite { rect: [1024, 0, 1280, 720], uv: [0, 736, 720, 992], texture: Some(0), flags: 0x0c01, .. }));
         let text = |file: &str, dialog: &str, object: &str| {
-            let d = read(&crate::dcx::decompress(&std::fs::read(lang.join(file)).unwrap()).unwrap()).unwrap();
+            let d = read(&disc.asset(&format!("lang/{file}")).unwrap()).unwrap();
             let o = d.dialog(dialog).unwrap().objects.iter().find(|o| o.name == object).unwrap().shape.clone();
             let Shape::Text { font, align, source, .. } = o else { panic!("{object} is not Text") };
             (font, align, source)

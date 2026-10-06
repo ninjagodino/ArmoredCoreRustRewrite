@@ -137,28 +137,18 @@ mod tests {
 
     #[test]
     fn disc_fonts() {
-        let usrdir = crate::vfs::usrdir(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("ACVD Unbound"));
-        let font = usrdir.join("font");
-        if !font.is_dir() {
-            return;
-        }
+        let Some(disc) = crate::vfs::test_disc() else { return };
         let mut n = 0;
-        for dir in std::fs::read_dir(&font).unwrap().flatten() {
-            let p = dir.path();
-            if !p.is_dir() {
+        for file in disc.files() {
+            let lower = file.to_ascii_lowercase();
+            if !lower.starts_with("font/") || !(lower.ends_with(".ccm") || lower.ends_with(".ccf")) {
                 continue;
             }
-            for ext in ["ccm", "ccf"] {
-                let file = p.join(format!("{}.{ext}", dir.file_name().to_string_lossy()));
-                if !file.is_file() {
-                    continue;
-                }
-                let c = read(&std::fs::read(&file).unwrap()).unwrap_or_else(|e| panic!("{}: {e:#}", file.display()));
-                n += 1;
-                if file.file_name().unwrap() == "e1_ext.ccm" {
-                    assert_eq!(c.line_height, 20);
-                    assert!(c.glyph(b'A' as u16).is_some());
-                }
+            let c = read(&disc.asset(&file).unwrap()).unwrap_or_else(|e| panic!("{file}: {e:#}"));
+            n += 1;
+            if lower.ends_with("/e1_ext.ccm") {
+                assert_eq!(c.line_height, 20);
+                assert!(c.glyph(b'A' as u16).is_some());
             }
         }
         assert!(n >= 26, "{n} CCM/CCF");

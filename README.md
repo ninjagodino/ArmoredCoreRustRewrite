@@ -6,16 +6,15 @@ are the source of truth, and every piece of game data code is generated from a s
 Game code is reverse-engineered from the Xbox 360 build only: its executable (`default.xex`,
 unpacked to `private/x360/vd/ACV2.pe`) is read statically through Ghidra and the fact index
 (`tools/acvd-index`), and runtime questions go to Xenia probes on that same executable. Disc
-files are read through `acvd_formats::vfs::Disc`, which opens either the 360 ISO (XDVDFS, the
-BHD5/BDT archives and the BHF3 script archive) or the PS3 dump (`ACVD Unbound/`, BLUS31194). The
-PS3 dump stays the default until the rest of the 360 disc data migration in `docs/status.md`
-(360 FLVER and textures, XMA sound, fonts) lands.
+files are read from the 360 ISO through `acvd_formats::vfs::Disc` (XDVDFS, the BHD5/BDT
+archives, the BHF3 script archive and the BND3 load bundles).
 
 ## Legal boundary
 
 This repository contains no disc image, executable, or retail data. You dump your own legally
-owned disc and every derived file stays in ignored local directories (`ACVD Unbound/`, `private/`,
-`external/`, `crates/acvd-data/src/generated/`). Do not upload or redistribute those files.
+owned disc and every derived file stays in ignored local directories (`armoredcoredumps/`,
+`private/`, `external/`, `crates/acvd-data/src/generated/`). Do not upload or redistribute those
+files.
 
 ## Pipeline
 
@@ -25,13 +24,12 @@ cargo run --release -p acvd-sheets -- all      # extract -> preflight -> gen (re
 cargo build -p acvd-data                       # compile the generated struts
 tools\analyze-x360.ps1                         # Ghidra project of ACV2.pe with .pdata bounds, then the fact index
 cargo run --release -p acvd-index -- audit     # every 360 address cited in sheets/ checked against the index
-tools\decompile-lua.ps1                        # Lua 5.0 AI/scene scripts -> private/lua
+tools\decompile-lua.ps1                        # Lua 5.0 AI/scene scripts -> private/lua360
 tools\xenia\setup.ps1                          # the project's Xenia build (runtime probes: tools\xenia\run.ps1)
 ```
 
-`--disc <dump root>` (or `ACVD_DISC`) points at the dump; it defaults to `ACVD Unbound/` until the
-360 migration lands. `extract` needs the dump for now; `dump`, `acvd-game`, `acvd-viewer` and
-`acvd-menu` also take `--disc <360 ISO>`.
+Every tool reads `armoredcoredumps/Armored Core - Verdict Day (USA)/Armored Core - Verdict Day
+(USA).iso` unless given `--disc <360 ISO>` (or `ACVD_DISC` for `acvd-sheets`).
 
 - `extract` reads every PARAMDEF and PARAM on the disc into `private/sheets` (JSON grouped by
   system, CSV per file, schema CSV per type). Each row is re-encoded and compared byte-for-byte with

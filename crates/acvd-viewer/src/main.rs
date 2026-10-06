@@ -1,7 +1,7 @@
 //! Model viewer: browses every FLVER in the generated model index, read straight off the
 //! owned disc.
 //!
-//! `acvd-viewer [model name or asset path] [--disc <360 ISO or dump root>] [--shot <png>] [--flat]`
+//! `acvd-viewer [model name or asset path] [--disc <360 ISO>] [--shot <png>] [--flat]`
 //! Left/Right: previous/next model, PageUp/PageDown: jump 50, drag left mouse: orbit,
 //! wheel: zoom, R: reframe. `--shot` saves one frame of the first model and exits.
 

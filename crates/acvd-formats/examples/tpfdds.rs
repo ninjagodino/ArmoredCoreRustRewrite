@@ -1,6 +1,6 @@
-//! Writes the textures of one TPF asset from both discs as DDS files for side-by-side viewing:
-//! `tpfdds <asset path> [texture name]` (`private/tmp/t2/dds/{x360,ps3}_<name>.dds`; with `ALL`
-//! set, every level and face into `private/tmp/t2/ddsall/`). 360 data is untiled first; codes
+//! Writes the textures of one TPF asset as DDS files for viewing:
+//! `tpfdds <asset path> [texture name]` (`private/tmp/t2/dds/x360_<name>.dds`; with `ALL`
+//! set, every level and face into `private/tmp/t2/ddsall/`). Tiled data is untiled first; codes
 //! 23/24/25 are written raw (`.bin`).
 use acvd_formats::{tpf, vfs};
 
@@ -38,12 +38,10 @@ fn main() -> anyhow::Result<()> {
     let root = vfs::repo_root();
     let out = root.join(if std::env::var_os("ALL").is_some() { "private/tmp/t2/ddsall" } else { "private/tmp/t2/dds" });
     std::fs::create_dir_all(&out)?;
-    for (tag, path) in [("x360", root.join(vfs::X360_ISO)), ("ps3", root.join(vfs::PS3_DUMP))] {
-        let disc = vfs::Disc::open(&path)?;
-        let Ok(d) = vfs::open(&disc, asset) else {
-            println!("{tag}: no {asset}");
-            continue;
-        };
+    {
+        let tag = "x360";
+        let disc = vfs::Disc::open(&root.join(vfs::X360_ISO))?;
+        let d = vfs::open(&disc, asset)?;
         let t = tpf::read(&d)?;
         for (i, tex) in t.textures.iter().enumerate() {
             if want.as_ref().is_some_and(|w| !tex.name.eq_ignore_ascii_case(w)) {
@@ -70,7 +68,7 @@ fn main() -> anyhow::Result<()> {
             if std::env::var_os("ALL").is_some() {
                 for face in 0..tex.faces() {
                     for level in 0..tex.levels() {
-                        let (at, len) = tpf::block_level_span(tex.width, tex.height, tex.levels(), tex.faces(), lin.len() as u64, face, level, bb);
+                        let (at, len) = tpf::block_level_span(tex.width, tex.height, tex.levels(), face, level, bb);
                         let (w, h) = ((tex.width as u32 >> level).max(1), (tex.height as u32 >> level).max(1));
                         let file = out.join(format!("{tag}_{}_f{face}_l{level}.dds", tex.name));
                         std::fs::write(&file, dds(w, h, cc, &lin[at as usize..(at + len) as usize]))?;

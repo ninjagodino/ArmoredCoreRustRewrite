@@ -457,7 +457,7 @@ fn textures(paths: &Paths, rep: &mut Report, marks: &mut Vec<Checkmark>, excepti
     }
     for f in &formats {
         if !used.contains(&f.code) {
-            rep.add(Severity::Warning, "texture_formats.not_on_disc", "texture_formats.csv", f.code.to_string(), "", "no texture on this disc uses this code (the PS3 and 360 discs use different sets)");
+            rep.add(Severity::Error, "sheet.stale_row", "texture_formats.csv", f.code.to_string(), "", "no texture on the disc uses this code");
         }
     }
     Ok(())
@@ -797,7 +797,7 @@ fn models(paths: &Paths, rep: &mut Report, marks: &mut Vec<Checkmark>, exception
     }
     for t in &types {
         if !used_types.contains(&format!("{}/{}", t.kind, t.semantic)) {
-            rep.add(Severity::Warning, "vertex_types.not_on_disc", "vertex_types.csv", format!("{}/{}", t.kind, t.semantic), "", "no mesh on this disc uses this member (the PS3 and 360 discs use different sets)");
+            rep.add(Severity::Error, "sheet.stale_row", "vertex_types.csv", format!("{}/{}", t.kind, t.semantic), "", "no mesh on the disc uses this member");
         }
     }
     Ok(())

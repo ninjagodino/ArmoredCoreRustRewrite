@@ -18,7 +18,7 @@ use anyhow::{bail, Result};
 
 use model::Paths;
 
-const USAGE: &str = "usage: acvd-sheets <extract|preflight|gen|all|dump <asset>> [--disc <dump root or 360 ISO>] [--root <repo root>]";
+const USAGE: &str = "usage: acvd-sheets <extract|preflight|gen|all|dump <asset>> [--disc <360 ISO>] [--root <repo root>]";
 
 fn main() -> ExitCode {
     match run() {

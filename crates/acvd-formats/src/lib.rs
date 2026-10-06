@@ -1,5 +1,5 @@
-//! Readers for Armored Core: Verdict Day (PS3, BLUS31194) data formats.
-//! All PS3 data is big-endian.
+//! Readers for Armored Core: Verdict Day (Xbox 360) data formats.
+//! Disc data is big-endian.
 
 pub mod acv_parts;
 pub mod ani;
@@ -9,7 +9,6 @@ pub mod ccm;
 pub mod dbp;
 pub mod dcx;
 pub mod drb;
-pub mod edge;
 pub mod fev;
 pub mod ffx;
 pub mod flver;

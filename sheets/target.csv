@@ -1,15 +1,15 @@
 key,value,evidence
-title,Armored Core: Verdict Day,PS3_GAME/PARAM.SFO TITLE
-title_id,BLUS31194 (North America),PS3_GAME/PARAM.SFO TITLE_ID; NP communication id NPWR04749_00
-version,APP_VER 01.00 / VERSION 01.00 (no title update applied),PS3_GAME/PARAM.SFO
+title,Armored Core: Verdict Day,360 disc image armoredcoredumps/Armored Core - Verdict Day (USA)/*.iso; default.xex original name ACV2.exe
+title_id,4E4D0864 (Xbox 360; USA disc),"default.xex execution info (optional header 0x00040006): title id 0x4E4D0864, media id 0x1307F51A, disc 1 of 1"
+version,0.0.0.3 (no title update applied),default.xex execution info: version and base version 0.0.0.3
 platform,"Xbox 360 (Xenon: 64-bit big-endian PowerPC with VMX128; 32-bit addressing)","ACV2.pe (default.xex on the 360 disc, unpacked): PE machine 0x1f2 (PowerPC big-endian), image base 0x82000000"
 executable,"default.xex (360 disc) unpacked to a 29687808-byte PE memory image (private/x360/vd/ACV2.pe)","MZ/PE header; file offset = address - 0x82000000; .pdata 0x8225c200 (78663 entries), .text 0x82300000-0x836ee5c8; private/index (cargo run -p acvd-index -- build)"
 engine,"FromSoftware in-house engine (Dantelion2 / FD4 / GX modules), Armored Core V generation","Souls-family file magics on disc (DCX, BND3, TPF, TAE, FMG, PARAM/PARAMDEF); soulsmodding.wikidot.com game-engine page; Paramdex ships ACV/ACVD defs"
 language,C++ compiled to native PowerPC code; Lua 5.0 bytecode for AI and scene scripts,"no managed runtime on disc; .lc files start 1B 4C 75 61 50 (Lua 5.0 'LuaP' header) and keep N:\AC... source paths"
-runtime,No VM for game logic (native); embedded Lua 5.0 interpreter for scripts,.lc headers; airesource/script and scene/*.lc
+runtime,No VM for game logic (native); embedded Lua 5.0 interpreter for scripts,.lc headers; script/*.lc in bind/script.bhd
 build_type,Retail disc build; Lua chunks keep debug info,Lua source paths present in chunks
-data_layout,"Loose-load layout: BHD/BDT archives already unpacked, unnamed entries hash-named under _unknown/","no bind/*.bhd on disc; _unknown/param/<hash>.param; ACVLooseLoader README describes the loose-load layout"
-compression,DCX with EDGE (zlib chunks; PS3 Edge),DCX header DCS/DCP 'EDGE' on all 9426 .dcx files
+data_layout,"Hashed archives: BHD5/BDT (bind/dvdbnd5_layer{0,1}.bhd / dvdbnd_layer{0,1}.bdt, no names), BHF3 script.bhd/.bdt, BND3 load bundles (bind/boot.bnd, boot_2nd.bnd, bind/mission/*.bnd); unnamed BHD5 entries named _unknown/<dir>/<hash>",XDVDFS listing of the ISO; acvd-formats::vfs; names in private/x360/dvdbnd_names.csv
+compression,DCX DFLT (one zlib stream); EDGE (raw-deflate 64 KB chunks) on 8 files copied from the PS3 disc,"DCX header DCP DFLT on 9404 of 9412 .dcx files, EDGE on model/ene/e9110-e9113 (formats.csv .bnd.dcx)"
 audio_middleware,FMOD Ex (FSB4 sound banks; FEV1 event projects),sound/*.fsb magic FSB4; *.fev magic FEV1
-video,PAMF (PlayStation movie container),movie/**/*.pam magic PAMF
+video,ASF: WMV3 video with WMA2 / WMA Pro audio,movie/jp/*.wmv ASF header 30 26 B2 75 (formats.csv .wmv)
 legacy_data,Armored Core: For Answer era tables still on disc (PARAM/PARAMDEF format 101),29 v101 defs whose fields name ACfA factions (GA; Interior Union; Omer; ORCA) and Primal/Assault Armor; Paramdex ACFA defs match their layouts exactly

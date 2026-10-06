@@ -1,20 +1,18 @@
-//! Reads files out of the owned disc through any nesting of DCX and BND3 containers.
+//! Reads files out of the owned 360 disc image through any nesting of DCX and BND3 containers.
 //!
-//! An asset path is a disc path (the PS3 `USRDIR`-relative layout, which the 360 archives keep)
-//! followed by binder entry names, separated by `|`:
+//! An asset path is a disc path followed by binder entry names, separated by `|`:
 //! `model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv`. An entry may also be named by its
 //! index as `#N`, for binders that repeat a name. DCX layers are expanded wherever they appear.
 //!
-//! A [`Disc`] is either a dump directory (the PS3 `USRDIR`) or the 360 ISO. On the ISO, a path
-//! is looked up as a loose XDVDFS file (`movie/jp/*.wmv`), then by [`bhd5::path_hash`] in
+//! A [`Disc`] is the 360 ISO. A path is looked up as a loose XDVDFS file (`movie/jp/*.wmv`),
+//! then by [`bhd5::path_hash`] in
 //! `bind/dvdbnd5_layer{0,1}.bhd` (data in `bind/dvdbnd_layer{0,1}.bdt`), then under `script/` in
 //! the BHF3 `bind/script.bhd` / `.bdt`, then as a member of a load bundle ([`BUNDLES`]: BND3
 //! binders whose member names are disc paths, e.g. `bind/boot.bnd|system\paramlist.xml`; the
 //! first bundle holding a path wins, and no path differs between bundles). The BHD5 archives
 //! store no names; listings come from `private/x360/dvdbnd_names.csv` (`archive,hash,size,path`).
-//! An entry whose real path is unknown is named as the PS3 dump names it,
-//! `_unknown/<dir>/<decimal hash>.<ext>`, and is read by that hash (both discs use the same
-//! [`bhd5::path_hash`]).
+//! An entry whose real path is unknown is named `_unknown/<dir>/<decimal hash>.<ext>` (the
+//! name the PS3 disc's extracted files used, kept so sheet ids stay put) and is read by that hash.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -28,8 +26,6 @@ pub const SEPARATOR: char = '|';
 
 /// The 360 disc image, relative to the repo root.
 pub const X360_ISO: &str = "armoredcoredumps/Armored Core - Verdict Day (USA)/Armored Core - Verdict Day (USA).iso";
-/// The PS3 dump, relative to the repo root.
-pub const PS3_DUMP: &str = "ACVD Unbound";
 /// Names of the BHD5 entries, relative to the repo root.
 pub const X360_NAMES: &str = "private/x360/dvdbnd_names.csv";
 
@@ -54,11 +50,9 @@ pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// The disc used when no `--disc` is given: the PS3 dump while present (until its code paths are
-/// deleted, `docs/status.md` migration 4), else the 360 ISO.
+/// The disc used when no `--disc` is given: the 360 ISO under `root`.
 pub fn default_disc(root: &Path) -> PathBuf {
-    let dump = root.join(PS3_DUMP);
-    if dump.is_dir() { dump } else { root.join(X360_ISO) }
+    root.join(X360_ISO)
 }
 
 /// Expands `data` if it is a DCX container; returns it unchanged otherwise.
@@ -68,16 +62,6 @@ pub fn undcx(data: Vec<u8>) -> Result<Vec<u8>> {
     } else {
         Ok(data)
     }
-}
-
-/// The disc's `USRDIR`, given either the dump root or `USRDIR` itself.
-pub fn usrdir(disc: &Path) -> PathBuf {
-    for cand in [disc.join("PS3_GAME").join("USRDIR"), disc.join("USRDIR")] {
-        if cand.is_dir() {
-            return cand;
-        }
-    }
-    disc.to_path_buf()
 }
 
 /// Bytes of one entry of a binder (by name, or `#N` for index N), with zlib and DCX layers removed.
@@ -96,14 +80,9 @@ pub fn open(disc: &Disc, asset: &str) -> Result<Vec<u8>> {
     disc.asset(asset)
 }
 
-/// A readable disc: a dump directory or the 360 ISO. Cheap to clone.
+/// The 360 ISO, opened. Cheap to clone.
 #[derive(Clone)]
-pub struct Disc(Arc<Source>);
-
-enum Source {
-    Dir(PathBuf),
-    X360(X360),
-}
+pub struct Disc(Arc<X360>);
 
 struct X360 {
     path: PathBuf,
@@ -124,21 +103,16 @@ fn key(path: &str) -> String {
 }
 
 impl Disc {
-    /// Opens a dump directory (root or `USRDIR`) or a 360 ISO; ISO entry names come from
-    /// [`X360_NAMES`] in [`repo_root`].
+    /// Opens a 360 ISO; entry names come from [`X360_NAMES`] in [`repo_root`].
     pub fn open(path: &Path) -> Result<Disc> {
         Self::open_with_names(path, &repo_root().join(X360_NAMES))
     }
 
     pub fn open_with_names(path: &Path, names: &Path) -> Result<Disc> {
-        let source = if path.is_dir() {
-            Source::Dir(usrdir(path))
-        } else if path.is_file() {
-            Source::X360(X360::open(path, names)?)
-        } else {
-            bail!("no disc at {}", path.display());
-        };
-        Ok(Disc(Arc::new(source)))
+        if !path.is_file() {
+            bail!("no disc image at {}", path.display());
+        }
+        Ok(Disc(Arc::new(X360::open(path, names)?)))
     }
 
     /// The default disc under the repo root (see [`default_disc`]).
@@ -146,65 +120,40 @@ impl Disc {
         Self::open(&default_disc(root))
     }
 
-    pub fn is_x360(&self) -> bool {
-        matches!(*self.0, Source::X360(_))
-    }
-
-    /// The game's `$(Platform)` path variable for this disc (`font/s1_$(Platform)/` ...): the 360
-    /// build registers `xbox` (`0x82303150` loads `$(Platform)` at `0x82001ad4` and `xbox` at
-    /// `0x82001ae0`); the PS3 dump's folders say `PS3`.
+    /// The game's `$(Platform)` path variable (`font/s1_$(Platform)/` ...): `xbox`
+    /// (`0x82303150` loads `$(Platform)` at `0x82001ad4` and `xbox` at `0x82001ae0`).
     pub fn platform(&self) -> &'static str {
-        if self.is_x360() { "xbox" } else { "PS3" }
+        "xbox"
     }
 
-    /// The directory or image this disc reads.
+    /// The image this disc reads.
     pub fn path(&self) -> &Path {
-        match &*self.0 {
-            Source::Dir(d) => d,
-            Source::X360(x) => &x.path,
-        }
+        &self.0.path
     }
 
     /// Raw bytes of one disc file (no DCX expansion).
     pub fn read(&self, file: &str) -> Result<Vec<u8>> {
-        match &*self.0 {
-            Source::Dir(d) => std::fs::read(d.join(file)).with_context(|| format!("reading {file}")),
-            Source::X360(x) => x.read(file),
-        }
+        self.0.read(file)
     }
 
     pub fn exists(&self, file: &str) -> bool {
-        match &*self.0 {
-            Source::Dir(d) => d.join(file).is_file(),
-            Source::X360(x) => x.exists(file),
-        }
+        self.0.exists(file)
     }
 
     /// Size of one disc file as stored (a DCX file's compressed size).
     pub fn size(&self, file: &str) -> Result<u64> {
-        match &*self.0 {
-            Source::Dir(d) => Ok(std::fs::metadata(d.join(file)).with_context(|| format!("reading {file}"))?.len()),
-            Source::X360(x) => match x.locate(file) {
-                Some(Loc::Image(_, size)) => Ok(size),
-                Some(Loc::Packed(_, e)) => Ok(e.size.unwrap_or(e.stored_size) as u64),
-                None => bail!("no `{file}` on the 360 disc"),
-            },
+        match self.0.locate(file) {
+            Some(Loc::Image(_, size)) => Ok(size),
+            Some(Loc::Packed(_, e)) => Ok(e.size.unwrap_or(e.stored_size) as u64),
+            None => bail!("no `{file}` on the 360 disc"),
         }
     }
 
     /// The first `n` bytes of one disc file (all of it when shorter).
     pub fn head(&self, file: &str, n: usize) -> Result<Vec<u8>> {
-        match &*self.0 {
-            Source::Dir(d) => {
-                let mut out = Vec::with_capacity(n);
-                let f = std::fs::File::open(d.join(file)).with_context(|| format!("reading {file}"))?;
-                std::io::Read::read_to_end(&mut std::io::Read::take(f, n as u64), &mut out)?;
-                Ok(out)
-            }
-            Source::X360(x) => match x.locate(file) {
-                Some(Loc::Image(at, size)) => x.image.read_at(at, n.min(size as usize)),
-                _ => Ok(x.read(file)?.into_iter().take(n).collect()),
-            },
+        match self.0.locate(file) {
+            Some(Loc::Image(at, size)) => self.0.image.read_at(at, n.min(size as usize)),
+            _ => Ok(self.0.read(file)?.into_iter().take(n).collect()),
         }
     }
 
@@ -219,47 +168,15 @@ impl Disc {
         Ok(data)
     }
 
-    /// Every file path on the disc (disc-relative, `/`-separated), sorted. On the ISO only named
-    /// entries are listed.
+    /// Every named file path on the disc (disc-relative, `/`-separated), sorted.
     pub fn files(&self) -> Vec<String> {
-        match &*self.0 {
-            Source::Dir(d) => {
-                let mut out = Vec::new();
-                let mut dirs = vec![d.clone()];
-                while let Some(dir) = dirs.pop() {
-                    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                        let p = e.path();
-                        if p.is_dir() {
-                            dirs.push(p);
-                        } else if let Ok(rel) = p.strip_prefix(d) {
-                            out.push(rel.to_string_lossy().replace('\\', "/"));
-                        }
-                    }
-                }
-                out.sort();
-                out
-            }
-            Source::X360(x) => x.names.values().cloned().collect(),
-        }
+        self.0.names.values().cloned().collect()
     }
 
-    /// Paths of the files directly in `dir` (disc-relative, `/`-separated), sorted. On the ISO
-    /// only named entries are listed.
+    /// Paths of the named files directly in `dir` (disc-relative, `/`-separated), sorted.
     pub fn list(&self, dir: &str) -> Vec<String> {
-        let dir = key(dir).trim_end_matches('/').to_string();
-        match &*self.0 {
-            Source::Dir(d) => {
-                let mut out: Vec<String> = std::fs::read_dir(d.join(&dir))
-                    .map(|rd| rd.flatten().filter(|e| e.path().is_file()).map(|e| format!("{dir}/{}", e.file_name().to_string_lossy())).collect())
-                    .unwrap_or_default();
-                out.sort();
-                out
-            }
-            Source::X360(x) => {
-                let prefix = format!("{dir}/");
-                x.names.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)).filter(|(k, _)| !k[prefix.len()..].contains('/')).map(|(_, v)| v.clone()).collect()
-            }
-        }
+        let prefix = format!("{}/", key(dir).trim_end_matches('/'));
+        self.0.names.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)).filter(|(k, _)| !k[prefix.len()..].contains('/')).map(|(_, v)| v.clone()).collect()
     }
 }
 
@@ -371,6 +288,13 @@ enum Loc<'a> {
     Packed(u64, &'a bnd3::Entry),
 }
 
+/// The repo's 360 ISO, for tests that skip when it is absent.
+#[cfg(test)]
+pub(crate) fn test_disc() -> Option<Disc> {
+    let path = repo_root().join(X360_ISO);
+    path.is_file().then(|| Disc::open(&path).unwrap())
+}
+
 /// The hash in an `_unknown/<dir>/<decimal hash>.<ext>` name.
 fn unknown_hash(file: &str) -> Option<u32> {
     let k = key(file);
@@ -382,15 +306,11 @@ fn unknown_hash(file: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn iso() -> Option<Disc> {
-        let path = repo_root().join(X360_ISO);
-        path.is_file().then(|| Disc::open(&path).unwrap())
-    }
+    use super::test_disc as iso;
 
     #[test]
     fn x360_disc_reads_every_source() {
         let Some(disc) = iso() else { return };
-        assert!(disc.is_x360());
         assert_eq!(disc.read("param/accolor/color5001.bin").unwrap().len(), 856);
         assert_eq!(disc.read("/PARAM/coloringset.bin").unwrap().len(), 2121);
         assert_eq!(disc.read("movie/jp/tu_boost.wmv").unwrap().len(), 2_505_347);

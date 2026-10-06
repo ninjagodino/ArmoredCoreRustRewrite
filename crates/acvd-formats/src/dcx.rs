@@ -1,4 +1,5 @@
-//! DCX: EDGE on the PS3 disc (all 9426 files), DFLT on the 360 disc.
+//! DCX: DFLT on 9404 of the 9412 360 files; EDGE (the PS3 disc's variant) on the other 8, the
+//! `model/ene/e9110`-`e9113` `.tpf.dcx` and `_a.bnd.dcx` copied unchanged from the PS3 disc.
 //!
 //! DFLT (big-endian): `0x00 "DCX\0", u32 0x10000, u32 0x18, u32 0x24, u32 0x24, u32 0x2C,
 //! 0x18 "DCS\0", u32 uncompressed_size, u32 compressed_size, 0x24 "DCP\0", "DFLT", u32 0x20,

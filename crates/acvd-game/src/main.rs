@@ -1,7 +1,7 @@
 //! Runtime skeleton: assembles ACs from the preset designs in `param/acassemblydrawing.bin`,
 //! entirely from generated data plus geometry read off the owned disc.
 //!
-//! `acvd-game [design id] [--disc <360 ISO or dump root>] [--shot <png>] [--flat] [--yaw <degrees>]
+//! `acvd-game [design id] [--disc <360 ISO>] [--shot <png>] [--flat] [--yaw <degrees>]
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
 //! [--water <y>]`
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump;

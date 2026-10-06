@@ -2,9 +2,8 @@
 //!
 //! Each `<Font>` has an `<ID>` and either `<CcmFile>$(FontData)\<folder>\<folder>.ccm</CcmFile>`
 //! (plus `Lang="JP"` / `"KR"` / `"CN"` variants, ignored here: the untagged one is the
-//! English/European default) or `<RefFontID>` naming another ID. Both discs ship the same file;
-//! `$(Platform)` is [`crate::vfs::Disc::platform`] (`font/s1_xbox/` on the 360, `s1_PS3/` on
-//! the PS3).
+//! English/European default) or `<RefFontID>` naming another ID. `$(Platform)` is
+//! [`crate::vfs::Disc::platform`] (`font/s1_xbox/`).
 
 use anyhow::{bail, Result};
 
@@ -87,18 +86,15 @@ mod tests {
 
     #[test]
     fn disc_fontdef() {
-        let root = crate::vfs::repo_root();
-        for path in [root.join(crate::vfs::PS3_DUMP), root.join(crate::vfs::X360_ISO)] {
-            let Ok(disc) = crate::vfs::Disc::open(&path) else { continue };
-            let d = read(&disc.read("font/fontdef.xml").unwrap(), disc.platform()).unwrap();
-            assert_eq!(d.0.len(), 20);
-            assert_eq!(d.folder(1), Some("e1_ext"));
-            assert_eq!(d.file(12), Some(("e10", "e10.ccf")));
-            assert_eq!(d.folder(99), Some("j1_16_ext"));
-            for (_, def) in &d.0 {
-                if let FontDef::File { folder, file } = def {
-                    assert!(disc.exists(&format!("font/{folder}/{file}")), "{}: font/{folder}/{file}", path.display());
-                }
+        let Some(disc) = crate::vfs::test_disc() else { return };
+        let d = read(&disc.read("font/fontdef.xml").unwrap(), disc.platform()).unwrap();
+        assert_eq!(d.0.len(), 20);
+        assert_eq!(d.folder(1), Some("e1_ext"));
+        assert_eq!(d.file(12), Some(("e10", "e10.ccf")));
+        assert_eq!(d.folder(99), Some("j1_16_ext"));
+        for (_, def) in &d.0 {
+            if let FontDef::File { folder, file } = def {
+                assert!(disc.exists(&format!("font/{folder}/{file}")), "font/{folder}/{file}");
             }
         }
     }

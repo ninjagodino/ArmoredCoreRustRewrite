@@ -1,7 +1,7 @@
 //! FLVER -> model sheet rows: tables, decoded face sets, and the evidence preflight checks
 //! (index ranges, winding around stored normals, vertices no face set reaches).
 
-use acvd_formats::{edge, flver};
+use acvd_formats::flver;
 
 use crate::model::*;
 
@@ -95,17 +95,12 @@ fn mesh(f: &flver::Flver, data: &[u8], world: &[flver::Xform], index: usize, m: 
             flags: fs.flags,
             strip: fs.strip,
             index_size: f.index_size(fs),
-            segments: 0,
             indices: 0,
             triangles: 0,
             degenerate: 0,
             max_index: None,
             error: None,
         };
-        if fr.index_size == 8 {
-            let at = f.data_offset as usize + fs.index_offset as usize;
-            fr.segments = data.get(at..).and_then(|g| edge::read_group(g).ok()).map_or(0, |g| g.segments.len());
-        }
         match f.indices(data, fs).and_then(|idx| Ok((idx.len(), f.triangles(data, fs)?))) {
             Ok((n, tris)) => {
                 fr.indices = n;

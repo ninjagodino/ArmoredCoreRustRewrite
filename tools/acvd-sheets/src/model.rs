@@ -301,8 +301,7 @@ pub struct TextureGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TpfSheet {
     pub path: String,
-    /// TPF platform byte (`tpf::PLATFORM_PS3` or `tpf::PLATFORM_X360`).
-    #[serde(default = "ps3_platform")]
+    /// TPF platform byte (`tpf::PLATFORM_X360`, or `tpf::PLATFORM_PS3` for the 4 linear packs).
     pub platform: u8,
     pub flag2: u8,
     pub encoding: u8,
@@ -329,10 +328,6 @@ pub struct TextureRow {
     /// The texture's data runs past the end of the pack.
     #[serde(default)]
     pub truncated: bool,
-}
-
-fn ps3_platform() -> u8 {
-    acvd_formats::tpf::PLATFORM_PS3
 }
 
 /// `private/sheets/json/motions/<group>.json`: every motion binder (`*_a.bnd.dcx`) and its `.ani` clips.
@@ -718,7 +713,6 @@ pub struct FaceSetRow {
     pub flags: u32,
     pub strip: u8,
     pub index_size: i32,
-    pub segments: usize,
     pub indices: usize,
     pub triangles: usize,
     pub degenerate: usize,

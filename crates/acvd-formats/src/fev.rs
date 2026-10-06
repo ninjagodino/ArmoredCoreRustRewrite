@@ -283,8 +283,7 @@ mod tests {
     use super::*;
 
     fn disc(name: &str) -> Option<Vec<u8>> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("ACVD Unbound").join("PS3_GAME/USRDIR/sound").join(name);
-        std::fs::read(path).ok()
+        Some(crate::vfs::test_disc()?.read(&format!("sound/{name}")).unwrap())
     }
 
     #[test]

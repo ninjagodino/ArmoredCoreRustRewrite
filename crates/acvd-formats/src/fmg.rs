@@ -141,43 +141,23 @@ mod tests {
 
     #[test]
     fn disc_banks() {
-        let usrdir = crate::vfs::usrdir(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("ACVD Unbound"));
-        if !usrdir.join("lang").is_dir() {
-            return;
-        }
+        let Some(disc) = crate::vfs::test_disc() else { return };
         let mut n = 0;
-        for lang in ["en", "jp"] {
-            let dir = usrdir.join("lang").join(lang).join("text");
-            for e in walkdir(&dir) {
-                if e.extension().and_then(|x| x.to_str()) != Some("fmg") {
-                    continue;
-                }
-                let data = std::fs::read(&e).unwrap();
-                let f = read(&data).unwrap_or_else(|err| panic!("{}: {err:#}", e.display()));
-                n += 1;
-                if e.file_name().is_some_and(|n| n.to_string_lossy().starts_with("partsname")) {
-                    assert_eq!(f.encoding, Encoding::ShiftJis, "{}", e.display());
-                }
+        for file in disc.files() {
+            let lower = file.to_ascii_lowercase();
+            if !(lower.starts_with("lang/en/text/") || lower.starts_with("lang/jp/text/")) || !lower.ends_with(".fmg") {
+                continue;
+            }
+            let f = read(&disc.asset(&file).unwrap()).unwrap_or_else(|err| panic!("{file}: {err:#}"));
+            n += 1;
+            if lower.rsplit('/').next().is_some_and(|n| n.starts_with("partsname")) {
+                assert_eq!(f.encoding, Encoding::ShiftJis, "{file}");
             }
         }
         assert!(n > 100, "{n} FMGs");
-        let names = read(&std::fs::read(usrdir.join("lang/en/text/partsname_en.fmg")).unwrap()).unwrap();
+        let names = read(&disc.asset("lang/en/text/partsname_en.fmg").unwrap()).unwrap();
         assert_eq!(names.get(110), Some("HA-202"));
-        let menu = read(&std::fs::read(usrdir.join("lang/en/text/menu/menu.fmg")).unwrap()).unwrap();
+        let menu = read(&disc.asset("lang/en/text/menu/menu.fmg").unwrap()).unwrap();
         assert_eq!(menu.get(204), Some("PRESS START"));
-    }
-
-    fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        let Ok(rd) = std::fs::read_dir(dir) else { return out };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                out.extend(walkdir(&p));
-            } else {
-                out.push(p);
-            }
-        }
-        out
     }
 }

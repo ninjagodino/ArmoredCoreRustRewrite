@@ -1,17 +1,18 @@
-//! TPF texture pack, PS3 (platform 2) or Xbox 360 (platform 1).
+//! TPF texture pack (Xbox 360).
 //!
 //! Header (0x10 bytes): `"TPF\0", u32 data_size, u32 texture_count, u8 platform, u8 flag2,
 //! u8 encoding, u8 0`, then per texture:
 //! `u32 data_offset, u32 data_size, u8 format, u8 kind (0 = 2D, 1 = cube), u8 mipmaps,
-//!  u8 flags1, u16 width, u16 height, u32 unk1, [u32 unk2 when PS3 and flag2 != 0],
+//!  u8 flags1, u16 width, u16 height, u32 unk1, [u32 unk2 when platform 2 and flag2 != 0],
 //!  u32 name_offset, u32 has_floats, [u32 floats_unk, u32 floats_len, f32 x floats_len/4 when
-//!  has_floats]`. The 360 entry has no `unk2` (every 360 pack has flag2 3 and 28-byte entries).
-//! Names are Shift-JIS (encoding 0 or 2) or UTF-16 (encoding 1). PS3 texture data is the raw RSX
-//! image: for the block-compressed formats on the disc, every mip level of every face in order,
-//! with `mipmaps == 0` meaning the full chain down to 1x1. Cube faces after the first start on a
-//! 128-byte boundary (65 of the 66 cube maps on the disc: 6 x 10936-byte faces are stored in
-//! 65976 bytes); the remaining one stores its faces back to back. 360 texture data is the Xenos
-//! tiled image ([`xenos`]); [`Texture::linear`] turns it into the PS3 layout.
+//!  has_floats]`. Every pack has flag2 3. Names are Shift-JIS (encoding 0 or 2) or UTF-16
+//! (encoding 1). `mipmaps == 0` means the full chain down to 1x1.
+//!
+//! Platform 1 packs (10,552 of 10,556 on the disc) hold the Xenos tiled image ([`xenos`]) and
+//! 28-byte entries. The other 4 (`model/ene/e9110`-`e9113`, byte-identical to the PS3 disc's
+//! copies) keep the PS3 platform byte 2, 32-byte entries and the linear layout: every mip level
+//! of each face in order, little-endian blocks; none is a cube map. [`Texture::linear`] gives
+//! the linear layout for both.
 
 use std::borrow::Cow;
 
@@ -22,6 +23,7 @@ use crate::reader::{utf16be, Be};
 
 pub const MAGIC: &[u8; 4] = b"TPF\0";
 pub const PLATFORM_X360: u8 = 1;
+/// The PS3 platform byte, kept by the 4 linear-layout packs on the 360 disc.
 pub const PLATFORM_PS3: u8 = 2;
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,7 +60,7 @@ pub fn read(data: &[u8]) -> Result<Tpf> {
     let r = Be(data);
     ensure!(r.bytes(0, 4)? == MAGIC, "not a TPF");
     let platform = r.u8(0x0C)?;
-    ensure!(platform == PLATFORM_PS3 || platform == PLATFORM_X360, "TPF platform {platform} is neither PS3 nor 360");
+    ensure!(platform == PLATFORM_PS3 || platform == PLATFORM_X360, "TPF platform {platform} is neither 1 nor 2");
     let flag2 = r.u8(0x0D)?;
     let encoding = r.u8(0x0E)?;
     ensure!(r.u8(0x0F)? == 0, "TPF byte 0x0F is nonzero");
@@ -124,13 +126,8 @@ impl Texture {
         }
     }
 
-    /// Byte size of the stored image for a 4x4 block format of `block_bytes` bytes per block.
-    pub fn block_size(&self, block_bytes: u32) -> u64 {
-        block_chain_size(self.width, self.height, self.levels(), self.faces(), block_bytes)
-    }
-
-    /// The image in the PS3 layout (every level of every face, linear little-endian blocks): the
-    /// stored bytes for PS3 packs, the untiled Xenos image for 360 ones, with faces back to back.
+    /// The image in the linear layout (every level of each face, little-endian blocks, faces back
+    /// to back): the untiled Xenos image, or the stored bytes of a platform 2 pack.
     pub fn linear<'a>(&self, platform: u8, tpf: &'a [u8], block_bytes: u32) -> Result<Cow<'a, [u8]>> {
         let data = self.data(tpf)?;
         if platform != PLATFORM_X360 {
@@ -140,12 +137,13 @@ impl Texture {
     }
 }
 
-/// Bytes a block-compressed image takes on `platform` (see [`block_chain_size`], [`xenos::size`]).
+/// Bytes a block-compressed image takes in a pack of `platform` ([`xenos::size`], or the linear
+/// chains of a platform 2 pack).
 pub fn stored_size(platform: u8, width: u16, height: u16, levels: u32, faces: u32, block_bytes: u32) -> u64 {
     if platform == PLATFORM_X360 {
         xenos::size(width as u32, height as u32, levels, faces, block_bytes)
     } else {
-        block_chain_size(width, height, levels, faces, block_bytes)
+        chain(width, height, levels, block_bytes) * faces.max(1) as u64
     }
 }
 
@@ -256,8 +254,7 @@ pub mod xenos {
     }
 }
 
-pub const FACE_ALIGN: u64 = 128;
-
+/// Bytes in one linear mip chain of `levels` levels of a 4x4 block-compressed image.
 fn chain(width: u16, height: u16, levels: u32, block_bytes: u32) -> u64 {
     let level = |m: u32| {
         let w = (width as u32 >> m).max(1).div_ceil(4);
@@ -267,18 +264,10 @@ fn chain(width: u16, height: u16, levels: u32, block_bytes: u32) -> u64 {
     (0..levels).map(level).sum()
 }
 
-/// Bytes in `faces` mip chains of `levels` levels of a 4x4 block-compressed image, with every
-/// face but the last padded to [`FACE_ALIGN`].
-pub fn block_chain_size(width: u16, height: u16, levels: u32, faces: u32, block_bytes: u32) -> u64 {
-    let face = chain(width, height, levels, block_bytes);
-    face.next_multiple_of(FACE_ALIGN) * (faces.max(1) as u64 - 1) + face
-}
-
-/// Byte offset of mip `level` of `face` inside a stored image of `stored` bytes, and that level's
-/// size. Faces are packed back to back when `stored` is exactly `faces` unpadded chains.
-pub fn block_level_span(width: u16, height: u16, levels: u32, faces: u32, stored: u64, face: u32, level: u32, block_bytes: u32) -> (u64, u64) {
-    let unpadded = chain(width, height, levels, block_bytes);
-    let stride = if stored == unpadded * faces as u64 { unpadded } else { unpadded.next_multiple_of(FACE_ALIGN) };
+/// Byte offset of mip `level` of `face` inside a [`Texture::linear`] image of `levels` levels,
+/// and that level's size.
+pub fn block_level_span(width: u16, height: u16, levels: u32, face: u32, level: u32, block_bytes: u32) -> (u64, u64) {
+    let stride = chain(width, height, levels, block_bytes);
     let before = chain(width, height, level, block_bytes);
     let this = chain(width, height, level + 1, block_bytes) - before;
     (face as u64 * stride + before, this)
@@ -305,26 +294,26 @@ mod tests {
     }
 
     #[test]
-    fn x360_textures_untile_to_the_ps3_blocks() {
-        let root = vfs::repo_root();
-        let (iso, dump) = (root.join(vfs::X360_ISO), root.join(vfs::PS3_DUMP));
-        if !iso.is_file() || !dump.is_dir() {
+    fn x360_packs_untile_or_read_linear() {
+        let iso = vfs::repo_root().join(vfs::X360_ISO);
+        if !iso.is_file() {
             return;
         }
-        // am9000's BC1 and BC3 textures were compressed once for both discs, so the untiled 360
-        // blocks equal the PS3 ones byte for byte, every level included.
-        let pack = "model/ac/parts/arm/am9000/am9000.tpf.dcx";
-        let (x, p) = (vfs::Disc::open(&iso).unwrap().asset(pack).unwrap(), vfs::Disc::open(&dump).unwrap().asset(pack).unwrap());
-        let (xt, pt) = (read(&x).unwrap(), read(&p).unwrap());
-        assert_eq!(xt.platform, PLATFORM_X360);
-        let compared = xt.textures.iter().filter(|a| a.format == 0 || a.format == 5).count();
-        assert_eq!(compared, 8);
-        for (a, b) in xt.textures.iter().zip(&pt.textures).filter(|(a, _)| a.format == 0 || a.format == 5) {
-            let bb = if a.format == 0 { 8 } else { 16 };
-            assert_eq!(a.size as u64, stored_size(xt.platform, a.width, a.height, a.levels(), a.faces(), bb));
-            let (la, lb) = (a.linear(xt.platform, &x, bb).unwrap(), b.linear(pt.platform, &p, bb).unwrap());
-            let n = block_chain_size(a.width, a.height, a.levels().min(b.levels()), 1, bb) as usize;
-            assert_eq!(la[..n], lb[..n], "{}", a.name);
+        let disc = vfs::Disc::open(&iso).unwrap();
+        // am9000: 8 tiled BC1/BC3 textures. e9110: a platform 2 pack of linear chains.
+        for (pack, platform, count) in [("model/ac/parts/arm/am9000/am9000.tpf.dcx", PLATFORM_X360, 8), ("model/ene/e9110/e9110.tpf.dcx", PLATFORM_PS3, 4)] {
+            let data = disc.asset(pack).unwrap();
+            let t = read(&data).unwrap();
+            assert_eq!(t.platform, platform, "{pack}");
+            let mut n = 0;
+            for a in t.textures.iter().filter(|a| a.format == 0 || a.format == 5) {
+                let bb = if a.format == 0 { 8 } else { 16 };
+                assert_eq!(a.size as u64, stored_size(t.platform, a.width, a.height, a.levels(), a.faces(), bb), "{}", a.name);
+                let lin = a.linear(t.platform, &data, bb).unwrap();
+                assert_eq!(lin.len() as u64, chain(a.width, a.height, a.levels(), bb) * a.faces() as u64, "{}", a.name);
+                n += 1;
+            }
+            assert_eq!(n, count, "{pack}");
         }
     }
 }

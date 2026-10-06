@@ -1,6 +1,4 @@
-//! FSB4 sound bank (`sound/*.fsb`, magic `FSB4`). Little-endian on both discs: the FMOD Ex
-//! banks the PS3 (MPEG) and Xbox 360 (XMA) builds play, at the same paths and with the same
-//! sample names.
+//! FSB4 sound bank (`sound/*.fsb`, magic `FSB4`), little-endian FMOD Ex banks.
 //!
 //! Header (48 bytes): `magic, u32 sample count, u32 sample-header bytes, u32 data bytes,
 //! u32 version (0x00040000), u32 mode, 24-byte hash`. Each sample header begins with its
@@ -9,9 +7,8 @@
 //! are extra chunks and are skipped (the 360 headers are 112 bytes). Sample payloads are
 //! packed in header order at `48 + sample-header bytes`.
 //!
-//! Mode bit `0x200` is MPEG (FMOD `FSOUND_MPEG`): `se_booster.fsb` payloads start `FF FB`.
-//! Each MPEG frame is padded out to a multiple of 4 bytes. Mode bit `0x01000000` is XMA
-//! (FMOD `FSOUND_XMA`; 360 samples are `0x01002020`): XMA2 packets for [`crate::xma`].
+//! Mode bit `0x01000000` is XMA (FMOD `FSOUND_XMA`; samples are `0x01002020`): XMA2 packets
+//! for [`crate::xma`].
 //! Neither, with `0x10` (`FSOUND_16BITS`), is raw 16-bit PCM, big-endian when the bank mode has
 //! `0x08` (FMOD `FSB_SOURCE_BIGENDIANPCM`): the 219 mode-`0x2130` samples of the 360
 //! `com_05` / `com_06` / `com_07` / `com_11` banks (bank mode `0x48`), padded to 32 bytes.
@@ -22,8 +19,6 @@ use anyhow::{bail, ensure, Result};
 pub const MAGIC: &[u8] = b"FSB4";
 pub const HEADER: usize = 48;
 pub const BASIC_SAMPLE: usize = 80;
-/// FMOD `FSOUND_MPEG`.
-pub const MODE_MPEG: u32 = 0x200;
 /// FMOD `FSOUND_XMA`.
 pub const MODE_XMA: u32 = 0x0100_0000;
 /// FMOD `FSOUND_16BITS`.
@@ -49,26 +44,20 @@ pub struct Sample {
     pub channels: u16,
     /// Bank mode [`BANK_BIG_ENDIAN_PCM`]: byte order of a [`Sample::pcm16`] payload.
     pub big_endian_pcm: bool,
-    /// Payload: MPEG frames when [`Sample::mpeg`], XMA2 packets when [`Sample::xma`], samples when
-    /// [`Sample::pcm16`].
+    /// Payload: XMA2 packets when [`Sample::xma`], samples when [`Sample::pcm16`].
     pub data: Vec<u8>,
 }
 
 impl Sample {
-    pub fn mpeg(&self) -> bool {
-        self.mode & MODE_MPEG != 0
-    }
-
     pub fn xma(&self) -> bool {
         self.mode & MODE_XMA != 0
     }
 
     pub fn pcm16(&self) -> bool {
-        !self.mpeg() && !self.xma() && self.mode & MODE_16BITS != 0
+        !self.xma() && self.mode & MODE_16BITS != 0
     }
 
-    /// Decodes an XMA or 16-bit PCM sample to interleaved PCM of [`Sample::length`] frames
-    /// (MPEG is left to the caller's decoder).
+    /// Decodes an XMA or 16-bit PCM sample to interleaved PCM of [`Sample::length`] frames.
     pub fn decode(&self) -> Result<crate::xma::Pcm> {
         if self.xma() {
             return crate::xma::decode(&self.data, self.channels, self.frequency, Some(self.length as usize));
@@ -159,27 +148,9 @@ fn cstr(b: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn disc(name: &str) -> Option<Vec<u8>> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("ACVD Unbound").join("PS3_GAME/USRDIR/sound").join(name);
-        std::fs::read(path).ok()
-    }
-
-    #[test]
-    fn booster_bank() {
-        let Some(data) = disc("se_booster.fsb") else { return };
-        let bank = read(&data).unwrap();
-        assert_eq!(bank.samples.len(), 8);
-        assert_eq!(bank.samples[0].name, "boost11.wav");
-        assert_eq!(bank.samples[4].name, "main_boost11.wav");
-        assert!(bank.samples.iter().all(|s| s.mpeg() && s.channels == 1 && s.frequency == 44100));
-        assert_eq!(bank.samples[0].loop_end, bank.samples[0].length - 1);
-        assert_eq!(&bank.samples[0].data[..2], &[0xFF, 0xFB]);
-    }
-
     #[test]
     fn x360_booster_bank_is_xma() {
-        let iso = crate::vfs::repo_root().join(crate::vfs::X360_ISO);
-        let Ok(disc) = crate::vfs::Disc::open(&iso) else { return };
+        let Some(disc) = crate::vfs::test_disc() else { return };
         let bank = read(&disc.read("sound/se_booster.fsb").unwrap()).unwrap();
         assert_eq!(bank.samples.len(), 8);
         assert_eq!(bank.samples[4].name, "main_boost11.wav");
@@ -191,8 +162,7 @@ mod tests {
 
     #[test]
     fn x360_comms_bank_is_big_endian_pcm() {
-        let iso = crate::vfs::repo_root().join(crate::vfs::X360_ISO);
-        let Ok(disc) = crate::vfs::Disc::open(&iso) else { return };
+        let Some(disc) = crate::vfs::test_disc() else { return };
         let bank = read(&disc.read("sound/com_07.fsb").unwrap()).unwrap();
         let s = &bank.samples[0];
         assert_eq!((s.name.as_str(), s.mode, s.frequency, s.length, s.big_endian_pcm), ("0010001.wav", 0x2130, 48000, 186308, true));
@@ -206,8 +176,8 @@ mod tests {
 
     #[test]
     fn weapon_bank_counts() {
-        let Some(data) = disc("se_weapon.fsb") else { return };
-        let bank = read(&data).unwrap();
+        let Some(disc) = crate::vfs::test_disc() else { return };
+        let bank = read(&disc.read("sound/se_weapon.fsb").unwrap()).unwrap();
         assert_eq!(bank.samples.len(), 124);
         assert!(bank.samples.iter().any(|s| s.name.ends_with(".wav")));
     }
