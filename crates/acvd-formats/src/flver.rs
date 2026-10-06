@@ -1,13 +1,18 @@
-//! FLVER2 model, big-endian (`"FLVER\0B\0"`), as on the PS3 disc.
+//! FLVER2 model, big-endian (`"FLVER\0B\0"`), as on the PS3 and 360 discs.
 //!
 //! Header (0x80 bytes): `"FLVER\0", "B\0", u32 version, u32 data_offset, u32 data_length,
 //! i32 dummy/material/bone/mesh/vertex_buffer counts, f32x3 bbox_min, f32x3 bbox_max,
-//! i32 true_faces, i32 total_faces, u8 index_size (8 = Edge, 16, 32), u8 unicode, u8 unk4a, u8 0,
-//! i32 unk4c, i32 face_set/layout/texture counts, u8 unk5c, u8 unk5d, u16 0, u32 0, u32 0,
-//! i32 unk68, 5 x u32 0`.
+//! i32 true_faces, i32 total_faces, u8 index_size (8 = Edge, 16, 32), u8 unicode, u8 unk4a,
+//! u8 unk4b, i32 unk4c, i32 face_set/layout/texture counts, u8 unk5c, u8 unk5d, u16 0, u32 0,
+//! u32 0, i32 unk68, 5 x u32 0`.
 //! Tables follow back to back: dummies 0x40, materials 0x20, bones 0x80, meshes 0x30,
 //! face sets 0x20, vertex buffers 0x20, layouts 0x10, textures 0x20. Index and vertex data
 //! offsets are relative to `data_offset`.
+//!
+//! PS3 models store Edge-compressed index groups (index size 8) and split vertex streams; 360
+//! models store big-endian 16-bit strips (0xFFFF restarts; `unk4c` = 0xFFFF, `unk4a` and
+//! `unk4b` = 1) over one interleaved buffer per mesh, with normals and tangents as signed
+//! bytes ([`MemberKind::NormalS8`], [`MemberKind::TangentS8`]).
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
@@ -73,6 +78,7 @@ pub struct Flver {
     pub index_size: u8,
     pub unicode: bool,
     pub unk4a: u8,
+    pub unk4b: u8,
     pub unk4c: i32,
     pub unk5c: u8,
     pub unk5d: u8,
@@ -246,7 +252,6 @@ pub fn read(data: &[u8]) -> Result<Flver> {
         1 => true,
         u => bail!("unicode flag {u}"),
     };
-    zero(r, 0x4B, 1, "header 0x4B")?;
     let n_face_sets = count(r, 0x50, "face set")?;
     let n_layouts = count(r, 0x54, "layout")?;
     let n_textures = count(r, 0x58, "texture")?;
@@ -417,6 +422,7 @@ pub fn read(data: &[u8]) -> Result<Flver> {
         index_size,
         unicode,
         unk4a: r.u8(0x4A)?,
+        unk4b: r.u8(0x4B)?,
         unk4c: r.i32(0x4C)?,
         unk5c: r.u8(0x5C)?,
         unk5d: r.u8(0x5D)?,
@@ -642,6 +648,13 @@ pub enum MemberKind {
     Normal,
     /// 0x10 Byte4A tangent: `(b - 127) / 127` for x, y, z, w.
     Tangent,
+    /// 0x12 360 normal: signed bytes stored w, z, y, x; `s / 127` for x, y, z, raw w (the bone,
+    /// as in [`Self::Normal`]). Checked on am0010 against the PS3 copy: mean dot 0.994.
+    NormalS8,
+    /// 0x14 360 tangent: signed bytes stored w, z, y, x, each `s / 127` (w = ±1 handedness).
+    TangentS8,
+    /// 0x12 360 bone indices: [`Self::BoneIndices`] with the four bytes in reverse order.
+    BoneIndicesRev,
     /// 0x10 Byte4A color: RGBA bytes / 255.
     Color,
     /// 0x15 UV: i16 u, v / uv_scale.
@@ -662,6 +675,9 @@ impl MemberKind {
             (0x02, 0) => Self::Position,
             (0x10, 3) => Self::Normal,
             (0x10, 6) => Self::Tangent,
+            (0x12, 2) => Self::BoneIndicesRev,
+            (0x12, 3) => Self::NormalS8,
+            (0x14, 6) => Self::TangentS8,
             (0x10, 10) => Self::Color,
             (0x15, 5) => Self::Uv,
             (0x16, 5) => Self::UvPair,
@@ -675,7 +691,7 @@ impl MemberKind {
     pub fn size(self) -> usize {
         match self {
             Self::EdgeStream => 1,
-            Self::Normal | Self::Tangent | Self::Color | Self::Uv | Self::BoneIndices => 4,
+            Self::Normal | Self::Tangent | Self::NormalS8 | Self::TangentS8 | Self::Color | Self::Uv | Self::BoneIndices | Self::BoneIndicesRev => 4,
             Self::UvPair | Self::BoneWeights => 8,
             Self::Position => 12,
         }
@@ -699,6 +715,10 @@ fn unorm(b: u8) -> f32 {
     (b as f32 - 127.0) / 127.0
 }
 
+fn snorm(b: u8) -> f32 {
+    b as i8 as f32 / 127.0
+}
+
 fn channel<T>(sets: &mut Vec<Vec<T>>, index: usize) -> &mut Vec<T> {
     if sets.len() <= index {
         sets.resize_with(index + 1, Vec::new);
@@ -718,6 +738,11 @@ impl Vertices {
                 self.normal_w.push(b(3)?);
             }
             MemberKind::Tangent => channel(&mut self.tangents, idx).push([unorm(b(0)?), unorm(b(1)?), unorm(b(2)?), unorm(b(3)?)]),
+            MemberKind::NormalS8 => {
+                self.normals.push([snorm(b(3)?), snorm(b(2)?), snorm(b(1)?)]);
+                self.normal_w.push(b(0)?);
+            }
+            MemberKind::TangentS8 => channel(&mut self.tangents, idx).push([snorm(b(3)?), snorm(b(2)?), snorm(b(1)?), snorm(b(0)?)]),
             MemberKind::Color => {
                 channel(&mut self.colors, idx).push([b(0)? as f32 / 255.0, b(1)? as f32 / 255.0, b(2)? as f32 / 255.0, b(3)? as f32 / 255.0])
             }
@@ -727,6 +752,7 @@ impl Vertices {
                 channel(&mut self.uvs, 2 * idx + 1).push(uv(4)?);
             }
             MemberKind::BoneIndices => self.bone_indices.push([b(0)?, b(1)?, b(2)?, b(3)?]),
+            MemberKind::BoneIndicesRev => self.bone_indices.push([b(3)?, b(2)?, b(1)?, b(0)?]),
             MemberKind::BoneWeights => {
                 let w = |k: usize| -> Result<f32> { Ok(r.i16(at + 2 * k)? as f32 / 32767.0) };
                 self.bone_weights.push([w(0)?, w(1)?, w(2)?, w(3)?])
@@ -754,6 +780,25 @@ mod tests {
         // Z by 90 takes +X to +Y before Y acts on it.
         let z = Xform::local([0.0; 3], [0.0, half, half], [2.0; 3]);
         assert!(close(z.apply([1.0, 0.0, 0.0]), [0.0, 2.0, 0.0]));
+    }
+
+    #[test]
+    fn x360_flver_decodes_strips_and_signed_normals() {
+        let path = crate::vfs::repo_root().join(crate::vfs::X360_ISO);
+        if !path.is_file() {
+            return;
+        }
+        let disc = crate::vfs::Disc::open(&path).unwrap();
+        let data = disc.asset("model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv").unwrap();
+        let f = read(&data).unwrap();
+        assert_eq!((f.index_size, f.unk4a, f.unk4b, f.unk4c), (16, 1, 1, 0xFFFF));
+        let mesh = &f.meshes[0];
+        let v = f.vertices(&data, mesh).unwrap();
+        assert_eq!(v.positions.len(), 10273);
+        assert!(v.normals.iter().all(|n| (n.iter().map(|c| c * c).sum::<f32>().sqrt() - 1.0).abs() < 0.03));
+        let tris = f.triangles(&data, f.main_face_set(mesh).unwrap()).unwrap();
+        assert!(tris.iter().flatten().all(|&i| (i as usize) < v.positions.len()));
+        assert!(!tris.is_empty());
     }
 
     #[test]

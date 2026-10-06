@@ -408,6 +408,16 @@ fn textures(paths: &Paths, rep: &mut Report, marks: &mut Vec<Checkmark>, excepti
                 if !names.insert(t.name.as_str()) {
                     rep.add(Severity::Warning, "texture.duplicate_name", &sheet, &row, "name", "name repeats within the pack");
                 }
+                if t.truncated {
+                    let detail = format!("{} bytes run past the end of the pack", t.size);
+                    match exceptions.excuse(&format!("{}#{}", p.path, t.index), "texture.truncated") {
+                        Some(why) => rep.add(Severity::Warning, "texture.truncated", &sheet, &row, "size", format!("{detail}: {why}")),
+                        None => {
+                            ok = false;
+                            rep.add(Severity::Error, "texture.truncated", &sheet, &row, "size", detail);
+                        }
+                    }
+                }
                 match by_code.get(&t.format) {
                     None => {
                         ok = false;
@@ -415,7 +425,7 @@ fn textures(paths: &Paths, rep: &mut Report, marks: &mut Vec<Checkmark>, excepti
                     }
                     Some(f) => {
                         used.insert(t.format);
-                        let want = acvd_formats::tpf::block_chain_size(t.width, t.height, t.levels, t.faces, f.block_bytes);
+                        let want = acvd_formats::tpf::stored_size(p.platform, t.width, t.height, t.levels, t.faces, f.block_bytes);
                         if want != t.size as u64 {
                             let detail = format!("{}x{} {} levels x{} faces as {} is {want} bytes, stored {}", t.width, t.height, t.levels, t.faces, f.name, t.size);
                             match exceptions.excuse(&format!("{}#{}", p.path, t.index), "texture.size") {
@@ -447,7 +457,7 @@ fn textures(paths: &Paths, rep: &mut Report, marks: &mut Vec<Checkmark>, excepti
     }
     for f in &formats {
         if !used.contains(&f.code) {
-            rep.add(Severity::Error, "sheet.stale_row", "texture_formats.csv", f.code.to_string(), "", "no texture on the disc uses this code");
+            rep.add(Severity::Warning, "texture_formats.not_on_disc", "texture_formats.csv", f.code.to_string(), "", "no texture on this disc uses this code (the PS3 and 360 discs use different sets)");
         }
     }
     Ok(())
@@ -787,7 +797,7 @@ fn models(paths: &Paths, rep: &mut Report, marks: &mut Vec<Checkmark>, exception
     }
     for t in &types {
         if !used_types.contains(&format!("{}/{}", t.kind, t.semantic)) {
-            rep.add(Severity::Error, "sheet.stale_row", "vertex_types.csv", format!("{}/{}", t.kind, t.semantic), "", "no mesh on the disc uses this member");
+            rep.add(Severity::Warning, "vertex_types.not_on_disc", "vertex_types.csv", format!("{}/{}", t.kind, t.semantic), "", "no mesh on this disc uses this member (the PS3 and 360 discs use different sets)");
         }
     }
     Ok(())

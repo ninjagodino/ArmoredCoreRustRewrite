@@ -16,7 +16,7 @@ extension,magic,format,system,parser,evidence
 .fev,FEV1,FMOD Ex event project,sound,"partial: acvd-formats::fev reads version 0x003D0000 through sound defs (cue, first sound-def per layer, first wavetable entry); reverb and composition unread","sound/**/*.fev (167); cue names in sound_cues.csv"
 .ffx,DLsE,FFX particle effect,effects,done,"acvd-formats::ffx reads all 1871 DLsE entries of sfx/acv_commoneffects.ffxbnd (test disc_effects); action slots in sheets/ffx_actions.csv; sfx/f0004092.ffx; f0004226.ffx; 20 empty entries"
 .ffxbnd,BND3,BND3 binder of FFX effects,effects,done,sfx/acv_commoneffects.ffxbnd; menusfx/acv_commoneffects.ffxbnd; read by acvd-formats::bnd3
-.flv,FLVER\0 B\0 0002000F,FLVER model (big-endian; versions 0x2000F/0x20009/0x2000E),models,done,acvd-formats::flver reads 8820 of 8828 (am0010.flv; e0210.flv + _l1.._l3 LODs); EDGE-compressed indices decoded by acvd-formats::edge with every index in range; 8 pending (0x20007 and FLVER0) in container_exceptions.csv; rendered by acvd-viewer
+.flv,FLVER\0 B\0 0002000F,FLVER model (big-endian; versions 0x2000F/0x20009/0x2000E),models,done,acvd-formats::flver reads 8820 of 8828 (am0010.flv; e0210.flv + _l1.._l3 LODs); EDGE-compressed indices decoded by acvd-formats::edge with every index in range; 8 pending (0x20007 and FLVER0) in container_exceptions.csv; rendered by acvd-viewer; 360 ISO: 8391 of 8399 read (the same 8 pending) with every face set index in range: header 0x4A/0x4B = 1 and 0x4C = 0xFFFF; big-endian 16-bit strips with 0xFFFF restarts; one interleaved vertex buffer per mesh; signed-byte normals/tangents and reversed bone indices (vertex_types.csv 0x12/0x14 rows)
 .fmg,00 01 00 00,FMG message bank,text,done,"acvd-formats::fmg: 1265 banks; encoding byte 1 = UTF-16BE (1250) or 0 = Shift-JIS (15 partsname_*.fmg); id groups then string offsets"
 .fpo,FF 0F 0F 11,RSX fragment program object,shaders,todo,inside binders only: shader/*.bnd (Font.fpo ...); 727 entries
 .fsb,FSB4,FMOD Ex sound bank,sound,"done: acvd-formats::fsb reads the 48-byte header and each sample (name, length, loop, mode, MPEG payload)","sound/**/*.fsb (94; 879 MB)"
@@ -40,7 +40,7 @@ extension,magic,format,system,parser,evidence
 .smd,SMD4,unidentified model companion (*_s.smd),models,todo,inside binders only: model/**/*_m.bnd.dcx (am0010_s.smd 24576 bytes); 2257 entries
 .tae,TAE\0,TAE animation event timeline,animation,todo,tae/*.tae (621)
 .tdf,text,TDF enum definition (Shift-JIS CSV),param_enums,todo,"param/tdf/*.tdf begin with ""ENUM_NAME"" then base type"
-.tpf,TPF\0,TPF texture pack (uncompressed),textures,done,acvd-formats::tpf reads all; magic TPF on all 1139; 55 more inside binders (51 zlib-compressed)
+.tpf,TPF\0,TPF texture pack (uncompressed),textures,done,acvd-formats::tpf reads all; magic TPF on all 1139; 55 more inside binders (51 zlib-compressed); 360 ISO: platform byte 1 with 28-byte entries (no unk2) and Xenos tiled data that tpf::xenos untiles; 10552 of the 10556 360 packs (4 e9110-e9113 packs keep platform 2); every stored size matches the tiled layout; one truncated texture (e4050.tpf.dcx #9)
 .tpf.dcx,DCX,DCX(EDGE)-compressed TPF texture pack,textures;fonts;ui,done,acvd-formats::dcx + acvd-formats::tpf; DCX EDGE on all 5875 on disc (expanded contents begin TPF\0) and 4210 inside model/map/*_htdcx.bnd
 .tsmap,PARAM header,PARAM (AI_MESSAGE_SOUND_MAP),params;sound,done,type string AI_MESSAGE_SOUND_MAP at 0x0C
 .txt,text,plain text lists,config,todo,system/deletechar.txt (UTF-16LE); oneshotsfxlist.txt

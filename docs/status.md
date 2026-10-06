@@ -119,22 +119,25 @@ Rough priority order; reorder freely.
   and `vfs::Disc` reads the 360 ISO (Done, "360 disc VFS"); the default disc stays the PS3 dump
   until 3 and 4 land, then `vfs::default_disc` flips to the ISO:
   1. Done: extract from the 360 disc (see Done, "360 extract").
-  2. **Xenos TPF and 360 FLVER**: 360 texture formats (tiled DXT) and FLVER vertex / index
-     buffers without Edge compression; `texture_formats.csv`, `formats.csv` rows updated.
-     From the ISO today every AC part FLVER fails `header 0x4B at 0x4b is nonzero` and every
-     TPF `TPF platform 1 is not PS3` (`acvd-game --disc <iso>` logs both; map `.hmd` and FFX
-     already read unchanged).
+  2. Done: Xenos TPF and 360 FLVER (see Done, "360 TPF and FLVER").
   3. **XMA sound, fonts, Lua, movies**: XMA FSB banks (`sheets/sound_cues.csv` playback; from
      the ISO `se_weapon` samples report "not MPEG"), the `s1_X360` font path (`font/e1_ext/` is
      not on the 360 disc), Lua from `script.bhd` (readable as `script/<name>.lc` through
      `Disc`), WMV movies (loose `movie/jp/*.wmv`; the PS3 build has PAMF). Re-read the
      zoom-blur Xenos shaders (`speed_blur_draw`).
-  4. **Delete the PS3 paths**: remove Edge / PAMF / RSX code, the `ACVD Unbound` defaults and
-     the directory side of `vfs::Disc`, PS3 rows in `target.csv` (title id, PARAM.SFO),
-     `formats.csv`, `texture_formats.csv`. The 360 extract's preflight then needs the 9
-     PS3-only exception rows dropped (`texture_formats.csv` 33, `vertex_types.csv` 0x10/3,
-     0x10/6, 0x2f/2, 0xf0/0, `container_exceptions.csv` m7540 / m7770 / e9120: PS3-only maps
-     and enemy) and the 4 PS3-only `formats.csv` rows (`.list`, `.pam`, `.pem`, `.sdat`).
+  4. **Delete the PS3 paths**: remove Edge / PAMF / RSX code (`tpf::block_chain_size` /
+     `FACE_ALIGN` and the PS3 branch of `Texture::linear`, `MemberKind::EdgeStream`), the
+     `ACVD Unbound` defaults and the directory side of `vfs::Disc`, PS3 rows in `target.csv`
+     (title id, PARAM.SFO), `formats.csv`, `texture_formats.csv`. `extract --disc <iso>` then
+     `preflight` gives 5 errors: the 4 PS3-only `container_exceptions.csv` rows (m7540 #10 /
+     #123, m7770 #8 `texture.size`, e9120 `motion.bone_count`: PS3-only maps and enemy) to
+     drop, and `texture.truncated` on the 360 `model/ene/e4050/e4050.tpf.dcx` #9 (needs a
+     `container_exceptions.csv` row once the ISO is the default: its cube map `Global_env+c`
+     is 147,456 bytes from 0x35A1E0 in a 0x35C1E0-byte pack whose header counts 8 KB of it).
+     Drop the PS3-only `vertex_types.csv` rows 0x10/3, 0x10/6, 0x2f/2, 0xf0/0 (warnings
+     `vertex_types.not_on_disc` on the ISO), then turn `texture_formats.not_on_disc` and
+     `vertex_types.not_on_disc` back into `sheet.stale_row` errors, and drop the 4 PS3-only
+     `formats.csv` rows (`.list`, `.pam`, `.pem`, `.sdat`).
   - **The two discs ship different balance data** (see Done, "360 extract"): 112 of 622
     `acvparts.bin` records, 95 rows of 6 PARAM files and 6 tuning values differ. The generated
     data (`acvd-data`) still comes from the PS3 dump, while every Xenia probe runs the 360
@@ -147,6 +150,11 @@ Rough priority order; reorder freely.
     in identical pairs), 3 DRB menus (`_unknown/lang/<hash>.drb.dcx`) and 1 PNG. Not found
     under `/lang/<l>/menu/`, `nowload/`, `model/image/`, `image/` with the exe / Lua / named
     stems (`private/tmp/guess360d.py`).
+  - **360 normal maps are not decoded**: codes 23 (DXN: BC4 x then BC4 y, uploadable as BC5
+    after `tpf::xenos::untile`) and 24/25 (CTX1: needs a CPU expand to RG8 or a BC5 re-pack)
+    are identified only (`texture_formats.csv`; Python decoders in
+    `private/tmp/t2/fmtguess.py`). Nothing renders normal maps yet; when it does, rebuild z
+    from x/y on both discs (the PS3 copies are BC1/BC3 with B = 0 or 255).
 - **Xenia re-checks of earlier emulator captures** (rows say "Xenia re-check pending"):
   `camera_follow.csv` `look_at_height`, `base_transform`, `pitch` (probe the AC+0x234 pitch
   update; its 360 address is still to find from the AC update `0x828bef18`), `follow_ease`,
@@ -157,6 +165,37 @@ Rough priority order; reorder freely.
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
 ## Done
+
+- 360 TPF and FLVER: `acvd-formats` reads both from the ISO; `acvd-game --disc <iso>` renders
+  the default scene like the PS3 dump (0.13% of pixels differ by more than 8/255, all from
+  texture recompression). `extract --disc <iso>` + `preflight`: 276,160 of 276,168 texture and
+  341,850 of 341,850 model checks pass (the rest: see Open, migration 4). PS3 `all`: 0 errors.
+  - **TPF**: platform byte 1 on 10,552 of the 10,556 360 packs (`e9110`-`e9113` keep 2); flag2
+    is 3 on all, but the 360 entry is 28 bytes with no `unk2`. Texture data is the Xenos tiled
+    image (`tpf::xenos`, ported from Xenia `texture_util.cc` / `texture_address.h`): per level,
+    every face's slice in turn (cube faces level-major); a slice is padded to 32x32 blocks (past
+    level 0 from the power-of-two base) and 4 KB; from the first level whose short side is <= 16
+    texels, the rest share one packed tail slice at Xenia's `GetPackedMipOffset` offsets;
+    16-bit words big-endian. Every stored BC1/BC3/33 size on the disc matches. Checked by
+    untiling: level 0 to 1x1 tail of Authenticate00 and am0010 (mean diff <= 7/255 against
+    the PS3 decode), all 6 faces x 8 levels of `Global_env+c` (each face matches only its PS3
+    face), and am9000 byte-identical (`tpf::tests`). `Texture::linear` gives the PS3 layout, so
+    the renderer and preflight (`tpf::stored_size`, `TpfSheet.platform`) share one path; the
+    renderer now takes format / size / levels from the pack (Authenticate00: PS3 11 levels,
+    360 4). The two discs' textures are compressed separately (only 998 of 30,206 level-0
+    images byte-identical). New codes 23 (DXN), 24 and 25 (CTX1) are all normal maps (see
+    `texture_formats.csv`). `tpf::read` no longer rejects a pack whose last texture overruns
+    it (e4050); `TextureRow.truncated` + preflight `texture.truncated` report it.
+  - **FLVER**: 360 header 0x4A = 1, 0x4B = 1 (now `unk4b`), 0x4C = 0xFFFF, index size 16;
+    face sets are big-endian `u16` strips with 0xFFFF restarts (flags 0 and 0x80000000, never
+    Edge); one interleaved buffer per mesh. New members (`vertex_types.csv`): 0x12/3 normal and
+    0x14/6 tangent as signed bytes stored w z y x (am0010 mesh 0 vs PS3: dot 0.994 / 0.988, w
+    = PS3 bone byte), 0x12/2 bone indices reversed (`examples/flvbones.rs`: every matched
+    vertex of 7 dynamic meshes). The same 8 FLVERs as on PS3 stay pending (0x20007, FLVER0).
+  - Sheet staleness for `texture_formats.csv` / `vertex_types.csv` is a `*.not_on_disc`
+    warning while both discs are checked (each disc uses a different set).
+  - Survey tools: `crates/acvd-formats/examples/tpfscan.rs` (every 360 TPF vs the PS3 copy),
+    `tpfdds.rs` (DDS dumps for viewing), `flvbones.rs`; `private/tmp/x360vsps3.py` (normals).
 
 - 360 extract: `acvd-sheets extract` (and `archives.rs`, tuning, AC parts) reads through
   `vfs::Disc` (`files` / `read` / new `size` / `head`), so `--disc` takes the dump or the ISO;

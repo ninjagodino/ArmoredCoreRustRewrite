@@ -240,9 +240,10 @@ impl Walk {
     }
 
     fn texture_pack(&mut self, group: &str, path: &str, data: &[u8]) {
-        let mut sheet = TpfSheet { path: path.to_owned(), flag2: 0, encoding: 0, error: None, textures: Vec::new() };
+        let mut sheet = TpfSheet { path: path.to_owned(), platform: tpf::PLATFORM_PS3, flag2: 0, encoding: 0, error: None, textures: Vec::new() };
         match tpf::read(data) {
             Ok(t) => {
+                sheet.platform = t.platform;
                 sheet.flag2 = t.flag2;
                 sheet.encoding = t.encoding;
                 sheet.textures = t
@@ -264,6 +265,7 @@ impl Walk {
                         unk1: x.unk1,
                         unk2: x.unk2,
                         floats: x.floats.clone(),
+                        truncated: x.data(data).is_err(),
                     })
                     .collect();
             }

@@ -57,8 +57,13 @@ pub struct TextureRef {
 
 impl TextureRef {
     pub fn format(&self) -> Option<&'static TextureFormat> {
-        generated::textures::TEXTURE_FORMATS.iter().find(|f| f.code == self.format)
+        texture_format(self.format)
     }
+}
+
+/// The `texture_formats.csv` row for a TPF format code.
+pub fn texture_format(code: u8) -> Option<&'static TextureFormat> {
+    generated::textures::TEXTURE_FORMATS.iter().find(|f| f.code == code)
 }
 
 /// One FLVER model. `path` is its asset path; `triangles` counts each mesh's main face set

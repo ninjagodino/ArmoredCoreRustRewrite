@@ -303,33 +303,37 @@ impl Packs {
         self.texture(disc, t)
     }
 
+    /// `t` comes from the extracted sheets; the format, size and levels are read from the pack on
+    /// `disc` itself, since the 360 packs differ from the PS3 ones in all three.
     pub fn texture(&mut self, disc: &Disc, t: &TextureRef) -> Result<Image> {
         let name = t.name;
-        let format = match t.format().map(|f| f.name) {
-            Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,
-            Some("bc3") => TextureFormat::Bc3RgbaUnormSrgb,
-            other => bail!("texture `{name}` format {other:?}"),
-        };
-        ensure!(t.faces == 1, "texture `{name}` is a cube map");
-        ensure!(t.width % 4 == 0 && t.height % 4 == 0, "texture `{name}` is {}x{}", t.width, t.height);
         let pack = match self.0.entry(t.pack) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(vfs::open(disc, t.pack)?),
         };
         let header = tpf::read(pack)?;
         let tex = header.textures.get(t.index).context("texture index past the pack")?;
-        let bytes = tex.data(pack)?;
-        let block = t.format().map_or(16, |f| f.block_bytes);
-        let mut levels = t.levels;
-        let (start, last) = tpf::block_level_span(t.width, t.height, levels, 1, bytes.len() as u64, 0, levels - 1, block);
+        let row = acvd_data::texture_format(tex.format);
+        let format = match row.map(|f| f.name) {
+            Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,
+            Some("bc3") => TextureFormat::Bc3RgbaUnormSrgb,
+            other => bail!("texture `{name}` format {other:?}"),
+        };
+        ensure!(tex.faces() == 1, "texture `{name}` is a cube map");
+        let (width, height) = (tex.width, tex.height);
+        ensure!(width % 4 == 0 && height % 4 == 0, "texture `{name}` is {width}x{height}");
+        let block = row.map_or(16, |f| f.block_bytes);
+        let bytes = tex.linear(header.platform, pack, block)?;
+        let mut levels = tex.levels();
+        let (start, last) = tpf::block_level_span(width, height, levels, 1, bytes.len() as u64, 0, levels - 1, block);
         let mut end = (start + last) as usize;
         if end > bytes.len() {
             levels = 1;
-            end = tpf::block_level_span(t.width, t.height, 1, 1, bytes.len() as u64, 0, 0, block).1 as usize;
+            end = tpf::block_level_span(width, height, 1, 1, bytes.len() as u64, 0, 0, block).1 as usize;
             ensure!(end <= bytes.len(), "texture `{name}` is shorter than its first level");
         }
         let mut image = Image::default();
-        image.texture_descriptor.size = Extent3d { width: t.width as u32, height: t.height as u32, depth_or_array_layers: 1 };
+        image.texture_descriptor.size = Extent3d { width: width as u32, height: height as u32, depth_or_array_layers: 1 };
         image.texture_descriptor.dimension = TextureDimension::D2;
         image.texture_descriptor.format = format;
         image.texture_descriptor.mip_level_count = levels;
