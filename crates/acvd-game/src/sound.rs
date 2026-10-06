@@ -1,6 +1,7 @@
 //! The first free-play cues. The 360 build formats a name (`Sound_formatCue` would be
 //! `FUN_82b47758`; the format table is at `0x8371c688`) and plays it through MagicOrchestra.
-//! This plays the PS3 MPEG sample that name indexes. Cue rows are `sheets/sound_cues.csv`.
+//! This plays the sample that name indexes: XMA on the 360 disc (`acvd_formats::xma`), MPEG on
+//! the PS3 dump. Cue rows are `sheets/sound_cues.csv`.
 //!
 //! Playback is not positional. `FUN_82b46df0` takes a position, and the follow camera sits
 //! far enough out that Bevy's spatial rolloff would silence the source. Layer envelopes
@@ -125,11 +126,12 @@ impl Cues {
             }
             return None;
         };
-        if !sample.mpeg() {
-            eprintln!("sound: {}#{} is not MPEG", wave.bank, wave.index);
-            return None;
-        }
-        let wav = match mpeg_to_wav(&sample.data) {
+        let decoded = if sample.mpeg() {
+            mpeg_to_wav(&sample.data)
+        } else {
+            sample.decode().map(|pcm| wav_pcm(&pcm.to_i16(), pcm.channels, sample.frequency))
+        };
+        let wav = match decoded {
             Ok(wav) => wav,
             Err(err) => {
                 eprintln!("sound: {}#{}: {err:#}", wave.bank, wave.index);
@@ -463,6 +465,25 @@ mod tests {
             .chunks_exact(2)
             .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs())
             .fold(0, u16::max)
+    }
+
+    /// The same cues from the 360 ISO: XMA samples decode, at the PS3 bank's sample names.
+    #[test]
+    fn gameplay_cues_decode_x360() {
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        let Ok(disc) = Disc::open(&iso) else { return };
+        let mut cues = Cues::load(&disc);
+        assert_eq!(cues.projects.len(), 3);
+        for cue in ["w00000034", BOOST_ON, BOOST_LOOP, "c00000024"] {
+            let waves: Vec<fev::Wave> = cues.projects.iter().find_map(|p| p.event(cue).map(|_| p.waves(cue).into_iter().cloned().collect())).unwrap();
+            let wave = &waves[0];
+            let sample = cues.bank(&wave.bank).unwrap().samples[wave.index as usize].clone();
+            assert!(sample.xma(), "{cue}: {} mode {:#x}", sample.name, sample.mode);
+            let pcm = sample.decode().unwrap();
+            assert_eq!(pcm.errors, 0, "{cue}");
+            assert_eq!(pcm.samples.len(), sample.length as usize * sample.channels as usize);
+            assert!(pcm.to_i16().iter().any(|&s| s.unsigned_abs() > 1000), "{cue} decoded to silence");
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 // 360 0x82c98368 with its +0x38 flag set): the centre rectangle is copied, and the frame around
 // it takes 10 taps toward the screen centre, weighted by a ramp that is 0 on the rectangle and
 // `thin` on the screen edge (per-vertex z of the four frame quads), times the distance from centre.
+// `d` is ZoomBlur_ScreenSpaceQuadShaderVS's texcoord x 2 - 1 minus the centre, which is 0 here.
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
 struct ZoomBlur {

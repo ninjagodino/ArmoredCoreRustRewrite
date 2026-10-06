@@ -19,12 +19,12 @@ extension,magic,format,system,parser,evidence
 .flv,FLVER\0 B\0 0002000F,FLVER model (big-endian; versions 0x2000F/0x20009/0x2000E),models,done,acvd-formats::flver reads 8820 of 8828 (am0010.flv; e0210.flv + _l1.._l3 LODs); EDGE-compressed indices decoded by acvd-formats::edge with every index in range; 8 pending (0x20007 and FLVER0) in container_exceptions.csv; rendered by acvd-viewer; 360 ISO: 8391 of 8399 read (the same 8 pending) with every face set index in range: header 0x4A/0x4B = 1 and 0x4C = 0xFFFF; big-endian 16-bit strips with 0xFFFF restarts; one interleaved vertex buffer per mesh; signed-byte normals/tangents and reversed bone indices (vertex_types.csv 0x12/0x14 rows)
 .fmg,00 01 00 00,FMG message bank,text,done,"acvd-formats::fmg: 1265 banks; encoding byte 1 = UTF-16BE (1250) or 0 = Shift-JIS (15 partsname_*.fmg); id groups then string offsets"
 .fpo,FF 0F 0F 11,RSX fragment program object,shaders,todo,inside binders only: shader/*.bnd (Font.fpo ...); 727 entries
-.fsb,FSB4,FMOD Ex sound bank,sound,"done: acvd-formats::fsb reads the 48-byte header and each sample (name, length, loop, mode, MPEG payload)","sound/**/*.fsb (94; 879 MB)"
+.fsb,FSB4,FMOD Ex sound bank,sound,"done: acvd-formats::fsb reads the 48-byte header and each sample (name, length, loop, mode, payload); payloads are MPEG (PS3), XMA2 (360 mode 0x01002020, acvd-formats::xma) or 16-bit PCM (360 mode 0x2130, big-endian when bank mode has 0x08)",sound/**/*.fsb (94; 879 MB)
 .hmd,10 00 01 17,hit model (*_h.hmd),models;maps,done,acvd-formats::hmd: nodes 0x34 / triangles 10 bytes (vertex = u16>>1) / f32x3 verts; sheets/hmd.csv; 45/45 m3100 *_h.hmd; 2993 entries on disc
 .hnav,HNAV,navigation mesh,navigation,todo,model/map/ch_nav/*.hnav (59)
 .htr,HTR\0 + '0001',height/terrain route data,navigation,todo,model/map/ch_nav/*.htr (59)
 .ini,text,INI configuration,config;sound,todo,system/acv.ini [PATH]; sound/magicorchestra.ini
-.lc,1B 4C 75 61 50,Lua 5.0 compiled chunk,ai,todo,airesource/script (1269); scene (18); script (11); param (2)
+.lc,1B 4C 75 61 50,Lua 5.0 compiled chunk,ai,todo,"360: script/** in bind/script.bhd (1303; PS3 airesource/script, scene and param move under script/). PS3: airesource/script (1269); scene (18); script (11); param (2). Both: header 1B 4C 75 61 50 01 04 04 04 06 08 09 (little-endian), decompiled by unluac (tools/decompile-lua.ps1)"
 .list,text,install file list,config,todo,system/install.list
 .manifest,XMNP,Xbox 360 system update manifest,disc,n/a,$SystemUpdate/system.manifest on the 360 ISO (30980 bytes; dashboard update; not game data)
 .mlb,00 00 00 10,unidentified model companion (*_m.mlb),models,todo,inside binders only: first entry of every model/**/*_m.bnd.dcx (am0010_m.mlb 5832 bytes); 2182 entries
@@ -45,7 +45,7 @@ extension,magic,format,system,parser,evidence
 .tsmap,PARAM header,PARAM (AI_MESSAGE_SOUND_MAP),params;sound,done,type string AI_MESSAGE_SOUND_MAP at 0x0C
 .txt,text,plain text lists,config,todo,system/deletechar.txt (UTF-16LE); oneshotsfxlist.txt
 .vpo,FF 0F 00 11,RSX vertex program object,shaders,todo,inside binders only: shader/*.bnd (Font.vpo ...); 806 entries
-.wmv,30 26 B2 75 (ASF),Windows Media video (360 movies),movies,todo,movie/jp/*.wmv (23) loose on the 360 ISO; the PS3 build ships PAMF .pam instead
+.wmv,30 26 B2 75 (ASF),Windows Media video (360 movies),movies,todo,"movie/jp/*.wmv (23) loose on the 360 ISO: ASF, WMV3 video 512x256 (512x512 emblems), WMA2 0x161 2ch 48 kHz; prologue and inisettings 1280x720 with WMA Pro 0x162 6ch; 1.7 or 10.3 Mbps. Same names as the PS3 .pam minus dummy_moh and monitor_test01"
 .xex,XEX2,Xbox 360 executable,executable,done,default.xex on the 360 ISO; unpacked to private/x360/vd/ACV2.pe (base 0x82000000) for static RE
 .xml,<?xml,XML definitions,missions;config;fonts,"partial: font/fontdef.xml read by acvd-formats::fontdef (ID -> CcmFile, RefFontID); others todo","mission (154); model (131); param (4); font (2); system (2); shader/flver_shader.bnd FlverShader.xml"
 .xpr,XPR2,Xbox packed resource (360 texture),textures,todo,inside binders only on the 360 disc: model/break/*/*_t.bnd (b9000.xpr 67596 bytes ...); 11 entries

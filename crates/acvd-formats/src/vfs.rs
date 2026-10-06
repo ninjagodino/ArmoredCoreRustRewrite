@@ -54,8 +54,8 @@ pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// The disc used when no `--disc` is given: the PS3 dump while present (360 FLVER, Xenos TPF,
-/// XMA and the 360 font folder are not read yet), else the 360 ISO.
+/// The disc used when no `--disc` is given: the PS3 dump while present (until its code paths are
+/// deleted, `docs/status.md` migration 4), else the 360 ISO.
 pub fn default_disc(root: &Path) -> PathBuf {
     let dump = root.join(PS3_DUMP);
     if dump.is_dir() { dump } else { root.join(X360_ISO) }
@@ -148,6 +148,13 @@ impl Disc {
 
     pub fn is_x360(&self) -> bool {
         matches!(*self.0, Source::X360(_))
+    }
+
+    /// The game's `$(Platform)` path variable for this disc (`font/s1_$(Platform)/` ...): the 360
+    /// build registers `xbox` (`0x82303150` loads `$(Platform)` at `0x82001ad4` and `xbox` at
+    /// `0x82001ae0`); the PS3 dump's folders say `PS3`.
+    pub fn platform(&self) -> &'static str {
+        if self.is_x360() { "xbox" } else { "PS3" }
     }
 
     /// The directory or image this disc reads.

@@ -74,7 +74,7 @@ pub fn load(disc: &Disc, path: &str, images: &mut Assets<Image>) -> Result<Layou
             }
         })
         .collect();
-    let fontdefs = disc.asset("font/fontdef.xml").and_then(|d| acvd_formats::fontdef::read(&d));
+    let fontdefs = disc.asset("font/fontdef.xml").and_then(|d| acvd_formats::fontdef::read(&d, disc.platform()));
     let mut fonts = HashMap::new();
     match fontdefs {
         Ok(defs) => {

@@ -1,16 +1,20 @@
-//! FSB4 sound bank (`sound/*.fsb`, magic `FSB4`). Little-endian, the FMOD Ex bank the PS3
-//! build plays. The Xbox 360 build uses the same event names against XMA banks; this reader
-//! is the PS3 MPEG banks the rewrite already loads from the disc.
+//! FSB4 sound bank (`sound/*.fsb`, magic `FSB4`). Little-endian on both discs: the FMOD Ex
+//! banks the PS3 (MPEG) and Xbox 360 (XMA) builds play, at the same paths and with the same
+//! sample names.
 //!
 //! Header (48 bytes): `magic, u32 sample count, u32 sample-header bytes, u32 data bytes,
 //! u32 version (0x00040000), u32 mode, 24-byte hash`. Each sample header begins with its
 //! own `u16` size. The basic 80-byte header is `name[30]`, sample count, compressed bytes,
 //! loop start, loop end, mode, frequency, volume, pan, priority, channels. Bytes past 80
-//! are extra chunks and are skipped. Sample payloads are packed in header order at
-//! `48 + sample-header bytes`.
+//! are extra chunks and are skipped (the 360 headers are 112 bytes). Sample payloads are
+//! packed in header order at `48 + sample-header bytes`.
 //!
 //! Mode bit `0x200` is MPEG (FMOD `FSOUND_MPEG`): `se_booster.fsb` payloads start `FF FB`.
-//! Each MPEG frame is padded out to a multiple of 4 bytes.
+//! Each MPEG frame is padded out to a multiple of 4 bytes. Mode bit `0x01000000` is XMA
+//! (FMOD `FSOUND_XMA`; 360 samples are `0x01002020`): XMA2 packets for [`crate::xma`].
+//! Neither, with `0x10` (`FSOUND_16BITS`), is raw 16-bit PCM, big-endian when the bank mode has
+//! `0x08` (FMOD `FSB_SOURCE_BIGENDIANPCM`): the 219 mode-`0x2130` samples of the 360
+//! `com_05` / `com_06` / `com_07` / `com_11` banks (bank mode `0x48`), padded to 32 bytes.
 //! A loop end of `length - 1` covers the whole sample.
 
 use anyhow::{bail, ensure, Result};
@@ -20,6 +24,12 @@ pub const HEADER: usize = 48;
 pub const BASIC_SAMPLE: usize = 80;
 /// FMOD `FSOUND_MPEG`.
 pub const MODE_MPEG: u32 = 0x200;
+/// FMOD `FSOUND_XMA`.
+pub const MODE_XMA: u32 = 0x0100_0000;
+/// FMOD `FSOUND_16BITS`.
+pub const MODE_16BITS: u32 = 0x10;
+/// Bank header mode: FMOD `FSB_SOURCE_BIGENDIANPCM`.
+pub const BANK_BIG_ENDIAN_PCM: u32 = 0x08;
 const VERSION: u32 = 0x0004_0000;
 
 #[derive(Debug, Clone)]
@@ -37,13 +47,40 @@ pub struct Sample {
     pub mode: u32,
     pub frequency: u32,
     pub channels: u16,
-    /// Compressed payload (MPEG frames when [`Sample::mpeg`]).
+    /// Bank mode [`BANK_BIG_ENDIAN_PCM`]: byte order of a [`Sample::pcm16`] payload.
+    pub big_endian_pcm: bool,
+    /// Payload: MPEG frames when [`Sample::mpeg`], XMA2 packets when [`Sample::xma`], samples when
+    /// [`Sample::pcm16`].
     pub data: Vec<u8>,
 }
 
 impl Sample {
     pub fn mpeg(&self) -> bool {
         self.mode & MODE_MPEG != 0
+    }
+
+    pub fn xma(&self) -> bool {
+        self.mode & MODE_XMA != 0
+    }
+
+    pub fn pcm16(&self) -> bool {
+        !self.mpeg() && !self.xma() && self.mode & MODE_16BITS != 0
+    }
+
+    /// Decodes an XMA or 16-bit PCM sample to interleaved PCM of [`Sample::length`] frames
+    /// (MPEG is left to the caller's decoder).
+    pub fn decode(&self) -> Result<crate::xma::Pcm> {
+        if self.xma() {
+            return crate::xma::decode(&self.data, self.channels, self.frequency, Some(self.length as usize));
+        }
+        ensure!(self.pcm16(), "{} is neither XMA nor 16-bit PCM (mode {:#x})", self.name, self.mode);
+        let wanted = self.length as usize * self.channels as usize;
+        ensure!(self.data.len() >= wanted * 2, "{}: {} PCM bytes for {wanted} samples", self.name, self.data.len());
+        let samples = self.data[..wanted * 2]
+            .chunks_exact(2)
+            .map(|b| f32::from(if self.big_endian_pcm { i16::from_be_bytes([b[0], b[1]]) } else { i16::from_le_bytes([b[0], b[1]]) }) / 32768.0)
+            .collect();
+        Ok(crate::xma::Pcm { channels: self.channels, samples, errors: 0 })
     }
 }
 
@@ -58,6 +95,7 @@ pub fn read(data: &[u8]) -> Result<Bank> {
     let data_bytes = lu32(data, 12)? as usize;
     let version = lu32(data, 16)?;
     ensure!(version == VERSION, "FSB4 version {version:#x}, want {VERSION:#x}");
+    let big_endian_pcm = lu32(data, 20)? & BANK_BIG_ENDIAN_PCM != 0;
     let headers = HEADER + header_bytes;
     let data_at = headers;
     ensure!(
@@ -94,6 +132,7 @@ pub fn read(data: &[u8]) -> Result<Bank> {
             mode,
             frequency,
             channels,
+            big_endian_pcm,
             data: data[cursor..end].to_vec(),
         });
         cursor = end;
@@ -135,6 +174,34 @@ mod tests {
         assert!(bank.samples.iter().all(|s| s.mpeg() && s.channels == 1 && s.frequency == 44100));
         assert_eq!(bank.samples[0].loop_end, bank.samples[0].length - 1);
         assert_eq!(&bank.samples[0].data[..2], &[0xFF, 0xFB]);
+    }
+
+    #[test]
+    fn x360_booster_bank_is_xma() {
+        let iso = crate::vfs::repo_root().join(crate::vfs::X360_ISO);
+        let Ok(disc) = crate::vfs::Disc::open(&iso) else { return };
+        let bank = read(&disc.read("sound/se_booster.fsb").unwrap()).unwrap();
+        assert_eq!(bank.samples.len(), 8);
+        assert_eq!(bank.samples[4].name, "main_boost11.wav");
+        let s = &bank.samples[0];
+        assert_eq!((s.name.as_str(), s.mode, s.frequency, s.channels, s.length), ("boost11.wav", 0x0100_2020, 44100, 1, 81920));
+        let pcm = s.decode().unwrap();
+        assert_eq!((pcm.errors, pcm.samples.len()), (0, 81920));
+    }
+
+    #[test]
+    fn x360_comms_bank_is_big_endian_pcm() {
+        let iso = crate::vfs::repo_root().join(crate::vfs::X360_ISO);
+        let Ok(disc) = crate::vfs::Disc::open(&iso) else { return };
+        let bank = read(&disc.read("sound/com_07.fsb").unwrap()).unwrap();
+        let s = &bank.samples[0];
+        assert_eq!((s.name.as_str(), s.mode, s.frequency, s.length, s.big_endian_pcm), ("0010001.wav", 0x2130, 48000, 186308, true));
+        assert!(s.pcm16());
+        let pcm = s.decode().unwrap();
+        assert_eq!(pcm.samples.len(), 186308);
+        // Big-endian reads as a smooth waveform: neighbouring samples are close.
+        let rough: f32 = pcm.samples.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / pcm.samples.iter().map(|v| v.abs()).sum::<f32>();
+        assert!(rough < 0.5, "roughness {rough}");
     }
 
     #[test]

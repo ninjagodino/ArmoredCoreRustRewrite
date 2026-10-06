@@ -295,7 +295,7 @@ pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut 
 
 /// Decoded TPF packs, keyed by pack asset path, so a model's textures open each pack once.
 #[derive(Default)]
-pub struct Packs(HashMap<&'static str, Vec<u8>>);
+pub struct Packs(HashMap<String, Vec<u8>>);
 
 impl Packs {
     pub fn image(&mut self, disc: &Disc, name: &str) -> Result<Image> {
@@ -303,16 +303,30 @@ impl Packs {
         self.texture(disc, t)
     }
 
+    fn pack(&mut self, disc: &Disc, pack: &str) -> Result<&Vec<u8>> {
+        Ok(match self.0.entry(pack.to_string()) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(vfs::open(disc, pack)?),
+        })
+    }
+
+    /// Index of the texture called `name` (ASCII case-insensitive) in the TPF at asset path `pack`.
+    pub fn find(&mut self, disc: &Disc, pack: &str, name: &str) -> Result<Option<usize>> {
+        let header = tpf::read(self.pack(disc, pack)?)?;
+        Ok(header.textures.iter().position(|t| t.name.eq_ignore_ascii_case(name)))
+    }
+
     /// `t` comes from the extracted sheets; the format, size and levels are read from the pack on
     /// `disc` itself, since the 360 packs differ from the PS3 ones in all three.
     pub fn texture(&mut self, disc: &Disc, t: &TextureRef) -> Result<Image> {
-        let name = t.name;
-        let pack = match self.0.entry(t.pack) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => e.insert(vfs::open(disc, t.pack)?),
-        };
+        self.texture_at(disc, t.pack, t.index, t.name)
+    }
+
+    /// Texture `index` of the TPF at asset path `pack`, `name` only labelling errors.
+    pub fn texture_at(&mut self, disc: &Disc, pack: &str, index: usize, name: &str) -> Result<Image> {
+        let pack = self.pack(disc, pack)?;
         let header = tpf::read(pack)?;
-        let tex = header.textures.get(t.index).context("texture index past the pack")?;
+        let tex = header.textures.get(index).context("texture index past the pack")?;
         let row = acvd_data::texture_format(tex.format);
         let format = match row.map(|f| f.name) {
             Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,

@@ -47,17 +47,23 @@ pub fn load_file(disc: &Disc, name: &str, file: &str, images: &mut Assets<Image>
     let mut sheet_size = Vec::with_capacity(ccm.texture_count as usize);
     for i in 0..ccm.texture_count {
         let tex = format!("{name}_{i:04}");
-        let t = acvd_data::textures_named(&tex)
-            .next()
-            .or_else(|| acvd_data::textures_named(&tex.to_lowercase()).next())
-            .with_context(|| format!("no texture `{tex}`"))?;
-        let mut image = packs.texture(disc, t)?;
+        let row = acvd_data::textures_named(&tex).next().or_else(|| acvd_data::textures_named(&tex.to_lowercase()).next());
+        let mut image = match row {
+            Some(t) => packs.texture(disc, t)?,
+            // Fonts the extracted sheets do not list (the 360 `s1_xbox*`) are read from their pack.
+            None => {
+                let pack = format!("font/{name}/{name}_t.bnd|#0");
+                let index = packs.find(disc, &pack, &tex)?.with_context(|| format!("no texture `{tex}` in {pack}"))?;
+                packs.texture_at(disc, &pack, index, &tex)?
+            }
+        };
         image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
             address_mode_u: ImageAddressMode::ClampToEdge,
             address_mode_v: ImageAddressMode::ClampToEdge,
             ..ImageSamplerDescriptor::linear()
         });
-        sheet_size.push([t.width, t.height]);
+        let size = image.texture_descriptor.size;
+        sheet_size.push([size.width as u16, size.height as u16]);
         sheets.push(images.add(image));
     }
     Ok(Font { ccm, sheets, sheet_size })

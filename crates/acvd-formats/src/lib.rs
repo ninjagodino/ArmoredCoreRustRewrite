@@ -25,3 +25,4 @@ pub mod reader;
 pub mod tpf;
 pub mod vfs;
 pub mod xdvdfs;
+pub mod xma;
