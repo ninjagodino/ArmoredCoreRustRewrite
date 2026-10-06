@@ -14,6 +14,8 @@
 //! Every ready weapon also plays the body clips in
 //! `sheets/ac_states.csv` (`sniper_ready_*`, then `sniper_stow_*`); their blend rows are named
 //! キャノン構え / キャノン解除. A sniper rifle (`weapon_kind` 5, no `ready_position`) does not.
+//! Holding fire raises that arm (`ArmAim`): `*_arm01` turns the barrel onto the aim, and it
+//! lowers again about a second after fire is let go.
 //! Every shot kicks the arm with the `param/jcondata.bin` control the 360 registers for that slot
 //! (`0x8287f2d8`): `sniper_$(LR)` for a sniper rifle, `gun_$(LR)` for any other hand weapon.
 //! Effects come from the `param/acweaponsfxparam.bin` row named by the part's `hit_id` (row 1
@@ -122,7 +124,41 @@ pub struct WeaponAnims {
     /// Arm `a00` clips, posed over locomotion while the weapon on that side is deployed.
     arms: Vec<WeaponRig>,
     recoil_bones: Vec<RecoilBone>,
+    /// Right, left.
+    aim: [ArmAim; 2],
     sniper: SniperStance,
+}
+
+/// Raise blend of the weapon-arm aim: `f1` of every `0x8287f448` call from `0x8289e468`.
+const AIM_RAISE: f32 = 10.0;
+/// Lower blend: `f1` of the per-frame release `0x82853660` -> `0x8287f5a8` on slots 0x0a/0x0b.
+const AIM_LOWER: f32 = 60.0;
+/// Frames the aim stays requested after fire is let go. The probe shows `AimArm` re-sent each
+/// frame from the trigger press until about 1 s after the last shot; the timer is not traced.
+const AIM_HOLD: f32 = 60.0;
+
+/// The weapon-arm aim (AC vtable `0x82044fc0` +0x90 `0x8284a570`, sent every frame from the
+/// weapon method `0x828a2488` while firing, weight 1.0). It turns `*_arm01` so the barrel
+/// points along the pilot's aim, within the joint's LockMin/MaxX. Probe file
+/// `private/xenia/armraise.txt`.
+#[derive(Clone, Copy, Debug, Default)]
+struct ArmAim {
+    shoulder: Option<Entity>,
+    limit: f32,
+    /// The hand weapon is a sniper rifle, so the `sniper_$(LR)` bone carries the turn.
+    sniper: bool,
+    hold: f32,
+    weight: f32,
+    frame: Option<AimFrame>,
+}
+
+/// Last frame's world rotation of the shoulder's parent, the barrel in shoulder space, and the
+/// aim direction.
+#[derive(Clone, Copy, Debug)]
+struct AimFrame {
+    parent: Quat,
+    barrel: Vec3,
+    aim: Vec3,
 }
 
 /// Frames the arm takes to settle after a kick: the `f2` the AC's shot handler `0x82847f18`
@@ -253,6 +289,37 @@ pub(crate) struct Body<'w> {
     motion: Option<ResMut<'w, Motion>>,
 }
 
+/// World transforms of the weapon roots and of any joint (last frame's propagation).
+#[derive(SystemParam)]
+pub(crate) struct Rigging<'w, 's> {
+    hardpoints: Query<'w, 's, (&'static Hardpoint, &'static GlobalTransform)>,
+    globals: Query<'w, 's, (&'static GlobalTransform, Option<&'static ChildOf>)>,
+}
+
+impl Rigging<'_, '_> {
+    fn aim_frame(
+        &self,
+        shoulder: Entity,
+        hand: Hand,
+        muzzle: Option<Entity>,
+        aim: Vec3,
+    ) -> Option<AimFrame> {
+        let (joint, child_of) = self.globals.get(shoulder).ok()?;
+        let (parent, _) = self.globals.get(child_of?.parent()).ok()?;
+        let (_, root) = self.hardpoints.iter().find(|(h, _)| h.hand == hand)?;
+        let barrel = muzzle
+            .and_then(|m| self.globals.get(m).ok())
+            .map(|(m, _)| m.translation() - root.translation())
+            .filter(|b| b.length_squared() > 1.0e-4)
+            .unwrap_or_else(|| root.forward().into());
+        Some(AimFrame {
+            parent: parent.rotation(),
+            barrel: joint.rotation().inverse() * barrel.normalize(),
+            aim,
+        })
+    }
+}
+
 pub fn fire(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -265,7 +332,7 @@ pub fn fire(
     mut speaker: Speaker,
     mut commands: Commands,
     mut acs: Query<(&mut Pilot, &mut Armament, &Transform), Without<ClipJoint>>,
-    hardpoints: Query<(&Hardpoint, &GlobalTransform)>,
+    rigging: Rigging,
     points: Query<(Entity, &EffectPoint)>,
     mut body: Body,
     mut posed: Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
@@ -345,7 +412,8 @@ pub fn fire(
         if !fired {
             continue;
         }
-        let origin = hardpoints
+        let origin = rigging
+            .hardpoints
             .iter()
             .find(|(h, _)| h.hand == hand)
             .map_or(ac_tf.translation, |(_, t)| t.translation());
@@ -404,6 +472,23 @@ pub fn fire(
         }
     }
     if let Some(anims) = body.anims.as_mut() {
+        for (i, gun) in arms.hands.iter().enumerate() {
+            let (hand, column) = if i == 0 {
+                (Hand::Right, "armwep_r")
+            } else {
+                (Hand::Left, "armwep_l")
+            };
+            let muzzle = points
+                .iter()
+                .find(|(_, p)| p.column == column && p.id == MUZZLE_POINT)
+                .map(|(e, _)| e);
+            let arm = &mut anims.aim[i];
+            arm.sniper = gun.sniper;
+            arm.step(want[i] && gun.kind != Kind::Skip && !gun.stance, frames);
+            arm.frame = arm
+                .shoulder
+                .and_then(|s| rigging.aim_frame(s, hand, muzzle, aim));
+        }
         anims.apply_recoil(frames, &mut posed);
     }
     for (e, mut shot, mut transform) in &mut shots {
@@ -832,6 +917,17 @@ impl WeaponAnims {
             let Some(control) = controls.iter().find(|c| c.name == name) else {
                 continue;
             };
+            if !sniper {
+                if let Some(object) = control.objects.iter().find(|o| o.bone.ends_with("_arm01")) {
+                    let aim = &mut self.aim[hand as usize];
+                    aim.shoulder = rig
+                        .bones
+                        .iter()
+                        .position(|b| b.name == object.bone)
+                        .and_then(|i| joints.get(i).copied());
+                    aim.limit = object.lock[0][0].abs().max(object.lock[0][1].abs());
+                }
+            }
             for object in control.objects.iter().filter(|o| o.react_ang != 0.0 && o.react_time > 0.0) {
                 let Some(entity) = rig
                     .bones
@@ -871,7 +967,14 @@ impl WeaponAnims {
             let Ok((mut transform, _)) = posed.get_mut(bone.entity) else {
                 continue;
             };
-            bone.rest_on(&mut transform, angle);
+            bone.rebase(&transform);
+            let aim = &self.aim[bone.hand as usize];
+            let turn = if aim.shoulder == Some(bone.entity) && aim.sniper == bone.sniper {
+                aim.turn(bone.base)
+            } else {
+                Quat::IDENTITY
+            };
+            bone.write(&mut transform, angle, turn);
         }
     }
 
@@ -908,15 +1011,60 @@ fn track_moves(track: &ani::Track) -> bool {
 
 impl RecoilBone {
     /// Writes the pose's own rotation turned by `angle` degrees about local X.
+    #[cfg(test)]
     fn rest_on(&mut self, transform: &mut Transform, angle: f32) {
+        self.rebase(transform);
+        self.write(transform, angle, Quat::IDENTITY);
+    }
+
+    /// Takes the clip's rotation as the base unless the joint still holds our last write.
+    fn rebase(&mut self, transform: &Transform) {
         if self.written != Some(transform.rotation) {
             self.base = transform.rotation;
         }
-        if angle == 0.0 && self.written.is_none() {
+    }
+
+    /// `turn` is a parent-space rotation applied before the base (the arm aim).
+    fn write(&mut self, transform: &mut Transform, angle: f32, turn: Quat) {
+        let idle = angle == 0.0 && turn == Quat::IDENTITY;
+        if idle && self.written.is_none() {
             return;
         }
-        transform.rotation = self.base * Quat::from_rotation_x(angle.to_radians());
-        self.written = (angle != 0.0).then_some(transform.rotation);
+        transform.rotation = turn * self.base * Quat::from_rotation_x(angle.to_radians());
+        self.written = (!idle).then_some(transform.rotation);
+    }
+}
+
+impl ArmAim {
+    /// Advances `frames` 60 Hz frames; `want` is fire held on this side this frame.
+    fn step(&mut self, want: bool, frames: f32) {
+        self.hold = if want { AIM_HOLD } else { (self.hold - frames).max(0.0) };
+        self.weight = if self.hold > 0.0 {
+            (self.weight + frames / AIM_RAISE).min(1.0)
+        } else {
+            (self.weight - frames / AIM_LOWER).max(0.0)
+        };
+    }
+
+    /// Parent-space turn of the shoulder whose unaimed rotation is `base`, bringing the barrel
+    /// toward `aim`, scaled by the weight and clamped to the joint's LockMin/MaxX.
+    fn turn(&self, base: Quat) -> Quat {
+        let Some(frame) = self.frame.filter(|_| self.weight > 0.0) else {
+            return Quat::IDENTITY;
+        };
+        let barrel = (frame.parent * base * frame.barrel).normalize_or_zero();
+        if barrel == Vec3::ZERO {
+            return Quat::IDENTITY;
+        }
+        let full = Quat::from_rotation_arc(barrel, frame.aim);
+        let limit = self.limit.to_radians();
+        let full = if full.angle_between(Quat::IDENTITY) > limit {
+            Quat::IDENTITY.slerp(full, limit / full.angle_between(Quat::IDENTITY))
+        } else {
+            full
+        };
+        let world = Quat::IDENTITY.slerp(full, self.weight);
+        frame.parent.inverse() * world * frame.parent
     }
 }
 
@@ -1159,6 +1307,52 @@ mod tests {
             bone.rest_on(&mut transform, angle);
         }
         assert!(transform.rotation.angle_between(pose) < 1e-4, "returns to the pose");
+    }
+
+    #[test]
+    fn arm_raises_on_fire_holds_then_lowers() {
+        let mut arm = ArmAim::default();
+        arm.step(true, 5.0);
+        assert!((arm.weight - 0.5).abs() < 1e-4, "half raised after 5 of {AIM_RAISE} frames");
+        arm.step(true, 5.0);
+        assert_eq!(arm.weight, 1.0);
+        for _ in 1..AIM_HOLD as usize {
+            arm.step(false, 1.0);
+        }
+        assert_eq!(arm.weight, 1.0, "held {AIM_HOLD} frames after fire is let go");
+        arm.step(false, 1.0);
+        arm.step(false, 29.0);
+        assert!((arm.weight - 0.5).abs() < 1e-4, "half lowered after 30 of {AIM_LOWER}");
+        arm.step(false, 30.0);
+        assert_eq!(arm.weight, 0.0);
+    }
+
+    #[test]
+    fn arm_turn_points_the_barrel_within_the_limit() {
+        let mut arm = ArmAim {
+            limit: 85.0,
+            weight: 1.0,
+            frame: Some(AimFrame {
+                parent: Quat::from_rotation_y(0.4),
+                barrel: Vec3::new(0.0, -1.0, -1.0).normalize(),
+                aim: Vec3::NEG_Z,
+            }),
+            ..default()
+        };
+        let base = Quat::from_rotation_z(0.2);
+        let frame = arm.frame.unwrap();
+        let barrel = |turn: Quat| frame.parent * turn * base * frame.barrel;
+        let full = arm.turn(base);
+        let off = barrel(Quat::IDENTITY).angle_between(frame.aim).to_degrees();
+        assert!(off < 85.0, "test setup: start {off} deg off");
+        assert!(barrel(full).angle_between(frame.aim) < 1e-3, "points along the aim");
+        arm.weight = 0.5;
+        let half = barrel(arm.turn(base)).angle_between(frame.aim).to_degrees();
+        assert!((half - off / 2.0).abs() < 0.1, "{half} vs {off}");
+        arm.frame = Some(AimFrame { aim: Vec3::Y, ..frame });
+        arm.weight = 1.0;
+        let turned = barrel(arm.turn(base)).angle_between(barrel(Quat::IDENTITY));
+        assert!((turned.to_degrees() - 85.0).abs() < 0.1, "clamped to LockMaxX");
     }
 
     #[test]

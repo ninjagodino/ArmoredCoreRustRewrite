@@ -114,8 +114,20 @@ in order:
     does not plant the rest of the arm back on the clip bind: those tracks are two identical
     identity keys, and writing them was erasing acmotion 78's `r_arm01` pose. The arm's
     `a00_001`/`a00_003` play on that side's bones while a ready weapon is deployed.
-  - Arm raise / aim (todo, separate from the kick): the arm lifts and points the weapon at the
-    aim when firing and lowers after a few seconds idle. Chain found so far: AC vtable
+  - Arm raise / aim (done, separate from the kick; `weapons.rs` `ArmAim`). Probe file
+    `private/xenia/armraise.txt` (user fired right rifle, left sniper rifle, then held fire):
+    `AimArm` `0x8284a570` is sent every frame (r4 1 = right, 0 = left; slot 0x0a / 0x0b) from
+    the weapon method `0x828a2488` (vtable `0x8209a5c8` +0x184, weight 1.0), starting about
+    6 frames before the shot (at the trigger press) and stopping about 1.0-1.17 s after the last
+    shot. Raise blend `0x8287f448` f1 = 10 frames; on frames with no aim, `0x82853660` releases
+    slots 0x0a/0x0b through `0x8287f5a8` with f1 = 60 frames (the lowering), and `0x8289d738`
+    releases slot 1 with 120. The rewrite holds the aim 60 frames after fire is let go, blends
+    the weight up over 10 and down over 60, and turns `*_arm01` (parent space, over the clip
+    and under the kick) so the barrel (weapon root to muzzle point 101) lies along the aim,
+    clamped to that joint's LockMin/MaxX (85°). Ready-stance weapons are left to their body
+    clip. Open: the hold timer inside the `+0x184` caller (no static call site found; probe
+    `0x828a2488 lr` next run), and the solver's TraceAng→LockAng posture blend on the lower
+    joints (`r_arm02..05`), not reproduced. Chain found statically: AC vtable
     `0x82044fc0` +0x90 = `0x8284a570(unit, target point, f1 weight)` → `0x8289e808` →
     `0x8289e468` → `0x8287f448` (activates the control with blend time from tuning record
     `0x82330c38` index 0x10 field +4, via `0x82bf1778`) → `0x82befb98` → `0x82bef6e0`
