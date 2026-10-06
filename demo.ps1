@@ -33,7 +33,7 @@ while ($true) {
     Write-Host @"
 
  ACVD rewrite demo ($profileDir build)
-  1  Pilot an AC on m3100 (default design)
+  1  Pilot an AC in the AC test map (m4000, default design)
   2  Pilot: pick design id and map
   3  Pilot on a flat plane with test water at y=2
   4  Model viewer (FLVER browser)
@@ -42,14 +42,15 @@ while ($true) {
   q  Quit
 
  In game: WASD move, Q/E turn, Up/Down pitch, Shift boost, Space jump, F/C fire right/left,
- P clip browser, Left/Right previous/next design, R reframe. Close the window to come back here.
+ M mouselook, P clip browser, Left/Right previous/next design, R reframe.
+ Close the window to come back here.
 "@
     switch ((Read-Host ' choice').Trim()) {
         '1' { Launch 'acvd-game' @() }
         '2' {
             $a = @()
             $id = (Read-Host ' design id (blank = first)').Trim(); if ($id) { $a += $id }
-            $map = (Read-Host ' map folder, e.g. m3200 (blank = m3100)').Trim(); if ($map) { $a += '--map', $map }
+            $map = (Read-Host ' map folder, e.g. m3200 (blank = m4000 AC test)').Trim(); if ($map) { $a += '--map', $map }
             Launch 'acvd-game' $a
         }
         '3' { Launch 'acvd-game' @('--plane', '--water', '2') }
