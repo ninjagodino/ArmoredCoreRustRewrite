@@ -298,8 +298,62 @@ pub fn run(paths: &Paths) -> Result<Summary> {
     tuning(paths, &mut rep, &mut marks)?;
     ac_states(paths, &mut rep, &mut marks, &groups)?;
     ac_ctrl(paths, &mut rep, &mut marks, &groups)?;
+    ps3_citations(paths, &mut rep)?;
     exceptions.report_stale(&mut rep);
     write_outputs(paths, &rep, &marks)
+}
+
+/// Code and runtime evidence cites the Xbox 360 executable (`ACV2.pe`) and Xenia probes only:
+/// PS3 executable addresses, RPCS3 runs and EBOOT/TOC references are errors in any sheet cell.
+fn ps3_citations(paths: &Paths, rep: &mut Report) -> Result<()> {
+    let mut files: Vec<_> = std::fs::read_dir(paths.sheets())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "csv"))
+        .collect();
+    files.sort();
+    for path in files {
+        let sheet = path.file_name().unwrap().to_string_lossy().into_owned();
+        let mut rd = csv::ReaderBuilder::new().flexible(true).from_path(&path)?;
+        let headers = rd.headers()?.clone();
+        for row in rd.records() {
+            let row = row?;
+            for (i, cell) in row.iter().enumerate() {
+                if let Some(hit) = ps3_citation(cell) {
+                    let column = headers.get(i).unwrap_or("");
+                    rep.add(Severity::Error, "evidence.ps3", &sheet, row.get(0).unwrap_or(""), column, format!("`{hit}`: cite the 360 address or a Xenia probe instead"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ps3_citation(cell: &str) -> Option<&str> {
+    for word in ["RPCS3", "EBOOT"] {
+        if let Some(i) = cell.find(word) {
+            return Some(&cell[i..i + word.len()]);
+        }
+    }
+    let bytes = cell.as_bytes();
+    let boundary = |i: usize| i >= bytes.len() || !bytes[i].is_ascii_alphanumeric();
+    for (i, _) in cell.match_indices("TOC") {
+        if (i == 0 || boundary(i - 1)) && boundary(i + 3) {
+            return Some(&cell[i..i + 3]);
+        }
+    }
+    for (i, _) in cell.match_indices("01.02") {
+        if (i == 0 || !bytes[i - 1].is_ascii_digit() && bytes[i - 1] != b'.') && (i + 5 >= bytes.len() || !bytes[i + 5].is_ascii_digit()) {
+            return Some(&cell[i..i + 5]);
+        }
+    }
+    for (i, _) in cell.match_indices("FUN_0") {
+        let hex = cell[i + 4..].bytes().take_while(u8::is_ascii_hexdigit).count();
+        if (6..=8).contains(&hex) && matches!(bytes.get(i + 5), Some(b'0' | b'1')) {
+            return Some(&cell[i..i + 4 + hex]);
+        }
+    }
+    None
 }
 
 /// `sheets/container_exceptions.csv`, tracking which rows matched a finding.
@@ -1274,4 +1328,20 @@ fn write_outputs(paths: &Paths, rep: &Report, marks: &[Checkmark]) -> Result<Sum
     }
     println!("preflight: report at {}", dir.join("report.md").display());
     Ok(Summary { errors })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ps3_citation;
+
+    #[test]
+    fn flags_ps3_code_and_runtime_citations() {
+        assert_eq!(ps3_citation("FUN_00a7f5d4 struct[2]"), Some("FUN_00a7f5d4"));
+        assert_eq!(ps3_citation("stub FUN_01a5ad14"), Some("FUN_01a5ad14"));
+        assert_eq!(ps3_citation("an RPCS3 breakpoint"), Some("RPCS3"));
+        assert_eq!(ps3_citation("TOC 0x1dcc8c0 -0xbfc"), Some("TOC"));
+        assert_eq!(ps3_citation("the 01.02 update"), Some("01.02"));
+        assert_eq!(ps3_citation("360 FUN_82899280 and 0x8285ff28"), None);
+        assert_eq!(ps3_citation("version 1.01.02, TOCTOU"), None);
+    }
 }

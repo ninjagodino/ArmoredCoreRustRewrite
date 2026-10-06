@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/acvd-formats", "crates/acvd-data", "crates/acvd-render", "crates/acvd-viewer", "crates/acvd-game", "tools/acvd-sheets"]
+members = ["crates/acvd-formats", "crates/acvd-data", "crates/acvd-render", "crates/acvd-viewer", "crates/acvd-game", "tools/acvd-sheets", "tools/acvd-index"]
 # acvd-data (and everything built on it) only exists after `acvd-sheets gen` has run against an owned disc.
 default-members = ["crates/acvd-formats", "tools/acvd-sheets"]
 

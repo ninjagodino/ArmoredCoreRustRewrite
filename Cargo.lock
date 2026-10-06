@@ -115,6 +115,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "acvd-index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "csv",
+ "regex",
+]
+
+[[package]]
 name = "acvd-render"
 version = "0.1.0"
 dependencies = [

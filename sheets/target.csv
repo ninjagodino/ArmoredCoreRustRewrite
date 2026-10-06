@@ -2,12 +2,12 @@ key,value,evidence
 title,Armored Core: Verdict Day,PS3_GAME/PARAM.SFO TITLE
 title_id,BLUS31194 (North America),PS3_GAME/PARAM.SFO TITLE_ID; NP communication id NPWR04749_00
 version,APP_VER 01.00 / VERSION 01.00 (no title update applied),PS3_GAME/PARAM.SFO
-platform,PlayStation 3 (Cell PPU: 64-bit big-endian PowerPC with Altivec; 32-bit addressing),EBOOT.elf ELF64 MSB machine 0x15 OSABI 0x66 (CellOS Lv-2); PARAM.SFO PS3_SYSTEM_VER 04.46
-executable,USRDIR/EBOOT.BIN: SCE SELF (encrypted); 12350128 bytes; decrypts to a 31446192-byte ELF,"magic 53 43 45 00; decrypted with RPCS3 --decrypt into private/exe/EBOOT.elf"
+platform,"Xbox 360 (Xenon: 64-bit big-endian PowerPC with VMX128; 32-bit addressing)","ACV2.pe (default.xex on the 360 disc, unpacked): PE machine 0x1f2 (PowerPC big-endian), image base 0x82000000"
+executable,"default.xex (360 disc) unpacked to a 29687808-byte PE memory image (private/x360/vd/ACV2.pe)","MZ/PE header; file offset = address - 0x82000000; .pdata 0x8225c200 (78663 entries), .text 0x82300000-0x836ee5c8; private/index (cargo run -p acvd-index -- build)"
 engine,"FromSoftware in-house engine (Dantelion2 / FD4 / GX modules), Armored Core V generation","Souls-family file magics on disc (DCX, BND3, TPF, TAE, FMG, PARAM/PARAMDEF); soulsmodding.wikidot.com game-engine page; Paramdex ships ACV/ACVD defs"
-language,C++ compiled to native PPU code; Lua 5.0 bytecode for AI and scene scripts,"no managed runtime on disc; .lc files start 1B 4C 75 61 50 (Lua 5.0 'LuaP' header) and keep N:\AC... source paths"
+language,C++ compiled to native PowerPC code; Lua 5.0 bytecode for AI and scene scripts,"no managed runtime on disc; .lc files start 1B 4C 75 61 50 (Lua 5.0 'LuaP' header) and keep N:\AC... source paths"
 runtime,No VM for game logic (native); embedded Lua 5.0 interpreter for scripts,.lc headers; airesource/script and scene/*.lc
-build_type,Retail disc build; executable encrypted; Lua chunks keep debug info,SELF header; Lua source paths present in chunks
+build_type,Retail disc build; Lua chunks keep debug info,Lua source paths present in chunks
 data_layout,"Loose-load layout: BHD/BDT archives already unpacked, unnamed entries hash-named under _unknown/","no bind/*.bhd on disc; _unknown/param/<hash>.param; ACVLooseLoader README describes the loose-load layout"
 compression,DCX with EDGE (zlib chunks; PS3 Edge),DCX header DCS/DCP 'EDGE' on all 9426 .dcx files
 audio_middleware,FMOD Ex (FSB4 sound banks; FEV1 event projects),sound/*.fsb magic FSB4; *.fev magic FEV1

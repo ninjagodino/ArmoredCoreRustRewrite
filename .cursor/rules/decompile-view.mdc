@@ -1,15 +1,31 @@
 ---
-description: Read and decompile the Xbox 360 build through ghidra-cli; touch PS3 addresses only for RPCS3 breakpoints
+description: Read and decompile the Xbox 360 build through the fact index and ghidra-cli; runtime questions go to Xenia probes
 alwaysApply: true
 ---
 
-# Decompile view: Xbox 360 first
+# Decompile view: Xbox 360 only
 
-All static reading of game code uses the Xbox 360 executable `private/x360/vd/ACV2.pe`
-(base 0x82000000). It has no TOC or function descriptors, so constants and call targets are
-plain addresses and Ghidra's output is cleaner than the PS3 build's.
+All reading of game code uses the Xbox 360 executable `private/x360/vd/ACV2.pe`
+(base 0x82000000, file offset = address - base): constants and call targets are plain addresses.
+The PS3 executable is not read, cited or run.
 
-## ghidra-cli first (sub-second, names persist)
+## Fact index first (`tools/acvd-index`, instant lookups)
+
+`private/index` holds CSVs of every function, call, address constant, immediate, field access,
+switch table, virtual call and vtable slot (`tools\analyze-x360.ps1` or `acvd-index build`
+rebuilds it). Look a fact up there before reading code:
+
+```powershell
+$x = "target\release\acvd-index.exe"   # cargo build --release -p acvd-index
+& $x q func 0x82821af0                 # bounds; q callers / q callees ADDR
+& $x q field 0x284 0x8281f960          # who reads/writes +0x284 (optionally in one function)
+& $x q const 0x82004408                # who loads an address, or a string (q const kosi)
+& $x q imm 0x38 ; & $x q slot 0x820958d0 0x4c ; & $x q vcall 0xd0 ; & $x q switch 0x8246fc0c
+& $x q name EyeDist                    # paramdef / tuning / Lua names for an offset
+& $x audit                             # check every sheet citation -> private/index/audit.md
+```
+
+## ghidra-cli for reading a function (sub-second, names persist)
 
 `external/ghidra-cli/ghidra.exe` drives a resident Ghidra bridge on the writable project
 `private/ghidra360cli` (defaults set in its config: project `ACV2`, program `ACV2.pe`). Every
@@ -60,9 +76,8 @@ With `-Seconds` the run is scripted end to end. Anything that needs gameplay (a 
 boosting) needs the user at the controls: hand them the command and read the `.jsonl` after.
 `tools\xenia\setup.ps1` rebuilds the emulator if `external/xenia-canary` is missing.
 
-RPCS3 on PS3 01.02 is the fallback only when Xenia cannot reach the state. Then translate that
-single address from the 360 function by matching its instruction bytes, verify it with
-`$env:EBOOT='private/exe102/EBOOT.elf'; py private/tmp/ppcdis.py LO HI`, and hand it over.
+When Xenia cannot reach a state, say so in the sheet row ("Xenia re-check pending") and record
+the probe recipe in `docs/status.md`; there is no other emulator fallback.
 
-Sheet evidence cites the 360 address first (a probe log line is evidence: cite the probe file);
-add a PS3 address only where an RPCS3 breakpoint was used.
+Sheet evidence cites 360 addresses and probe files only (a probe log line is evidence: cite the
+probe file). Preflight rejects PS3 addresses, RPCS3, EBOOT and TOC references in any sheet cell.

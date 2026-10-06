@@ -15,11 +15,17 @@ Rough priority order; reorder freely.
     (100, 1100, 1200, 4100, 7100, 8100, ... = `tae/ac/action_ow_disarm/own000100.tae` ...); the
     360 TAE event dispatcher is `0x8238eb08` (switch on event type: 10, 20, 100-104, 150-152,
     200-202, 300, 301, 400, 405, 410, 450, 500, 900, 910, 920, 1000, 1010, 1020, 1030, 1040).
-  - Blend units open (see Done): needs one RPCS3 read breakpoint, recipe in
-    `sheets/anim_blend.csv` row `blend`.
+  - Blend units open (see Done): find the 360 reader of a hokan row's `GeneralFrame`
+    (`acvd-index q field` on the `ACANIM_HOKANPARAM_ST` offsets; `AcMotion_loadCollate`
+    `0x8249e840` stores `HokanParamID`), then one Xenia probe on it while walking (row 2 = 60).
+    Recipe in `sheets/anim_blend.csv` row `blend`.
 - **Camera leftovers**: impact / foot-step shake and the ready-position first-person view (both
-  need triggers free play doesn't produce: RPCS3 breakpoints on the 0x68 / 0x69 handlers never
-  fired; ready position waits on weapons). Speed blur: the per-call ease runs once per 1/30 s
+  need triggers free play doesn't produce: earlier emulator breakpoints on the camera message
+  0x68 / 0x69 handlers never fired; ready position waits on weapons). Xenia re-check: probe the
+  handlers `0x8285cf48` / `0x8285cf68` / `0x8285cf88` / `0x8285cfb0` (registered for messages
+  0x66-0x69 by `0x836cad88` into the table at `0x83713b70`) during a mission with landings and
+  hits; the same run re-checks `dash_inv` (0x66) and `side_moving` (0x67) in
+  `sheets/camera_follow.csv`. Speed blur: the per-call ease runs once per 1/30 s
   game frame (Xenia probe, `frame_time` / `speed_blur` in `sheets/camera_follow.csv`); the
   runtime (`blur.rs`) still steps it per 60 Hz tick and needs to step per 1/30 s. A camera action
   with BlurRate 2 (seen for about 0.8 s in a run that included firing) is not mapped: probe the
@@ -61,8 +67,9 @@ Rough priority order; reorder freely.
 - **Weapons leftovers** (hand-weapon tracers done, see Done):
   - Units unconfirmed: `init_speed` (read as km/h), `BulletRigidSt.gravity` (paramdef label
     重力加速度, no unit; read as m/s added per 60 Hz tick, so 1.0 drops rifle 10002 rounds
-    steeply), `reload_time` (read as ticks). Needs the 360 bullet update reading these, or one
-    RPCS3 breakpoint on a fired round's velocity.
+    steeply), `reload_time` (read as ticks). Needs the 360 bullet update reading these
+    (`acvd-index q field` on the `BulletRigidSt` offsets), then a Xenia probe on a fired round's
+    velocity (user at the controls, firing).
   - `magazine` (+0x138) name unconfirmed: may be total ammo.
   - Not done: bullet max/min speed and brake, hit/damage (`hit_id`, `damage_power`), energy
     drain, missiles (`bulletmissile`), blades, shoulder weapons (category 12 bullet ids at
@@ -104,13 +111,71 @@ Rough priority order; reorder freely.
   - Muzzle scale: f0001218 as stored is a 16 m flash and a 20 m sprite (user: far too
     large), so the game scales weapon effects at spawn. `weapons::MUZZLE_SCALE` 0.25 is a
     guess; find the spawn call that reads `muzzle_sfx_id` (+0x02 of the weaponsfx row) and its
-    scale argument (or one RPCS3 breakpoint on it).
+    scale argument (`acvd-index q field 0x2` / `q name muzzle`), then a Xenia probe on that
+    call while firing.
   - Hits always use `default2`: the collision mesh keeps no material.
   - The `hit_sfx_type` to `bullethitsfxparam.bin` row mapping is assumed.
+- **360 disc data migration** (in this order; one task per chat). Game code is already 360-only;
+  the disc data still loads from the PS3 dump until these land:
+  1. **BHD5/BDT + XDVDFS VFS**: an `acvd-formats` reader for the 360 ISO (XDVDFS, XGD2 game
+     partition at 0xfd90000; layout in `private/tmp/xdvdfs.py`) and `bind/dvdbnd5_layer{0,1}.bhd`
+     / `.bdt` (layout under Done, "360 archives"), named through `private/x360/dvdbnd_names.csv`
+     (hash, size, path; 14,626 of 16,909 entries named, see Done). `bind/script.bhd` is BHF3 with
+     names inside. `--disc` defaults to the 360 ISO.
+  2. **Re-run extract from the 360 disc**: every PARAM row still round-trips byte for byte;
+     diff the generated sheets against the PS3 ones and record every difference. The 2,283
+     unnamed entries (and PS3 paths with no 360 hash: PARAM / FMG / menu tables, mostly
+     inside binders such as `/param/regulation.bin` or `/bind/boot.bnd`) get named here.
+  3. **Xenos TPF and 360 FLVER**: 360 texture formats (tiled DXT) and FLVER vertex / index
+     buffers without Edge compression; `texture_formats.csv`, `formats.csv` rows updated.
+  4. **XMA sound, fonts, Lua, movies**: XMA FSB banks (`sheets/sound_cues.csv` playback), the
+     `s1_X360` font path, Lua from `script.bhd`, WMV movies (the PS3 build has PAMF).
+     Re-read the zoom-blur Xenos shaders (`speed_blur_draw`).
+  5. **Delete the PS3 paths**: remove Edge / PAMF / RSX code, the `ACVD Unbound` defaults and
+     PS3 rows in `target.csv` (title id, PARAM.SFO), `formats.csv`, `texture_formats.csv`.
+- **Xenia re-checks of earlier emulator captures** (rows say "Xenia re-check pending"):
+  `camera_follow.csv` `look_at_height`, `base_transform`, `pitch` (probe the AC+0x234 pitch
+  update; its 360 address is still to find from the AC update `0x828bef18`), `follow_ease`,
+  `dash_inv`, `side_moving`, `shake`, `eye_lift`. Pending 360 addresses: the per-id part
+  getters behind `0x8246fbb0` (`ac_part_fields.csv`), the AC+0x1104 update gate, the
+  camera-effects view builder, the offset-row lerp.
 - **Movies** (PAMF), **mission events** (EVD),
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
 ## Done
+
+- Static fact index, sheet audit, and the move to 360-only RE (`tools/acvd-index`).
+  - **Index**: `cargo run --release -p acvd-index -- build` (or `tools\analyze-x360.ps1`) reads
+    `ACV2.pe` in about a second into `private/index/*.csv`: 113,722 functions (78,663 `.pdata`,
+    35,059 leaf: `bl` targets, data pointers and `lis`/`addi` code pointers at a function
+    boundary), calls, address constants (floats and strings decoded), immediates, field
+    accesses, 505 switch tables, virtual calls, 234,862 function pointers in 7,434 tables, and
+    2,487 names (PARAMDEF offsets, `.dbp` labels, Lua param ids). Query with `acvd-index q ...`
+    (forms in `.cursor/rules/decompile-view.mdc`); never read whole CSVs into a chat. Spot
+    checks: movement vtable `0x8208fea0` `+0xec` = `0x82826058`; integrator `0x82822ea0` called
+    from `0x82824078`. The task's "548 switch sites" counted 68 indexed virtual tail calls
+    (`lwzx` + `mtctr` + `bctr` over a vtable), not switch tables.
+  - **Audit**: `acvd-index audit` checks every 360 address in `sheets/*.csv` (function, inside
+    a function, referenced data), `vtable X slot +Y = Z` claims, and the offsets / floats written
+    after a function address, into `private/index/audit.md`. Now: 306 addresses, 0 mismatches,
+    0 slot mismatches, 0 PS3 citations. The 196 "offset not in the cited function" notes are
+    mostly offsets of a caller's or callee's struct; check one by hand when a row depends on it.
+  - **PS3 to 360**: the one-time pass matched the 156 PS3 addresses cited in the sheets to 360
+    functions (token overlap plus call-graph anchoring, then each kept match checked by hand on
+    its offsets and constants; `0x828590f8` and `0x8249e840` stay instruction-pattern matches,
+    marked so in their rows). Every sheet row now cites 360 addresses; facts with no 360
+    address found say "360 address pending", values from earlier emulator captures say "Xenia
+    re-check pending" (open task). Preflight (`evidence.ps3`) rejects RPCS3 / EBOOT / TOC /
+    01.02 / PS3 `FUN_00`/`FUN_01` citations in any sheet cell. PS3 RE tooling is gone
+    (`analyze-eboot.ps1`, Ps3GhidraScripts and RPCS3 in `setup-tools.ps1`, the rule fallback).
+  - **BHD5 names**: `private/x360/dvdbnd_names.csv` (archive, hash, size, path) from hashing
+    the PS3 dump's 18,861 USRDIR paths with the `/`-rooted path hash: layer0 11,458 / 13,479,
+    layer1 3,168 / 3,430 named (86.5%). Extension swaps (`.pam` to `.wmv`, `ps3` to `x360`)
+    named none; the PS3 paths with no 360 hash are 1,298 Lua (in `script.bhd`), 972 `.param`,
+    515 `.fmg`, 343 extensionless and 200 `.dcx`.
+  - Helpers (one-time, `private/tmp`): `ps3cites.py`, `ps3to360.py`, `bhd5names.py`,
+    `bhd5more.py`, `rewrite360.py` (the sheet edits), `requote.py` (keeps unchanged CSV
+    records byte-identical), `idxfind.py` / `idxhas.py` (offset queries over the index).
 
 - Socket facing and hanger racks (`acvd-game::assemble`, `sheets/assembly_slots.csv`).
   `param/acattachinfo.bin` is 30 records of 16 bytes at `0x10` (string table at `0x1F0`):
@@ -183,7 +248,7 @@ Rough priority order; reorder freely.
   A rifle (kind 4) adds the `gun_$(LR)` ReactAng kick on arm01-03 (−12°) and arm05 (−5°) for
   6 frames, as a local X rotation.
 
-- Movement units: every NewAcBehavior input the runtime reads has its unit and 360/PS3 evidence
+- Movement units: every NewAcBehavior input the runtime reads has its unit and 360 evidence
   (`tuning_fields.csv`); part stats + `AcCtrlParamCalc.lua` formulas live in `ac_ctrl_calc.csv`.
   Field 438 (0.01) is the over-max decay: above the current max the integrator `0x82822ea0`
   (slot +0xec = `0x82826058` "speed > max") only steers and scales speed by 0.99 per tick while
@@ -211,16 +276,17 @@ Rough priority order; reorder freely.
   sideways roll, per-state camera action (FOV, eye rates, move shake, EyeDistance / EyeOffsetY /
   EyeOffsetX eased over EyeFadeInFrame), base point at the waist (`center` bone), look-at pushed
   1000 m out before the eye lift and the side shift (eye on the AC's right, flipping with the turn
-  direction), eye floor above water. Standing framing checked against an RPCS3 spawn shot and the
-  01.02 dump `20261003_172321_044` (camera matrix 0x2188790).
+  direction), eye floor above water. Standing framing checked against an earlier emulator spawn
+  shot and memory capture (rows `look_at_height` / `base_transform`; Xenia re-check pending: probe
+  `CamCtrl_place` `0x8285ff28` after spawn and log the placed eye and look-at).
   Delay follow, side-moving and dash inversion traced but unused in free play.
 - Speed blur (`speed_blur` / `speed_blur_draw` in `sheets/camera_follow.csv`): CPU ease 360
   0x82bfa9f0 / 0x82bf9c98 from horizontal and vertical km/h × the action's BlurRate; filter
   block 0x83a8b1e0+0x660; zoom-blur draw 0x82c98368 (centre rectangle copied, 10-tap frame).
   `acvd-game` draws it as a Bevy `FullscreenMaterial` (`blur.rs`, `zoom_blur.wgsl`); boosting at
-  125 km/h gives intensity 0.82. PS3 RSX fragment programs decode with `private/tmp/rsxfp.py`
-  (wrapper: size at +4, constant patches from +0x20); BND3 entries extract with
-  `private/tmp/bnd3x.py`; the 360 filter shader name table is at 0x8371e978.
+  125 km/h gives intensity 0.82. The zoom-blur pixel math was read from the PS3 disc's shader
+  binder; re-read the 360 `ZoomBlur_*` Xenos shaders (`private/tmp/xenosdis.py`, filter shader
+  name table at 0x8371e978) in the 360 data migration.
 - Tooling: ghidra-cli bridge on `private/ghidra360cli` with all 78,661 `.pdata` functions defined;
   camera functions renamed `CamCtrl_*` / `CamFx_*`.
 - Text: FMG reader (`acvd-formats::fmg`); 1250 UTF-16BE banks, 15 Shift-JIS `partsname_*.fmg`.

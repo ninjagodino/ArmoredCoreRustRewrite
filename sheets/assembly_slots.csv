@@ -1,6 +1,6 @@
 slot,table,column,category,prefix,parent,socket,root,orient,evidence
 legs,AC_ASSEMBLY_DESIGN_ST,legs,3,lg,none,none,kosi,none,"anchor: legs stand on the ground and kosi (hip) is the root bone of 140 of 141 leg models"
-core,AC_ASSEMBLY_DESIGN_ST,core,1,cr,legs,bone:kosi,core,none,"the core's root bone joins the legs' kosi bone; EBOOT joint names at 0x1ab1a60: head l_kata r_kata kosi core"
+core,AC_ASSEMBLY_DESIGN_ST,core,1,cr,legs,bone:kosi,core,none,"the core's root bone joins the legs' kosi bone; 360 joint name strings (head 0x820267e0, l_kata 0x82044f40, r_kata 0x82044f30, kosi 0x8204a134, core 0x820267d8): head l_kata r_kata kosi core"
 head,AC_ASSEMBLY_DESIGN_ST,head,0,hd,core,4,head,none,"cr0230 dummy 4 sits on top of core_01 facing up; every head's root bone is named head. Not an acattachinfo record, so it stays translation-only"
 arm_l,AC_ASSEMBLY_DESIGN_ST,arms,2,am,core,5,l_kata,1,"cr0230 dummies 5/6 sit at x=+/-1.275 facing out; am7410's l_kata lands on dummy 5 of a core rooted at y=3.621. acattachinfo (param/acattachinfo.bin, flag switch 360 0x8288cea0) record (1,5,2,1,""1""): flag 1, child bone l_kata"
 arm_r,AC_ASSEMBLY_DESIGN_ST,arms,2,am,core,6,r_kata,0,"mirror of arm_l. acattachinfo (1,6,2,0,""2""): flag 0, child bone r_kata"

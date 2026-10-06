@@ -18,7 +18,7 @@ disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
   without a sheet row or a comment citing the 360 address.
 - Static RE uses the Xbox 360 build (see `.cursor/rules/decompile-view.mdc`). Runtime questions
  ("does this path fire?") go to the project's Xenia probes on that same 360 build
- (`tools/xenia/run.ps1`), not long static hunts; RPCS3 on PS3 01.02 is the fallback.
+ (`tools/xenia/run.ps1`), not long static hunts. The PS3 executable is never read or cited.
 - Before any `cargo` command, set `CARGO_TARGET_DIR` (see `.cursor/rules/cargo-target.mdc`).
 
 ## Layout
@@ -31,6 +31,7 @@ disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
 | `crates/acvd-viewer` | FLVER model browser |
 | `crates/acvd-game` | runtime: AC assembly (`assemble`), posing/motion (`pose`), piloting + follow camera (`control`), map `.hmd` collision (`collision`), DRB lock-sight HUD (`hud`) |
 | `tools/acvd-sheets` | `extract` → `preflight` → `gen` (`all` runs every step); preflight errors block gen |
+| `tools/acvd-index` | static fact index of `ACV2.pe` (`build` → `private/index`, `q ...` lookups, `audit` of sheet citations) |
 | `tools/ghidra` | Ghidra scripts (`X360Pdata.java`, `DecompileRefs.java`, ...) |
 | `tools/xenia` | the project's Xenia Canary fork (`acvd-probe.patch`, built into `external/xenia-canary`): `setup.ps1` builds it, `run.ps1` boots the 360 disc and logs probe hits |
 | `sheets/` | committed source-of-truth CSVs (`systems.csv` = per-system status) |
