@@ -14,8 +14,8 @@
 //! Every ready weapon also plays the body clips in
 //! `sheets/ac_states.csv` (`sniper_ready_*`, then `sniper_stow_*`); their blend rows are named
 //! キャノン構え / キャノン解除. A sniper rifle (`weapon_kind` 5, no `ready_position`) does not.
-//! A rifle (`weapon_kind` 4)
-//! kicks `gun_$(LR)` ReactAng on the arm for ReactTime frames.
+//! Every shot kicks the arm with the `param/jcondata.bin` control the 360 registers for that slot
+//! (`0x8287f2d8`): `sniper_$(LR)` for a sniper rifle, `gun_$(LR)` for any other hand weapon.
 //! Effects come from the `param/acweaponsfxparam.bin` row named by the part's `hit_id` (row 1
 //! when it has none): the muzzle flash at the weapon's effect point 101, the bullet effect on
 //! the shot, and the `param/bullethitsfxparam.bin` `default2` effect where it hits the ground
@@ -29,8 +29,8 @@ use acvd_data::generated::bullet::{
 use acvd_data::generated::sfx::PARAM_ACWEAPONSFXPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACWEAPONSOUNDPARAM_BIN;
 use acvd_data::{ac_state, find, part_field};
-use acvd_formats::ani;
 use acvd_formats::vfs::{self, Disc};
+use acvd_formats::{ani, jcon};
 use acvd_render::Rig;
 use bevy::audio::AudioSource;
 use bevy::ecs::system::SystemParam;
@@ -86,8 +86,8 @@ pub struct Gun {
     /// Ready weapon (`ready_position`). Holding fire plays the body stance before the shot.
     /// A sniper rifle (`weapon_kind` 5) is not one of these.
     pub stance: bool,
-    /// Rifle (`weapon_kind` 4). Each shot plays the `gun_$(LR)` joint kick.
-    pub kick: bool,
+    /// Sniper rifle (`weapon_kind` 5): shots kick with `sniper_$(LR)` instead of `gun_$(LR)`.
+    pub sniper: bool,
 }
 
 /// FFX effect ids of a weapon; 0 plays nothing.
@@ -122,32 +122,38 @@ pub struct WeaponAnims {
     /// Arm `a00` clips, posed over locomotion while the weapon on that side is deployed.
     arms: Vec<WeaponRig>,
     recoil_bones: Vec<RecoilBone>,
-    recoils: Vec<Recoil>,
     sniper: SniperStance,
 }
 
-/// `gun_$(LR)` bones from `param/jcondata.xml`. The 360 parser `0x82b73b28` stores ReactAng at
-/// object +0x18 (`0x82b73f10`) and ReactTime at +0x24 (`0x82b73f8c`). The kick axis is not a
-/// field; LockMinX/LockMaxX is the wide limit on these bones, so the kick is a local X rotation.
-/// Angles are degrees and the times are 60 Hz frames: `(suffix, angle, delay, time)`.
-const GUN_REACT: &[(&str, f32, f32, f32)] = &[
-    ("arm01", -12.0, 0.0, 6.0),
-    ("arm02", -12.0, 0.0, 6.0),
-    ("arm03", -12.0, 0.0, 6.0),
-    ("arm05", -5.0, 0.0, 6.0),
-];
+/// Frames the arm takes to settle after a kick: the `f2` the AC's shot handler `0x82847f18`
+/// passes to the kick start (`0x8210a498` = 30.0), applied when the kick ends (`0x82beeb30`).
+const KICK_RETURN: f32 = 30.0;
 
 struct RecoilBone {
     entity: Entity,
     hand: Hand,
+    /// From a `sniper_$(LR)` control rather than `gun_$(LR)`.
+    sniper: bool,
+    kick: Kick,
+}
+
+/// One `jcondata.bin` object's shot reaction, stepped like the 360 per-object update
+/// `0x82beea90`. A shot (`0x82bee808`, weight 1.0 from `0x82cf8110`) restarts the clock. After
+/// ReactDelay frames the weight ramps 0 → 1 over ReactTime frames, then drops to 0; the solver
+/// `0x82cb4d98` turns ReactAng × weight into the extra rotation. The joint eases toward that
+/// target over ReactTime frames while kicking and `KICK_RETURN` frames after
+/// (`0x82c42048` with ReactTime, then 30): read as a linear blend from where the joint was.
+#[derive(Clone, Copy, Debug)]
+struct Kick {
     angle: f32,
     delay: f32,
     time: f32,
-}
-
-struct Recoil {
-    hand: Hand,
-    frame: f32,
+    clock: Option<f32>,
+    ramping: bool,
+    shown: f32,
+    from: f32,
+    blend: f32,
+    progress: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -327,9 +333,9 @@ pub fn fire(
         } else {
             want[i] && can && stance_ready
         };
-        if fired && gun.kick {
+        if fired {
             if let Some(anims) = body.anims.as_mut() {
-                anims.kick(hand);
+                anims.kick(hand, gun.sniper);
             }
         }
         if !fired {
@@ -436,7 +442,7 @@ fn gun(id: i64) -> Gun {
         fx: fx(id),
         shoot: shoot_of(id),
         stance: part_field(id, 10, "ready_position") != 0.0,
-        kick: part_field(id, 10, "weapon_kind") == 4.0,
+        sniper: part_field(id, 10, "weapon_kind") == 5.0,
     }
 }
 
@@ -717,8 +723,11 @@ impl WeaponAnims {
         // `arm_l` and `arm_r` share one placement (assembly_slots.csv column `arms`).
         let arm = placement.column == "arms";
         if arm {
+            let controls = vfs::open(disc, "param/jcondata.bin")
+                .and_then(|d| jcon::read(&d))
+                .unwrap_or_default();
             for &hand in hands {
-                self.note_recoil(hand, rig, joints);
+                self.note_recoil(hand, &controls, rig, joints);
             }
         }
         let Some(binder) = anim_binder(placement.model.path) else {
@@ -807,38 +816,42 @@ impl WeaponAnims {
         }
     }
 
-    /// `gun_$(LR)` kick bones on this arm. The names in the xml are `l_arm01` / `r_arm01`.
-    fn note_recoil(&mut self, hand: Hand, rig: &Rig, joints: &[Entity]) {
+    /// Kicking bones of this arm's `gun_$(LR)` and `sniper_$(LR)` controls. The kick axis is
+    /// not a field; LockMinX/LockMaxX is the wide limit on `*_arm01`, so it is a local X rotation.
+    fn note_recoil(&mut self, hand: Hand, controls: &[jcon::Control], rig: &Rig, joints: &[Entity]) {
         let side = match hand {
-            Hand::Right => "r_",
-            Hand::Left => "l_",
+            Hand::Right => "R",
+            Hand::Left => "L",
         };
-        for (i, bone) in rig.bones.iter().enumerate() {
-            let Some((_, angle, delay, time)) = GUN_REACT
-                .iter()
-                .copied()
-                .find(|(suffix, ..)| bone.name == format!("{side}{suffix}"))
-            else {
+        for (sniper, prefix) in [(false, "gun_"), (true, "sniper_")] {
+            let name = format!("{prefix}{side}");
+            let Some(control) = controls.iter().find(|c| c.name == name) else {
                 continue;
             };
-            let Some(&entity) = joints.get(i) else {
-                continue;
-            };
-            self.recoil_bones.push(RecoilBone {
-                entity,
-                hand,
-                angle,
-                delay,
-                time,
-            });
+            for object in control.objects.iter().filter(|o| o.react_ang != 0.0 && o.react_time > 0.0) {
+                let Some(entity) = rig
+                    .bones
+                    .iter()
+                    .position(|b| b.name == object.bone)
+                    .and_then(|i| joints.get(i).copied())
+                else {
+                    continue;
+                };
+                self.recoil_bones.push(RecoilBone {
+                    entity,
+                    hand,
+                    sniper,
+                    kick: Kick::new(object.react_ang, object.react_delay, object.react_time),
+                });
+            }
         }
     }
 
-    fn kick(&mut self, hand: Hand) {
-        if let Some(recoil) = self.recoils.iter_mut().find(|r| r.hand == hand) {
-            recoil.frame = 0.0;
-        } else {
-            self.recoils.push(Recoil { hand, frame: 0.0 });
+    fn kick(&mut self, hand: Hand, sniper: bool) {
+        for bone in &mut self.recoil_bones {
+            if bone.hand == hand && bone.sniper == sniper {
+                bone.kick.trigger();
+            }
         }
     }
 
@@ -847,27 +860,15 @@ impl WeaponAnims {
         frames: f32,
         posed: &mut Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
     ) {
-        for recoil in &self.recoils {
-            for bone in self.recoil_bones.iter().filter(|b| b.hand == recoil.hand) {
-                let angle = recoil_angle(bone.angle, bone.delay, bone.time, recoil.frame);
-                if angle == 0.0 {
-                    continue;
-                }
-                if let Ok((mut transform, _)) = posed.get_mut(bone.entity) {
-                    transform.rotation *= Quat::from_rotation_x(angle.to_radians());
-                }
+        for bone in &mut self.recoil_bones {
+            let angle = bone.kick.step(frames);
+            if angle == 0.0 {
+                continue;
+            }
+            if let Ok((mut transform, _)) = posed.get_mut(bone.entity) {
+                transform.rotation *= Quat::from_rotation_x(angle.to_radians());
             }
         }
-        for recoil in &mut self.recoils {
-            recoil.frame += frames;
-        }
-        let bones = &self.recoil_bones;
-        self.recoils.retain(|recoil| {
-            bones
-                .iter()
-                .filter(|b| b.hand == recoil.hand)
-                .any(|b| recoil.frame < b.delay + b.time)
-        });
     }
 
     pub fn joints(&self) -> impl Iterator<Item = Entity> + '_ {
@@ -901,16 +902,58 @@ fn track_moves(track: &ani::Track) -> bool {
     })
 }
 
-/// Degrees left of a kick that starts at `angle` and returns to 0 across `time` frames.
-fn recoil_angle(angle: f32, delay: f32, time: f32, frame: f32) -> f32 {
-    if time <= 0.0 || frame < delay {
-        return 0.0;
+impl Kick {
+    fn new(angle: f32, delay: f32, time: f32) -> Self {
+        Self {
+            angle,
+            delay,
+            time,
+            clock: None,
+            ramping: false,
+            shown: 0.0,
+            from: 0.0,
+            blend: KICK_RETURN,
+            progress: KICK_RETURN,
+        }
     }
-    let u = (frame - delay) / time;
-    if u >= 1.0 {
-        0.0
-    } else {
-        angle * (1.0 - u)
+
+    fn trigger(&mut self) {
+        self.clock = Some(0.0);
+        self.ramping = false;
+    }
+
+    fn ease(&mut self, frames: f32) {
+        (self.from, self.blend, self.progress) = (self.shown, frames, 0.0);
+    }
+
+    /// Advances `frames` 60 Hz frames; returns the degrees the joint is turned now.
+    fn step(&mut self, frames: f32) -> f32 {
+        let mut target = 0.0;
+        if let Some(clock) = self.clock {
+            if clock >= self.delay {
+                if !self.ramping {
+                    self.ramping = true;
+                    self.ease(self.time);
+                }
+                target = self.angle * ((clock - self.delay) / self.time).min(1.0);
+            }
+        }
+        let t = if self.blend > 0.0 {
+            (self.progress / self.blend).min(1.0)
+        } else {
+            1.0
+        };
+        self.shown = self.from + (target - self.from) * t;
+        self.progress += frames;
+        if let Some(clock) = self.clock.map(|c| c + frames) {
+            self.clock = Some(clock);
+            if clock > self.delay + self.time {
+                self.clock = None;
+                self.ramping = false;
+                self.ease(KICK_RETURN);
+            }
+        }
+        self.shown
     }
 }
 
@@ -1027,7 +1070,7 @@ mod tests {
             "{g:?}"
         );
         assert!(
-            g.kick && !g.stance,
+            !g.sniper && !g.stance,
             "the starter rifle uses the gun kick, not the ready stance"
         );
     }
@@ -1036,8 +1079,8 @@ mod tests {
     fn lightweight_sniper_rifle_does_not_take_a_stance() {
         let g = gun(2410);
         assert!(
-            !g.stance && !g.kick,
-            "a sniper rifle fires without the ready stance"
+            !g.stance && g.sniper,
+            "a sniper rifle fires without the ready stance and kicks with sniper_$(LR)"
         );
         assert_eq!(part_field(2410, 10, "weapon_kind"), 5.0);
         assert_eq!(part_field(2410, 10, "ready_position"), 0.0);
@@ -1055,10 +1098,34 @@ mod tests {
     }
 
     #[test]
-    fn gun_kick_returns_to_zero_across_react_time() {
-        assert_eq!(recoil_angle(-12.0, 0.0, 6.0, 0.0), -12.0);
-        assert_eq!(recoil_angle(-12.0, 0.0, 6.0, 3.0), -6.0);
-        assert_eq!(recoil_angle(-12.0, 0.0, 6.0, 6.0), 0.0);
+    fn gun_kick_waits_ramps_and_settles() {
+        // gun_R r_arm01: ReactAng -10, ReactDelay 5, ReactTime 6.
+        let mut kick = Kick::new(-10.0, 5.0, 6.0);
+        assert_eq!(kick.step(1.0), 0.0, "idle joint is untouched");
+        kick.trigger();
+        let frames: Vec<f32> = (0..60).map(|_| kick.step(1.0)).collect();
+        assert!(frames[..5].iter().all(|&a| a == 0.0), "nothing before ReactDelay");
+        let (peak_at, peak) = frames
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap();
+        assert!((peak + 10.0).abs() < 1e-4 && (10..=12).contains(&peak_at), "{frames:?}");
+        assert!(frames[peak_at + 15] > -6.0 && frames[peak_at + 15] < -4.0, "halfway back");
+        assert_eq!(frames[59], 0.0, "settled {KICK_RETURN} frames after the kick");
+    }
+
+    #[test]
+    fn a_new_shot_restarts_the_kick_from_the_current_angle() {
+        let mut kick = Kick::new(-5.0, 0.0, 6.0);
+        kick.trigger();
+        for _ in 0..10 {
+            kick.step(1.0);
+        }
+        let mid = kick.shown;
+        kick.trigger();
+        let first = kick.step(1.0);
+        assert!((first - mid).abs() < 1e-4, "eases from {mid}, got {first}");
     }
 
     #[test]

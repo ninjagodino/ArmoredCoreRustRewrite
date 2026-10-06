@@ -16,6 +16,7 @@ pub mod fsb;
 pub mod fontdef;
 pub mod fmg;
 pub mod hmd;
+pub mod jcon;
 pub mod layout;
 pub mod msb;
 pub mod param;

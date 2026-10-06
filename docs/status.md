@@ -113,10 +113,20 @@ in order:
     clip only overrides the bones it animates (the `r_shoul_p*` / `l_shoul_p*` pads), so it
     does not plant the rest of the arm back on the clip bind: those tracks are two identical
     identity keys, and writing them was erasing acmotion 78's `r_arm01` pose. The arm's
-    `a00_001`/`a00_003` play on that side's bones while a ready weapon is deployed. Rifles
-    (kind 4) kick `gun_$(LR)` ReactAng (−12° on arm01-03, −5° on arm05, 6 frames;
-    parser `0x82b73b28` stores the angle at +0x18). The kick axis is not a field; it is applied
-    as a local X rotation because LockMinX/LockMaxX is the wide limit on those bones.
+    `a00_001`/`a00_003` play on that side's bones while a ready weapon is deployed.
+  - Shot kick (done, see Done): read from `param/jcondata.bin` (`acvd-formats::jcon`), not the
+    stale `jcondata.xml`. Open: (1) which weapons take `sniper_$(LR)`: bit 31 from `0x82456f68`
+    is set when `0x82479820` (weapon record byte +0x13c == 3) is false and `0x82475ac0`
+    (sub-record byte +0x1f) is true; those records are not mapped, so `weapon_kind` 5 stands
+    in. (2) The joint-layer blend: `0x82c42048` sets anim-player +0x5c (ReactTime when the ramp
+    starts, 30 when it ends) and zeroes +0x60. The code reads that as a linear ease from the
+    current angle over that many frames. On the 360 the ReactTime switch only fires when
+    `clock - delay == 0` exactly, so with delay 5 and 2-frame steps it may never fire.
+    `0x82beefdc` also scales anim-player value +0x2c by 0.3 (`0x82016f20`) while the weight
+    is 0; meaning unknown. Xenia probe recipe (user firing a rifle):
+    `0x82bee808 kick_start r3 f1 f2 lr`, `0x82beeb38 kick_weight max=400 r31 f30 [r31+0x8]:f32 [r31+0x10]:f32`,
+    `0x82c42048 blend_time max=200 r3 f1 lr`, `0x8287f348 gun_ctrl r30`,
+    `0x8287f33c sniper_ctrl r30`.
 - **UI**: in-game HUD next steps: AP / energy state for the hidden `AP*` / `EN*` digits, the `AlphaAnimSprite` gauges (`Gauge_LWeapon` ...; record layout unread), the side `Weapon` panels (part name + `CurAmmo` runtime text at the `ACV_FE_Normal` LeftArm / Shoulder / RightArm anchors); trace the Dialog color tint (inferred, see Notes); animation tables (PINA/KINA/OINA/MINA...). Open: Text word +0x0c (0, 502, 1000-1004, 1030, 1200-1204; not a scale), Text flags byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0). **Param enums**: TDF reader.
 - **Effects leftovers** (FFX player done, see Done): every slot meaning in
   `sheets/ffx_actions.csv` is inferred from the effect files. The 360 action-id to class map
@@ -498,8 +508,23 @@ in order:
   Every ready weapon (part 2010 cannon, 2230 H.E.A.T., 2610 sniper cannon) plays
   `sniper_ready_r`/`_l` (acmotion 93/95) to the end before the shot and `sniper_stow_*`
   (94/96) on release. A sniper rifle (kind 5, part 2410) does not take that stance.
-  A rifle (kind 4) adds the `gun_$(LR)` ReactAng kick on arm01-03 (−12°) and arm05 (−5°) for
-  6 frames, as a local X rotation.
+  Shot kick: every hand-weapon shot kicks the arm with its `param/jcondata.bin` joint control
+  (`acvd-formats::jcon`; header `u32 0, count, table offset, string offset`, 12-byte controls,
+  0x40-byte objects in the runtime layout the XML reader `0x82b73b28` fills: +0x08 AxisY angle,
+  +0x0c LockAng, +0x10/+0x14 LimitRotAngVelX/Y, +0x18 ReactAng, +0x1c TraceAng, +0x20
+  ReactDelay, +0x24 ReactTime, +0x28-+0x3c LockMin/Max X/Y/Z). The disc's `jcondata.xml` is an
+  older revision (AC4 `kata`/`ude`/`te` bones, −12° on arm01-03) and was what made the
+  old kick about 3× too big. `gun_R`/`gun_L`: arm01 −10° and arm02 −2° (delay 5, time 6), arm05
+  −5° (delay 0, time 6); `sniper_*`: arm01 −2° (time 6). Every arm-slot weapon is registered
+  with `gun_$(LR)` or `sniper_$(LR)` (`0x8287f2d8` for slots 0x0a/0x0b/0x0f/0x10), not just
+  rifles. The shot path `0x82cf8110` → `0x82847ea8` → AC handler `0x82847f18` (vtable
+  `0x82044fc0` +0xa4) → `0x82bef490` → `0x82bee808` restarts each object's clock with weight
+  1.0 (`0x82000fc4`) and return time 30 (`0x8210a498`). The per-object step `0x82beea90`
+  advances the clock by dt × 60 (`0x8200fce0`). After ReactDelay frames the weight ramps
+  0 → 1 over ReactTime frames, then drops to 0. The solver `0x82cb4d98` adds ReactAng × weight
+  × π/180 to the joint (`0x8371c0e8`). The joint eases over ReactTime frames during the ramp
+  and over 30 frames after it, so the arm settles in about half a second. The kick is applied
+  as a local X rotation (LockMin/MaxX is the wide limit on arm01).
 
 - Movement units: every NewAcBehavior input the runtime reads has its unit and 360 evidence
   (`tuning_fields.csv`); part stats + `AcCtrlParamCalc.lua` formulas live in `ac_ctrl_calc.csv`.
