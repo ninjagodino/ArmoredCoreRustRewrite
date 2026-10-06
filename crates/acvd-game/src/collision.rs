@@ -3,9 +3,9 @@
 //! after the part transform, same as FLVER → Bevy (`acvd-render`).
 
 use std::collections::HashMap;
-use std::path::Path;
 
-use acvd_formats::{flver, hmd, msb, vfs};
+use acvd_formats::vfs::{self, Disc};
+use acvd_formats::{flver, hmd, msb};
 use anyhow::{Context, Result};
 use bevy::prelude::*;
 
@@ -108,18 +108,18 @@ fn mirror(v: [f32; 3]) -> Vec3 {
 }
 
 /// Load `{map}_map.msb` (else `{map}.msb`) and every part whose `{model}_h.hmd` is in the map binder.
-pub fn load_map(usrdir: &Path, map: &str) -> Result<Collision> {
+pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
     let folder = format!("model/map/{map}");
     let msb_path = {
         let named = format!("{folder}/{map}_map.msb");
-        if usrdir.join(&named).is_file() {
+        if disc.exists(&named) {
             named
         } else {
             format!("{folder}/{map}.msb")
         }
     };
     let binder = format!("{folder}/{map}_m.dcx.bnd");
-    let parts = msb::parts(&vfs::open(usrdir, &msb_path)?)?;
+    let parts = msb::parts(&vfs::open(disc, &msb_path)?)?;
     let mut cache: HashMap<String, hmd::Hmd> = HashMap::new();
     let mut hits = Vec::new();
     for part in &parts {
@@ -127,7 +127,7 @@ pub fn load_map(usrdir: &Path, map: &str) -> Result<Collision> {
             Some(h) => h,
             None => {
                 let asset = format!("{binder}|{}_h.hmd", part.model);
-                let Ok(bytes) = vfs::open(usrdir, &asset) else {
+                let Ok(bytes) = vfs::open(disc, &asset) else {
                     continue;
                 };
                 cache.insert(

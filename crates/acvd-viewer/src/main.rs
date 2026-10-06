@@ -1,20 +1,21 @@
 //! Model viewer: browses every FLVER in the generated model index, read straight off the
 //! owned disc.
 //!
-//! `acvd-viewer [model name or asset path] [--disc <dump root>] [--shot <png>] [--flat]`
+//! `acvd-viewer [model name or asset path] [--disc <360 ISO or dump root>] [--shot <png>] [--flat]`
 //! Left/Right: previous/next model, PageUp/PageDown: jump 50, drag left mouse: orbit,
 //! wheel: zoom, R: reframe. `--shot` saves one frame of the first model and exits.
 
 use std::path::PathBuf;
 
 use acvd_data::ModelRef;
+use acvd_formats::vfs::{self, Disc};
 use acvd_render::app::{orbit, take_shot, Orbit, Shot};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 #[derive(Resource)]
 struct Viewer {
-    usrdir: PathBuf,
+    disc: Disc,
     models: Vec<&'static ModelRef>,
     current: usize,
     shown: Option<usize>,
@@ -37,7 +38,7 @@ fn main() {
         }
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let usrdir = acvd_formats::vfs::usrdir(&disc.unwrap_or_else(|| root.join("ACVD Unbound")));
+    let disc = Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
     let models: Vec<&'static ModelRef> = acvd_data::generated::models::ALL.iter().flat_map(|g| g.iter()).collect();
     let wanted = wanted.unwrap_or_else(|| "am0010.flv".into());
     let current = models
@@ -54,7 +55,7 @@ fn main() {
         ..default()
     }))
     .insert_resource(ClearColor(Color::srgb(0.11, 0.12, 0.14)))
-    .insert_resource(Viewer { usrdir, models, current, shown: None, flat, bounds: (Vec3::ZERO, Vec3::ONE) })
+    .insert_resource(Viewer { disc, models, current, shown: None, flat, bounds: (Vec3::ZERO, Vec3::ONE) })
     .add_systems(Startup, setup)
     .add_systems(Update, (browse, show, orbit).chain());
     if let Some(shot) = shot {
@@ -110,14 +111,14 @@ fn show(
 
     let mut status = format!("[{}/{}] {} - {} meshes, {} triangles", viewer.current + 1, viewer.models.len(), model.path, model.meshes, model.triangles);
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    match acvd_render::model(&viewer.usrdir, model.path) {
+    match acvd_render::model(&viewer.disc, model.path) {
         Ok(list) => {
             let mut packs = acvd_render::Packs::default();
             let mut missing = 0;
             for part in list {
                 min = min.min(Vec3::from(part.min));
                 max = max.max(Vec3::from(part.max));
-                let material = materials.add(acvd_render::material(&viewer.usrdir, &part, &mut packs, &mut images, viewer.flat, &mut missing));
+                let material = materials.add(acvd_render::material(&viewer.disc, &part, &mut packs, &mut images, viewer.flat, &mut missing));
                 commands.spawn((Mesh3d(meshes.add(part.mesh)), MeshMaterial3d(material), Transform::default(), ModelPart));
             }
             if missing > 0 {

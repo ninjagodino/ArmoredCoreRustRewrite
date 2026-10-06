@@ -9,8 +9,7 @@
 //! Not drawn: the `AlphaAnimSprite` gauges, the side `Weapon` panels (part name, `CurAmmo`
 //! runtime text) and the conditional warnings of `ACV_FE_Normal`.
 
-use std::path::Path;
-
+use acvd_formats::vfs::Disc;
 use acvd_render::menu::{self, Layout, MenuObject, MenuRoot, MenuSprite};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -33,9 +32,9 @@ pub struct Sortie {
     size: Vec2,
 }
 
-pub fn load(usrdir: &Path, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
+pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
     Ok(Sortie {
-        layout: menu::load(usrdir, LAYOUT, images)?,
+        layout: menu::load(disc, LAYOUT, images)?,
         size: Vec2::ZERO,
     })
 }

@@ -482,12 +482,8 @@ mod tests {
 
     #[test]
     fn disc_effects() {
-        let usrdir = crate::vfs::usrdir(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("ACVD Unbound"));
-        let path = usrdir.join("sfx/acv_commoneffects.ffxbnd");
-        if !path.is_file() {
-            return;
-        }
-        let binder = std::fs::read(&path).unwrap();
+        let Ok(disc) = crate::vfs::Disc::open(&crate::vfs::repo_root().join(crate::vfs::X360_ISO)) else { return };
+        let Ok(binder) = disc.read("sfx/acv_commoneffects.ffxbnd") else { return };
         let b = crate::bnd3::read(&binder).unwrap();
         let mut n = 0;
         for entry in &b.entries {
@@ -501,7 +497,7 @@ mod tests {
             n += 1;
         }
         assert!(n >= 1800, "{n} effects");
-        let muzzle = read(&crate::vfs::open(&usrdir, "sfx/acv_commoneffects.ffxbnd|f0001218.ffx").unwrap()).unwrap();
+        let muzzle = read(&disc.asset("sfx/acv_commoneffects.ffxbnd|f0001218.ffx").unwrap()).unwrap();
         assert_eq!(muzzle.resources[1], [1038, 230, 4022, 1036, 220, 242, 232, 233]);
         assert!(muzzle.nodes().any(|(id, _)| id == 2023));
     }

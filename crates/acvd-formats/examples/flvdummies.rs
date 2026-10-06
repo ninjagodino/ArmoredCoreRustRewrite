@@ -1,8 +1,9 @@
-//! Prints the vertex bounds and dummy points of FLVERs: `flvdummies <usrdir> <asset path>...`.
+//! Prints the vertex bounds and dummy points of FLVERs: `flvdummies <disc> <asset path>...`.
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let disc = acvd_formats::vfs::Disc::open(std::path::Path::new(&args[0]))?;
     for asset in &args[1..] {
-        let data = acvd_formats::vfs::open(std::path::Path::new(&args[0]), asset)?;
+        let data = disc.asset(asset)?;
         let f = acvd_formats::flver::read(&data)?;
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
         for m in &f.meshes {

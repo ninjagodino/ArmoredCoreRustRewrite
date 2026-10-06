@@ -9,11 +9,11 @@
 //! Joints are solved in FLVER axes and mirrored on X into Bevy's, like the meshes.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use acvd_data::generated::ac_unit::AcanimHokanparamSt;
 use acvd_data::{Asset, SocketRef};
-use acvd_formats::{ani, flver, vfs};
+use acvd_formats::vfs::{self, Disc};
+use acvd_formats::{ani, flver};
 use acvd_render::{Rig, RigBone};
 use anyhow::{Context, Result};
 use bevy::math::{Affine3A, Mat3};
@@ -135,12 +135,12 @@ impl Motion {
     }
 
     /// Loads clip `index`; clips whose bone count differs from the skeleton's are refused.
-    pub fn select(&mut self, usrdir: &Path, index: usize) -> Result<()> {
+    pub fn select(&mut self, disc: &Disc, index: usize) -> Result<()> {
         let clip = match self.cache.remove(&index) {
             Some(clip) => clip,
             None => {
                 let asset = self.clips.get(index).context("no such clip")?;
-                let clip = ani::read(&vfs::open(usrdir, &asset.path())?)?;
+                let clip = ani::read(&vfs::open(disc, &asset.path())?)?;
                 anyhow::ensure!(
                     clip.bones.len() == self.skeleton.bones.len(),
                     "{} has {} bones, the skeleton {}",
@@ -167,7 +167,7 @@ impl Motion {
     /// it is already playing; a new clip crossfades in over `fade` seconds per bone group.
     pub fn play(
         &mut self,
-        usrdir: &Path,
+        disc: &Disc,
         anim_id: u16,
         looping: bool,
         speed: f32,
@@ -180,7 +180,7 @@ impl Motion {
             .position(|a| a.entry == entry)
             .with_context(|| format!("{} has no {entry}", self.set))?;
         if index != self.index {
-            self.select(usrdir, index)?;
+            self.select(disc, index)?;
             self.fade.secs = fade;
         }
         (self.looping, self.speed, self.playing) = (looping, speed, true);
@@ -244,14 +244,14 @@ pub(crate) fn to_transform(t: Vec3, r: Quat, s: Vec3) -> Transform {
 }
 
 /// Opens the motion set the placements select (the first that has one) and its skeleton clip.
-fn motion(usrdir: &Path, parts: &[Loaded]) -> Result<Option<Motion>> {
+fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
     let Some(m) = parts
         .iter()
         .find_map(|p| acvd_data::ac_motion(p.placement.category, p.placement.part))
     else {
         return Ok(None);
     };
-    let skeleton = ani::read(&vfs::open(usrdir, &format!("{}|{}", m.set, m.skeleton))?)
+    let skeleton = ani::read(&vfs::open(disc, &format!("{}|{}", m.set, m.skeleton))?)
         .with_context(|| format!("{}|{}", m.set, m.skeleton))?;
     let mut clips: Vec<&'static Asset> = acvd_data::generated::assets::ALL
         .iter()
@@ -285,8 +285,8 @@ fn motion(usrdir: &Path, parts: &[Loaded]) -> Result<Option<Motion>> {
     }))
 }
 
-pub fn build(usrdir: &Path, parts: &[Loaded]) -> Result<Built> {
-    let mut motion = motion(usrdir, parts)?;
+pub fn build(disc: &Disc, parts: &[Loaded]) -> Result<Built> {
+    let mut motion = motion(disc, parts)?;
     let rest: Vec<ani::Rest> = motion
         .as_ref()
         .map(|m| {

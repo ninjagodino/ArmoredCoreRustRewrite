@@ -25,7 +25,7 @@ disc dump. `README.md` covers the legal boundary and the sheet pipeline in full.
 
 | path | what |
 |---|---|
-| `crates/acvd-formats` | disc format readers: DCX, BND3, FLVER (+ Edge indices), TPF, PARAM/PARAMDEF, `.ani`, `.dbp`, `acvparts.bin`, VFS (`path|entry` asset paths) |
+| `crates/acvd-formats` | disc format readers: DCX, BND3, FLVER (+ Edge indices), TPF, PARAM/PARAMDEF, `.ani`, `.dbp`, `acvparts.bin`, the 360 ISO (XDVDFS, BHD5/BDT, BHF3), VFS (`vfs::Disc`, `path|entry` asset paths) |
 | `crates/acvd-data` | generated structs/rows from the sheets (`src/generated/` is never committed) |
 | `crates/acvd-render` | disc → Bevy meshes/textures, orbit camera, `--shot` screenshot mode |
 | `crates/acvd-viewer` | FLVER model browser |

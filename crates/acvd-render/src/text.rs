@@ -4,9 +4,8 @@
 //! `<name>.ccm`, or `<name>.ccf` when that is what fontdef lists; sheets are
 //! `font/<name>/<name>_t.bnd|<name>.tpf`, named `{name}_{index:04}` in the texture sheet.
 
-use std::path::Path;
-
 use acvd_formats::ccm::{self, Ccm};
+use acvd_formats::vfs::Disc;
 use anyhow::{Context, Result};
 use bevy::asset::{Assets, Handle};
 use bevy::color::Color;
@@ -34,14 +33,14 @@ pub struct GlyphQuad {
     pub uv: Rect,
 }
 
-pub fn load(usrdir: &Path, name: &str, images: &mut Assets<Image>) -> Result<Font> {
-    let file = ["ccm", "ccf"].iter().map(|ext| format!("{name}.{ext}")).find(|f| usrdir.join("font").join(name).join(f).is_file());
-    load_file(usrdir, name, &file.with_context(|| format!("no font/{name}/{name}.ccm or .ccf"))?, images)
+pub fn load(disc: &Disc, name: &str, images: &mut Assets<Image>) -> Result<Font> {
+    let file = ["ccm", "ccf"].iter().map(|ext| format!("{name}.{ext}")).find(|f| disc.exists(&format!("font/{name}/{f}")));
+    load_file(disc, name, &file.with_context(|| format!("no font/{name}/{name}.ccm or .ccf"))?, images)
 }
 
 /// Like [`load`] with the glyph map named explicitly (`fontdef.xml` `CcmFile`).
-pub fn load_file(usrdir: &Path, name: &str, file: &str, images: &mut Assets<Image>) -> Result<Font> {
-    let data = acvd_formats::vfs::open(usrdir, &format!("font/{name}/{file}"))?;
+pub fn load_file(disc: &Disc, name: &str, file: &str, images: &mut Assets<Image>) -> Result<Font> {
+    let data = disc.asset(&format!("font/{name}/{file}"))?;
     let ccm = ccm::read(&data)?;
     let mut packs = Packs::default();
     let mut sheets = Vec::with_capacity(ccm.texture_count as usize);
@@ -52,7 +51,7 @@ pub fn load_file(usrdir: &Path, name: &str, file: &str, images: &mut Assets<Imag
             .next()
             .or_else(|| acvd_data::textures_named(&tex.to_lowercase()).next())
             .with_context(|| format!("no texture `{tex}`"))?;
-        let mut image = packs.texture(usrdir, t)?;
+        let mut image = packs.texture(disc, t)?;
         image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
             address_mode_u: ImageAddressMode::ClampToEdge,
             address_mode_v: ImageAddressMode::ClampToEdge,

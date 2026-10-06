@@ -22,8 +22,6 @@
 //! (collision triangles keep no material). The shot sound is the `acweaponsoundparam` row with
 //! that same `hit_id` (`w%08d`); a missing row plays cue 299, and a shoot id ≤ 0 is silent.
 
-use std::path::Path;
-
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::bullet::{
     BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN, PARAM_BULLETHITSFXPARAM_BIN,
@@ -31,7 +29,8 @@ use acvd_data::generated::bullet::{
 use acvd_data::generated::sfx::PARAM_ACWEAPONSFXPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACWEAPONSOUNDPARAM_BIN;
 use acvd_data::{ac_state, find, part_field};
-use acvd_formats::{ani, vfs};
+use acvd_formats::ani;
+use acvd_formats::vfs::{self, Disc};
 use acvd_render::Rig;
 use bevy::audio::AudioSource;
 use bevy::ecs::system::SystemParam;
@@ -291,12 +290,12 @@ pub fn fire(
             Hand::Left
         }
     });
-    let usrdir = body.garage.usrdir.clone();
+    let disc = body.garage.disc.clone();
     if let Some(motion) = body.motion.as_mut() {
         if let Some(anims) = body.anims.as_mut() {
             anims
                 .sniper
-                .update(sniper_hand, motion, &usrdir, &mut *pilot);
+                .update(sniper_hand, motion, &disc, &mut *pilot);
         }
     }
     for (i, gun) in arms.hands.iter_mut().enumerate() {
@@ -635,7 +634,7 @@ impl SniperStance {
         &mut self,
         want: Option<Hand>,
         motion: &mut Motion,
-        usrdir: &Path,
+        disc: &Disc,
         pilot: &mut Pilot,
     ) {
         match want {
@@ -645,7 +644,7 @@ impl SniperStance {
                     || self.hand != hand;
                 if restart {
                     self.hand = hand;
-                    self.phase = if play_stance(hand, false, motion, usrdir, pilot) {
+                    self.phase = if play_stance(hand, false, motion, disc, pilot) {
                         SniperPhase::Engage
                     } else {
                         SniperPhase::Hold
@@ -663,7 +662,7 @@ impl SniperStance {
                 }
                 SniperPhase::Release => {}
                 SniperPhase::Engage | SniperPhase::Hold => {
-                    self.phase = if play_stance(self.hand, true, motion, usrdir, pilot) {
+                    self.phase = if play_stance(self.hand, true, motion, disc, pilot) {
                         SniperPhase::Release
                     } else {
                         SniperPhase::Off
@@ -685,7 +684,7 @@ fn play_stance(
     hand: Hand,
     release: bool,
     motion: &mut Motion,
-    usrdir: &Path,
+    disc: &Disc,
     pilot: &Pilot,
 ) -> bool {
     let state = match (hand, release) {
@@ -699,7 +698,7 @@ fn play_stance(
     };
     motion
         .play(
-            usrdir,
+            disc,
             row.data.anim_id,
             row.data.b_loop != 0,
             1.0,
@@ -710,7 +709,7 @@ fn play_stance(
 
 impl WeaponAnims {
     /// Loads hand `a00` clips, the arm deploy clips on that side, and the rifle kick bones.
-    pub fn load(&mut self, usrdir: &Path, placement: &Placement, rig: &Rig, joints: &[Entity]) {
+    pub fn load(&mut self, disc: &Disc, placement: &Placement, rig: &Rig, joints: &[Entity]) {
         let hands = placement_hands(placement.column);
         if hands.is_empty() {
             return;
@@ -733,7 +732,7 @@ impl WeaponAnims {
         let Some(skeleton_asset) = assets.iter().find(|a| a.entry == ROLES[0]) else {
             return;
         };
-        let Ok(bytes) = vfs::open(usrdir, &skeleton_asset.path()) else {
+        let Ok(bytes) = vfs::open(disc, &skeleton_asset.path()) else {
             return;
         };
         let Ok(skeleton) = ani::read(&bytes) else {
@@ -748,7 +747,7 @@ impl WeaponAnims {
             let Some(asset) = assets.iter().find(|a| a.entry == *entry) else {
                 continue;
             };
-            let Ok(bytes) = vfs::open(usrdir, &asset.path()) else {
+            let Ok(bytes) = vfs::open(disc, &asset.path()) else {
                 continue;
             };
             let Ok(clip) = ani::read(&bytes) else {

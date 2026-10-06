@@ -5,9 +5,11 @@ are the source of truth, and every piece of game data code is generated from a s
 
 Game code is reverse-engineered from the Xbox 360 build only: its executable (`default.xex`,
 unpacked to `private/x360/vd/ACV2.pe`) is read statically through Ghidra and the fact index
-(`tools/acvd-index`), and runtime questions go to Xenia probes on that same executable. The disc
-data readers still load the PS3 dump (`ACVD Unbound/`, BLUS31194) until the 360 disc data
-migration in `docs/status.md` replaces it with the 360 disc's BHD5/BDT archives.
+(`tools/acvd-index`), and runtime questions go to Xenia probes on that same executable. Disc
+files are read through `acvd_formats::vfs::Disc`, which opens either the 360 ISO (XDVDFS, the
+BHD5/BDT archives and the BHF3 script archive) or the PS3 dump (`ACVD Unbound/`, BLUS31194). The
+PS3 dump stays the default until the rest of the 360 disc data migration in `docs/status.md`
+(360 FLVER and textures, XMA sound, fonts) lands.
 
 ## Legal boundary
 
@@ -28,7 +30,8 @@ tools\xenia\setup.ps1                          # the project's Xenia build (runt
 ```
 
 `--disc <dump root>` (or `ACVD_DISC`) points at the dump; it defaults to `ACVD Unbound/` until the
-360 migration lands.
+360 migration lands. `extract` needs the dump for now; `dump`, `acvd-game`, `acvd-viewer` and
+`acvd-menu` also take `--disc <360 ISO>`.
 
 - `extract` reads every PARAMDEF and PARAM on the disc into `private/sheets` (JSON grouped by
   system, CSV per file, schema CSV per type). Each row is re-encoded and compared byte-for-byte with

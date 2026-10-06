@@ -6,6 +6,9 @@
 //! where the bracketed fields exist when the format has IDs, names, and compression respectively.
 //! Names are NUL-terminated Shift-JIS. Entries with flag bit 0 hold a zlib stream that expands to
 //! `size` bytes; all other entries are stored as-is.
+//!
+//! BHF3 (360 `bind/script.bhd`) is the same header and entry table with magic `"BHF3"` and no
+//! data: offsets point into the sibling `.bdt` (`"BDF3"` + version, data from 0x10).
 
 use std::borrow::Cow;
 
@@ -15,6 +18,7 @@ use serde::Serialize;
 use crate::reader::Be;
 
 pub const MAGIC: &[u8; 4] = b"BND3";
+pub const BHF3_MAGIC: &[u8; 4] = b"BHF3";
 
 pub const BIG_ENDIAN: u8 = 0x01;
 pub const IDS: u8 = 0x02;
@@ -76,8 +80,18 @@ pub fn entry_size(format: u8) -> usize {
 }
 
 pub fn read(data: &[u8]) -> Result<Bnd3> {
+    ensure!(data.starts_with(MAGIC), "not a BND3");
+    parse(data, true)
+}
+
+/// A BHF3 header; entry contents are read from the `.bdt` bytes with [`Entry::contents`].
+pub fn read_bhf3(header: &[u8]) -> Result<Bnd3> {
+    ensure!(header.starts_with(BHF3_MAGIC), "not a BHF3");
+    parse(header, false)
+}
+
+fn parse(data: &[u8], inline_data: bool) -> Result<Bnd3> {
     let r = Be(data);
-    ensure!(r.bytes(0, 4)? == MAGIC, "not a BND3");
     let raw_format = r.u8(0x0C)?;
     let big_endian = r.u8(0x0D)?;
     let bit_big_endian = r.u8(0x0E)?;
@@ -108,7 +122,9 @@ pub fn read(data: &[u8]) -> Result<Bnd3> {
         let name_offset = next(has(format, NAMES1 | NAMES2))?;
         let size = next(has(format, COMPRESSION))?;
         let name = name_offset.map(|o| r.cstr_sjis(o as usize)).transpose().with_context(|| format!("entry {i} name"))?;
-        r.bytes(offset as usize, stored_size as usize).with_context(|| format!("entry {i} data"))?;
+        if inline_data {
+            r.bytes(offset as usize, stored_size as usize).with_context(|| format!("entry {i} data"))?;
+        }
         entries.push(Entry { flags, stored_size, offset, id, name_offset, name, size });
     }
 

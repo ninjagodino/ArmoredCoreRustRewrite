@@ -115,24 +115,29 @@ Rough priority order; reorder freely.
     call while firing.
   - Hits always use `default2`: the collision mesh keeps no material.
   - The `hit_sfx_type` to `bullethitsfxparam.bin` row mapping is assumed.
-- **360 disc data migration** (in this order; one task per chat). Game code is already 360-only;
-  the disc data still loads from the PS3 dump until these land:
-  1. **BHD5/BDT + XDVDFS VFS**: an `acvd-formats` reader for the 360 ISO (XDVDFS, XGD2 game
-     partition at 0xfd90000; layout in `private/tmp/xdvdfs.py`) and `bind/dvdbnd5_layer{0,1}.bhd`
-     / `.bdt` (layout under Done, "360 archives"), named through `private/x360/dvdbnd_names.csv`
-     (hash, size, path; 14,626 of 16,909 entries named, see Done). `bind/script.bhd` is BHF3 with
-     names inside. `--disc` defaults to the 360 ISO.
-  2. **Re-run extract from the 360 disc**: every PARAM row still round-trips byte for byte;
-     diff the generated sheets against the PS3 ones and record every difference. The 2,283
-     unnamed entries (and PS3 paths with no 360 hash: PARAM / FMG / menu tables, mostly
-     inside binders such as `/param/regulation.bin` or `/bind/boot.bnd`) get named here.
-  3. **Xenos TPF and 360 FLVER**: 360 texture formats (tiled DXT) and FLVER vertex / index
+- **360 disc data migration** (in this order; one task per chat). Game code is already 360-only,
+  and `vfs::Disc` reads the 360 ISO (Done, "360 disc VFS"); the default disc stays the PS3 dump
+  until 3 and 4 land, then `vfs::default_disc` flips to the ISO:
+  1. **Re-run extract from the 360 disc**: port `acvd-sheets extract` (and `archives.rs`) from
+     walking the dump directory to `Disc::files()` / `Disc::read` (it refuses an ISO today);
+     every PARAM row still round-trips byte for byte; diff the generated sheets against the
+     PS3 ones and record every difference. The 2,283 unnamed entries (and PS3 paths with no
+     360 hash: PARAM / FMG / menu tables, mostly inside binders such as `/param/regulation.bin`
+     or `/bind/boot.bnd`) get named here. The `.bdt` / `.bhd` `formats.not_on_disc` warnings
+     clear once the inventory comes from the ISO.
+  2. **Xenos TPF and 360 FLVER**: 360 texture formats (tiled DXT) and FLVER vertex / index
      buffers without Edge compression; `texture_formats.csv`, `formats.csv` rows updated.
-  4. **XMA sound, fonts, Lua, movies**: XMA FSB banks (`sheets/sound_cues.csv` playback), the
-     `s1_X360` font path, Lua from `script.bhd`, WMV movies (the PS3 build has PAMF).
-     Re-read the zoom-blur Xenos shaders (`speed_blur_draw`).
-  5. **Delete the PS3 paths**: remove Edge / PAMF / RSX code, the `ACVD Unbound` defaults and
-     PS3 rows in `target.csv` (title id, PARAM.SFO), `formats.csv`, `texture_formats.csv`.
+     From the ISO today every AC part FLVER fails `header 0x4B at 0x4b is nonzero` and every
+     TPF `TPF platform 1 is not PS3` (`acvd-game --disc <iso>` logs both; map `.hmd` and FFX
+     already read unchanged).
+  3. **XMA sound, fonts, Lua, movies**: XMA FSB banks (`sheets/sound_cues.csv` playback; from
+     the ISO `se_weapon` samples report "not MPEG"), the `s1_X360` font path (`font/e1_ext/` is
+     not on the 360 disc), Lua from `script.bhd` (readable as `script/<name>.lc` through
+     `Disc`), WMV movies (loose `movie/jp/*.wmv`; the PS3 build has PAMF). Re-read the
+     zoom-blur Xenos shaders (`speed_blur_draw`).
+  4. **Delete the PS3 paths**: remove Edge / PAMF / RSX code, the `ACVD Unbound` defaults and
+     the directory side of `vfs::Disc`, PS3 rows in `target.csv` (title id, PARAM.SFO),
+     `formats.csv`, `texture_formats.csv`.
 - **Xenia re-checks of earlier emulator captures** (rows say "Xenia re-check pending"):
   `camera_follow.csv` `look_at_height`, `base_transform`, `pitch` (probe the AC+0x234 pitch
   update; its 360 address is still to find from the AC update `0x828bef18`), `follow_ease`,
@@ -143,6 +148,30 @@ Rough priority order; reorder freely.
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
 ## Done
+
+- 360 disc VFS (`acvd-formats`: `xdvdfs`, `bhd5`, `bnd3::read_bhf3`, `dcx` DFLT, `vfs::Disc`).
+  - **`vfs::Disc`** opens a dump directory or the 360 ISO (`vfs::X360_ISO`); every consumer
+    (`acvd-render`, `acvd-game`, `acvd-viewer`, `acvd-menu`, `acvd-sheets dump`, the
+    `acvd-formats` examples) reads through `Disc::read` / `asset` / `exists` / `list` / `files`
+    instead of `std::fs` on a `USRDIR` path. `--disc` takes either; `vfs::default_disc` is the
+    PS3 dump while present (see Open, 360 migration).
+  - **ISO lookup order**: loose XDVDFS file (33: `bind/*`, `default.xex`, `movie/jp/*.wmv`,
+    `$SystemUpdate`, `NxeArt`), then BHD5 path hash in layer 0 then 1, then `script/<name>`
+    in `bind/script.bhd` (BHF3, format 0x2c: names + sizes, no ids, 0x14-byte entries; 1303
+    zlib Lua entries named relative to `script/` with `\`; data in `script.bdt`, BDF3 header,
+    offsets absolute). Listings come from `private/x360/dvdbnd_names.csv` (2,283 rows with an
+    empty path are the unnamed hashes) plus the script names and loose files.
+  - **DCX DFLT** (360): same `DCX`/`DCS`/`DCP`/`DCA` header as EDGE with `0x14` = 0x2C, `DCP`
+    `DFLT`, `0x20, 0x09000000, 0, 0, 0, 0x00010100`, `DCA` size 8, then one zlib stream of
+    `compressed_size` at 0x4C (ends at end of file on `am0010_m.bnd.dcx`: 0x4C + 0x38d21 =
+    232,813 bytes). 8 files on the 360 disc are still EDGE.
+  - **Check**: `cargo run --release -p acvd-formats --example disccheck` reads all 15,961 named
+    360 files and expands every DCX (9,218 DFLT, 8 EDGE) and every member of the 3,740 BND3
+    binders: 0 failures. Unit tests cover both readers; `vfs` disc tests read
+    `param/accolor/color5001.bin` (856), `movie/jp/tu_boost.wmv`, `script/acctrlparamcalc.lc`
+    and `am0010.flv` from the ISO; `ffx::disc_effects` now runs on the 360 effect binder (all
+    FFX parse unchanged). `acvd-game --disc <iso>` loads map m3100 collision (84,864 hit
+    triangles, same as the dump) but no AC (FLVER), textures or HUD font yet.
 
 - Static fact index, sheet audit, and the move to 360-only RE (`tools/acvd-index`).
   - **Index**: `cargo run --release -p acvd-index -- build` (or `tools\analyze-x360.ps1`) reads

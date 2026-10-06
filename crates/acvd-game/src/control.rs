@@ -1134,7 +1134,7 @@ pub fn pilot(
                         });
                     motion
                         .play(
-                            &garage.usrdir,
+                            &garage.disc,
                             row.data.anim_id,
                             row.data.b_loop != 0,
                             speed,

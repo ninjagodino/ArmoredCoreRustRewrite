@@ -13,11 +13,10 @@
 //! its letters). Sprite blend 1 is alpha, blend 2 additive ([`AdditiveSprite`]; apps add
 //! [`MenuPlugin`]). Not yet: runtime image slots (emblems, maps, movies), `NoiseSprite`.
 
-use std::path::Path;
-
 use std::collections::HashMap;
 
 use acvd_formats::drb::{self, Drb, Shape, TextSource};
+use acvd_formats::vfs::Disc;
 use acvd_formats::fmg::Fmg;
 use anyhow::{Context, Result};
 use bevy::asset::{embedded_asset, Asset, Assets, Handle};
@@ -44,8 +43,8 @@ pub struct Layout {
     pub placeholders: bool,
 }
 
-pub fn load(usrdir: &Path, path: &str, images: &mut Assets<Image>) -> Result<Layout> {
-    let drb = drb::read(&acvd_formats::vfs::open(usrdir, path)?).with_context(|| format!("reading {path}"))?;
+pub fn load(disc: &Disc, path: &str, images: &mut Assets<Image>) -> Result<Layout> {
+    let drb = drb::read(&disc.asset(path)?).with_context(|| format!("reading {path}"))?;
     let pack = path.strip_suffix(".drb.dcx").map(|p| format!("{p}.tpf.dcx")).with_context(|| format!("{path} is not a .drb.dcx"))?;
     let mut packs = Packs::default();
     let textures = drb
@@ -59,7 +58,7 @@ pub fn load(usrdir: &Path, path: &str, images: &mut Assets<Image>) -> Result<Lay
                 eprintln!("{path}: texture `{}` not in {pack}", t.name);
                 return None;
             };
-            match packs.texture(usrdir, r) {
+            match packs.texture(disc, r) {
                 Ok(mut image) => {
                     image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
                         address_mode_u: ImageAddressMode::ClampToEdge,
@@ -75,7 +74,7 @@ pub fn load(usrdir: &Path, path: &str, images: &mut Assets<Image>) -> Result<Lay
             }
         })
         .collect();
-    let fontdefs = acvd_formats::vfs::open(usrdir, "font/fontdef.xml").and_then(|d| acvd_formats::fontdef::read(&d));
+    let fontdefs = disc.asset("font/fontdef.xml").and_then(|d| acvd_formats::fontdef::read(&d));
     let mut fonts = HashMap::new();
     match fontdefs {
         Ok(defs) => {
@@ -84,7 +83,7 @@ pub fn load(usrdir: &Path, path: &str, images: &mut Assets<Image>) -> Result<Lay
                 if fonts.contains_key(&font) {
                     continue;
                 }
-                let loaded = defs.file(font as u32).with_context(|| format!("font {font} not in fontdef.xml")).and_then(|(name, file)| text::load_file(usrdir, name, file, images));
+                let loaded = defs.file(font as u32).with_context(|| format!("font {font} not in fontdef.xml")).and_then(|(name, file)| text::load_file(disc, name, file, images));
                 match loaded {
                     Ok(f) => {
                         fonts.insert(font, f);
@@ -96,7 +95,7 @@ pub fn load(usrdir: &Path, path: &str, images: &mut Assets<Image>) -> Result<Lay
         Err(e) => eprintln!("font/fontdef.xml: {e:#}"),
     }
     let menu_fmg = path.split_once("/menu/").map(|(lang, _)| format!("{lang}/text/menu/menu.fmg"));
-    let messages = menu_fmg.and_then(|p| match acvd_formats::vfs::open(usrdir, &p).and_then(|d| acvd_formats::fmg::read(&d)) {
+    let messages = menu_fmg.and_then(|p| match disc.asset(&p).and_then(|d| acvd_formats::fmg::read(&d)) {
         Ok(f) => Some(f),
         Err(e) => {
             eprintln!("{p}: {e:#}");

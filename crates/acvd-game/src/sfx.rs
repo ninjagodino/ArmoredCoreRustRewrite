@@ -11,13 +11,12 @@
 
 use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use acvd_data::find;
 use acvd_data::generated::sfx::PARAM_MAPSFXPARAM_BIN;
 use acvd_formats::ffx::{self, Param, ParamList, Value};
-use acvd_formats::vfs;
+use acvd_formats::vfs::{self, Disc};
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::{NoFrustumCulling, VisibilitySystems};
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
@@ -46,12 +45,12 @@ const FOOT_NOZZLES: [u8; 2] = [21, 23];
 const BACK_NOZZLES: std::ops::RangeInclusive<u8> = 25..=28;
 
 pub struct SfxPlugin {
-    pub usrdir: PathBuf,
+    pub disc: Disc,
 }
 
 impl Plugin for SfxPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(Dir(self.usrdir.clone()))
+        app.insert_resource(Dir(self.disc.clone()))
             .add_systems(Startup, setup)
             .add_systems(Update, (boosters.after(control::pilot), preview))
             .add_systems(
@@ -65,7 +64,7 @@ impl Plugin for SfxPlugin {
 }
 
 #[derive(Resource)]
-struct Dir(PathBuf);
+struct Dir(Disc);
 
 /// A playing effect. Effects end on their own when every node's life is over; [`Sfx::stop`]
 /// ends the nodes that never would. The entity despawns when its effect ends.
@@ -139,7 +138,7 @@ fn mirror(v: Vec3) -> Vec3 {
 
 #[derive(Resource)]
 struct Library {
-    usrdir: PathBuf,
+    disc: Disc,
     effects: HashMap<i32, Option<Arc<Vec<Arc<NodeDef>>>>>,
     textures: HashMap<String, Option<Handle<Image>>>,
     models: HashMap<i32, Option<Arc<Vec<Part>>>>,
@@ -185,7 +184,7 @@ fn setup(
         RenderAssetUsages::default(),
     );
     commands.insert_resource(Library {
-        usrdir: dir.0.clone(),
+        disc: dir.0.clone(),
         effects: HashMap::new(),
         textures: HashMap::new(),
         models: HashMap::new(),
@@ -198,12 +197,12 @@ fn setup(
 
 impl Library {
     fn effect(&mut self, id: i32) -> Option<Arc<Vec<Arc<NodeDef>>>> {
-        let usrdir = &self.usrdir;
+        let disc = &self.disc;
         self.effects
             .entry(id)
             .or_insert_with(|| {
                 let read = || -> anyhow::Result<ffx::Effect> {
-                    ffx::read(&vfs::open(usrdir, &format!("{EFFECTS}|f{id:07}.ffx"))?)
+                    ffx::read(&vfs::open(disc, &format!("{EFFECTS}|f{id:07}.ffx"))?)
                 };
                 match read() {
                     Ok(e) => {
@@ -238,7 +237,7 @@ impl Library {
         let found = acvd_data::textures_named(name)
             .find(|t| t.pack.starts_with("model/sfx/"))
             .or_else(|| acvd_data::textures_named(name).next());
-        let handle = match found.map(|t| self.packs.texture(&self.usrdir, t)) {
+        let handle = match found.map(|t| self.packs.texture(&self.disc, t)) {
             Some(Ok(img)) => Some(images.add(img)),
             Some(Err(e)) => {
                 warn!("sfx texture {name}: {e:#}");
@@ -262,7 +261,7 @@ impl Library {
         if let Some(m) = self.models.get(&id) {
             return m.clone();
         }
-        let loaded = match acvd_render::model(&self.usrdir, &format!("{MODELS}|s{id:04}.flv")) {
+        let loaded = match acvd_render::model(&self.disc, &format!("{MODELS}|s{id:04}.flv")) {
             Ok(l) => l,
             Err(e) => {
                 warn!("sfx model {id}: {e:#}");

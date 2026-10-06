@@ -1,6 +1,11 @@
-//! DCX, EDGE variant: the only DCX variant on the ACVD disc (all 9426 files share it).
+//! DCX: EDGE on the PS3 disc (all 9426 files), DFLT on the 360 disc.
 //!
-//! Layout (big-endian):
+//! DFLT (big-endian): `0x00 "DCX\0", u32 0x10000, u32 0x18, u32 0x24, u32 0x24, u32 0x2C,
+//! 0x18 "DCS\0", u32 uncompressed_size, u32 compressed_size, 0x24 "DCP\0", "DFLT", u32 0x20,
+//! u32 0x09000000, u32 0, u32 0, u32 0, u32 0x00010100, 0x44 "DCA\0", u32 8`, then one zlib stream
+//! of `compressed_size` bytes at 0x4C.
+//!
+//! EDGE layout (big-endian):
 //! `0x00 "DCX\0", u32 0x10000, u32 0x18, u32 0x24, u32 0x24, u32 0x2C + egdt_size,
 //!  0x18 "DCS\0", u32 uncompressed_size, u32 compressed_size,
 //!  0x24 "DCP\0", "EDGE", u32 0x20, u32 0x09000000, u32 0x10000, u32 0, u32 0, u32 0x00100100,
@@ -22,9 +27,17 @@ pub const MAGIC: &[u8; 4] = b"DCX\0";
 pub const CHUNK_SIZE: u32 = 0x10000;
 const DCA_AT: usize = 0x44;
 const CHUNKS_AT: usize = 0x70;
+const DFLT_DATA_AT: usize = 0x4C;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Variant {
+    Edge,
+    Dflt,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Dcx {
+    pub variant: Variant,
     pub uncompressed_size: u32,
     pub compressed_size: u32,
     pub last_chunk_size: u32,
@@ -63,6 +76,9 @@ pub fn read(data: &[u8]) -> Result<Dcx> {
     }
     expect_tag(&r, 0x18, b"DCS\0")?;
     expect_tag(&r, 0x24, b"DCP\0")?;
+    if r.bytes(0x28, 4)? == b"DFLT" {
+        return read_dflt(&r);
+    }
     expect_tag(&r, 0x28, b"EDGE")?;
     for (at, want) in [(0x2C, 0x20), (0x30, 0x0900_0000), (0x34, 0x10000), (0x38, 0), (0x3C, 0), (0x40, 0x0010_0100)] {
         expect_u32(&r, at, want)?;
@@ -96,7 +112,19 @@ pub fn read(data: &[u8]) -> Result<Dcx> {
         ensure!(flag <= 1, "chunk {i} compression flag {flag}");
         chunks.push(Chunk { offset: r.u32(at + 4)?, size: r.u32(at + 8)?, deflated: flag == 1 });
     }
-    Ok(Dcx { uncompressed_size, compressed_size, last_chunk_size, trailing_bytes: data.len() - end, chunks })
+    Ok(Dcx { variant: Variant::Edge, uncompressed_size, compressed_size, last_chunk_size, trailing_bytes: data.len() - end, chunks })
+}
+
+fn read_dflt(r: &Be) -> Result<Dcx> {
+    for (at, want) in [(0x14, 0x2C), (0x2C, 0x20), (0x30, 0x0900_0000), (0x34, 0), (0x38, 0), (0x3C, 0), (0x40, 0x0001_0100), (0x48, 8)] {
+        expect_u32(r, at, want)?;
+    }
+    expect_tag(r, DCA_AT, b"DCA\0")?;
+    let uncompressed_size = r.u32(0x1C)?;
+    let compressed_size = r.u32(0x20)?;
+    let end = DFLT_DATA_AT + compressed_size as usize;
+    ensure!(r.len() >= end, "file is {:#x} bytes, header implies {end:#x}", r.len());
+    Ok(Dcx { variant: Variant::Dflt, uncompressed_size, compressed_size, last_chunk_size: 0, trailing_bytes: r.len() - end, chunks: Vec::new() })
 }
 
 impl Dcx {
@@ -107,6 +135,15 @@ impl Dcx {
     /// Expands every chunk and checks each one produces exactly its declared size.
     pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
         let r = Be(data);
+        if self.variant == Variant::Dflt {
+            let want = self.uncompressed_size as usize;
+            let out = match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(r.bytes(DFLT_DATA_AT, self.compressed_size as usize)?, want) {
+                Ok(v) => v,
+                Err(e) => bail!("inflate failed: {e:?}"),
+            };
+            ensure!(out.len() == want, "expanded to {:#x} bytes, expected {want:#x}", out.len());
+            return Ok(out);
+        }
         let mut out = Vec::with_capacity(self.uncompressed_size as usize);
         for (i, c) in self.chunks.iter().enumerate() {
             let want = if i + 1 == self.chunks.len() { self.last_chunk_size } else { CHUNK_SIZE } as usize;
@@ -170,6 +207,26 @@ mod tests {
         assert_eq!(d.chunks.len(), 2);
         assert_eq!(d.last_chunk_size, 0x8000);
         assert_eq!(d.trailing_bytes, 5);
+        assert_eq!(d.decompress(&file).unwrap(), plain);
+    }
+
+    #[test]
+    fn dflt_expands_one_zlib_stream() {
+        let plain: Vec<u8> = (0..0x18000u32).map(|i| (i % 251) as u8).collect();
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let mut file = Vec::new();
+        let u32s = |out: &mut Vec<u8>, vals: &[u32]| vals.iter().for_each(|v| out.extend(v.to_be_bytes()));
+        file.extend(MAGIC);
+        u32s(&mut file, &[0x10000, 0x18, 0x24, 0x24, 0x2C]);
+        file.extend(b"DCS\0");
+        u32s(&mut file, &[plain.len() as u32, packed.len() as u32]);
+        file.extend(b"DCP\0DFLT");
+        u32s(&mut file, &[0x20, 0x0900_0000, 0, 0, 0, 0x0001_0100]);
+        file.extend(b"DCA\0");
+        u32s(&mut file, &[8]);
+        file.extend(&packed);
+        let d = read(&file).unwrap();
+        assert_eq!((d.variant, d.trailing_bytes), (Variant::Dflt, 0));
         assert_eq!(d.decompress(&file).unwrap(), plain);
     }
 

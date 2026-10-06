@@ -1,6 +1,6 @@
 //! Menu layout viewer: draws one DRB dialog with its disc textures.
 //!
-//! `acvd-menu [layout] [dialog] [--lang en] [--disc <dump root>] [--shot <png>] [--placeholders] [--atlas <texture>]`
+//! `acvd-menu [layout] [dialog] [--lang en] [--disc <360 ISO or dump root>] [--shot <png>] [--placeholders] [--atlas <texture>]`
 //! `layout` is a `lang/<lang>/menu/` name (`staffroll`) or a full `.drb.dcx` asset path; `dialog`
 //! is a dialog name, defaulting to the first one no other dialog nests. `--placeholders` shows
 //! texts the game fills at runtime as their object names. `--atlas` draws one of the layout's
@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use acvd_formats::vfs::{self, Disc};
 use acvd_render::app::{take_shot, Shot};
 use acvd_render::menu::{self, Layout, MenuRoot};
 use bevy::prelude::*;
@@ -16,7 +17,7 @@ use bevy::window::{PrimaryWindow, WindowResolution};
 
 #[derive(Resource)]
 struct Viewer {
-    usrdir: PathBuf,
+    disc: Disc,
     layouts: Vec<String>,
     current: usize,
     dialog: usize,
@@ -41,12 +42,9 @@ fn main() {
         }
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let usrdir = acvd_formats::vfs::usrdir(&disc.unwrap_or_else(|| root.join("ACVD Unbound")));
+    let disc = Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
     let folder = format!("lang/{lang}/menu");
-    let mut layouts: Vec<String> = std::fs::read_dir(usrdir.join(&folder))
-        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".drb.dcx")).map(|n| format!("{folder}/{n}")).collect())
-        .unwrap_or_default();
-    layouts.sort();
+    let mut layouts: Vec<String> = disc.list(&folder).into_iter().filter(|n| n.ends_with(".drb.dcx")).collect();
     let wanted = positional.first().cloned().unwrap_or_else(|| "staffroll".into());
     let path = if wanted.ends_with(".drb.dcx") { wanted.clone() } else { format!("{folder}/{wanted}.drb.dcx") };
     let current = layouts.iter().position(|l| l.eq_ignore_ascii_case(&path)).unwrap_or_else(|| {
@@ -61,7 +59,7 @@ fn main() {
     }))
     .add_plugins(menu::MenuPlugin)
     .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.07)))
-    .insert_resource(Viewer { usrdir, layouts, current, dialog: 0, wanted_dialog: positional.get(1).cloned(), shown: None, layout: None, placeholders, atlas })
+    .insert_resource(Viewer { disc, layouts, current, dialog: 0, wanted_dialog: positional.get(1).cloned(), shown: None, layout: None, placeholders, atlas })
     .add_systems(Startup, |mut commands: Commands| {
         commands.spawn(Camera2d);
     })
@@ -100,7 +98,7 @@ fn show(
     let size = Vec2::new(window.width(), window.height());
     if viewer.layout.is_none() {
         let path = viewer.layouts[viewer.current].clone();
-        match menu::load(&viewer.usrdir, &path, &mut images) {
+        match menu::load(&viewer.disc, &path, &mut images) {
             Ok(mut layout) => {
                 layout.placeholders = viewer.placeholders;
                 let wanted = viewer.wanted_dialog.take();

@@ -9,10 +9,10 @@ pub mod menu;
 pub mod text;
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use acvd_data::TextureRef;
-use acvd_formats::{flver, tpf, vfs};
+use acvd_formats::vfs::{self, Disc};
+use acvd_formats::{flver, tpf};
 use anyhow::{bail, ensure, Context, Result};
 use bevy::asset::{Assets, RenderAssetUsages};
 use bevy::color::Color;
@@ -40,14 +40,14 @@ pub fn texture_stem(path: &str) -> String {
     file.split('.').next().unwrap_or(file).to_owned()
 }
 
-pub fn model(usrdir: &Path, asset: &str) -> Result<Vec<LoadedMesh>> {
-    model_with_offsets(usrdir, asset, &|_| [0.0; 3])
+pub fn model(disc: &Disc, asset: &str) -> Result<Vec<LoadedMesh>> {
+    model_with_offsets(disc, asset, &|_| [0.0; 3])
 }
 
 /// Like [`model`], moving every vertex by `offset(root)` once it is in model space, in FLVER
 /// axes: `root` names the root bone above the vertex's bone, `None` when it has no bone.
-pub fn model_with_offsets(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3]) -> Result<Vec<LoadedMesh>> {
-    Ok(load(usrdir, asset, &|root| RootPlace::translate(offset(root)), false)?.0)
+pub fn model_with_offsets(disc: &Disc, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3]) -> Result<Vec<LoadedMesh>> {
+    Ok(load(disc, asset, &|root| RootPlace::translate(offset(root)), false)?.0)
 }
 
 /// Where one root bone of a part sits on the assembled AC, in FLVER axes. Columns are the
@@ -135,8 +135,8 @@ pub struct RigEffect {
 
 /// Like [`model_with_offsets`], with joint indices and weights on every mesh for GPU skinning.
 /// `place(root)` is where that root sits on the assembled AC.
-pub fn rigged_model(usrdir: &Path, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace) -> Result<(Vec<LoadedMesh>, Rig)> {
-    let (meshes, f) = load(usrdir, asset, place, true)?;
+pub fn rigged_model(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace) -> Result<(Vec<LoadedMesh>, Rig)> {
+    let (meshes, f) = load(disc, asset, place, true)?;
     let world = f.bone_transforms()?;
     let roots = f.bone_roots();
     let bones = f
@@ -177,8 +177,8 @@ pub fn rigged_model(usrdir: &Path, asset: &str, place: &dyn Fn(Option<&str>) -> 
     Ok((meshes, Rig { bones, unboned: place(None).t, sockets, frames, effects }))
 }
 
-fn load(usrdir: &Path, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig: bool) -> Result<(Vec<LoadedMesh>, flver::Flver)> {
-    let data = vfs::open(usrdir, asset)?;
+fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig: bool) -> Result<(Vec<LoadedMesh>, flver::Flver)> {
+    let data = vfs::open(disc, asset)?;
     let f = flver::read(&data)?;
     let world = f.bone_transforms()?;
     let by_bone: Vec<RootPlace> = f.bone_roots().into_iter().map(|r| place(Some(&f.bones[r].name))).collect();
@@ -276,8 +276,8 @@ fn vertex_joints(f: &flver::Flver, m: &flver::Mesh, v: &flver::Vertices, bones: 
 
 /// The material for `part`: its diffuse texture, or flat grey when it has none, `flat` is set,
 /// or the texture fails to load (reported to stderr and counted in `missing`).
-pub fn material(usrdir: &Path, part: &LoadedMesh, packs: &mut Packs, images: &mut Assets<Image>, flat: bool, missing: &mut usize) -> StandardMaterial {
-    let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| match packs.image(usrdir, name) {
+pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut Assets<Image>, flat: bool, missing: &mut usize) -> StandardMaterial {
+    let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| match packs.image(disc, name) {
         Ok(img) => Some(images.add(img)),
         Err(e) => {
             *missing += 1;
@@ -298,12 +298,12 @@ pub fn material(usrdir: &Path, part: &LoadedMesh, packs: &mut Packs, images: &mu
 pub struct Packs(HashMap<&'static str, Vec<u8>>);
 
 impl Packs {
-    pub fn image(&mut self, usrdir: &Path, name: &str) -> Result<Image> {
+    pub fn image(&mut self, disc: &Disc, name: &str) -> Result<Image> {
         let t: &TextureRef = acvd_data::textures_named(name).next().with_context(|| format!("no texture named `{name}`"))?;
-        self.texture(usrdir, t)
+        self.texture(disc, t)
     }
 
-    pub fn texture(&mut self, usrdir: &Path, t: &TextureRef) -> Result<Image> {
+    pub fn texture(&mut self, disc: &Disc, t: &TextureRef) -> Result<Image> {
         let name = t.name;
         let format = match t.format().map(|f| f.name) {
             Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,
@@ -314,7 +314,7 @@ impl Packs {
         ensure!(t.width % 4 == 0 && t.height % 4 == 0, "texture `{name}` is {}x{}", t.width, t.height);
         let pack = match self.0.entry(t.pack) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => e.insert(vfs::open(usrdir, t.pack)?),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(vfs::open(disc, t.pack)?),
         };
         let header = tpf::read(pack)?;
         let tex = header.textures.get(t.index).context("texture index past the pack")?;

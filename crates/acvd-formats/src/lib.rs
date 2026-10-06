@@ -3,6 +3,7 @@
 
 pub mod acv_parts;
 pub mod ani;
+pub mod bhd5;
 pub mod bnd3;
 pub mod ccm;
 pub mod dbp;
@@ -23,3 +24,4 @@ pub mod paramdef;
 pub mod reader;
 pub mod tpf;
 pub mod vfs;
+pub mod xdvdfs;

@@ -1,7 +1,8 @@
-//! Prints the bones of a named `.ani` clip: `anibones <usrdir> <asset path>`.
+//! Prints the bones of a named `.ani` clip: `anibones <disc> <asset path>`.
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let anim = acvd_formats::ani::read(&acvd_formats::vfs::open(std::path::Path::new(&args[0]), &args[1])?)?;
+    let disc = acvd_formats::vfs::Disc::open(std::path::Path::new(&args[0]))?;
+    let anim = acvd_formats::ani::read(&disc.asset(&args[1])?)?;
     println!("{} frames, {} bones", anim.frames, anim.bones.len());
     for (i, b) in anim.bones.iter().enumerate() {
         let r = b.rest.as_ref();

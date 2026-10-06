@@ -1,7 +1,7 @@
 //! Runtime skeleton: assembles ACs from the preset designs in `param/acassemblydrawing.bin`,
 //! entirely from generated data plus geometry read off the owned disc.
 //!
-//! `acvd-game [design id] [--disc <dump root>] [--shot <png>] [--flat] [--yaw <degrees>]
+//! `acvd-game [design id] [--disc <360 ISO or dump root>] [--shot <png>] [--flat] [--yaw <degrees>]
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
 //! [--water <y>]`
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump;
@@ -39,6 +39,7 @@ use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
 use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::Row;
 use acvd_formats::fmg::Fmg;
+use acvd_formats::vfs::{self, Disc};
 use acvd_render::app::{orbit, take_shot, Orbit, Shot};
 use acvd_render::text::{self, Font};
 use bevy::camera::visibility::NoFrustumCulling;
@@ -49,7 +50,7 @@ use collision::{Collision, Layer, Plane, RAY_HALF};
 
 #[derive(Resource)]
 struct Garage {
-    usrdir: PathBuf,
+    disc: Disc,
     designs: Vec<&'static Row<AcAssemblyDesignSt>>,
     current: usize,
     shown: Option<usize>,
@@ -123,7 +124,7 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let usrdir = acvd_formats::vfs::usrdir(&disc.unwrap_or_else(|| root.join("ACVD Unbound")));
+    let disc = Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
     let mut collision = if plane {
         Collision {
             planes: vec![Plane {
@@ -133,7 +134,7 @@ fn main() {
             hits: Vec::new(),
         }
     } else if let Some(id) = map {
-        match collision::load_map(&usrdir, &id) {
+        match collision::load_map(&disc, &id) {
             Ok(c) => {
                 eprintln!("map {id}: {} hit triangles", c.hits.len());
                 c
@@ -191,14 +192,14 @@ fn main() {
     }))
     .add_plugins((blur::BlurPlugin, acvd_render::menu::MenuPlugin))
     .add_plugins(sfx::SfxPlugin {
-        usrdir: usrdir.clone(),
+        disc: disc.clone(),
     })
     .add_plugins(sound::SoundPlugin {
-        usrdir: usrdir.clone(),
+        disc: disc.clone(),
     })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(Garage {
-        usrdir,
+        disc,
         designs,
         current,
         shown: None,
@@ -368,23 +369,20 @@ fn setup(
             }
         }
     }
-    match load_hud(&garage.usrdir, &mut images) {
+    match load_hud(&garage.disc, &mut images) {
         Ok(hud) => commands.insert_resource(hud),
         Err(e) => warn!("hud: {e:#}"),
     }
-    match hud::load(&garage.usrdir, &mut images) {
+    match hud::load(&garage.disc, &mut images) {
         Ok(sortie) => commands.insert_resource(sortie),
         Err(e) => warn!("sortie hud: {e:#}"),
     }
 }
 
-fn load_hud(usrdir: &std::path::Path, images: &mut Assets<Image>) -> anyhow::Result<Hud> {
+fn load_hud(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Hud> {
     Ok(Hud {
-        font: text::load(usrdir, "e1_ext", images)?,
-        parts: acvd_formats::fmg::read(&acvd_formats::vfs::open(
-            usrdir,
-            "lang/en/text/partsname_en.fmg",
-        )?)?,
+        font: text::load(disc, "e1_ext", images)?,
+        parts: acvd_formats::fmg::read(&disc.asset("lang/en/text/partsname_en.fmg")?)?,
     })
 }
 
@@ -478,7 +476,7 @@ fn show(
     for (index, p) in built.placements.iter().enumerate() {
         let places = assemble::root_places(p, &built.placements, &known);
         debug!("{} {}", p.column, p.model.path);
-        match acvd_render::rigged_model(&garage.usrdir, p.model.path, &|root| {
+        match acvd_render::rigged_model(&garage.disc, p.model.path, &|root| {
             assemble::place_of(&places, root)
         }) {
             Ok((meshes, rig)) => {
@@ -496,7 +494,7 @@ fn show(
             Err(e) => problems.push(format!("{}: {e:#}", p.model.path)),
         }
     }
-    let rig = match pose::build(&garage.usrdir, &loaded) {
+    let rig = match pose::build(&garage.disc, &loaded) {
         Ok(rig) => rig,
         Err(e) => {
             problems.push(format!("motion: {e:#}"));
@@ -512,13 +510,13 @@ fn show(
                 commands.entity(root).insert(h);
             }
         }
-        weapon_anims.load(&garage.usrdir, part.placement, &part.rig, &joints);
+        weapon_anims.load(&garage.disc, part.placement, &part.rig, &joints);
         sfx::effect_points(&mut commands, &part.rig, &joints, part.placement.column);
         for mesh in part.meshes {
             min = min.min(Vec3::from(mesh.min));
             max = max.max(Vec3::from(mesh.max));
             let material = materials.add(acvd_render::material(
-                &garage.usrdir,
+                &garage.disc,
                 &mesh,
                 &mut packs,
                 &mut images,
@@ -550,7 +548,7 @@ fn show(
             if let Some(name) = garage.clip.take() {
                 match motion.clips.iter().position(|a| a.entry == name) {
                     Some(i) => {
-                        if let Err(e) = motion.select(&garage.usrdir, i) {
+                        if let Err(e) = motion.select(&garage.disc, i) {
                             problems.push(format!("clip {name}: {e:#}"));
                         }
                     }
@@ -658,7 +656,7 @@ fn clips(
             break;
         }
         index = (index as isize + step).rem_euclid(n) as usize;
-        match m.select(&garage.usrdir, index) {
+        match m.select(&garage.disc, index) {
             Ok(()) => break,
             Err(e) => warn!("{e:#}"),
         }

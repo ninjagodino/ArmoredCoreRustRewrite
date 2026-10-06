@@ -9,10 +9,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
+use acvd_formats::vfs::Disc;
 use acvd_formats::{fev, fsb};
 use anyhow::{anyhow, bail, Context, Result};
 use bevy::audio::{AudioPlayer, AudioSource, PlaybackSettings};
@@ -38,7 +38,7 @@ const BOOST_LOOP: &str = "b00000010";
 /// Projects and the banks a cue has already pulled in.
 #[derive(Resource)]
 pub struct Cues {
-    dir: PathBuf,
+    disc: Disc,
     projects: Vec<fev::Project>,
     banks: HashMap<String, fsb::Bank>,
     decoded: HashMap<(String, u32), Handle<AudioSource>>,
@@ -46,16 +46,15 @@ pub struct Cues {
 }
 
 impl Cues {
-    fn load(usrdir: &Path) -> Self {
-        let dir = usrdir.join("sound");
+    fn load(disc: &Disc) -> Self {
         let mut projects = Vec::new();
         for name in [
             "acv2_se_weapon.fev",
             "acv2_se_booster.fev",
             "acv2_se_ac.fev",
         ] {
-            match std::fs::read(dir.join(name))
-                .with_context(|| name.to_string())
+            match disc
+                .read(&format!("sound/{name}"))
                 .and_then(|b| fev::read(&b))
             {
                 Ok(project) => projects.push(project),
@@ -63,7 +62,7 @@ impl Cues {
             }
         }
         Self {
-            dir,
+            disc: disc.clone(),
             projects,
             banks: HashMap::new(),
             decoded: HashMap::new(),
@@ -146,8 +145,9 @@ impl Cues {
 
     fn bank(&mut self, name: &str) -> Option<&fsb::Bank> {
         if !self.banks.contains_key(name) {
-            match std::fs::read(self.dir.join(format!("{name}.fsb")))
-                .with_context(|| name.to_string())
+            match self
+                .disc
+                .read(&format!("sound/{name}.fsb"))
                 .and_then(|b| fsb::read(&b))
             {
                 Ok(bank) => {
@@ -174,12 +174,12 @@ pub fn shot(commands: &mut Commands, cues: &mut Cues, assets: &mut Assets<AudioS
 }
 
 pub struct SoundPlugin {
-    pub usrdir: PathBuf,
+    pub disc: Disc,
 }
 
 impl Plugin for SoundPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(Cues::load(&self.usrdir))
+        app.insert_resource(Cues::load(&self.disc))
             .add_systems(Update, motion.after(crate::weapons::fire));
     }
 }
@@ -450,7 +450,7 @@ mod tests {
     use super::*;
 
     fn disc(name: &str) -> Option<Vec<u8>> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("ACVD Unbound")
             .join("PS3_GAME/USRDIR/sound")
