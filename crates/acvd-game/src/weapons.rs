@@ -135,6 +135,10 @@ struct RecoilBone {
     /// From a `sniper_$(LR)` control rather than `gun_$(LR)`.
     sniper: bool,
     kick: Kick,
+    /// Rotation before the kick, and the kicked rotation last written. Joints the clip does
+    /// not key keep the written value, so the kick must not stack on it.
+    base: Quat,
+    written: Option<Quat>,
 }
 
 /// One `jcondata.bin` object's shot reaction, stepped like the 360 per-object update
@@ -842,6 +846,8 @@ impl WeaponAnims {
                     hand,
                     sniper,
                     kick: Kick::new(object.react_ang, object.react_delay, object.react_time),
+                    base: Quat::IDENTITY,
+                    written: None,
                 });
             }
         }
@@ -862,12 +868,10 @@ impl WeaponAnims {
     ) {
         for bone in &mut self.recoil_bones {
             let angle = bone.kick.step(frames);
-            if angle == 0.0 {
+            let Ok((mut transform, _)) = posed.get_mut(bone.entity) else {
                 continue;
-            }
-            if let Ok((mut transform, _)) = posed.get_mut(bone.entity) {
-                transform.rotation *= Quat::from_rotation_x(angle.to_radians());
-            }
+            };
+            bone.rest_on(&mut transform, angle);
         }
     }
 
@@ -900,6 +904,20 @@ fn track_moves(track: &ani::Track) -> bool {
                 _ => false,
             }
     })
+}
+
+impl RecoilBone {
+    /// Writes the pose's own rotation turned by `angle` degrees about local X.
+    fn rest_on(&mut self, transform: &mut Transform, angle: f32) {
+        if self.written != Some(transform.rotation) {
+            self.base = transform.rotation;
+        }
+        if angle == 0.0 && self.written.is_none() {
+            return;
+        }
+        transform.rotation = self.base * Quat::from_rotation_x(angle.to_radians());
+        self.written = (angle != 0.0).then_some(transform.rotation);
+    }
 }
 
 impl Kick {
@@ -1113,6 +1131,34 @@ mod tests {
         assert!((peak + 10.0).abs() < 1e-4 && (10..=12).contains(&peak_at), "{frames:?}");
         assert!(frames[peak_at + 15] > -6.0 && frames[peak_at + 15] < -4.0, "halfway back");
         assert_eq!(frames[59], 0.0, "settled {KICK_RETURN} frames after the kick");
+    }
+
+    #[test]
+    fn spammed_kick_on_an_unkeyed_joint_does_not_stack() {
+        let mut bone = RecoilBone {
+            entity: Entity::PLACEHOLDER,
+            hand: Hand::Right,
+            sniper: false,
+            kick: Kick::new(-10.0, 5.0, 6.0),
+            base: Quat::IDENTITY,
+            written: None,
+        };
+        let pose = Quat::from_rotation_y(0.3);
+        let mut transform = Transform::from_rotation(pose);
+        for frame in 0..300 {
+            if frame % 3 == 0 {
+                bone.kick.trigger();
+            }
+            let angle = bone.kick.step(1.0);
+            bone.rest_on(&mut transform, angle);
+            let off = pose.inverse() * transform.rotation;
+            assert!(off.angle_between(Quat::IDENTITY).to_degrees() <= 10.01, "frame {frame}");
+        }
+        for _ in 0..60 {
+            let angle = bone.kick.step(1.0);
+            bone.rest_on(&mut transform, angle);
+        }
+        assert!(transform.rotation.angle_between(pose) < 1e-4, "returns to the pose");
     }
 
     #[test]
