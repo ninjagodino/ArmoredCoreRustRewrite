@@ -26,6 +26,11 @@ pub const FRAME_RATE: f32 = 60.0;
 
 /// How fast the lean follows the heading, degrees per second (assumed; the 360 rate is unread).
 const WHEEL_RATE: f32 = 540.0;
+/// How fast a wheel clip may slide the `center` bone, metres per second. On `a01_055` that
+/// bone's translation (its rotation stays identity) carries the whole body and swings about
+/// 1.8 m around the wheel. Tracking the heading at `WHEEL_RATE` shoves the mech whenever the
+/// strafe direction changes. The limb pose still follows the heading; this only limits the slide.
+const CENTER_SHIFT_RATE: f32 = 2.5;
 
 /// Bone-group columns of `param/acanimhokan.bin` after GeneralFrame, by skeleton bone name
 /// (`sheets/anim_blend.csv`). A joint takes the column of its nearest ancestor-or-self in the
@@ -119,6 +124,10 @@ pub struct Motion {
     /// Wheel clips: 0..1 weight of the lean pose over the pose shown at the clip change (set from
     /// the AC's speed, so the lean builds up as it accelerates) instead of the timed crossfade.
     pub lean: f32,
+    /// Smoothed `center` translation while a wheel clip plays, so a heading change does not
+    /// shove the body. `center_ready` is false until the first wheel frame plants it.
+    center_shift: Vec3,
+    center_ready: bool,
     /// Hold the clip's root bone (`master`) at rest: its motion (the turn clips yaw it) is
     /// applied by whoever moves the AC instead.
     pub in_place: bool,
@@ -155,6 +164,7 @@ impl Motion {
         self.cache.insert(self.index, old);
         (self.index, self.frame, self.looping, self.speed, self.wheel) =
             (index, 0.0, true, 1.0, None);
+        self.center_ready = false;
         self.fade = Fade {
             generation: self.fade.generation.wrapping_add(1),
             secs: [0.0; 8],
@@ -182,7 +192,10 @@ impl Motion {
         if index != self.index {
             self.select(disc, index)?;
             self.fade.secs = fade;
-        } else if !looping {
+        } else if !looping && self.wheel.is_none() {
+            // A one-shot replays from the start. A wheel clip (dash, air move, glide) is marked
+            // non-looping in acmotion but stays on this anim across headings; restarting it
+            // every direction change snaps the pose back to frame 0.
             self.frame = 0.0;
         }
         (self.looping, self.speed, self.playing) = (looping, speed, true);
@@ -283,6 +296,8 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
         in_place: false,
         scale: 1.0,
         fade: Fade::default(),
+        center_shift: Vec3::ZERO,
+        center_ready: false,
         cache: HashMap::new(),
     }))
 }
@@ -506,13 +521,40 @@ pub fn animate(
         let diff = (target - m.frame + 540.0).rem_euclid(360.0) - 180.0;
         let step = WHEEL_RATE * time.delta_secs();
         m.frame = (m.frame + diff.clamp(-step, step)).rem_euclid(360.0);
-    } else if m.playing {
-        let next = m.frame + time.delta_secs() * FRAME_RATE * m.speed;
-        m.frame = if m.looping {
-            next % frames
-        } else {
-            next.min(frames - 1.0)
-        };
+        // The wheel's `center` translation is the body's shift into the heading. Follow it
+        // slowly so a strafe change leans the limbs without shoving the whole mech.
+        let center = m.skeleton.bones.iter().position(|b| {
+            b.rest.as_ref().is_some_and(|r| r.name == "center")
+        });
+        if let Some(goal) = center
+            .and_then(|i| m.clip.bones.get(i))
+            .and_then(|b| b.track.translation(m.frame))
+        {
+            let goal = Vec3::from(goal);
+            if !m.center_ready {
+                m.center_shift = goal;
+                m.center_ready = true;
+            } else {
+                let step = CENTER_SHIFT_RATE * time.delta_secs();
+                let d = goal - m.center_shift;
+                let len = d.length();
+                m.center_shift = if len > step {
+                    m.center_shift + d * (step / len)
+                } else {
+                    goal
+                };
+            }
+        }
+    } else {
+        m.center_ready = false;
+        if m.playing {
+            let next = m.frame + time.delta_secs() * FRAME_RATE * m.speed;
+            m.frame = if m.looping {
+                next % frames
+            } else {
+                next.min(frames - 1.0)
+            };
+        }
     }
     m.fade.t += time.delta_secs();
     let (f, scale, fade) = (m.frame, m.scale, m.fade);
@@ -537,7 +579,11 @@ pub fn animate(
                 .rotation(f)
                 .unwrap_or_else(|| ani::euler_quat(rest.euler)),
         );
-        let t = Vec3::from(bone.track.translation(f).unwrap_or(rest.translation));
+        let t = if wheel && m.center_ready && rest.name == "center" {
+            m.center_shift
+        } else {
+            Vec3::from(bone.track.translation(f).unwrap_or(rest.translation))
+        };
         let s = Vec3::from(bone.track.scale(f).unwrap_or(rest.scale));
         let translation = if d.absolute {
             t * scale

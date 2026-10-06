@@ -51,11 +51,6 @@ const NO_ACTION_SIDE_FRAMES: f32 = 120.0;
 const ACTION_DIST_MIN: f32 = 0.001;
 /// The zoom-blur filter draws only above this alpha (360 0x82c98368: `if (9 < alpha)`).
 const BLUR_MIN_ALPHA: u8 = 9;
-/// After a high boost, the speed above the boost max is kept at this fraction per tick until
-/// the burst is spent. Not game data: the 360 burst length and its deceleration are not traced
-/// (the per-state max 0x82822af0 case 4 blends +0x120 and +0x11c by the impulse's f1).
-const QUICK_BOOST_DECAY: f32 = 0.85;
-
 /// Whether input drives the AC (`P` toggles) instead of browsing clips.
 #[derive(Resource)]
 pub struct Piloting(pub bool);
@@ -82,8 +77,6 @@ pub struct Pilot {
     pub quick_dir: Vec3,
     /// The body-relative eighth of a high boost whose clip starts on the next state pick.
     quick_pending: Option<u8>,
-    /// A high boost's burst is still above the boost max.
-    quick_burst: bool,
     /// Ticks of take-off acceleration left.
     takeoff: f32,
     jump_queued: bool,
@@ -764,7 +757,6 @@ impl Pilot {
             quick_boosts: 0,
             quick_dir: FORWARD,
             quick_pending: None,
-            quick_burst: false,
             takeoff: 0.0,
             jump_queued: false,
             landed: false,
@@ -807,6 +799,7 @@ impl Pilot {
 const MOUSE_YAW: f32 = 0.003;
 const MOUSE_PITCH: f32 = 0.003;
 
+#[derive(Default)]
 struct Input {
     /// x: right, y: forward, length at most 1.
     stick: Vec2,
@@ -879,7 +872,7 @@ fn quick_boost(p: &mut Pilot, stick: Vec2) {
     let forward = Quat::from_rotation_y(p.yaw + p.cam.yaw_off) * FORWARD;
     let world = forward.cross(Vec3::Y) * stick.x + forward * stick.y;
     p.velocity = (world * p.ctrl.quick_boost_max_tick).with_y(p.velocity.y);
-    (p.boost, p.glide, p.quick_dir, p.quick_burst) = (true, false, world, true);
+    (p.boost, p.glide, p.quick_dir) = (true, false, world);
     p.quick_boosts += 1;
     p.quick_pending = Some(direction(body_stick(stick, p.cam.yaw_off)));
     let c = p.ctrl;
@@ -937,10 +930,9 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         c.lospeed_brake_tick
     };
 
-    p.quick_burst &= speed > c.boost_max_tick;
-    if p.quick_burst {
-        horizontal *= (c.boost_max_tick + (speed - c.boost_max_tick) * QUICK_BOOST_DECAY) / speed;
-    } else if !p.airborne || p.glide {
+    // After a high boost the speed sits above the boost max; `integrate` keeps steering with the
+    // stick while it falls back by `over_max_decel_tick` per tick.
+    if !p.airborne || p.glide {
         let (max, accel) = if p.glide {
             (c.glide_max_tick, c.glide_acc_tick)
         } else if p.boost {
@@ -1056,6 +1048,15 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
         }
         return match dir {
             Some(d) => ("air_move", Some(d)),
+            // A direction change lets the stick pass through zero for a frame. Keep the wheel
+            // while the AC is still moving, or that frame cuts to rise/fall and the lean snaps.
+            None
+                if current.0 == "air_move"
+                    && p.boost
+                    && Vec2::new(p.velocity.x, p.velocity.z).length() > 0.05 =>
+            {
+                current
+            }
             None if p.velocity.y > 0.0 => ("rise", None),
             None => ("fall", None),
         };
@@ -1071,6 +1072,15 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
         Some(d) => ("walk", Some(d)),
         None if input.turn > 0.0 => ("turn_left", None),
         None if input.turn < 0.0 => ("turn_right", None),
+        // Same as the air case: keyboard direction changes zero the stick for a frame.
+        // Dropping to idle restarts the clip, which is the strafe twitch.
+        None
+            if current.0 == "dash"
+                && p.boost
+                && Vec2::new(p.velocity.x, p.velocity.z).length() > 0.05 =>
+        {
+            current
+        }
         None => ("idle", None),
     }
 }
@@ -1339,6 +1349,44 @@ pub fn pilot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A high boost is not a locked impulse: the stick keeps steering the velocity while the
+    /// speed above the boost max falls back, in the air and on the ground.
+    #[test]
+    fn high_boost_steers_and_settles() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .filter(|r| AcCtrlParam::buildable(&r.data))
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .find(|c| c.boost_acc_tick > 0.0 && c.over_max_decel_tick > 0.0)
+            .expect("a preset with boost acceleration");
+        for airborne in [false, true] {
+            let mut p = Pilot::new(ctrl, 0);
+            let collision = Collision::default();
+            let mut position = Vec3::new(0.0, 500.0, 0.0);
+            p.airborne = airborne;
+            quick_boost(&mut p, Vec2::Y);
+            assert!(p.velocity.length() > ctrl.boost_max_tick, "impulse above boost max");
+            let right = Input { stick: Vec2::X, ..Input::default() };
+            for _ in 0..30 {
+                step(&mut p, &right, &mut position, &collision);
+            }
+            let horizontal = Vec2::new(p.velocity.x, p.velocity.z);
+            let sideways = horizontal.dot(Vec2::new(p.yaw.cos(), -p.yaw.sin())).abs();
+            assert!(sideways > 0.2 * horizontal.length(), "air={airborne}: stuck on the QB heading {horizontal:?}, boost acc {} max {} decel {} qb {}", ctrl.boost_acc_tick, ctrl.boost_max_tick, ctrl.over_max_decel_tick, ctrl.quick_boost_max_tick);
+            for _ in 0..400 {
+                step(&mut p, &right, &mut position, &collision);
+            }
+            let settled = Vec2::new(p.velocity.x, p.velocity.z).length();
+            assert!(
+                (settled - ctrl.boost_max_tick).abs() < 1e-4,
+                "air={airborne}: speed {settled} should settle at boost max {}",
+                ctrl.boost_max_tick
+            );
+        }
+    }
 
     #[test]
     fn over_max_speed_decays_to_max() {
