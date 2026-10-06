@@ -5,7 +5,12 @@
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
 //! [--water <y>]`
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump;
-//! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left (see `weapons`);
+//! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left (see `weapons`).
+//! A ready-position weapon (cannon, autocannon, and the other classes with `ready_position`)
+//! plays its deploy clip while fire is held and does not shoot until that clip ends; releasing
+//! fire plays the stow, and that side's arm plays its deploy clip over the walk. A ready weapon
+//! also plays its body stance until that clip ends, then fires; a sniper rifle does not. Rifles kick
+//! the arm on each shot. Other weapons fire on the press and play their fire clip when they have one.
 //! M toggles mouselook (mouse turns and pitches, cursor grabbed);
 //! P switches to the clip browser: Up/Down previous/next clip, Space pause. Left/Right: previous/next design,
 //! drag left mouse: orbit, wheel: zoom, R: reframe. `--clip`/`--frame` start in the browser,
@@ -30,17 +35,17 @@ mod weapons;
 use std::path::PathBuf;
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, AC_ASSEMBLY_DESIGN_ST_FILES};
-use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::Row;
 use acvd_formats::fmg::Fmg;
 use acvd_render::app::{orbit, take_shot, Orbit, Shot};
 use acvd_render::text::{self, Font};
-use collision::{Collision, Layer, Plane, RAY_HALF};
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use collision::{Collision, Layer, Plane, RAY_HALF};
 
 #[derive(Resource)]
 struct Garage {
@@ -82,11 +87,28 @@ fn main() {
             "--disc" => disc = args.next().map(PathBuf::from),
             "--shot" => shot = args.next().map(|p| Shot::new(PathBuf::from(p))),
             "--flat" => flat = true,
-            "--yaw" => yaw = args.next().and_then(|d| d.parse::<f32>().ok()).map(f32::to_radians),
+            "--yaw" => {
+                yaw = args
+                    .next()
+                    .and_then(|d| d.parse::<f32>().ok())
+                    .map(f32::to_radians)
+            }
             "--clip" => clip = args.next(),
             "--frame" => frame = args.next().and_then(|f| f.parse::<f32>().ok()),
-            "--hold" => held = args.next().unwrap_or_default().split(',').filter_map(key).collect(),
-            "--wait" => wait = args.next().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0),
+            "--hold" => {
+                held = args
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(key)
+                    .collect()
+            }
+            "--wait" => {
+                wait = args
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.0)
+            }
             "--map" => map = args.next().filter(|s| s != "none"),
             "--plane" => plane = true,
             "--water" => water = args.next().and_then(|s| s.parse::<f32>().ok()),
@@ -98,10 +120,18 @@ fn main() {
     let piloting = clip.is_none() && frame.is_none();
     // Piloting starts behind the AC, the browser in front of it.
     let yaw = yaw.unwrap_or(if piloting { 0.25 } else { 2.6 });
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
     let usrdir = acvd_formats::vfs::usrdir(&disc.unwrap_or_else(|| root.join("ACVD Unbound")));
     let mut collision = if plane {
-        Collision { planes: vec![Plane { y: 0.0, layer: Layer::Ground }], hits: Vec::new() }
+        Collision {
+            planes: vec![Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            hits: Vec::new(),
+        }
     } else if let Some(id) = map {
         match collision::load_map(&usrdir, &id) {
             Ok(c) => {
@@ -110,48 +140,104 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("map {id}: {e:#}; using a flat plane");
-                Collision { planes: vec![Plane { y: 0.0, layer: Layer::Ground }], hits: Vec::new() }
+                Collision {
+                    planes: vec![Plane {
+                        y: 0.0,
+                        layer: Layer::Ground,
+                    }],
+                    hits: Vec::new(),
+                }
             }
         }
     } else {
-        Collision { planes: vec![Plane { y: 0.0, layer: Layer::Ground }], hits: Vec::new() }
+        Collision {
+            planes: vec![Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            hits: Vec::new(),
+        }
     };
     if let Some(y) = water {
-        collision.planes.push(Plane { y, layer: Layer::Water });
+        collision.planes.push(Plane {
+            y,
+            layer: Layer::Water,
+        });
     }
     let designs: Vec<&'static Row<AcAssemblyDesignSt>> = AC_ASSEMBLY_DESIGN_ST_FILES
         .iter()
         .flat_map(|(_, rows)| rows.iter())
-        .filter(|r| AC_ASSEMBLY_DESIGN_ST_SLOTS.iter().any(|s| (s.part)(&r.data) > 0) && AcCtrlParam::buildable(&r.data))
+        .filter(|r| {
+            AC_ASSEMBLY_DESIGN_ST_SLOTS
+                .iter()
+                .any(|s| (s.part)(&r.data) > 0)
+                && AcCtrlParam::buildable(&r.data)
+        })
         .collect();
-    let current = wanted.and_then(|id| designs.iter().position(|r| r.id == id)).unwrap_or(0);
+    let current = wanted
+        .and_then(|id| designs.iter().position(|r| r.id == id))
+        .unwrap_or(0);
     if let Some(id) = wanted.filter(|&id| designs.get(current).is_none_or(|r| r.id != id)) {
         eprintln!("no design {id}; starting at the first");
     }
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window { title: "acvd-game".into(), ..default() }),
+        primary_window: Some(Window {
+            title: "acvd-game".into(),
+            ..default()
+        }),
         ..default()
     }))
     .add_plugins((blur::BlurPlugin, acvd_render::menu::MenuPlugin))
-    .add_plugins(sfx::SfxPlugin { usrdir: usrdir.clone() })
-    .add_plugins(sound::SoundPlugin { usrdir: usrdir.clone() })
+    .add_plugins(sfx::SfxPlugin {
+        usrdir: usrdir.clone(),
+    })
+    .add_plugins(sound::SoundPlugin {
+        usrdir: usrdir.clone(),
+    })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
-    .insert_resource(Garage { usrdir, designs, current, shown: None, flat, bounds: (Vec3::ZERO, Vec3::ONE), clip, frame, status: String::new() })
+    .insert_resource(Garage {
+        usrdir,
+        designs,
+        current,
+        shown: None,
+        flat,
+        bounds: (Vec3::ZERO, Vec3::ONE),
+        clip,
+        frame,
+        status: String::new(),
+    })
     .insert_resource(StartYaw(yaw))
     .insert_resource(collision)
     .insert_resource(control::Piloting(piloting))
     .insert_resource(control::Held(held))
     .add_systems(Startup, (setup, weapons::setup))
-    .add_systems(Update, (browse, show, clips, control::pilot, pose::animate, weapons::fire, orbit).chain())
-    .add_systems(Update, (hud::layout, hud::readouts).chain().after(weapons::fire));
+    .add_systems(
+        Update,
+        (
+            browse,
+            show,
+            clips,
+            control::pilot,
+            pose::animate,
+            weapons::fire,
+            orbit,
+        )
+            .chain(),
+    )
+    .add_systems(
+        Update,
+        (hud::layout, hud::readouts).chain().after(weapons::fire),
+    );
     if let Some(id) = preview {
         app.insert_resource(sfx::Preview(id));
     }
     if let Some(mut shot) = shot {
         shot.burst = burst;
-        app.insert_resource(ShotDelay(wait, false)).insert_resource(shot).add_systems(Update, (delay_shot, take_shot).chain().after(pose::animate));
+        app.insert_resource(ShotDelay(wait, false))
+            .insert_resource(shot)
+            .add_systems(Update, (delay_shot, take_shot).chain().after(pose::animate));
     }
     app.run();
 }
@@ -199,35 +285,85 @@ fn setup(
     yaw: Res<StartYaw>,
     collision: Res<Collision>,
 ) {
-    commands.spawn((Camera3d::default(), Transform::default(), Orbit::new(yaw.0, 0.25), blur::ZoomBlur::default()));
-    commands.spawn((DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() }, Transform::from_xyz(4.0, 10.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y)));
-    commands.spawn((DirectionalLight { illuminance: 2500.0, ..default() }, Transform::from_xyz(-6.0, 3.0, -4.0).looking_at(Vec3::ZERO, Vec3::Y)));
+    commands.spawn((
+        Camera3d::default(),
+        Transform::default(),
+        Orbit::new(yaw.0, 0.25),
+        blur::ZoomBlur::default(),
+    ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 9000.0,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::from_xyz(4.0, 10.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 2500.0,
+            ..default()
+        },
+        Transform::from_xyz(-6.0, 3.0, -4.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
     if collision.hits.is_empty() {
         commands.spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))),
-            MeshMaterial3d(materials.add(StandardMaterial { base_color: Color::srgb(0.22, 0.23, 0.25), perceptual_roughness: 0.95, ..default() })),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.22, 0.23, 0.25),
+                perceptual_roughness: 0.95,
+                ..default()
+            })),
         ));
     } else {
-        for (layer, color) in [(Layer::Ground, Color::srgb(0.22, 0.23, 0.25)), (Layer::Water, Color::srgba(0.15, 0.35, 0.6, 0.5))] {
-            let Some(mesh) = debug_mesh(collision.hits.iter().filter(|h| h.layer == layer)) else { continue };
-            let mut mat = StandardMaterial { base_color: color, perceptual_roughness: 0.95, ..default() };
+        for (layer, color) in [
+            (Layer::Ground, Color::srgb(0.22, 0.23, 0.25)),
+            (Layer::Water, Color::srgba(0.15, 0.35, 0.6, 0.5)),
+        ] {
+            let Some(mesh) = debug_mesh(collision.hits.iter().filter(|h| h.layer == layer)) else {
+                continue;
+            };
+            let mut mat = StandardMaterial {
+                base_color: color,
+                perceptual_roughness: 0.95,
+                ..default()
+            };
             if layer == Layer::Water {
                 mat.alpha_mode = AlphaMode::Blend;
             }
             commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(materials.add(mat))));
         }
     }
-    let water = materials.add(StandardMaterial { base_color: Color::srgba(0.15, 0.35, 0.6, 0.5), alpha_mode: AlphaMode::Blend, ..default() });
+    let water = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.15, 0.35, 0.6, 0.5),
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
     for p in collision.planes.iter().filter(|p| p.layer == Layer::Water) {
-        commands.spawn((Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))), MeshMaterial3d(water.clone()), Transform::from_xyz(0.0, p.y, 0.0)));
+        commands.spawn((
+            Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))),
+            MeshMaterial3d(water.clone()),
+            Transform::from_xyz(0.0, p.y, 0.0),
+        ));
     }
     if collision.hits.is_empty() {
-        let (pillar, grey) = (meshes.add(Cuboid::new(1.0, 6.0, 1.0)), materials.add(Color::srgb(0.45, 0.47, 0.5)));
+        let (pillar, grey) = (
+            meshes.add(Cuboid::new(1.0, 6.0, 1.0)),
+            materials.add(Color::srgb(0.45, 0.47, 0.5)),
+        );
         let n = (FLOOR / 2.0 / PILLAR_SPACING) as i32;
         for x in -n..=n {
             for z in -n..=n {
                 if (x, z) != (0, 0) {
-                    commands.spawn((Mesh3d(pillar.clone()), MeshMaterial3d(grey.clone()), Transform::from_xyz(x as f32 * PILLAR_SPACING, 3.0, z as f32 * PILLAR_SPACING)));
+                    commands.spawn((
+                        Mesh3d(pillar.clone()),
+                        MeshMaterial3d(grey.clone()),
+                        Transform::from_xyz(
+                            x as f32 * PILLAR_SPACING,
+                            3.0,
+                            z as f32 * PILLAR_SPACING,
+                        ),
+                    ));
                 }
             }
         }
@@ -245,7 +381,10 @@ fn setup(
 fn load_hud(usrdir: &std::path::Path, images: &mut Assets<Image>) -> anyhow::Result<Hud> {
     Ok(Hud {
         font: text::load(usrdir, "e1_ext", images)?,
-        parts: acvd_formats::fmg::read(&acvd_formats::vfs::open(usrdir, "lang/en/text/partsname_en.fmg")?)?,
+        parts: acvd_formats::fmg::read(&acvd_formats::vfs::open(
+            usrdir,
+            "lang/en/text/partsname_en.fmg",
+        )?)?,
     })
 }
 
@@ -262,7 +401,10 @@ fn debug_mesh<'a>(hits: impl Iterator<Item = &'a collision::Hit>) -> Option<Mesh
     if positions.is_empty() {
         return None;
     }
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_indices(Indices::U32(indices));
     mesh.compute_smooth_normals();
@@ -274,7 +416,11 @@ const PILLAR_SPACING: f32 = 40.0;
 
 fn browse(keys: Res<ButtonInput<KeyCode>>, mut garage: ResMut<Garage>) {
     let n = garage.designs.len() as isize;
-    let step = [(KeyCode::ArrowRight, 1), (KeyCode::ArrowLeft, -1)].iter().filter(|(k, _)| keys.just_pressed(*k)).map(|(_, s)| *s).sum::<isize>();
+    let step = [(KeyCode::ArrowRight, 1), (KeyCode::ArrowLeft, -1)]
+        .iter()
+        .filter(|(k, _)| keys.just_pressed(*k))
+        .map(|(_, s)| *s)
+        .sum::<isize>();
     if step != 0 && n > 0 {
         garage.current = (garage.current as isize + step).rem_euclid(n) as usize;
     }
@@ -306,23 +452,47 @@ fn show(
         }
         return;
     }
-    let Some(&design) = garage.designs.get(garage.current) else { return };
+    let Some(&design) = garage.designs.get(garage.current) else {
+        return;
+    };
     garage.shown = Some(garage.current);
     for e in acs.iter().chain(shots.iter()).chain(labels.iter()) {
         commands.entity(e).despawn();
     }
+    commands.remove_resource::<weapons::WeaponAnims>();
 
     let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design.data);
     let spawn_y = collision.ground_below(Vec3::new(0.0, RAY_HALF, 0.0));
-    let ac = commands.spawn((Ac, Transform::from_xyz(0.0, spawn_y.unwrap_or(0.0), 0.0), Visibility::default())).id();
+    let ac = commands
+        .spawn((
+            Ac,
+            Transform::from_xyz(0.0, spawn_y.unwrap_or(0.0), 0.0),
+            Visibility::default(),
+        ))
+        .id();
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     let (mut packs, mut missing) = (acvd_render::Packs::default(), 0);
     let mut problems = built.problems;
     let mut loaded = Vec::new();
+    let mut known = vec![None; built.placements.len()];
     for (index, p) in built.placements.iter().enumerate() {
-        debug!("{} {} {:?}", p.column, p.model.path, p.offsets);
-        match acvd_render::rigged_model(&garage.usrdir, p.model.path, &|root| p.offset(root)) {
-            Ok((meshes, rig)) => loaded.push(pose::Loaded { index, placement: p, meshes, rig }),
+        let places = assemble::root_places(p, &built.placements, &known);
+        debug!("{} {}", p.column, p.model.path);
+        match acvd_render::rigged_model(&garage.usrdir, p.model.path, &|root| {
+            assemble::place_of(&places, root)
+        }) {
+            Ok((meshes, rig)) => {
+                known[index] = Some(assemble::Stored {
+                    places,
+                    frames: rig.frames.clone(),
+                });
+                loaded.push(pose::Loaded {
+                    index,
+                    placement: p,
+                    meshes,
+                    rig,
+                });
+            }
             Err(e) => problems.push(format!("{}: {e:#}", p.model.path)),
         }
     }
@@ -334,6 +504,7 @@ fn show(
         }
     };
     let skins = pose::spawn(&mut commands, ac, &rig, &loaded);
+    let mut weapon_anims = weapons::WeaponAnims::default();
     for (part, (joints, binds)) in loaded.into_iter().zip(skins) {
         let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
         if let Some(h) = weapons::hardpoint(part.placement) {
@@ -341,21 +512,39 @@ fn show(
                 commands.entity(root).insert(h);
             }
         }
+        weapon_anims.load(&garage.usrdir, part.placement, &part.rig, &joints);
         sfx::effect_points(&mut commands, &part.rig, &joints, part.placement.column);
         for mesh in part.meshes {
             min = min.min(Vec3::from(mesh.min));
             max = max.max(Vec3::from(mesh.max));
-            let material = materials.add(acvd_render::material(&garage.usrdir, &mesh, &mut packs, &mut images, garage.flat, &mut missing));
+            let material = materials.add(acvd_render::material(
+                &garage.usrdir,
+                &mesh,
+                &mut packs,
+                &mut images,
+                garage.flat,
+                &mut missing,
+            ));
             commands.spawn((
                 Mesh3d(meshes.add(mesh.mesh)),
                 MeshMaterial3d(material),
-                SkinnedMesh { inverse_bindposes: inverse_bindposes.clone(), joints: joints.clone() },
+                SkinnedMesh {
+                    inverse_bindposes: inverse_bindposes.clone(),
+                    joints: joints.clone(),
+                },
                 NoFrustumCulling,
                 Transform::default(),
                 ChildOf(ac),
             ));
         }
     }
+    for entity in weapon_anims.joints() {
+        commands.entity(entity).insert(weapons::ClipJoint);
+    }
+    for (entity, transform) in weapon_anims.rest_pose() {
+        commands.entity(entity).insert(transform);
+    }
+    commands.insert_resource(weapon_anims);
     match rig.motion {
         Some(mut motion) => {
             if let Some(name) = garage.clip.take() {
@@ -376,7 +565,14 @@ fn show(
         None => commands.remove_resource::<pose::Motion>(),
     }
 
-    let mut status = format!("[{}/{}] design {} {} - {} models", garage.current + 1, garage.designs.len(), design.id, design.name, built.placements.len());
+    let mut status = format!(
+        "[{}/{}] design {} {} - {} models",
+        garage.current + 1,
+        garage.designs.len(),
+        design.id,
+        design.name,
+        built.placements.len()
+    );
     if missing > 0 {
         status.push_str(&format!(", {missing} textures missing"));
     }
@@ -392,7 +588,9 @@ fn show(
     if spawn_y.is_none() && !collision.hits.is_empty() {
         pilot.airborne = true;
     }
-    commands.entity(ac).insert((pilot, weapons::Armament::from_design(&design.data)));
+    commands
+        .entity(ac)
+        .insert((pilot, weapons::Armament::from_design(&design.data)));
     if min.x <= max.x {
         garage.bounds = (min, max);
         if let Ok(mut o) = orbit.single_mut() {
@@ -406,7 +604,14 @@ fn show(
     garage.status = status;
     if let Some(hud) = hud.as_deref() {
         // Tint is not game data; DRB colours are still unread.
-        text::spawn(&mut commands, &hud.font, &hud_lines(design, &hud.parts), Vec2::new(24.0, 20.0), 2.0, Color::srgb(0.92, 0.95, 0.98));
+        text::spawn(
+            &mut commands,
+            &hud.font,
+            &hud_lines(design, &hud.parts),
+            Vec2::new(24.0, 20.0),
+            2.0,
+            Color::srgb(0.92, 0.95, 0.98),
+        );
     }
     if let Some(mut shot) = shot {
         shot.ready = true;
@@ -415,7 +620,10 @@ fn show(
 
 fn hud_lines(design: &Row<AcAssemblyDesignSt>, parts: &Fmg) -> String {
     let mut text = format!("{} {}", design.id, design.name);
-    let names: Vec<&str> = [design.data.head, design.data.core, design.data.legs].into_iter().filter_map(|id| parts.get(id as i32)).collect();
+    let names: Vec<&str> = [design.data.head, design.data.core, design.data.legs]
+        .into_iter()
+        .filter_map(|id| parts.get(id as i32))
+        .collect();
     if !names.is_empty() {
         text.push('\n');
         text.push_str(&names.join("  "));
@@ -438,7 +646,11 @@ fn clips(
     if keys.just_pressed(KeyCode::Space) {
         m.playing = !m.playing;
     }
-    let step = [(KeyCode::ArrowDown, 1), (KeyCode::ArrowUp, -1)].iter().filter(|(k, _)| keys.just_pressed(*k)).map(|(_, s)| *s).sum::<isize>();
+    let step = [(KeyCode::ArrowDown, 1), (KeyCode::ArrowUp, -1)]
+        .iter()
+        .filter(|(k, _)| keys.just_pressed(*k))
+        .map(|(_, s)| *s)
+        .sum::<isize>();
     let n = m.clips.len() as isize;
     let mut index = m.index;
     for _ in 0..n.max(1) {
@@ -452,7 +664,12 @@ fn clips(
         }
     }
     if step != 0 || m.is_added() {
-        let title = format!("{} - {} ({} frames)", garage.status, m.name(), m.clip.frames);
+        let title = format!(
+            "{} - {} ({} frames)",
+            garage.status,
+            m.name(),
+            m.clip.frames
+        );
         info!("{title}");
         if let Ok(mut w) = window.single_mut() {
             w.title = title;

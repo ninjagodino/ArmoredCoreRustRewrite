@@ -7,9 +7,12 @@
 //! `AcCtrlParamCalc.lua`), and every step plays the clip of the `sheets/ac_states.csv` state it
 //! lands in, through that state's `param/acmotion.bin` row.
 
-use acvd_data::generated::ac_unit::{MotionCollateSt, PARAM_ACANIMHOKAN_BIN, PARAM_ACMOTION_BIN, PARAM_MOTIONCOLLATE_BIN};
+use acvd_data::generated::ac_unit::{
+    MotionCollateSt, PARAM_ACANIMHOKAN_BIN, PARAM_ACMOTION_BIN, PARAM_MOTIONCOLLATE_BIN,
+};
 use acvd_data::generated::camera::{
-    AcCameraActionSt, AccamBehaviorParamSt, PARAM_ACCAMBEHAVIORPARAM_BIN, PARAM_ACCAMERAACTION_BIN, PARAM_ACCAMERAOFFSETPARAM_BIN,
+    AcCameraActionSt, AccamBehaviorParamSt, PARAM_ACCAMBEHAVIORPARAM_BIN, PARAM_ACCAMERAACTION_BIN,
+    PARAM_ACCAMERAOFFSETPARAM_BIN,
 };
 use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::generated::tuning::AC_ANIM_PARAM;
@@ -76,6 +79,8 @@ pub struct Pilot {
     landed: bool,
     /// The state playing, and whether its clip is in the set.
     state: Option<(&'static str, Option<u8>)>,
+    /// A sniper stance clip owns the body until it is released.
+    suppress_locomotion: bool,
     clip_ok: bool,
     accumulator: f32,
     /// The legs' `motioncollate` HokanParamID: the `acanimhokan.bin` block (0, or 500 for tanks)
@@ -170,7 +175,11 @@ impl Blend {
             (self.from, self.to, self.t, self.duration) = (self.value, target, 0.0, duration);
         }
         self.t = (self.t + dt).min(self.duration);
-        self.value = if self.duration > 0.0 { self.from + (self.to - self.from) * self.t / self.duration } else { self.to };
+        self.value = if self.duration > 0.0 {
+            self.from + (self.to - self.from) * self.t / self.duration
+        } else {
+            self.to
+        };
         self.value
     }
 }
@@ -193,7 +202,16 @@ struct Envelope {
 impl Envelope {
     fn start(&mut self, to: f32, rise: f32, hold: f32, fall: f32) {
         let from = if self.active { self.out } else { 0.0 };
-        *self = Self { rise, hold, fall, active: true, from, to, out: self.out, ..Self::default() };
+        *self = Self {
+            rise,
+            hold,
+            fall,
+            active: true,
+            from,
+            to,
+            out: self.out,
+            ..Self::default()
+        };
     }
 
     fn fade(&mut self, fall: f32) {
@@ -219,7 +237,11 @@ impl Envelope {
         } else if past < self.fall {
             self.level = 1.0 - past / self.fall;
         }
-        self.out = if self.t < self.rise { self.from + (self.to - self.from) * self.level } else { self.to * self.level };
+        self.out = if self.t < self.rise {
+            self.from + (self.to - self.from) * self.level
+        } else {
+            self.to * self.level
+        };
         self.out
     }
 }
@@ -260,7 +282,11 @@ fn camera_action(state: &str, boost: bool, airborne: bool) -> u32 {
         "land" => 9,
         _ => 8,
     };
-    if boost && !BOOST_KEEPS.contains(&base) { 38 + u32::from(airborne) } else { base }
+    if boost && !BOOST_KEEPS.contains(&base) {
+        38 + u32::from(airborne)
+    } else {
+        base
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -275,7 +301,15 @@ struct Shown {
 /// slides from `last_target` in 60 Hz steps, and each step closes `rate` of the gap per local axis
 /// of `frame` (front when the gap points down -Z), with `1 - (1 - rate)^t` for a partial step, and
 /// moves a further `push` x t along local x / y (360 0x82bfbb68).
-fn ease(shown: Vec3, last_target: Vec3, target: Vec3, rates: [f32; 4], push: Vec2, frame: Quat, dt: f32) -> Vec3 {
+fn ease(
+    shown: Vec3,
+    last_target: Vec3,
+    target: Vec3,
+    rates: [f32; 4],
+    push: Vec2,
+    frame: Quat,
+    dt: f32,
+) -> Vec3 {
     let frames = dt * TICK_RATE;
     if frames <= 0.0 {
         return shown;
@@ -283,13 +317,24 @@ fn ease(shown: Vec3, last_target: Vec3, target: Vec3, rates: [f32; 4], push: Vec
     let step = (target - last_target) / frames;
     let whole = frames.floor();
     let frac = frames - whole;
-    let close = |r: f32, t: f32| if t >= 1.0 || r >= 1.0 { r } else { 1.0 - (1.0 - r).powf(t) };
+    let close = |r: f32, t: f32| {
+        if t >= 1.0 || r >= 1.0 {
+            r
+        } else {
+            1.0 - (1.0 - r).powf(t)
+        }
+    };
     let mut goal = last_target;
     let mut shown = shown;
     let advance = |goal: Vec3, shown: &mut Vec3, t: f32| {
         let d = frame.inverse() * (goal - *shown);
         let z = if d.z < 0.0 { rates[2] } else { rates[3] };
-        *shown += frame * Vec3::new(d.x * close(rates[0], t) + push.x * t, d.y * close(rates[1], t) + push.y * t, d.z * close(z, t));
+        *shown += frame
+            * Vec3::new(
+                d.x * close(rates[0], t) + push.x * t,
+                d.y * close(rates[1], t) + push.y * t,
+                d.z * close(z, t),
+            );
     };
     for _ in 0..whole as u32 {
         goal += step;
@@ -304,25 +349,51 @@ fn ease(shown: Vec3, last_target: Vec3, target: Vec3, rates: [f32; 4], push: Vec
 
 /// The `motioncollate` row of a legs motion set without arms or OW motion.
 fn collate(legs_motion_id: u8) -> Option<&'static Row<MotionCollateSt>> {
-    PARAM_MOTIONCOLLATE_BIN.iter().find(|r| r.data.arms_motion_id == 0 && r.data.legs_motion_id == legs_motion_id && r.data.ow_motion_id == 0)
+    PARAM_MOTIONCOLLATE_BIN.iter().find(|r| {
+        r.data.arms_motion_id == 0
+            && r.data.legs_motion_id == legs_motion_id
+            && r.data.ow_motion_id == 0
+    })
 }
 
 impl FollowCam {
     /// Row 0 of `accambehaviorparam` with the `accameraoffsetparam` row of the legs' motion set
     /// (`motioncollate` without arms or OW motion).
     fn of(legs_motion_id: u8) -> Self {
-        let behavior = &find(PARAM_ACCAMBEHAVIORPARAM_BIN, 0).expect("accambehaviorparam row 0").data;
-        let offset = collate(legs_motion_id).and_then(|r| find(PARAM_ACCAMERAOFFSETPARAM_BIN, u32::from(r.data.camera_param_id)));
-        let (eye_dist_offset, eye_min_dist, lift_rate, shift_rate, approach, down_rate) = match offset {
-            Some(o) => {
-                let o = &o.data;
-                (o.eye_dist_offset, o.eye_min_dist, o.eye_offset_y_offset_rate, o.eye_offset_x_offset_rate, o.eye_approach_rate, o.eye_down_rate)
-            }
-            None => {
-                warn!("no accameraoffsetparam row for legs motion {legs_motion_id}");
-                (0.0, 0.0, 1.0, 1.0, behavior.eye_approach_rate, behavior.eye_down_rate)
-            }
-        };
+        let behavior = &find(PARAM_ACCAMBEHAVIORPARAM_BIN, 0)
+            .expect("accambehaviorparam row 0")
+            .data;
+        let offset = collate(legs_motion_id).and_then(|r| {
+            find(
+                PARAM_ACCAMERAOFFSETPARAM_BIN,
+                u32::from(r.data.camera_param_id),
+            )
+        });
+        let (eye_dist_offset, eye_min_dist, lift_rate, shift_rate, approach, down_rate) =
+            match offset {
+                Some(o) => {
+                    let o = &o.data;
+                    (
+                        o.eye_dist_offset,
+                        o.eye_min_dist,
+                        o.eye_offset_y_offset_rate,
+                        o.eye_offset_x_offset_rate,
+                        o.eye_approach_rate,
+                        o.eye_down_rate,
+                    )
+                }
+                None => {
+                    warn!("no accameraoffsetparam row for legs motion {legs_motion_id}");
+                    (
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
+                        behavior.eye_approach_rate,
+                        behavior.eye_down_rate,
+                    )
+                }
+            };
         let x = behavior.look_at_offset_x;
         debug!(
             "follow camera: legs motion {legs_motion_id}, eye dist offset {eye_dist_offset}, eye height {}, look-at height {}, offset x {x}",
@@ -350,12 +421,32 @@ impl FollowCam {
             shake_phase: 0.0,
             accel: 0.0,
             eye_rates: [
-                [behavior.eye_follow_rate_x, behavior.fly_eye_follow_rate_y, behavior.eye_follow_rate_f, behavior.eye_follow_rate_b],
-                [behavior.fly_eye_follow_rate_x, behavior.fly_eye_follow_rate_y, behavior.fly_eye_follow_rate_f, behavior.fly_eye_follow_rate_b],
+                [
+                    behavior.eye_follow_rate_x,
+                    behavior.fly_eye_follow_rate_y,
+                    behavior.eye_follow_rate_f,
+                    behavior.eye_follow_rate_b,
+                ],
+                [
+                    behavior.fly_eye_follow_rate_x,
+                    behavior.fly_eye_follow_rate_y,
+                    behavior.fly_eye_follow_rate_f,
+                    behavior.fly_eye_follow_rate_b,
+                ],
             ],
             look_at_rates: [
-                [behavior.look_at_follow_rate_x, behavior.fly_look_at_follow_rate_y, behavior.look_at_follow_rate_f, behavior.look_at_follow_rate_b],
-                [behavior.fly_look_at_follow_rate_x, behavior.fly_look_at_follow_rate_y, behavior.fly_look_at_follow_rate_f, behavior.fly_look_at_follow_rate_b],
+                [
+                    behavior.look_at_follow_rate_x,
+                    behavior.fly_look_at_follow_rate_y,
+                    behavior.look_at_follow_rate_f,
+                    behavior.look_at_follow_rate_b,
+                ],
+                [
+                    behavior.fly_look_at_follow_rate_x,
+                    behavior.fly_look_at_follow_rate_y,
+                    behavior.fly_look_at_follow_rate_f,
+                    behavior.fly_look_at_follow_rate_b,
+                ],
             ],
             rate_blend_secs: f32::from(behavior.cam_follow_rate_interpolate_frame) / TICK_RATE,
             eye_rate: [Blend::default(); 4],
@@ -370,7 +461,10 @@ impl FollowCam {
             cam_yaw: 0.0,
             tilt_speeds: (behavior.z_tilt_start_x_speed, behavior.z_tilt_max_x_speed),
             tilt_max: behavior.max_z_tilt_angle.to_radians(),
-            tilt_secs: (f32::from(behavior.z_tilt_interpolate_frame) / TICK_RATE, f32::from(behavior.z_tilt_end_interpolate_frame) / TICK_RATE),
+            tilt_secs: (
+                f32::from(behavior.z_tilt_interpolate_frame) / TICK_RATE,
+                f32::from(behavior.z_tilt_end_interpolate_frame) / TICK_RATE,
+            ),
             tilt: Blend::default(),
             behavior,
             blur: 0.0,
@@ -384,12 +478,27 @@ impl FollowCam {
     /// approached by BlurIntpRate of the gap, and the intensity stays within 0..1.
     fn blur_tick(&mut self, velocity: Vec3) {
         let b = self.behavior;
-        let ramp = |speed: f32, start: f32, max: f32| if speed > start && start < max { (speed - start) / (max - start) } else { 0.0 };
-        let h = ramp(velocity.with_y(0.0).length() * TICK_TO_KMH, b.blur_start_speed, b.blur_max_speed);
-        let v = ramp(velocity.y.abs() * TICK_TO_KMH, b.blur_start_speed_v, b.blur_max_speed_v);
+        let ramp = |speed: f32, start: f32, max: f32| {
+            if speed > start && start < max {
+                (speed - start) / (max - start)
+            } else {
+                0.0
+            }
+        };
+        let h = ramp(
+            velocity.with_y(0.0).length() * TICK_TO_KMH,
+            b.blur_start_speed,
+            b.blur_max_speed,
+        );
+        let v = ramp(
+            velocity.y.abs() * TICK_TO_KMH,
+            b.blur_start_speed_v,
+            b.blur_max_speed_v,
+        );
         let rate = self.action.map_or(0.0, |(_, a)| a.blur_rate);
         let target = (h + v).clamp(0.0, 1.0) * rate;
-        self.blur = (self.blur + (target - self.blur) * b.blur_intp_rate).clamp(0.0, 1.0);    }
+        self.blur = (self.blur + (target - self.blur) * b.blur_intp_rate).clamp(0.0, 1.0);
+    }
 
     /// The zoom-blur filter for this intensity (360 0x82bfa9f0, 0x82bf8c20); the filter skips
     /// drawing at alpha 9 or less (360 0x82c98368).
@@ -398,7 +507,12 @@ impl FollowCam {
         let i = self.blur;
         let alpha = ((b.blur_alpha as f32 * i) as i32).clamp(0, 255) as u8;
         let alpha = if alpha > BLUR_MIN_ALPHA { alpha } else { 0 };
-        ZoomBlur::new(b.blur_offset * i, alpha, b.blur_thin_pow * i, Vec2::new(b.blur_no_effect_size_x, b.blur_no_effect_size_y))
+        ZoomBlur::new(
+            b.blur_offset * i,
+            alpha,
+            b.blur_thin_pow * i,
+            Vec2::new(b.blur_no_effect_size_x, b.blur_no_effect_size_y),
+        )
     }
 
     /// Rotates the eased camera points about pivot by delta (yaw), so freelook turns the view
@@ -406,7 +520,12 @@ impl FollowCam {
     fn swing(&mut self, pivot: Vec3, delta: f32) {
         if let Some(s) = self.shown.as_mut() {
             let r = Quat::from_rotation_y(delta);
-            for v in [&mut s.eye, &mut s.look_at, &mut s.eye_target, &mut s.look_at_target] {
+            for v in [
+                &mut s.eye,
+                &mut s.look_at,
+                &mut s.eye_target,
+                &mut s.look_at_target,
+            ] {
                 *v = pivot + r * (*v - pivot);
             }
         }
@@ -419,7 +538,12 @@ impl FollowCam {
         let (target, secs) = if side.abs() <= start || start >= max {
             (0.0, self.tilt_secs.1)
         } else {
-            (((side.abs() - start) / (max - start)).min(1.0).copysign(side), self.tilt_secs.0)
+            (
+                ((side.abs() - start) / (max - start))
+                    .min(1.0)
+                    .copysign(side),
+                self.tilt_secs.0,
+            )
         };
         self.tilt_max * self.tilt.toward(target, secs, dt)
     }
@@ -444,7 +568,11 @@ impl FollowCam {
         let (mut eye, look_at) = if f.y >= 0.0 {
             let flat = Vec3::new(f.x, 0.0, f.z).normalize_or_zero();
             let t = 1.0 - self.approach;
-            let h = Vec3::new(f.x + (flat.x - f.x) * t, self.down_rate * f.y, f.z + (flat.z - f.z) * t);
+            let h = Vec3::new(
+                f.x + (flat.x - f.x) * t,
+                self.down_rate * f.y,
+                f.z + (flat.z - f.z) * t,
+            );
             let eye = p - h * dist;
             (eye, eye + f * dist)
         } else {
@@ -468,14 +596,21 @@ impl FollowCam {
         if self.action.is_some_and(|(id, _)| id == action) {
             return;
         }
-        let Some(row) = find(PARAM_ACCAMERAACTION_BIN, action).map(|r| &r.data) else { return };
+        let Some(row) = find(PARAM_ACCAMERAACTION_BIN, action).map(|r| &r.data) else {
+            return;
+        };
         let secs = |frames: i16| f32::from(frames) / TICK_RATE;
         if let Some((_, old)) = self.action.filter(|(_, old)| old.fov_enable != 0) {
             self.fov.fade(secs(old.fov_fade_frame));
         }
         if row.fov_enable != 0 {
             let to = f32::from(row.fov_max_angle) - self.base_fov;
-            self.fov.start(to, secs(row.fov_max_frame), secs(row.fov_keep_frame), secs(row.fov_fade_frame));
+            self.fov.start(
+                to,
+                secs(row.fov_max_frame),
+                secs(row.fov_keep_frame),
+                secs(row.fov_fade_frame),
+            );
         }
         self.action = Some((action, row));
     }
@@ -484,17 +619,27 @@ impl FollowCam {
     /// targets 0x8285d7f8 / 0x8285d8c8 over EyeFadeInFrame, set outright on its first update).
     fn blend_eye(&mut self, turn: f32, dt: f32) {
         let a = self.action.map(|(_, a)| a);
-        let dist = a.map(|a| a.eye_distance).filter(|&d| d > ACTION_DIST_MIN).unwrap_or(self.behavior.eye_dist);
+        let dist = a
+            .map(|a| a.eye_distance)
+            .filter(|&d| d > ACTION_DIST_MIN)
+            .unwrap_or(self.behavior.eye_dist);
         let lift = a.map_or(0.0, |a| a.eye_offset_y);
         let shift = a.map_or(0.0, |a| a.eye_offset_x);
         let secs = a.map_or(0.0, |a| f32::from(a.eye_fade_in_frame) / TICK_RATE);
-        let side_secs = a.map_or(NO_ACTION_SIDE_FRAMES, |a| f32::from(a.turn_offset_move_frame)) / TICK_RATE;
+        let side_secs = a.map_or(NO_ACTION_SIDE_FRAMES, |a| {
+            f32::from(a.turn_offset_move_frame)
+        }) / TICK_RATE;
         if a.is_some_and(|a| a.b_trun_move_enable != 0) && turn != 0.0 {
             self.side_sign = -turn.signum();
         }
         if self.shown.is_none() {
-            let set = |v: f32| Blend { value: v, to: v, ..Blend::default() };
-            (self.eye_dist, self.lift, self.shift, self.side) = (set(dist), set(lift), set(shift), set(self.side_sign));
+            let set = |v: f32| Blend {
+                value: v,
+                to: v,
+                ..Blend::default()
+            };
+            (self.eye_dist, self.lift, self.shift, self.side) =
+                (set(dist), set(lift), set(shift), set(self.side_sign));
         }
         self.eye_dist.toward(dist, secs, dt);
         self.lift.toward(lift, secs, dt);
@@ -527,22 +672,55 @@ impl FollowCam {
     }
 
     /// The shown eye and look-at for this frame's targets.
-    fn follow(&mut self, eye: Vec3, look_at: Vec3, frame: Quat, airborne: bool, dt: f32) -> (Vec3, Vec3) {
+    fn follow(
+        &mut self,
+        eye: Vec3,
+        look_at: Vec3,
+        frame: Quat,
+        airborne: bool,
+        dt: f32,
+    ) -> (Vec3, Vec3) {
         let air = usize::from(airborne);
         let secs = self.rate_blend_secs;
-        let action = self.action.map(|(_, a)| [a.eye_follow_rate_x, a.eye_follow_rate_y, a.eye_follow_rate_f, a.eye_follow_rate_b]);
+        let action = self.action.map(|(_, a)| {
+            [
+                a.eye_follow_rate_x,
+                a.eye_follow_rate_y,
+                a.eye_follow_rate_f,
+                a.eye_follow_rate_b,
+            ]
+        });
         let eye_rates: [f32; 4] = std::array::from_fn(|i| {
             let target = action.map_or(0.0, |a| a[i]);
-            let target = if target < ACTION_RATE_MIN { self.eye_rates[air][i] } else { target };
+            let target = if target < ACTION_RATE_MIN {
+                self.eye_rates[air][i]
+            } else {
+                target
+            };
             self.eye_rate[i].toward(target, secs, dt)
         });
-        let look_at_rates: [f32; 4] = std::array::from_fn(|i| self.look_at_rate[i].toward(self.look_at_rates[air][i], secs, dt));
+        let look_at_rates: [f32; 4] = std::array::from_fn(|i| {
+            self.look_at_rate[i].toward(self.look_at_rates[air][i], secs, dt)
+        });
         let push = self.shake(dt);
         let shown = match self.shown {
-            None => Shown { eye, look_at, eye_target: eye, look_at_target: look_at },
+            None => Shown {
+                eye,
+                look_at,
+                eye_target: eye,
+                look_at_target: look_at,
+            },
             Some(s) => Shown {
                 eye: ease(s.eye, s.eye_target, eye, eye_rates, push, frame, dt),
-                look_at: ease(s.look_at, s.look_at_target, look_at, look_at_rates, push, frame, dt),
+                look_at: ease(
+                    s.look_at,
+                    s.look_at_target,
+                    look_at,
+                    look_at_rates,
+                    push,
+                    frame,
+                    dt,
+                ),
                 eye_target: eye,
                 look_at_target: look_at,
             },
@@ -566,6 +744,7 @@ impl Pilot {
             jump_queued: false,
             landed: false,
             state: None,
+            suppress_locomotion: false,
             clip_ok: false,
             accumulator: 0.0,
             hokan_base: collate(legs_motion_id).map_or(0, |r| r.data.hokan_param_id.into()),
@@ -573,10 +752,29 @@ impl Pilot {
         }
     }
 
+    /// Crossfade times for an `acmotion` interpolate id, added to the legs' hokan block.
+    pub(crate) fn fade(&self, interpolate_id: u8) -> [f32; 8] {
+        let hokan = self.hokan_base + u32::from(interpolate_id);
+        find(PARAM_ACANIMHOKAN_BIN, hokan)
+            .map(|h| Fade::of(&h.data))
+            .unwrap_or([0.0; 8])
+    }
+
+    /// While held, the locomotion state does not replace the clip. Clearing it replays the
+    /// state on the next step.
+    pub(crate) fn body_held(&mut self, hold: bool) {
+        if self.suppress_locomotion && !hold {
+            self.state = None;
+        }
+        self.suppress_locomotion = hold;
+    }
+
     /// Fire direction: the follow camera's pitched forward (`FollowCam::place`); core aim is not
     /// posed yet.
     pub fn aim_direction(&self) -> Vec3 {
-        Quat::from_rotation_y(self.yaw + self.cam.yaw_off) * Quat::from_rotation_x(self.cam.pitch) * FORWARD
+        Quat::from_rotation_y(self.yaw + self.cam.yaw_off)
+            * Quat::from_rotation_x(self.cam.pitch)
+            * FORWARD
     }
 }
 
@@ -598,12 +796,18 @@ struct Input {
 
 fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamepad>) -> Input {
     let down = |k: KeyCode| keys.pressed(k) || held.contains(&k);
-    let axis = |pos: KeyCode, neg: KeyCode| f32::from(u8::from(down(pos))) - f32::from(u8::from(down(neg)));
-    let mut stick = Vec2::new(axis(KeyCode::KeyD, KeyCode::KeyA), axis(KeyCode::KeyW, KeyCode::KeyS));
+    let axis = |pos: KeyCode, neg: KeyCode| {
+        f32::from(u8::from(down(pos))) - f32::from(u8::from(down(neg)))
+    };
+    let mut stick = Vec2::new(
+        axis(KeyCode::KeyD, KeyCode::KeyA),
+        axis(KeyCode::KeyW, KeyCode::KeyS),
+    );
     let mut turn = axis(KeyCode::KeyQ, KeyCode::KeyE);
     let mut look = axis(KeyCode::ArrowUp, KeyCode::ArrowDown);
     let mut jump = keys.just_pressed(KeyCode::Space) || held.contains(&KeyCode::Space);
-    let mut boost_toggle = keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight);
+    let mut boost_toggle =
+        keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight);
     let mut glide = keys.just_pressed(KeyCode::ControlLeft) || held.contains(&KeyCode::ControlLeft);
     for pad in pads {
         let left = pad.left_stick();
@@ -621,7 +825,14 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
         boost_toggle |= pad.just_pressed(GamepadButton::LeftTrigger);
         glide |= pad.just_pressed(GamepadButton::LeftThumb);
     }
-    Input { stick: stick.clamp_length_max(1.0), turn: turn.clamp(-1.0, 1.0), look: look.clamp(-1.0, 1.0), jump, boost_toggle, glide }
+    Input {
+        stick: stick.clamp_length_max(1.0),
+        turn: turn.clamp(-1.0, 1.0),
+        look: look.clamp(-1.0, 1.0),
+        jump,
+        boost_toggle,
+        glide,
+    }
 }
 
 /// Eighth of the circle `stick` points at, 0 forward, clockwise.
@@ -632,7 +843,11 @@ fn direction(stick: Vec2) -> u8 {
 
 fn approach(v: Vec2, target: Vec2, step: f32) -> Vec2 {
     let d = target - v;
-    if d.length() <= step { target } else { v + d.normalize() * step }
+    if d.length() <= step {
+        target
+    } else {
+        v + d.normalize() * step
+    }
 }
 
 /// One tick of the move integrator (360 0x82822ea0) with a move action held: at or under `max`
@@ -661,7 +876,11 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     let speed = horizontal.length();
     let moving = wish != Vec2::ZERO;
     p.glide &= p.boost && moving && !p.airborne;
-    let brake = if speed >= c.brake_switch_tick { c.hispeed_brake_tick } else { c.lospeed_brake_tick };
+    let brake = if speed >= c.brake_switch_tick {
+        c.hispeed_brake_tick
+    } else {
+        c.lospeed_brake_tick
+    };
 
     if !p.airborne {
         let (max, accel) = if p.glide {
@@ -672,7 +891,11 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
             (c.walk_max_tick, c.walk_acc_tick)
         };
         horizontal = if p.glide {
-            approach(horizontal, wish * max, if speed <= max { accel } else { brake })
+            approach(
+                horizontal,
+                wish * max,
+                if speed <= max { accel } else { brake },
+            )
         } else if moving {
             integrate(horizontal, wish * accel, max, c.over_max_decel_tick)
         } else {
@@ -684,9 +907,18 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     } else if p.takeoff > 0.0 {
         horizontal += wish * c.jump_h_acc_tick;
     } else if p.boost && moving {
-        horizontal = integrate(horizontal, wish * c.boost_acc_tick, c.boost_max_tick, c.over_max_decel_tick);
+        horizontal = integrate(
+            horizontal,
+            wish * c.boost_acc_tick,
+            c.boost_max_tick,
+            c.over_max_decel_tick,
+        );
     } else {
-        let drag = if p.boost { c.air_drag_boost_tick } else { c.air_drag_tick };
+        let drag = if p.boost {
+            c.air_drag_boost_tick
+        } else {
+            c.air_drag_tick
+        };
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     }
     p.jump_queued = false;
@@ -698,7 +930,11 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         } else {
             // Boost gravity (movement +0x284) only while boost mode is on and the AC falls; it
             // rises under full gravity (Xenia probe private/xenia/vertical.txt).
-            p.velocity.y -= if p.boost && p.velocity.y < 0.0 { c.boost_gravity_tick } else { c.gravity_tick };
+            p.velocity.y -= if p.boost && p.velocity.y < 0.0 {
+                c.boost_gravity_tick
+            } else {
+                c.gravity_tick
+            };
         }
         p.velocity.y = p.velocity.y.max(-c.fall_max_tick);
     }
@@ -706,7 +942,11 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     *position += p.velocity;
     // Snap puts y on the triangle, so a grounded ray has to start above it. The lift is this
     // tick's travel (slopes) or 5 cm when still — a hit farther down than that is a drop.
-    let lift = if p.airborne { 0.0 } else { horizontal.length().max(0.05) };
+    let lift = if p.airborne {
+        0.0
+    } else {
+        horizontal.length().max(0.05)
+    };
     let ground = collision.ground_below(Vec3::new(position.x, position.y + lift, position.z));
     if p.airborne {
         if let Some(g) = ground.filter(|&g| position.y <= g && p.velocity.y <= 0.0) {
@@ -794,7 +1034,10 @@ pub fn pilot(
             c.visible = visible;
         }
     }
-    let (Some(mut motion), Ok((mut p, mut transform, ac_global))) = (motion, acs.single_mut()) else { return };
+    let (Some(mut motion), Ok((mut p, mut transform, ac_global))) = (motion, acs.single_mut())
+    else {
+        return;
+    };
     if motion.in_place != piloting.0 {
         motion.in_place = piloting.0;
     }
@@ -806,7 +1049,13 @@ pub fn pilot(
         p.cam.eye_rate = [Blend::default(); 4];
         p.cam.look_at_rate = [Blend::default(); 4];
         p.cam.tilt = Blend::default();
-        (p.cam.action, p.cam.fov, p.cam.shake_phase, p.cam.accel, p.cam.blur) = (None, Envelope::default(), 0.0, 0.0, 0.0);
+        (
+            p.cam.action,
+            p.cam.fov,
+            p.cam.shake_phase,
+            p.cam.accel,
+            p.cam.blur,
+        ) = (None, Envelope::default(), 0.0, 0.0, 0.0);
         if let Ok((mut o, _, _, mut blur)) = cams.single_mut() {
             *blur = ZoomBlur::default();
             if o.follow {
@@ -822,7 +1071,8 @@ pub fn pilot(
     }
     if *mouselook {
         // AC6-style: the mouse moves the camera freely; the AC turns toward it at its turn rate.
-        p.cam.yaw_off = (p.cam.yaw_off - mouse.delta.x * MOUSE_YAW).clamp(-std::f32::consts::PI, std::f32::consts::PI);
+        p.cam.yaw_off = (p.cam.yaw_off - mouse.delta.x * MOUSE_YAW)
+            .clamp(-std::f32::consts::PI, std::f32::consts::PI);
         p.cam.pitch = (p.cam.pitch - mouse.delta.y * MOUSE_PITCH).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
     if input.boost_toggle {
@@ -855,29 +1105,55 @@ pub fn pilot(
     // The walk / dash clip direction is relative to the body, the stick to the camera.
     let (sin, cos) = p.cam.yaw_off.sin_cos();
     let body = Input {
-        stick: Vec2::new(input.stick.x * cos - input.stick.y * sin, input.stick.x * sin + input.stick.y * cos),
+        stick: Vec2::new(
+            input.stick.x * cos - input.stick.y * sin,
+            input.stick.x * sin + input.stick.y * cos,
+        ),
         ..input
     };
     let next = state(&p, &body, &motion);
     p.landed = false;
     let changed = p.state != Some(next);
     if changed {
-        p.clip_ok = match acvd_data::ac_state(next.0, next.1).and_then(|s| acvd_data::find(PARAM_ACMOTION_BIN, s.row)) {
-            Some(row) => {
-                let speed = if next.0.starts_with("turn_") { AC_ANIM_PARAM.turn_clip_speed } else { 1.0 };
-                let hokan = p.hokan_base + u32::from(row.data.interpolate_id);
-                let fade = find(PARAM_ACANIMHOKAN_BIN, hokan).map(|h| Fade::of(&h.data)).unwrap_or_else(|| {
-                    warn!("no acanimhokan row {hokan}");
-                    [0.0; 8]
-                });
-                motion.play(&garage.usrdir, row.data.anim_id, row.data.b_loop != 0, speed, fade).map_err(|e| debug!("{}: {e:#}", next.0)).is_ok()
-            }
-            None => {
-                warn!("no ac_states.csv row for {next:?}");
-                false
-            }
-        };
-        debug!("state {next:?} -> {} at {:.1?}", motion.name(), transform.translation);
+        if !p.suppress_locomotion {
+            p.clip_ok = match acvd_data::ac_state(next.0, next.1)
+                .and_then(|s| acvd_data::find(PARAM_ACMOTION_BIN, s.row))
+            {
+                Some(row) => {
+                    let speed = if next.0.starts_with("turn_") {
+                        AC_ANIM_PARAM.turn_clip_speed
+                    } else {
+                        1.0
+                    };
+                    let hokan = p.hokan_base + u32::from(row.data.interpolate_id);
+                    let fade = find(PARAM_ACANIMHOKAN_BIN, hokan)
+                        .map(|h| Fade::of(&h.data))
+                        .unwrap_or_else(|| {
+                            warn!("no acanimhokan row {hokan}");
+                            [0.0; 8]
+                        });
+                    motion
+                        .play(
+                            &garage.usrdir,
+                            row.data.anim_id,
+                            row.data.b_loop != 0,
+                            speed,
+                            fade,
+                        )
+                        .map_err(|e| debug!("{}: {e:#}", next.0))
+                        .is_ok()
+                }
+                None => {
+                    warn!("no ac_states.csv row for {next:?}");
+                    false
+                }
+            };
+        }
+        debug!(
+            "state {next:?} -> {} at {:.1?}",
+            motion.name(),
+            transform.translation
+        );
         p.state = Some(next);
     }
 
@@ -898,7 +1174,8 @@ pub fn pilot(
         }
         motion.wheel = Some(target);
         // The lean builds with speed: 0 at a standstill, full at the boost top speed.
-        motion.lean = (p.velocity.with_y(0.0).length() / p.ctrl.boost_max_tick.max(1e-4)).clamp(0.0, 1.0);
+        motion.lean =
+            (p.velocity.with_y(0.0).length() / p.ctrl.boost_max_tick.max(1e-4)).clamp(0.0, 1.0);
     }
 
     if let Ok((mut o, mut cam, mut proj, mut blur)) = cams.single_mut() {
@@ -909,12 +1186,29 @@ pub fn pilot(
         p.cam.act(action);
         // Mouselook turning is auto-generated and jittery near zero: ignore small values so the
         // side shift only flips for a real turn (the blend itself smooths the move).
-        let cam_turn = if *mouselook && input.turn.abs() < 0.25 { 0.0 } else { input.turn };
+        let cam_turn = if *mouselook && input.turn.abs() < 0.25 {
+            0.0
+        } else {
+            input.turn
+        };
         p.cam.blend_eye(cam_turn, time.delta_secs());
         let root = transform.translation;
-        let center = motion.skeleton.bones.iter().position(|b| b.rest.as_ref().is_some_and(|r| r.name == WAIST_BONE));
-        let waist = joints.iter().find(|(d, _)| Some(d.bone) == center).map_or(Vec3::ZERO, |(_, g)| g.translation() - ac_global.translation());
-        let water = collision.ray_down(Vec3::new(root.x, root.y + RAY_HALF, root.z), root.y - RAY_HALF, Layer::Water);
+        let center = motion
+            .skeleton
+            .bones
+            .iter()
+            .position(|b| b.rest.as_ref().is_some_and(|r| r.name == WAIST_BONE));
+        let waist = joints
+            .iter()
+            .find(|(d, _)| Some(d.bone) == center)
+            .map_or(Vec3::ZERO, |(_, g)| {
+                g.translation() - ac_global.translation()
+            });
+        let water = collision.ray_down(
+            Vec3::new(root.x, root.y + RAY_HALF, root.z),
+            root.y - RAY_HALF,
+            Layer::Water,
+        );
         let cam_rot = transform.rotation * Quat::from_rotation_y(p.cam.yaw_off);
         let total_yaw = p.yaw + p.cam.yaw_off;
         if *mouselook {
@@ -923,7 +1217,9 @@ pub fn pilot(
         }
         p.cam.cam_yaw = total_yaw;
         let (eye, look_at) = p.cam.place(root + waist, cam_rot, water);
-        let (eye, look_at) = p.cam.follow(eye, look_at, cam_rot, airborne, time.delta_secs());
+        let (eye, look_at) = p
+            .cam
+            .follow(eye, look_at, cam_rot, airborne, time.delta_secs());
         o.focus = look_at;
         let velocity = p.velocity;
         let roll = p.cam.roll(velocity, transform.rotation, time.delta_secs());
@@ -974,6 +1270,15 @@ mod tests {
         }
         assert_eq!(v.length(), walk);
         assert!((80..=90).contains(&ticks), "{ticks} ticks");
-        assert_eq!(integrate(Vec2::new(0.0, walk * 0.5), Vec2::new(0.0, walk), walk, decel).length(), walk);
+        assert_eq!(
+            integrate(
+                Vec2::new(0.0, walk * 0.5),
+                Vec2::new(0.0, walk),
+                walk,
+                decel
+            )
+            .length(),
+            walk
+        );
     }
 }

@@ -147,8 +147,10 @@ pub enum SocketRef {
 }
 
 /// One assembly column of `T` (`sheets/assembly_slots.csv`): the part it names (`part`, 0 or
-/// below for none) is drawn by the `prefix` model, the centroid of whose `roots` lands on
-/// `socket` of the `parent` slot's model. Empty `roots` means every root of the model.
+/// below for none) is drawn by the `prefix` model. Each listed root lands on `socket` of the
+/// `parent` slot's model; empty `roots` means every root of the model. `orient` is the
+/// attach-info flag (byte +3 of a `param/acattachinfo.bin` record, switched at 360
+/// `0x8288cea0`); `None` keeps the model's rest orientation.
 #[derive(Debug, Clone, Copy)]
 pub struct Slot<T: 'static> {
     pub name: &'static str,
@@ -159,6 +161,7 @@ pub struct Slot<T: 'static> {
     pub parent: Option<&'static str>,
     pub socket: SocketRef,
     pub roots: &'static [&'static str],
+    pub orient: Option<u8>,
 }
 
 /// The motion set part `id` of `category` selects (`sheets/ac_motion.csv`): `set` is the

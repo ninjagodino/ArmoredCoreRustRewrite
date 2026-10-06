@@ -54,7 +54,13 @@ impl Plugin for SfxPlugin {
         app.insert_resource(Dir(self.usrdir.clone()))
             .add_systems(Startup, setup)
             .add_systems(Update, (boosters.after(control::pilot), preview))
-            .add_systems(PostUpdate, (simulate, sweep).chain().after(TransformSystems::Propagate).before(VisibilitySystems::CheckVisibility));
+            .add_systems(
+                PostUpdate,
+                (simulate, sweep)
+                    .chain()
+                    .after(TransformSystems::Propagate)
+                    .before(VisibilitySystems::CheckVisibility),
+            );
     }
 }
 
@@ -72,7 +78,11 @@ pub struct Sfx {
 
 impl Sfx {
     pub fn new(id: i32) -> Self {
-        Self { id, stopping: false, run: None }
+        Self {
+            id,
+            stopping: false,
+            run: None,
+        }
     }
 
     pub fn stop(&mut self) {
@@ -94,12 +104,29 @@ pub struct Preview(pub i32);
 
 /// Spawns `rig`'s effect points under the part's `joints` (bone `i` is `joints[i]`, the last
 /// joint carries dummies without a bone).
-pub fn effect_points(commands: &mut Commands, rig: &acvd_render::Rig, joints: &[Entity], column: &'static str) {
+pub fn effect_points(
+    commands: &mut Commands,
+    rig: &acvd_render::Rig,
+    joints: &[Entity],
+    column: &'static str,
+) {
     for e in &rig.effects {
-        let Some(&joint) = e.bone.and_then(|b| joints.get(b)).or(joints.last()) else { continue };
+        let Some(&joint) = e.bone.and_then(|b| joints.get(b)).or(joints.last()) else {
+            continue;
+        };
         let forward = mirror(Vec3::from(e.forward)).normalize_or(Vec3::Z);
-        let transform = Transform::from_translation(mirror(Vec3::from(e.position))).with_rotation(Quat::from_rotation_arc(Vec3::Z, forward));
-        commands.spawn((EffectPoint { id: e.id, column, playing: None }, transform, Visibility::default(), ChildOf(joint)));
+        let transform = Transform::from_translation(mirror(Vec3::from(e.position)))
+            .with_rotation(Quat::from_rotation_arc(Vec3::Z, forward));
+        commands.spawn((
+            EffectPoint {
+                id: e.id,
+                column,
+                playing: None,
+            },
+            transform,
+            Visibility::default(),
+            ChildOf(joint),
+        ));
     }
 }
 
@@ -131,7 +158,12 @@ struct Part {
     indices: Vec<u32>,
 }
 
-fn setup(mut commands: Commands, dir: Res<Dir>, mut meshes: ResMut<Assets<Mesh>>, mut images: ResMut<Assets<Image>>) {
+fn setup(
+    mut commands: Commands,
+    dir: Res<Dir>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+) {
     let n = 32u32;
     let mut dot = Vec::with_capacity((n * n * 4) as usize);
     for y in 0..n {
@@ -141,7 +173,17 @@ fn setup(mut commands: Commands, dir: Res<Dir>, mut meshes: ResMut<Assets<Mesh>>
             dot.extend([255, 255, 255, (a * a * 255.0) as u8]);
         }
     }
-    let dot = Image::new(Extent3d { width: n, height: n, depth_or_array_layers: 1 }, TextureDimension::D2, dot, TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::default());
+    let dot = Image::new(
+        Extent3d {
+            width: n,
+            height: n,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        dot,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
     commands.insert_resource(Library {
         usrdir: dir.0.clone(),
         effects: HashMap::new(),
@@ -160,10 +202,18 @@ impl Library {
         self.effects
             .entry(id)
             .or_insert_with(|| {
-                let read = || -> anyhow::Result<ffx::Effect> { ffx::read(&vfs::open(usrdir, &format!("{EFFECTS}|f{id:07}.ffx"))?) };
+                let read = || -> anyhow::Result<ffx::Effect> {
+                    ffx::read(&vfs::open(usrdir, &format!("{EFFECTS}|f{id:07}.ffx"))?)
+                };
                 match read() {
                     Ok(e) => {
-                        let roots = e.states.first().into_iter().flat_map(|s| &s.actions).flat_map(|a| nodes(&a.params)).collect();
+                        let roots = e
+                            .states
+                            .first()
+                            .into_iter()
+                            .flat_map(|s| &s.actions)
+                            .flat_map(|a| nodes(&a.params))
+                            .collect();
                         Some(Arc::new(roots))
                     }
                     Err(err) => {
@@ -176,14 +226,18 @@ impl Library {
     }
 
     fn texture(&mut self, id: i32, images: &mut Assets<Image>) -> Option<Handle<Image>> {
-        (id > 0).then(|| self.texture_named(&format!("s{id:04}"), images)).flatten()
+        (id > 0)
+            .then(|| self.texture_named(&format!("s{id:04}"), images))
+            .flatten()
     }
 
     fn texture_named(&mut self, name: &str, images: &mut Assets<Image>) -> Option<Handle<Image>> {
         if let Some(t) = self.textures.get(name) {
             return t.clone();
         }
-        let found = acvd_data::textures_named(name).find(|t| t.pack.starts_with("model/sfx/")).or_else(|| acvd_data::textures_named(name).next());
+        let found = acvd_data::textures_named(name)
+            .find(|t| t.pack.starts_with("model/sfx/"))
+            .or_else(|| acvd_data::textures_named(name).next());
         let handle = match found.map(|t| self.packs.texture(&self.usrdir, t)) {
             Some(Ok(img)) => Some(images.add(img)),
             Some(Err(e)) => {
@@ -199,7 +253,12 @@ impl Library {
         handle
     }
 
-    fn model(&mut self, id: i32, meshes: &mut Assets<Mesh>, images: &mut Assets<Image>) -> Option<Arc<Vec<Part>>> {
+    fn model(
+        &mut self,
+        id: i32,
+        meshes: &mut Assets<Mesh>,
+        images: &mut Assets<Image>,
+    ) -> Option<Arc<Vec<Part>>> {
         if let Some(m) = self.models.get(&id) {
             return m.clone();
         }
@@ -214,7 +273,9 @@ impl Library {
         let mut parts = Vec::new();
         for m in loaded {
             let positions: Vec<Vec3> = match m.mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
-                Some(VertexAttributeValues::Float32x3(p)) => p.iter().map(|&p| Vec3::from(p)).collect(),
+                Some(VertexAttributeValues::Float32x3(p)) => {
+                    p.iter().map(|&p| Vec3::from(p)).collect()
+                }
                 _ => continue,
             };
             let uvs = match m.mesh.attribute(Mesh::ATTRIBUTE_UV_0) {
@@ -225,8 +286,17 @@ impl Library {
                 Some(i) => i.iter().map(|i| i as u32).collect(),
                 None => continue,
             };
-            let texture = m.diffuse.as_deref().and_then(|name| self.texture_named(name, images));
-            parts.push(Part { mesh: meshes.add(m.mesh), texture, positions, uvs, indices });
+            let texture = m
+                .diffuse
+                .as_deref()
+                .and_then(|name| self.texture_named(name, images));
+            parts.push(Part {
+                mesh: meshes.add(m.mesh),
+                texture,
+                positions,
+                uvs,
+                indices,
+            });
         }
         let parts = Some(Arc::new(parts));
         self.models.insert(id, parts.clone());
@@ -246,11 +316,17 @@ struct Curve {
 
 impl Curve {
     fn constant(v: f32) -> Self {
-        Self { keys: vec![(0.0, v)], ..default() }
+        Self {
+            keys: vec![(0.0, v)],
+            ..default()
+        }
     }
 
     fn at(&self, t: f32) -> f32 {
-        sample(&self.keys, t, self.step, self.cyclic, |a, b, f| a + (b - a) * f).unwrap_or(0.0)
+        sample(&self.keys, t, self.step, self.cyclic, |a, b, f| {
+            a + (b - a) * f
+        })
+        .unwrap_or(0.0)
     }
 }
 
@@ -263,21 +339,38 @@ struct ColorCurve {
 
 impl ColorCurve {
     fn at(&self, t: f32) -> Vec4 {
-        sample(&self.keys, t, self.step, self.cyclic, |a, b, f| a.lerp(b, f)).unwrap_or(Vec4::ONE)
+        sample(&self.keys, t, self.step, self.cyclic, |a, b, f| {
+            a.lerp(b, f)
+        })
+        .unwrap_or(Vec4::ONE)
     }
 }
 
 /// Keyframes at seconds `keys[i].0`; `cyclic` repeats them over the last key's time.
-fn sample<T: Copy>(keys: &[(f32, T)], t: f32, step: bool, cyclic: bool, lerp: impl Fn(T, T, f32) -> T) -> Option<T> {
+fn sample<T: Copy>(
+    keys: &[(f32, T)],
+    t: f32,
+    step: bool,
+    cyclic: bool,
+    lerp: impl Fn(T, T, f32) -> T,
+) -> Option<T> {
     let (first, last) = (keys.first()?, keys.last()?);
-    let t = if cyclic && last.0 > 0.0 { t.rem_euclid(last.0) } else { t };
+    let t = if cyclic && last.0 > 0.0 {
+        t.rem_euclid(last.0)
+    } else {
+        t
+    };
     if t <= first.0 {
         return Some(first.1);
     }
     for w in keys.windows(2) {
         let (a, b) = (w[0], w[1]);
         if t < b.0 {
-            return Some(if step || b.0 <= a.0 { a.1 } else { lerp(a.1, b.1, (t - a.0) / (b.0 - a.0)) });
+            return Some(if step || b.0 <= a.0 {
+                a.1
+            } else {
+                lerp(a.1, b.1, (t - a.0) / (b.0 - a.0))
+            });
         }
     }
     Some(last.1)
@@ -286,13 +379,27 @@ fn sample<T: Copy>(keys: &[(f32, T)], t: f32, step: bool, cyclic: bool, lerp: im
 /// Sequence modes follow the runtime class order Step, Cyclic, Linear, LinearCyclic, Cubic,
 /// CubicCyclic: float kinds 9..14, colour kinds 17..22; int kinds 3 step, 5 linear, 6 cyclic.
 fn float_curve(p: Option<&Param>) -> Curve {
-    let Some(p) = p else { return Curve::constant(0.0) };
+    let Some(p) = p else {
+        return Curve::constant(0.0);
+    };
     match &p.value {
         Value::Float(v) | Value::Tick(v) => Curve::constant(*v),
         Value::Int(v) => Curve::constant(*v as f32),
-        Value::FloatKeys(k) => Curve { keys: k.clone(), step: matches!(p.kind, 9 | 10), cyclic: matches!(p.kind, 10 | 12) },
-        Value::CubicKeys(k) => Curve { keys: k.iter().map(|(t, v)| (*t, v[0])).collect(), step: false, cyclic: p.kind == 14 },
-        Value::IntKeys(k) => Curve { keys: k.iter().map(|(t, v)| (*t, *v as f32)).collect(), step: p.kind == 3, cyclic: p.kind == 6 },
+        Value::FloatKeys(k) => Curve {
+            keys: k.clone(),
+            step: matches!(p.kind, 9 | 10),
+            cyclic: matches!(p.kind, 10 | 12),
+        },
+        Value::CubicKeys(k) => Curve {
+            keys: k.iter().map(|(t, v)| (*t, v[0])).collect(),
+            step: false,
+            cyclic: p.kind == 14,
+        },
+        Value::IntKeys(k) => Curve {
+            keys: k.iter().map(|(t, v)| (*t, *v as f32)).collect(),
+            step: p.kind == 3,
+            cyclic: p.kind == 6,
+        },
         Value::FloatPair(a, b) | Value::TickPair(a, b) => Curve::constant((a + b) / 2.0),
         Value::Scaled(inner, _) => float_curve(Some(inner)),
         _ => Curve::constant(0.0),
@@ -300,12 +407,26 @@ fn float_curve(p: Option<&Param>) -> Curve {
 }
 
 fn color_curve(p: Option<&Param>) -> ColorCurve {
-    let one = |keys| ColorCurve { keys, step: false, cyclic: false };
-    let Some(p) = p else { return one(vec![(0.0, Vec4::ONE)]) };
+    let one = |keys| ColorCurve {
+        keys,
+        step: false,
+        cyclic: false,
+    };
+    let Some(p) = p else {
+        return one(vec![(0.0, Vec4::ONE)]);
+    };
     match &p.value {
         Value::Color(c) => one(vec![(0.0, Vec4::from(*c))]),
-        Value::ColorKeys(k) => ColorCurve { keys: k.iter().map(|(t, c)| (*t, Vec4::from(*c))).collect(), step: matches!(p.kind, 17 | 18), cyclic: matches!(p.kind, 18 | 20) },
-        Value::CubicColorKeys(k) => ColorCurve { keys: k.iter().map(|(t, c)| (*t, Vec4::from(c[0]))).collect(), step: false, cyclic: p.kind == 22 },
+        Value::ColorKeys(k) => ColorCurve {
+            keys: k.iter().map(|(t, c)| (*t, Vec4::from(*c))).collect(),
+            step: matches!(p.kind, 17 | 18),
+            cyclic: matches!(p.kind, 18 | 20),
+        },
+        Value::CubicColorKeys(k) => ColorCurve {
+            keys: k.iter().map(|(t, c)| (*t, Vec4::from(c[0]))).collect(),
+            step: false,
+            cyclic: p.kind == 22,
+        },
         Value::ScaledColor(inner, _) => color_curve(Some(inner)),
         _ => one(vec![(0.0, Vec4::ONE)]),
     }
@@ -343,7 +464,9 @@ fn param(l: &ParamList, i: usize) -> Option<&Param> {
 
 fn tick(l: &ParamList, i: usize) -> f32 {
     match l.get(i) {
-        Some(Value::Tick(t) | Value::Float(t) | Value::TickPair(t, _) | Value::FloatPair(t, _)) => *t,
+        Some(Value::Tick(t) | Value::Float(t) | Value::TickPair(t, _) | Value::FloatPair(t, _)) => {
+            *t
+        }
         Some(Value::Int(i)) => *i as f32,
         _ => 0.0,
     }
@@ -393,7 +516,11 @@ enum Blend {
 /// Blend slot values: 2 on smoke (alpha), 4 on flames and flashes (additive). Others are drawn
 /// additive.
 fn blend(v: i32) -> Blend {
-    if v == 2 { Blend::Alpha } else { Blend::Add }
+    if v == 2 {
+        Blend::Alpha
+    } else {
+        Blend::Add
+    }
 }
 
 /// Node transform action 36 (offset xyz, rotation xyz in degrees, then their random ranges) or
@@ -408,11 +535,22 @@ struct Xf {
 
 impl Xf {
     fn read(a: Option<(i32, &ParamList)>) -> Self {
-        let Some((id, l)) = a else { return Self::default() };
+        let Some((id, l)) = a else {
+            return Self::default();
+        };
         let v3 = |i| Vec3::new(tick(l, i), tick(l, i + 1), tick(l, i + 2));
         match id {
-            36 => Self { offset: v3(0), rotation: v3(3), offset_rand: v3(6), rotation_rand: v3(9) },
-            35 => Self { offset: v3(0), rotation: v3(3), ..default() },
+            36 => Self {
+                offset: v3(0),
+                rotation: v3(3),
+                offset_rand: v3(6),
+                rotation_rand: v3(9),
+            },
+            35 => Self {
+                offset: v3(0),
+                rotation: v3(3),
+                ..default()
+            },
             _ => Self::default(),
         }
     }
@@ -421,7 +559,10 @@ impl Xf {
         let mut r3 = || Vec3::new(rng.signed(), rng.signed(), rng.signed());
         let o = self.offset + self.offset_rand * r3();
         let r = (self.rotation + self.rotation_rand * r3()) * (PI / 180.0);
-        Affine3A::from_rotation_translation(Quat::from_euler(EulerRot::YXZ, -r.y, r.x, -r.z), mirror(o))
+        Affine3A::from_rotation_translation(
+            Quat::from_euler(EulerRot::YXZ, -r.y, r.x, -r.z),
+            mirror(o),
+        )
     }
 }
 
@@ -435,7 +576,11 @@ struct Frames {
 
 impl Frames {
     fn new(cols: i32, total: i32, key: Option<&Param>) -> Self {
-        Self { cols: cols.max(1) as u32, total: total.max(1) as u32, key: float_curve(key) }
+        Self {
+            cols: cols.max(1) as u32,
+            total: total.max(1) as u32,
+            key: float_curve(key),
+        }
     }
 
     fn rect(&self, t: f32, start: f32) -> (Vec2, Vec2) {
@@ -445,16 +590,37 @@ impl Frames {
         let rows = self.total.div_ceil(self.cols);
         let f = ((self.key.at(t) + start).floor().max(0.0) as u32) % self.total;
         let scale = Vec2::new(1.0 / self.cols as f32, 1.0 / rows as f32);
-        (Vec2::new((f % self.cols) as f32, (f / self.cols) as f32) * scale, scale)
+        (
+            Vec2::new((f % self.cols) as f32, (f / self.cols) as f32) * scale,
+            scale,
+        )
     }
 }
 
 /// What a static node draws.
 #[derive(Clone, Debug)]
 enum Look {
-    Billboard { texture: i32, blend: Blend, width: Curve, height: Curve, color: ColorCurve, frames: Frames, rotation: (f32, f32), spin: Curve },
-    Model { model: i32, blend: Blend, scale: [Curve; 3], color: ColorCurve, frames: Frames },
-    Light { color: ColorCurve, radius: Curve },
+    Billboard {
+        texture: i32,
+        blend: Blend,
+        width: Curve,
+        height: Curve,
+        color: ColorCurve,
+        frames: Frames,
+        rotation: (f32, f32),
+        spin: Curve,
+    },
+    Model {
+        model: i32,
+        blend: Blend,
+        scale: [Curve; 3],
+        color: ColorCurve,
+        frames: Frames,
+    },
+    Light {
+        color: ColorCurve,
+        radius: Curve,
+    },
 }
 
 fn look(id: i32, l: &ParamList) -> Option<Look> {
@@ -487,7 +653,10 @@ fn look(id: i32, l: &ParamList) -> Option<Look> {
             color: color_curve(p(9)),
             frames: Frames::new(int(l, 16), int(l, 17), p(15)),
         },
-        24 => Look::Light { color: color_curve(p(0)), radius: float_curve(p(2)) },
+        24 => Look::Light {
+            color: color_curve(p(0)),
+            radius: float_curve(p(2)),
+        },
         _ => return None,
     })
 }
@@ -523,7 +692,10 @@ fn particle_look(id: i32, l: &ParamList) -> Option<ParticleLook> {
     let p = |i| param(l, i);
     Some(match id {
         71 => ParticleLook {
-            shape: Shape::Quad { texture: Some(int(l, 1)), blend: blend(int(l, 5)) },
+            shape: Shape::Quad {
+                texture: Some(int(l, 1)),
+                blend: blend(int(l, 5)),
+            },
             life: pair(l, 3),
             size: [float_curve(p(10)), float_curve(p(11)), Curve::constant(1.0)],
             scale: 1.0,
@@ -553,7 +725,10 @@ fn particle_look(id: i32, l: &ParamList) -> Option<ParticleLook> {
             follow: true,
         },
         82 => ParticleLook {
-            shape: Shape::Quad { texture: None, blend: blend(int(l, 2)) },
+            shape: Shape::Quad {
+                texture: None,
+                blend: blend(int(l, 2)),
+            },
             life: pair(l, 1),
             size: [float_curve(p(3)), float_curve(p(3)), Curve::constant(1.0)],
             scale: POINT_SPRITE_METRES,
@@ -587,19 +762,35 @@ impl Emitter {
             Some((28, l)) => Self {
                 angle: float_curve(p(l, 1)).at(0.0),
                 speed: Spread::read(p(l, 3)),
-                size: [Spread::read(p(l, 4)), Spread::read(p(l, 5)), Spread::read(p(l, 8))],
+                size: [
+                    Spread::read(p(l, 4)),
+                    Spread::read(p(l, 5)),
+                    Spread::read(p(l, 8)),
+                ],
                 color: color_curve(p(l, 9)),
             },
             Some((117, l)) => Self {
                 angle: float_curve(p(l, 4)).at(0.0),
                 speed: Spread::read(p(l, 6)),
-                size: [Spread::read(p(l, 7)), Spread::read(p(l, 8)), Spread::read(p(l, 11))],
+                size: [
+                    Spread::read(p(l, 7)),
+                    Spread::read(p(l, 8)),
+                    Spread::read(p(l, 11)),
+                ],
                 color: color_curve(p(l, 14)),
             },
-            Some((4, l)) => Self { angle: float_curve(p(l, 1)).at(0.0), ..Self::read(None) },
+            Some((4, l)) => Self {
+                angle: float_curve(p(l, 1)).at(0.0),
+                ..Self::read(None)
+            },
             _ => {
                 let one = || Spread::Curve(Curve::constant(1.0), 0.0);
-                Self { angle: 0.0, speed: Spread::Curve(Curve::constant(0.0), 0.0), size: [one(), one(), one()], color: color_curve(None) }
+                Self {
+                    angle: 0.0,
+                    speed: Spread::Curve(Curve::constant(0.0), 0.0),
+                    size: [one(), one(), one()],
+                    color: color_curve(None),
+                }
             }
         }
     }
@@ -634,8 +825,15 @@ struct Motion {
 impl Motion {
     fn read(a: Option<(i32, &ParamList)>) -> Self {
         match a {
-            Some((1, l)) => Self { speed: pair(l, 0), accel: float_curve(param(l, 1)), ..default() },
-            Some((34, l)) => Self { spin: [0, 2, 4].map(|i| (float_curve(param(l, i)), pair(l, i + 1))), ..default() },
+            Some((1, l)) => Self {
+                speed: pair(l, 0),
+                accel: float_curve(param(l, 1)),
+                ..default()
+            },
+            Some((34, l)) => Self {
+                spin: [0, 2, 4].map(|i| (float_curve(param(l, i)), pair(l, i + 1))),
+                ..default()
+            },
             _ => Self::default(),
         }
     }
@@ -646,7 +844,12 @@ enum Kind {
     Static,
     /// Spawns `count` copies of `child` every `interval` (once when zero), each turned into a
     /// random direction of the cone `angle`.
-    Spawner { count: u32, interval: f32, angle: f32, child: Vec<Arc<NodeDef>> },
+    Spawner {
+        count: u32,
+        interval: f32,
+        angle: f32,
+        child: Vec<Arc<NodeDef>>,
+    },
     Cluster(Arc<ClusterDef>),
 }
 
@@ -675,7 +878,9 @@ fn nodes(l: &ParamList) -> Vec<Arc<NodeDef>> {
 
 fn children(l: &ParamList, i: usize) -> Vec<Arc<NodeDef>> {
     match (param(l, i).map(|p| p.kind), l.get(i)) {
-        (Some(37), Some(Value::Node(id, list))) if *id != 0 => node(*id, list).map(Arc::new).into_iter().collect(),
+        (Some(37), Some(Value::Node(id, list))) if *id != 0 => {
+            node(*id, list).map(Arc::new).into_iter().collect()
+        }
         (_, Some(Value::Node(14 | 79, list))) => nodes(list),
         _ => Vec::new(),
     }
@@ -683,7 +888,15 @@ fn children(l: &ParamList, i: usize) -> Vec<Arc<NodeDef>> {
 
 fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
     let p = |i| param(l, i);
-    let mut n = NodeDef { life: -1.0, delay: 0.0, xf: Xf::default(), look: None, motion: Motion::default(), children: Vec::new(), kind: Kind::Static };
+    let mut n = NodeDef {
+        life: -1.0,
+        delay: 0.0,
+        xf: Xf::default(),
+        look: None,
+        motion: Motion::default(),
+        children: Vec::new(),
+        kind: Kind::Static,
+    };
     match id {
         2101 | 2102 => {
             (n.life, n.delay) = (tick(l, 0), tick(l, 3));
@@ -699,8 +912,17 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
         2020 | 2024 => {
             (n.life, n.delay) = (tick(l, 0), tick(l, 4));
             let angle = Emitter::read(action(l, 9)).angle;
-            n.kind = Kind::Spawner { count: int(l, 5).max(1) as u32, interval: tick(l, 6), angle, child: children(l, 8) };
-            n.xf = Xf::read(action(l, 10).filter(|a| matches!(a.0, 35 | 36)).or(action(l, 11)));
+            n.kind = Kind::Spawner {
+                count: int(l, 5).max(1) as u32,
+                interval: tick(l, 6),
+                angle,
+                child: children(l, 8),
+            };
+            n.xf = Xf::read(
+                action(l, 10)
+                    .filter(|a| matches!(a.0, 35 | 36))
+                    .or(action(l, 11)),
+            );
         }
         2023 => {
             let look = action(l, 11).and_then(|(a, al)| particle_look(a, al))?;
@@ -744,10 +966,13 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
 /// Cluster motion action 55: [0] gravity keys, [1] drag keys, [2] gravity range.
 fn gravity(a: Option<(i32, &ParamList)>) -> (Curve, (f32, f32)) {
     match a {
-        Some((55, l)) => (float_curve(param(l, 0)), match l.get(2) {
-            Some(Value::FloatPair(a, b)) => (*a, *b),
-            _ => (1.0, 1.0),
-        }),
+        Some((55, l)) => (
+            float_curve(param(l, 0)),
+            match l.get(2) {
+                Some(Value::FloatPair(a, b)) => (*a, *b),
+                _ => (1.0, 1.0),
+            },
+        ),
         _ => (Curve::constant(0.0), (1.0, 1.0)),
     }
 }
@@ -765,11 +990,18 @@ fn sparks(l: &ParamList) -> ClusterDef {
         emitter: Emitter {
             angle: float_curve(param(l, 12)).at(0.0),
             speed: Spread::Range(pair(l, 14).0, pair(l, 14).1),
-            size: [Spread::read(param(l, 3)).with_curve(1.0), Spread::Curve(Curve::constant(1.0), 0.0), Spread::Curve(Curve::constant(1.0), 0.0)],
+            size: [
+                Spread::read(param(l, 3)).with_curve(1.0),
+                Spread::Curve(Curve::constant(1.0), 0.0),
+                Spread::Curve(Curve::constant(1.0), 0.0),
+            ],
             color: color_curve(None),
         },
         look: ParticleLook {
-            shape: Shape::Quad { texture: Some(int(l, 0)), blend: blend(int(l, 2)) },
+            shape: Shape::Quad {
+                texture: Some(int(l, 0)),
+                blend: blend(int(l, 2)),
+            },
             life: pair(l, 1),
             size: [width.clone(), width, Curve::constant(1.0)],
             scale: 1.0,
@@ -894,7 +1126,11 @@ struct Cx<'a, 'w, 's> {
 }
 
 impl Cx<'_, '_, '_> {
-    fn material(&mut self, texture: Option<Handle<Image>>, blend: Blend) -> Handle<StandardMaterial> {
+    fn material(
+        &mut self,
+        texture: Option<Handle<Image>>,
+        blend: Blend,
+    ) -> Handle<StandardMaterial> {
         self.materials.add(StandardMaterial {
             base_color_texture: texture,
             unlit: true,
@@ -910,7 +1146,17 @@ impl Cx<'_, '_, '_> {
     }
 
     fn spawn(&mut self, bundle: impl Bundle, transform: Transform) -> Entity {
-        self.commands.spawn((bundle, transform, GlobalTransform::from(transform), NoFrustumCulling, NotShadowCaster, NotShadowReceiver, SfxVisual(self.owner))).id()
+        self.commands
+            .spawn((
+                bundle,
+                transform,
+                GlobalTransform::from(transform),
+                NoFrustumCulling,
+                NotShadowCaster,
+                NotShadowReceiver,
+                SfxVisual(self.owner),
+            ))
+            .id()
     }
 
     fn despawn(&mut self, v: Visual) {
@@ -943,9 +1189,26 @@ impl NodeRt {
         };
         let children = match def.kind {
             Kind::Spawner { .. } => Vec::new(),
-            _ => def.children.iter().map(|c| NodeRt::new(c.clone(), rng, Quat::IDENTITY)).collect(),
+            _ => def
+                .children
+                .iter()
+                .map(|c| NodeRt::new(c.clone(), rng, Quat::IDENTITY))
+                .collect(),
         };
-        Self { def, age: 0.0, base, speed, travel: 0.0, spin, roll, visual: None, children, emit: 0.0, particles: Vec::new(), batch: None }
+        Self {
+            def,
+            age: 0.0,
+            base,
+            speed,
+            travel: 0.0,
+            spin,
+            roll,
+            visual: None,
+            children,
+            emit: 0.0,
+            particles: Vec::new(),
+            batch: None,
+        }
     }
 
     /// Advances the node by `dt` under its parent's world transform; false once it and all its
@@ -961,7 +1224,11 @@ impl NodeRt {
         self.speed += def.motion.accel.at(t) * dt;
         self.travel += self.speed * dt;
         let s = self.spin * t;
-        let local = self.base * Affine3A::from_rotation_translation(Quat::from_euler(EulerRot::YXZ, -s.y, s.x, -s.z), Vec3::Z * self.travel);
+        let local = self.base
+            * Affine3A::from_rotation_translation(
+                Quat::from_euler(EulerRot::YXZ, -s.y, s.x, -s.z),
+                Vec3::Z * self.travel,
+            );
         let world = parent * local;
         match (&def.look, own) {
             (Some(look), true) => self.draw(look, t, world, cx),
@@ -974,7 +1241,12 @@ impl NodeRt {
         let mut alive = own;
         match &def.kind {
             Kind::Static => {}
-            Kind::Spawner { count, interval, angle, child } => {
+            Kind::Spawner {
+                count,
+                interval,
+                angle,
+                child,
+            } => {
                 if own {
                     self.emit -= dt;
                     if self.emit <= 0.0 {
@@ -984,7 +1256,11 @@ impl NodeRt {
                                 self.children.push(NodeRt::new(c.clone(), rng, turn));
                             }
                         }
-                        self.emit = if *interval > 0.0 { self.emit + interval } else { f32::INFINITY };
+                        self.emit = if *interval > 0.0 {
+                            self.emit + interval
+                        } else {
+                            f32::INFINITY
+                        };
                     }
                 }
             }
@@ -1001,7 +1277,10 @@ impl NodeRt {
     }
 
     fn clear(&mut self, cx: &mut Cx) {
-        for v in [self.visual.take(), self.batch.take()].into_iter().flatten() {
+        for v in [self.visual.take(), self.batch.take()]
+            .into_iter()
+            .flatten()
+        {
             cx.despawn(v);
         }
         for c in &mut self.children {
@@ -1013,17 +1292,40 @@ impl NodeRt {
         let (_, rot, pos) = world.to_scale_rotation_translation();
         let k = scale_of(world);
         match look {
-            Look::Billboard { texture, blend, width, height, color, frames, spin, .. } => {
+            Look::Billboard {
+                texture,
+                blend,
+                width,
+                height,
+                color,
+                frames,
+                spin,
+                ..
+            } => {
                 if self.visual.is_none() {
                     let tex = cx.lib.texture(*texture, cx.images);
                     let material = cx.material(tex, *blend);
-                    let e = cx.spawn((Mesh3d(cx.lib.quad.clone()), MeshMaterial3d(material.clone())), Transform::from_translation(pos).with_scale(Vec3::ZERO));
-                    self.visual = Some(Visual { entities: vec![e], material, mesh: None });
+                    let e = cx.spawn(
+                        (
+                            Mesh3d(cx.lib.quad.clone()),
+                            MeshMaterial3d(material.clone()),
+                        ),
+                        Transform::from_translation(pos).with_scale(Vec3::ZERO),
+                    );
+                    self.visual = Some(Visual {
+                        entities: vec![e],
+                        material,
+                        mesh: None,
+                    });
                 }
                 let v = self.visual.as_ref().unwrap();
                 let roll = self.roll + spin.at(t) * t;
                 let scale = Vec3::new(width.at(t) * k, height.at(t) * k, 1.0);
-                let tf = Transform { translation: pos, rotation: cx.camera_rot * Quat::from_rotation_z(roll), scale };
+                let tf = Transform {
+                    translation: pos,
+                    rotation: cx.camera_rot * Quat::from_rotation_z(roll),
+                    scale,
+                };
                 if let Some(mut m) = cx.materials.get_mut(&v.material) {
                     m.base_color = srgba(color.at(t));
                     let (o, s) = frames.rect(t, 0.0);
@@ -1031,16 +1333,40 @@ impl NodeRt {
                 }
                 cx.moves.push((v.entities[0], tf, None));
             }
-            Look::Model { model, blend, scale, color, frames } => {
+            Look::Model {
+                model,
+                blend,
+                scale,
+                color,
+                frames,
+            } => {
                 if self.visual.is_none() {
-                    let Some(parts) = cx.lib.model(*model, cx.meshes, cx.images) else { return };
+                    let Some(parts) = cx.lib.model(*model, cx.meshes, cx.images) else {
+                        return;
+                    };
                     let tex = parts.first().and_then(|p| p.texture.clone());
                     let material = cx.material(tex, *blend);
-                    let entities = parts.iter().map(|p| cx.spawn((Mesh3d(p.mesh.clone()), MeshMaterial3d(material.clone())), Transform::from_translation(pos).with_scale(Vec3::ZERO))).collect();
-                    self.visual = Some(Visual { entities, material, mesh: None });
+                    let entities = parts
+                        .iter()
+                        .map(|p| {
+                            cx.spawn(
+                                (Mesh3d(p.mesh.clone()), MeshMaterial3d(material.clone())),
+                                Transform::from_translation(pos).with_scale(Vec3::ZERO),
+                            )
+                        })
+                        .collect();
+                    self.visual = Some(Visual {
+                        entities,
+                        material,
+                        mesh: None,
+                    });
                 }
                 let v = self.visual.as_ref().unwrap();
-                let tf = Transform { translation: pos, rotation: rot, scale: Vec3::new(scale[0].at(t), scale[1].at(t), scale[2].at(t)) * k };
+                let tf = Transform {
+                    translation: pos,
+                    rotation: rot,
+                    scale: Vec3::new(scale[0].at(t), scale[1].at(t), scale[2].at(t)) * k,
+                };
                 if let Some(mut m) = cx.materials.get_mut(&v.material) {
                     m.base_color = srgba(color.at(t));
                     let (o, s) = frames.rect(t, 0.0);
@@ -1052,13 +1378,23 @@ impl NodeRt {
             }
             Look::Light { color, radius } => {
                 let c = color.at(t);
-                let light = PointLight { color: Color::srgb(c.x, c.y, c.z), intensity: LIGHT_LUMENS * c.w.max(0.0), range: (radius.at(t) * k).max(0.01), shadow_maps_enabled: false, ..default() };
+                let light = PointLight {
+                    color: Color::srgb(c.x, c.y, c.z),
+                    intensity: LIGHT_LUMENS * c.w.max(0.0),
+                    range: (radius.at(t) * k).max(0.01),
+                    shadow_maps_enabled: false,
+                    ..default()
+                };
                 let tf = Transform::from_translation(pos);
                 match &self.visual {
                     Some(v) => cx.moves.push((v.entities[0], tf, Some(light))),
                     None => {
                         let e = cx.spawn(light, tf);
-                        self.visual = Some(Visual { entities: vec![e], material: Handle::default(), mesh: None });
+                        self.visual = Some(Visual {
+                            entities: vec![e],
+                            material: Handle::default(),
+                            mesh: None,
+                        });
                     }
                 }
             }
@@ -1066,7 +1402,16 @@ impl NodeRt {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn cluster(&mut self, c: &ClusterDef, t: f32, own: bool, world: Affine3A, dt: f32, rng: &mut Rng, cx: &mut Cx) -> bool {
+    fn cluster(
+        &mut self,
+        c: &ClusterDef,
+        t: f32,
+        own: bool,
+        world: Affine3A,
+        dt: f32,
+        rng: &mut Rng,
+        cx: &mut Cx,
+    ) -> bool {
         let emitting = own && (c.emit_for <= 0.0 || t < c.emit_for);
         if emitting {
             self.emit -= dt;
@@ -1076,10 +1421,19 @@ impl NodeRt {
                     let p = self.particle(c, t, world, rng);
                     self.particles.push(p);
                 }
-                self.emit = if c.interval > 0.0 { self.emit + c.interval } else { f32::INFINITY };
+                self.emit = if c.interval > 0.0 {
+                    self.emit + c.interval
+                } else {
+                    f32::INFINITY
+                };
             }
         }
-        let down = scale_of(world) * if c.look.follow { world.inverse().transform_vector3(Vec3::NEG_Y) } else { Vec3::NEG_Y };
+        let down = scale_of(world)
+            * if c.look.follow {
+                world.inverse().transform_vector3(Vec3::NEG_Y)
+            } else {
+                Vec3::NEG_Y
+            };
         for p in &mut self.particles {
             p.age += dt;
             p.vel += down * c.gravity.0.at(p.age) * p.gravity * dt;
@@ -1099,9 +1453,20 @@ impl NodeRt {
     fn particle(&self, c: &ClusterDef, t: f32, world: Affine3A, rng: &mut Rng) -> Particle {
         let dir = rng.cone(c.emitter.angle);
         let speed = c.emitter.speed.sample(t, rng);
-        let size = Vec3::new(c.emitter.size[0].sample(t, rng), c.emitter.size[1].sample(t, rng), c.emitter.size[2].sample(t, rng));
+        let size = Vec3::new(
+            c.emitter.size[0].sample(t, rng),
+            c.emitter.size[1].sample(t, rng),
+            c.emitter.size[2].sample(t, rng),
+        );
         let tint = c.look.tint.0.lerp(c.look.tint.1, rng.next()) * c.emitter.color.at(t);
-        let (pos, vel) = if c.look.follow { (Vec3::ZERO, dir * speed) } else { (Vec3::from(world.translation), world.transform_vector3(dir) * speed) };
+        let (pos, vel) = if c.look.follow {
+            (Vec3::ZERO, dir * speed)
+        } else {
+            (
+                Vec3::from(world.translation),
+                world.transform_vector3(dir) * speed,
+            )
+        };
         Particle {
             pos,
             vel,
@@ -1132,13 +1497,30 @@ impl NodeRt {
         let k = scale_of(world);
         for p in &self.particles {
             let l = &c.look;
-            let size = Vec3::new(l.size[0].at(p.age), l.size[1].at(p.age), l.size[2].at(p.age)) * p.size * l.scale * k;
+            let size = Vec3::new(
+                l.size[0].at(p.age),
+                l.size[1].at(p.age),
+                l.size[2].at(p.age),
+            ) * p.size
+                * l.scale
+                * k;
             let color = (l.color.at(p.age) * p.tint).to_array();
             let rect = l.frames.rect(p.age, p.frame);
-            let (center, vel) = if l.follow { (world.transform_point3(p.pos), world.transform_vector3(p.vel)) } else { (p.pos, p.vel) };
+            let (center, vel) = if l.follow {
+                (
+                    world.transform_point3(p.pos),
+                    world.transform_vector3(p.vel),
+                )
+            } else {
+                (p.pos, p.vel)
+            };
             if let Some(parts) = &model {
                 let (_, rot, _) = world.to_scale_rotation_translation();
-                let m = Affine3A::from_scale_rotation_translation(size, rot * p.dir * Quat::from_rotation_z(-p.angle), center - origin);
+                let m = Affine3A::from_scale_rotation_translation(
+                    size,
+                    rot * p.dir * Quat::from_rotation_z(-p.angle),
+                    center - origin,
+                );
                 for part in parts.iter() {
                     b.model(part, m, rect, color);
                 }
@@ -1147,32 +1529,60 @@ impl NodeRt {
             let (r, u) = if p.streak > 0.0 && vel.length_squared() > 1e-6 {
                 let axis = vel.normalize();
                 let side = axis.cross(cx.camera - center).normalize_or_zero();
-                (side * size.x * 0.5, axis * (vel.length() * p.streak).max(size.y) * 0.5)
+                (
+                    side * size.x * 0.5,
+                    axis * (vel.length() * p.streak).max(size.y) * 0.5,
+                )
             } else {
                 let (s, co) = p.angle.sin_cos();
-                ((right * co + up * s) * size.x * 0.5, (up * co - right * s) * size.y * 0.5)
+                (
+                    (right * co + up * s) * size.x * 0.5,
+                    (up * co - right * s) * size.y * 0.5,
+                )
             };
             let q = center - origin;
             b.quad([q - r - u, q + r - u, q + r + u, q - r + u], rect, color);
         }
         if self.batch.is_none() {
             let (texture, blend) = match (&c.look.shape, &model) {
-                (Shape::Quad { texture: Some(id), blend }, _) => (cx.lib.texture(*id, cx.images), *blend),
-                (Shape::Quad { texture: None, blend }, _) => (Some(cx.lib.dot.clone()), *blend),
-                (Shape::Model(_), Some(parts)) => (parts.first().and_then(|p| p.texture.clone()), Blend::Add),
+                (
+                    Shape::Quad {
+                        texture: Some(id),
+                        blend,
+                    },
+                    _,
+                ) => (cx.lib.texture(*id, cx.images), *blend),
+                (
+                    Shape::Quad {
+                        texture: None,
+                        blend,
+                    },
+                    _,
+                ) => (Some(cx.lib.dot.clone()), *blend),
+                (Shape::Model(_), Some(parts)) => {
+                    (parts.first().and_then(|p| p.texture.clone()), Blend::Add)
+                }
                 _ => (None, Blend::Add),
             };
             let material = cx.material(texture, blend);
             let mesh = cx.meshes.add(b.mesh());
-            let e = cx.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())), Transform::from_translation(origin));
-            self.batch = Some(Visual { entities: vec![e], material, mesh: Some(mesh) });
+            let e = cx.spawn(
+                (Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())),
+                Transform::from_translation(origin),
+            );
+            self.batch = Some(Visual {
+                entities: vec![e],
+                material,
+                mesh: Some(mesh),
+            });
             return;
         }
         let v = self.batch.as_ref().unwrap();
         if let Some(mut m) = v.mesh.as_ref().and_then(|h| cx.meshes.get_mut(h)) {
             *m = b.mesh();
         }
-        cx.moves.push((v.entities[0], Transform::from_translation(origin), None));
+        cx.moves
+            .push((v.entities[0], Transform::from_translation(origin), None));
     }
 }
 
@@ -1189,16 +1599,25 @@ impl Batch {
     fn quad(&mut self, corners: [Vec3; 4], (o, s): (Vec2, Vec2), color: [f32; 4]) {
         let i = self.pos.len() as u32;
         self.pos.extend(corners.map(|c| c.to_array()));
-        self.uv.extend([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]].map(|[u, v]| [o.x + u * s.x, o.y + v * s.y]));
+        self.uv.extend(
+            [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]
+                .map(|[u, v]| [o.x + u * s.x, o.y + v * s.y]),
+        );
         self.color.extend([linear(color); 4]);
         self.index.extend([i, i + 1, i + 2, i, i + 2, i + 3]);
     }
 
     fn model(&mut self, part: &Part, m: Affine3A, (o, s): (Vec2, Vec2), color: [f32; 4]) {
         let i = self.pos.len() as u32;
-        self.pos.extend(part.positions.iter().map(|&p| m.transform_point3(p).to_array()));
-        self.uv.extend(part.uvs.iter().map(|[u, v]| [o.x + u * s.x, o.y + v * s.y]));
-        self.color.extend(std::iter::repeat_n(linear(color), part.positions.len()));
+        self.pos.extend(
+            part.positions
+                .iter()
+                .map(|&p| m.transform_point3(p).to_array()),
+        );
+        self.uv
+            .extend(part.uvs.iter().map(|[u, v]| [o.x + u * s.x, o.y + v * s.y]));
+        self.color
+            .extend(std::iter::repeat_n(linear(color), part.positions.len()));
         self.index.extend(part.indices.iter().map(|&k| i + k));
     }
 
@@ -1210,7 +1629,10 @@ impl Batch {
             self.index = vec![0, 1, 2];
         }
         let n = self.pos.len();
-        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, self.pos);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 0.0, 1.0]; n]);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, self.uv);
@@ -1221,7 +1643,9 @@ impl Batch {
 }
 
 fn linear(c: [f32; 4]) -> [f32; 4] {
-    Color::srgba(c[0], c[1], c[2], c[3]).to_linear().to_f32_array()
+    Color::srgba(c[0], c[1], c[2], c[3])
+        .to_linear()
+        .to_f32_array()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1234,13 +1658,23 @@ fn simulate(
     mut images: ResMut<Assets<Image>>,
     cameras: Query<&GlobalTransform, (With<Camera3d>, Without<SfxVisual>)>,
     mut effects: Query<(Entity, &mut Sfx, &GlobalTransform)>,
-    mut visuals: Query<(&mut Transform, &mut GlobalTransform, Option<&mut PointLight>), (With<SfxVisual>, Without<Sfx>)>,
+    mut visuals: Query<
+        (
+            &mut Transform,
+            &mut GlobalTransform,
+            Option<&mut PointLight>,
+        ),
+        (With<SfxVisual>, Without<Sfx>),
+    >,
 ) {
     let Some(mut lib) = lib else { return };
-    let (camera, camera_rot) = cameras.iter().next().map_or((Vec3::ZERO, Quat::IDENTITY), |c| {
-        let (_, r, t) = c.to_scale_rotation_translation();
-        (t, r)
-    });
+    let (camera, camera_rot) = cameras
+        .iter()
+        .next()
+        .map_or((Vec3::ZERO, Quat::IDENTITY), |c| {
+            let (_, r, t) = c.to_scale_rotation_translation();
+            (t, r)
+        });
     let dt = time.delta_secs().min(0.1);
     for (entity, mut sfx, at) in &mut effects {
         let stop = sfx.stopping;
@@ -1249,13 +1683,29 @@ fn simulate(
                 commands.entity(entity).try_despawn();
                 continue;
             };
-            lib.seed = lib.seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+            lib.seed = lib
+                .seed
+                .wrapping_mul(747_796_405)
+                .wrapping_add(2_891_336_453);
             let mut rng = Rng(lib.seed | 1);
-            let nodes = roots.iter().map(|d| NodeRt::new(d.clone(), &mut rng, Quat::IDENTITY)).collect();
+            let nodes = roots
+                .iter()
+                .map(|d| NodeRt::new(d.clone(), &mut rng, Quat::IDENTITY))
+                .collect();
             sfx.run = Some(Run { nodes, rng });
         }
         let run = sfx.run.as_mut().unwrap();
-        let mut cx = Cx { commands: &mut commands, lib: &mut lib, meshes: &mut meshes, materials: &mut materials, images: &mut images, camera, camera_rot, owner: entity, moves: Vec::new() };
+        let mut cx = Cx {
+            commands: &mut commands,
+            lib: &mut lib,
+            meshes: &mut meshes,
+            materials: &mut materials,
+            images: &mut images,
+            camera,
+            camera_rot,
+            owner: entity,
+            moves: Vec::new(),
+        };
         let world = at.affine();
         let Run { nodes, rng } = run;
         nodes.retain_mut(|n| {
@@ -1281,7 +1731,11 @@ fn simulate(
 }
 
 /// Despawns visuals whose effect entity is gone (despawned with its AC, or ended).
-fn sweep(mut commands: Commands, visuals: Query<(Entity, &SfxVisual)>, effects: Query<(), With<Sfx>>) {
+fn sweep(
+    mut commands: Commands,
+    visuals: Query<(Entity, &SfxVisual)>,
+    effects: Query<(), With<Sfx>>,
+) {
     for (e, v) in &visuals {
         if !effects.contains(v.0) {
             commands.entity(e).try_despawn();
@@ -1293,9 +1747,16 @@ fn sweep(mut commands: Commands, visuals: Query<(Entity, &SfxVisual)>, effects: 
 /// boost mode moves it: main booster on the booster nozzles moving forward, back booster on
 /// the legs' back nozzles moving backward, foot booster on the feet while rising. Which motion
 /// fires which booster is not traced.
-pub fn boosters(mut commands: Commands, pilots: Query<&Pilot>, mut points: Query<(Entity, &mut EffectPoint)>, mut effects: Query<&mut Sfx>) {
+pub fn boosters(
+    mut commands: Commands,
+    pilots: Query<&Pilot>,
+    mut points: Query<(Entity, &mut EffectPoint)>,
+    mut effects: Query<&mut Sfx>,
+) {
     let Ok(pilot) = pilots.single() else { return };
-    let Some(row) = find(PARAM_MAPSFXPARAM_BIN, 0).map(|r| &r.data) else { return };
+    let Some(row) = find(PARAM_MAPSFXPARAM_BIN, 0).map(|r| &r.data) else {
+        return;
+    };
     let flat = Vec2::new(pilot.velocity.x, pilot.velocity.z);
     let facing = (Quat::from_rotation_y(pilot.yaw) * Vec3::NEG_Z).xz();
     let moving = pilot.boost && flat.length() > BOOST_MOVING;
@@ -1304,7 +1765,11 @@ pub fn boosters(mut commands: Commands, pilots: Query<&Pilot>, mut points: Query
         let want = match (p.column, p.id) {
             ("booster", id) if MAIN_NOZZLES.contains(&id) && moving && ahead => row.ac_main_booster,
             ("legs", id) if BACK_NOZZLES.contains(&id) && moving && !ahead => row.ac_back_booster,
-            ("legs", id) if FOOT_NOZZLES.contains(&id) && pilot.airborne && pilot.velocity.y > 0.0 => row.ac_foot_booster,
+            ("legs", id)
+                if FOOT_NOZZLES.contains(&id) && pilot.airborne && pilot.velocity.y > 0.0 =>
+            {
+                row.ac_foot_booster
+            }
             _ => 0,
         } as i32;
         let current = p.playing.filter(|&(_, fx)| effects.contains(fx));
@@ -1317,17 +1782,43 @@ pub fn boosters(mut commands: Commands, pilots: Query<&Pilot>, mut points: Query
                 s.stop();
             }
         }
-        p.playing = (want > 0).then(|| (want, commands.spawn((Sfx::new(want), Transform::default(), Visibility::default(), ChildOf(e))).id()));
+        p.playing = (want > 0).then(|| {
+            (
+                want,
+                commands
+                    .spawn((
+                        Sfx::new(want),
+                        Transform::default(),
+                        Visibility::default(),
+                        ChildOf(e),
+                    ))
+                    .id(),
+            )
+        });
     }
 }
 
 /// `--sfx`: keeps one copy of the effect playing 20 m ahead of and 5 m above the AC, facing up.
-fn preview(mut commands: Commands, preview: Option<Res<Preview>>, acs: Query<&GlobalTransform, With<Pilot>>, effects: Query<&Sfx>, mut playing: Local<Option<Entity>>) {
+fn preview(
+    mut commands: Commands,
+    preview: Option<Res<Preview>>,
+    acs: Query<&GlobalTransform, With<Pilot>>,
+    effects: Query<&Sfx>,
+    mut playing: Local<Option<Entity>>,
+) {
     let Some(preview) = preview else { return };
     if playing.is_some_and(|e| effects.contains(e)) {
         return;
     }
     let Ok(ac) = acs.single() else { return };
     let at = ac.transform_point(Vec3::new(0.0, 5.0, -20.0));
-    *playing = Some(commands.spawn((Sfx::new(preview.0), Transform::from_translation(at).with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)))).id());
+    *playing = Some(
+        commands
+            .spawn((
+                Sfx::new(preview.0),
+                Transform::from_translation(at)
+                    .with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
+            ))
+            .id(),
+    );
 }

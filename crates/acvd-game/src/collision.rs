@@ -44,8 +44,18 @@ pub struct Collision {
 impl Collision {
     /// Height of the first `layer` surface a ray straight down from `from` meets before `to`.
     pub fn ray_down(&self, from: Vec3, to: f32, layer: Layer) -> Option<f32> {
-        let plane = self.planes.iter().filter(|p| p.layer == layer && (to..=from.y).contains(&p.y)).map(|p| p.y).reduce(f32::max);
-        let mesh = self.hits.iter().filter(|h| h.layer == layer).filter_map(|h| tri_y(h.a, h.b, h.c, from.x, from.z, from.y, to)).reduce(f32::max);
+        let plane = self
+            .planes
+            .iter()
+            .filter(|p| p.layer == layer && (to..=from.y).contains(&p.y))
+            .map(|p| p.y)
+            .reduce(f32::max);
+        let mesh = self
+            .hits
+            .iter()
+            .filter(|h| h.layer == layer)
+            .filter_map(|h| tri_y(h.a, h.b, h.c, from.x, from.z, from.y, to))
+            .reduce(f32::max);
         match (plane, mesh) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -86,7 +96,11 @@ fn tri_y(a: Vec3, b: Vec3, c: Vec3, x: f32, z: f32, from: f32, to: f32) -> Optio
 }
 
 fn layer_of(name: &str) -> Layer {
-    if name.to_ascii_lowercase().contains("water") { Layer::Water } else { Layer::Ground }
+    if name.to_ascii_lowercase().contains("water") {
+        Layer::Water
+    } else {
+        Layer::Ground
+    }
 }
 
 fn mirror(v: [f32; 3]) -> Vec3 {
@@ -98,7 +112,11 @@ pub fn load_map(usrdir: &Path, map: &str) -> Result<Collision> {
     let folder = format!("model/map/{map}");
     let msb_path = {
         let named = format!("{folder}/{map}_map.msb");
-        if usrdir.join(&named).is_file() { named } else { format!("{folder}/{map}.msb") }
+        if usrdir.join(&named).is_file() {
+            named
+        } else {
+            format!("{folder}/{map}.msb")
+        }
     };
     let binder = format!("{folder}/{map}_m.dcx.bnd");
     let parts = msb::parts(&vfs::open(usrdir, &msb_path)?)?;
@@ -109,8 +127,13 @@ pub fn load_map(usrdir: &Path, map: &str) -> Result<Collision> {
             Some(h) => h,
             None => {
                 let asset = format!("{binder}|{}_h.hmd", part.model);
-                let Ok(bytes) = vfs::open(usrdir, &asset) else { continue };
-                cache.insert(part.model.clone(), hmd::read(&bytes).with_context(|| asset)?);
+                let Ok(bytes) = vfs::open(usrdir, &asset) else {
+                    continue;
+                };
+                cache.insert(
+                    part.model.clone(),
+                    hmd::read(&bytes).with_context(|| asset)?,
+                );
                 cache.get(&part.model).unwrap()
             }
         };
@@ -118,11 +141,23 @@ pub fn load_map(usrdir: &Path, map: &str) -> Result<Collision> {
         let xf = flver::Xform::local(part.translation, rot, part.scale);
         for tri in &h.triangles {
             let [a, b, c] = tri.verts.map(|i| mirror(xf.apply(h.vertices[i as usize])));
-            let mat = h.materials.get(tri.material as usize).map(String::as_str).unwrap_or("");
-            hits.push(Hit { a, b, c, layer: layer_of(mat) });
+            let mat = h
+                .materials
+                .get(tri.material as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            hits.push(Hit {
+                a,
+                b,
+                c,
+                layer: layer_of(mat),
+            });
         }
     }
-    Ok(Collision { planes: Vec::new(), hits })
+    Ok(Collision {
+        planes: Vec::new(),
+        hits,
+    })
 }
 
 #[cfg(test)]
@@ -137,9 +172,18 @@ mod tests {
             c: Vec3::new(0.0, 1.0, 2.0),
             layer: Layer::Ground,
         };
-        let c = Collision { planes: vec![Plane { y: 0.5, layer: Layer::Ground }], hits: vec![tri] };
+        let c = Collision {
+            planes: vec![Plane {
+                y: 0.5,
+                layer: Layer::Ground,
+            }],
+            hits: vec![tri],
+        };
         assert_eq!(c.ground_below(Vec3::new(0.25, 10.0, 0.25)), Some(1.0));
-        assert_eq!(c.ray_down(Vec3::new(0.25, 0.8, 0.25), f32::NEG_INFINITY, Layer::Ground), Some(0.5));
+        assert_eq!(
+            c.ray_down(Vec3::new(0.25, 0.8, 0.25), f32::NEG_INFINITY, Layer::Ground),
+            Some(0.5)
+        );
         assert_eq!(c.ground_below(Vec3::new(10.0, 10.0, 10.0)), Some(0.5));
     }
 }

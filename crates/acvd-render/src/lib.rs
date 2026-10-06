@@ -47,11 +47,55 @@ pub fn model(usrdir: &Path, asset: &str) -> Result<Vec<LoadedMesh>> {
 /// Like [`model`], moving every vertex by `offset(root)` once it is in model space, in FLVER
 /// axes: `root` names the root bone above the vertex's bone, `None` when it has no bone.
 pub fn model_with_offsets(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3]) -> Result<Vec<LoadedMesh>> {
-    Ok(load(usrdir, asset, offset, false)?.0)
+    Ok(load(usrdir, asset, &|root| RootPlace::translate(offset(root)), false)?.0)
+}
+
+/// Where one root bone of a part sits on the assembled AC, in FLVER axes. Columns are the
+/// images of the model's local axes; `IDENTITY` leaves the model where it was authored.
+#[derive(Debug, Clone, Copy)]
+pub struct RootPlace {
+    pub x: [f32; 3],
+    pub y: [f32; 3],
+    pub z: [f32; 3],
+    pub t: [f32; 3],
+}
+
+impl RootPlace {
+    pub const IDENTITY: Self = Self { x: [1.0, 0.0, 0.0], y: [0.0, 1.0, 0.0], z: [0.0, 0.0, 1.0], t: [0.0; 3] };
+
+    pub fn translate(t: [f32; 3]) -> Self {
+        Self { t, ..Self::IDENTITY }
+    }
+
+    pub fn apply_point(&self, p: [f32; 3]) -> [f32; 3] {
+        let d = self.apply_dir(p);
+        [d[0] + self.t[0], d[1] + self.t[1], d[2] + self.t[2]]
+    }
+
+    pub fn apply_dir(&self, p: [f32; 3]) -> [f32; 3] {
+        [
+            self.x[0] * p[0] + self.y[0] * p[1] + self.z[0] * p[2],
+            self.x[1] * p[0] + self.y[1] * p[1] + self.z[1] * p[2],
+            self.x[2] * p[0] + self.y[2] * p[1] + self.z[2] * p[2],
+        ]
+    }
+
+    /// `self * inner` once `inner` is an [`flver::Xform`]: the model's bind, then this place.
+    pub fn then_bind(&self, bind: &flver::Xform) -> flver::Xform {
+        flver::Xform {
+            m: [
+                [self.x[0], self.y[0], self.z[0]],
+                [self.x[1], self.y[1], self.z[1]],
+                [self.x[2], self.y[2], self.z[2]],
+            ],
+            t: self.t,
+        }
+        .then(bind)
+    }
 }
 
 /// One FLVER bone at rest, in FLVER axes. `bind` is its model-space transform with its root's
-/// offset applied.
+/// [`RootPlace`] applied (`place`, then the bind).
 pub struct RigBone {
     pub name: String,
     pub parent: Option<usize>,
@@ -65,8 +109,20 @@ pub struct Rig {
     pub unboned: [f32; 3],
     /// `(socket id, bone carrying the dummy)` for every dummy with a socket id.
     pub sockets: Vec<(u8, Option<usize>)>,
+    /// Attach sockets in model space, before this part's own [`RootPlace`]. `forward` is the
+    /// dummy's forward through its bone; `root` is the root bone above that bone.
+    pub frames: Vec<SocketFrame>,
     /// Every dummy with an effect point id (colour byte 1).
     pub effects: Vec<RigEffect>,
+}
+
+/// One attach socket of a loaded model, in that model's space.
+#[derive(Clone)]
+pub struct SocketFrame {
+    pub id: u8,
+    pub root: String,
+    pub position: [f32; 3],
+    pub forward: [f32; 3],
 }
 
 /// An FFX effect point, in FLVER axes: `position` relative to `bone` and `forward` in its frame.
@@ -78,8 +134,9 @@ pub struct RigEffect {
 }
 
 /// Like [`model_with_offsets`], with joint indices and weights on every mesh for GPU skinning.
-pub fn rigged_model(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3]) -> Result<(Vec<LoadedMesh>, Rig)> {
-    let (meshes, f) = load(usrdir, asset, offset, true)?;
+/// `place(root)` is where that root sits on the assembled AC.
+pub fn rigged_model(usrdir: &Path, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace) -> Result<(Vec<LoadedMesh>, Rig)> {
+    let (meshes, f) = load(usrdir, asset, place, true)?;
     let world = f.bone_transforms()?;
     let roots = f.bone_roots();
     let bones = f
@@ -87,17 +144,24 @@ pub fn rigged_model(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) ->
         .iter()
         .enumerate()
         .map(|(i, b)| {
-            let d = offset(Some(&f.bones[roots[i]].name));
-            let mut bind = world[i];
-            (0..3).for_each(|a| bind.t[a] += d[a]);
-            RigBone { name: b.name.clone(), parent: usize::try_from(b.parent).ok().filter(|&p| p < f.bones.len()), bind }
+            let placed = place(Some(&f.bones[roots[i]].name)).then_bind(&world[i]);
+            RigBone { name: b.name.clone(), parent: usize::try_from(b.parent).ok().filter(|&p| p < f.bones.len()), bind: placed }
         })
         .collect();
-    let sockets = f
+    let bone_of = |d: &flver::Dummy| {
+        usize::try_from(d.parent_bone).ok().or(usize::try_from(d.attach_bone).ok()).filter(|&b| b < f.bones.len())
+    };
+    let sockets = f.dummies.iter().filter(|d| d.color[0] != 0).map(|d| (d.color[0], bone_of(d))).collect();
+    let frames = f
         .dummies
         .iter()
         .filter(|d| d.color[0] != 0)
-        .map(|d| (d.color[0], usize::try_from(d.parent_bone).ok().or(usize::try_from(d.attach_bone).ok()).filter(|&b| b < f.bones.len())))
+        .filter_map(|d| {
+            let b = bone_of(d)?;
+            let m = &world[b].m;
+            let forward = [0, 1, 2].map(|r| m[r][0] * d.forward[0] + m[r][1] * d.forward[1] + m[r][2] * d.forward[2]);
+            Some(SocketFrame { id: d.color[0], root: f.bones[roots[b]].name.clone(), position: world[b].apply(d.position), forward })
+        })
         .collect();
     let effects = f
         .dummies
@@ -110,15 +174,15 @@ pub fn rigged_model(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) ->
             forward: d.forward,
         })
         .collect();
-    Ok((meshes, Rig { bones, unboned: offset(None), sockets, effects }))
+    Ok((meshes, Rig { bones, unboned: place(None).t, sockets, frames, effects }))
 }
 
-fn load(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3], rig: bool) -> Result<(Vec<LoadedMesh>, flver::Flver)> {
+fn load(usrdir: &Path, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig: bool) -> Result<(Vec<LoadedMesh>, flver::Flver)> {
     let data = vfs::open(usrdir, asset)?;
     let f = flver::read(&data)?;
     let world = f.bone_transforms()?;
-    let by_bone: Vec<[f32; 3]> = f.bone_roots().into_iter().map(|r| offset(Some(&f.bones[r].name))).collect();
-    let unboned = offset(None);
+    let by_bone: Vec<RootPlace> = f.bone_roots().into_iter().map(|r| place(Some(&f.bones[r].name))).collect();
+    let unboned = place(None);
     let mut out = Vec::new();
     for (i, m) in f.meshes.iter().enumerate() {
         let Some(fs) = f.main_face_set(m) else { continue };
@@ -130,9 +194,14 @@ fn load(usrdir: &Path, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3], r
         let bones = f.vertex_bones(m, &v);
         let joints = rig.then(|| vertex_joints(&f, m, &v, &bones));
         f.to_model_space(m, &mut v, &bones, &world);
-        for (p, bone) in v.positions.iter_mut().zip(&bones) {
-            let d = bone.and_then(|b| by_bone.get(b)).copied().unwrap_or(unboned);
-            (0..3).for_each(|a| p[a] += d[a]);
+        let placed_at = |i: usize| bones.get(i).and_then(|b| b.and_then(|b| by_bone.get(b))).copied().unwrap_or(unboned);
+        for (i, p) in v.positions.iter_mut().enumerate() {
+            *p = placed_at(i).apply_point(*p);
+        }
+        if v.normals.len() == v.positions.len() {
+            for (i, n) in v.normals.iter_mut().enumerate() {
+                *n = placed_at(i).apply_dir(*n);
+            }
         }
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
         for &i in tris.iter().flatten() {

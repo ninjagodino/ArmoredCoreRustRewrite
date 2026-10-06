@@ -250,9 +250,16 @@ fn assembly(paths: &Paths, out: &std::path::Path, groups: &[GroupSheet], models:
             };
             let parent = if s.parent == crate::preflight::NONE { "None".to_owned() } else { format!("Some({:?})", s.parent) };
             let roots: Vec<&str> = if s.root.trim() == ALL_ROOTS { Vec::new() } else { s.root.split(';').map(str::trim).collect() };
+            let orient = match s.orient.trim() {
+                "" | "none" => "None".to_owned(),
+                n => {
+                    let v: u8 = n.parse().with_context(|| format!("slot {}: orient `{n}` is not none or a flag byte", s.slot))?;
+                    format!("Some({v})")
+                }
+            };
             writeln!(
                 src,
-                "    Slot {{ name: {:?}, column: {:?}, part: |a| a.{} as i64, category: {}, prefix: {:?}, parent: {parent}, socket: {socket}, roots: &{roots:?} }},",
+                "    Slot {{ name: {:?}, column: {:?}, part: |a| a.{} as i64, category: {}, prefix: {:?}, parent: {parent}, socket: {socket}, roots: &{roots:?}, orient: {orient} }},",
                 s.slot, s.column, s.column, s.category, s.prefix
             )?;
         }

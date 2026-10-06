@@ -27,7 +27,12 @@ pub struct ZoomBlur {
 
 impl ZoomBlur {
     pub fn new(offset: f32, alpha: u8, thin: f32, no_effect: Vec2) -> Self {
-        Self { step: offset / FRAME_WIDTH, alpha: f32::from(alpha) / 255.0, thin, no_effect }
+        Self {
+            step: offset / FRAME_WIDTH,
+            alpha: f32::from(alpha) / 255.0,
+            thin,
+            no_effect,
+        }
     }
 }
 

@@ -50,8 +50,9 @@ Rough priority order; reorder freely.
     switch is decided per 1/30 s frame in the game, per tick here.
 - **Paint**: map `_c` mask regions to accolor channels via the ACColor fragment programs in
   `shader/flver_shader.bnd`.
-- **Assembly gaps**: socket rotation, recon/hanger mounts, LOD switching; 8 pending FLVERs
-  (`0x20007` and FLVER0).
+- **Assembly gaps**: shoulder attach flag 5 (VMX `0x8288a058`; the parallel-to-+Y case
+  rotates the up hint by ±90° and that axis is still unread), recon mounts, LOD switching;
+  8 pending FLVERs (`0x20007` and FLVER0).
 - **Maps leftovers**: rest of MSB (MODEL/EVENT/POINT/ROUTE/LAYER/TREE), `.smd`, map FLVER
   visuals, water-layer materials (none named water on m3100), collision filters 0x100002 /
   0x200002. HNAV/HTR navigation readers.
@@ -67,6 +68,20 @@ Rough priority order; reorder freely.
     drain, missiles (`bulletmissile`), blades, shoulder weapons (category 12 bullet ids at
     +356/+360), weapon modes, bay shift, core aim (shots follow the camera pitch, not a posed
     upper body). The lock-sight HUD shows the hand-weapon ammo counts (`acvd-game::hud`).
+  - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
+    360 call that starts `a00_001` on a held trigger was not found (joint-control bit 31 at
+    `0x82456f68` selects `sniper_$(LR)` vs `gun_$(LR)` and was not tied back to +0x153).
+    Shots wait until the deploy clip ends; that timing is the clip, not a TAE event.
+    Ready weapons (`ready_position`: cannons, sniper cannons, the other heavy classes) play
+    acmotion 78/75 while fire is held and 79/76 on release (`sheets/ac_states.csv`; the blend
+    rows are キャノン構え / キャノン解除, b_apply_lower 1). Sniper rifles (kind 5) do not. The arm
+    clip only overrides the bones it animates (the `r_shoul_p*` / `l_shoul_p*` pads), so it
+    does not plant the rest of the arm back on the clip bind: those tracks are two identical
+    identity keys, and writing them was erasing acmotion 78's `r_arm01` pose. The arm's
+    `a00_001`/`a00_003` play on that side's bones while a ready weapon is deployed. Rifles
+    (kind 4) kick `gun_$(LR)` ReactAng (−12° on arm01-03, −5° on arm05, 6 frames;
+    parser `0x82b73b28` stores the angle at +0x18). The kick axis is not a field; it is applied
+    as a local X rotation because LockMinX/LockMaxX is the wide limit on those bones.
 - **UI**: in-game HUD next steps: AP / energy state for the hidden `AP*` / `EN*` digits, the `AlphaAnimSprite` gauges (`Gauge_LWeapon` ...; record layout unread), the side `Weapon` panels (part name + `CurAmmo` runtime text at the `ACV_FE_Normal` LeftArm / Shoulder / RightArm anchors); trace the Dialog color tint (inferred, see Notes); animation tables (PINA/KINA/OINA/MINA...). Open: Text word +0x0c (0, 502, 1000-1004, 1030, 1200-1204; not a scale), Text flags byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0). **Param enums**: TDF reader.
 - **Effects leftovers** (FFX player done, see Done): every slot meaning in
   `sheets/ffx_actions.csv` is inferred from the effect files. The 360 action-id to class map
@@ -92,23 +107,22 @@ Rough priority order; reorder freely.
     scale argument (or one RPCS3 breakpoint on it).
   - Hits always use `default2`: the collision mesh keeps no material.
   - The `hit_sfx_type` to `bullethitsfxparam.bin` row mapping is assumed.
-- **Static fact index and sheet audit** (planned, not built): one script pass over `ACV2.pe`
-  writing per-function facts (bounds, direct callers / callees, the table slots that point at it,
-  including leaf functions missing from `.pdata`, loaded strings / constants, struct offsets read
-  and written) plus every vtable and switch table (548 `lwzx` + `mtctr` + `bctr` sites), joined
-  to names from PARAMDEF, TDF (198 files, reader still todo), `.dbp` labels and Lua param ids.
-  Then an audit that checks each sheet row's 360 addresses, offsets and constants against it.
-  54 sheet rows cite only PS3 addresses and need byte-matched 360 equivalents.
-  - Output lives only on disk: the script writes the index sheets, and chats query the rows
-    they need (by address, slot or id). Never read the whole index into a chat.
-  - The script does the reading; model tokens go to writing it and spot-checking samples
-    against known rows (movement vtable `0x8208fea0` slot `+0xec` = `0x82826058`).
-  - Budget: about a day and 200-400k tokens for the function and vtable index, about a day
-    more for switch tables (only runs read by an `lwzx` / `mtctr` / `bctr` sequence count).
 - **Movies** (PAMF), **mission events** (EVD),
   **AI** (decompiled Lua in `private/lua`, no sheet yet).
 
 ## Done
+
+- Socket facing and hanger racks (`acvd-game::assemble`, `sheets/assembly_slots.csv`).
+  `param/acattachinfo.bin` is 30 records of 16 bytes at `0x10` (string table at `0x1F0`):
+  parent category, socket, child category, flag, name offset, then `u32` 0, `u16` extra.
+  The flag byte is switched at 360 `0x8288cea0`. Flags 0/1 (`0x8288c0b8`) build a basis on
+  the socket forward against world +Y; flags 2/3 (`0x8288bef8`) against world +Z, so a
+  booster nozzle (local -Y) lies along the socket forward. Each booster root uses its own
+  socket (`l_boost` 8, `l2_boost` 25, `r_boost` 9, `r2_boost` 26); a missing 25/26 copies
+  the inner booster's place. Hanger racks are the fixed models `hgl0001` / `hgr0001` on arm
+  dummies 80/81; the hanger weapon then sits on rack dummies 85/87 with the rack's rotation
+  (flag 4 shares the unread VMX path, so it copies the rack instead). Checked on designs
+  5013 and 6003 from the front, side, back and three-quarter.
 
 - Sound, the first free-play cues (`acvd-formats::fsb` / `::fev`, `acvd-game::sound`,
   `sheets/sound_cues.csv`). PS3 banks are FSB4 MPEG; the 360 build names the cue.
@@ -153,7 +167,21 @@ Rough priority order; reorder freely.
   against `growpartsarmunitparam.bin`). F / left mouse / R2 fire the right arm, C / right
   mouse / L2 the left (button defaults from `manual.fmg`). Tracers leave the weapon-root joint
   along the follow camera's pitched forward, fly with the `bulletrigid` / `bulletenergy` row
-  of `bullet_id`, and despawn on the ground or after 5 s.
+  of `bullet_id`, and despawn on the ground or after 5 s. `weapon_kind` (+0x0f) and
+  `ready_position` (+0x153) are on the same sheet. A hand `_a` binder's `a00_000`/`001`/`002`/`003`
+  are stowed, deploy, fire and stow. Weapons with `ready_position` and `a00_001` (cannon 2010,
+  autocannon 1210, H.E.A.T. cannon 2230) stay on `a00_000` until fire is held, then play `a00_001`
+  and do not shoot until it ends; release plays `a00_003`. `a00_002` restarts on each shot
+  (handgun 410). A ready weapon with no weapon deploy clip (howitzer 2310) still waits for
+  the body stance. While a ready weapon is deployed, that side's arm `a00_001` (stow `a00_003`)
+  poses the shoulder pads the clip animates. Its other tracks are a two-key identity hold and
+  are not written, so the body stance keeps the arm. Tank sets (`acv_t`) do not ship anims
+  75/76/78/79, so a tank's ready weapon deploys the gun without that body clip.
+  Every ready weapon (part 2010 cannon, 2230 H.E.A.T., 2610 sniper cannon) plays
+  `sniper_ready_r`/`_l` (acmotion 93/95) to the end before the shot and `sniper_stow_*`
+  (94/96) on release. A sniper rifle (kind 5, part 2410) does not take that stance.
+  A rifle (kind 4) adds the `gun_$(LR)` ReactAng kick on arm01-03 (−12°) and arm05 (−5°) for
+  6 frames, as a local X rotation.
 
 - Movement units: every NewAcBehavior input the runtime reads has its unit and 360/PS3 evidence
   (`tuning_fields.csv`); part stats + `AcCtrlParamCalc.lua` formulas live in `ac_ctrl_calc.csv`.
@@ -207,14 +235,3 @@ Rough priority order; reorder freely.
 - Lean command RE (360): ground dash start builder 0x82883870 (called from vtable fn 0x8284b210; turn arg 0/1/2 adds 0/1/2 to the row id, ids 0x11,0x14,... = acmotion rows 17,20,..), quick-boost 360 builder 0x828844f0 (row 218), air-float 0x82883d30 (row 222), dash-jump charge 0x828839d0 (rows 49-56). Each takes the move vec2, angle = atan2 (0x823a5d20) wrapped to +-pi, fraction = angle/2pi (+1 if negative), start time = 1 - fraction (mirrored left/right, matching the by-eye swap), sent via 0x82883370 -> cmd struct (+4 start, +8) -> 0x82854060 -> clip time at 0x8289a750. Not yet found: whether the command is re-issued each frame, which vec2 it is (stick or velocity), and any smoothing.
 
 - Armored Core V (retail 360, no Verdict Day extras) unpacked to private/x360/v/ACV.pe (xdvdfs + xexunpack from armoredcoredumps), Ghidra project private/ghidraV (ACV, PowerPC:BE:64:A2ALT-32addr base 0x82000000, .pdata 0x82215c00 size 0x8f2b0, 88,788 functions; start the bridge with --project <abs>/private/ghidraV/ACV --program ACV.pe, pass both flags on every command). The lean command builders are identical there: dash 0x827fbba0 (called by 0x827bc190, which also stores the move vec2 at this+8/+0xc), quick-boost 0x827fc938, air-float 0x827fbfa8, jump/charge tables; helper atan 0x823433d8, command 0x827fb5f8. Callers that pass the vec2 not found yet.
-
-- Runtime probes on the 360 build (`tools/xenia`). The project's Xenia Canary fork
-  (`external/xenia-canary`, branch `acvd-debug` = upstream `0b0d57a1b` + `acvd-probe.patch`)
-  logs registers and guest memory before chosen guest instructions, so runtime checks use the
-  Ghidra addresses directly (no PS3 translation, no hand-set breakpoints). `setup.ps1` builds it
-  (VS 2022, Python, Vulkan SDK); `run.ps1 <probes> [-Seconds N]` boots the 360 ISO with
-  `protect_zero=false`, `readback_resolve=full` and no game patches, and writes one JSON line per
-  hit (syntax in `probes.example.txt`). Smoke test at boot: entry `0x82d1ef30` hit once;
-  `TextMgr_getMessage` `0x82b1a8b0` is called from `0x824ac358` (inside `DrbShape_createText`)
-  with r4 = 1 (bank) and r5 = message id, matching the DRB Text notes. Xenia's compatibility
-  issue #278 lists Verdict Day as gameplay; not yet run inside a mission.

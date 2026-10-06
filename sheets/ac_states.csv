@@ -30,3 +30,7 @@ air_move,4,80,空中移動( 後 ),"Airborne with horizontal input, without the t
 air_move,5,83,空中移動(左後),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
 air_move,6,86,空中移動( 左 ),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
 air_move,7,89,空中移動(左前),"Airborne with horizontal input, without the turn variants; directions run clockwise from forward: front, front-right, right, back-right, back, back-left, left, front-left."
+sniper_ready_r,,93,スナイパー構え(右),"Hold fire with any ready_position weapon on the right (cannon, sniper cannon, the other heavy classes). A sniper rifle (weapon_kind 5) does not play this. param/acmotion.bin row 93: anim 78, not looping, interpolate 19 (hokan row キャノン構え), b_apply_lower 1 so the clip replaces the whole body. Rows 97-99 are named 旧仕様 and are not used."
+sniper_stow_r,,94,スナイパー解除(右),"Release of sniper_ready_r. Row 94: anim 79, interpolate 21, b_apply_lower 1."
+sniper_ready_l,,95,スナイパー構え(左),"Hold fire with any ready_position weapon on the left. Row 95: anim 75, interpolate 19, b_apply_lower 1."
+sniper_stow_l,,96,スナイパー解除(左),"Release of sniper_ready_l. Row 96: anim 76, interpolate 21, b_apply_lower 1."

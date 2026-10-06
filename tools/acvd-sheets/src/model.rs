@@ -545,7 +545,8 @@ impl AcPartCategoryRow {
 /// `sheets/assembly_slots.csv`: where one assembly column's part attaches. `socket` is a dummy
 /// id (`color[0]`) on the parent slot's model, or `bone:<name>` for one of its bones; `root` names
 /// the root bones of this slot's model that land on it (see [`AssemblySlotRow::roots`]). The
-/// anchor slot has `none` for parent and socket.
+/// anchor slot has `none` for parent and socket. `orient` is `none` or the attach-info flag
+/// byte (360 `0x8288cea0`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssemblySlotRow {
     pub slot: String,
@@ -556,6 +557,9 @@ pub struct AssemblySlotRow {
     pub parent: String,
     pub socket: String,
     pub root: String,
+    /// `none`, or the flag byte. Empty (older sheets) means no rotation.
+    #[serde(default)]
+    pub orient: String,
     pub evidence: String,
 }
 
@@ -563,8 +567,8 @@ pub struct AssemblySlotRow {
 pub const ALL_ROOTS: &str = "*";
 
 impl AssemblySlotRow {
-    /// The root bones this slot moves on `m`: the `;`-separated `root` cell (their centroid
-    /// lands on the socket), or every root of `m` for `*`.
+    /// The root bones this slot moves on `m`: the `;`-separated `root` cell, or every root of
+    /// `m` for `*`. The first lands on the socket; a booster's second root uses dummy 25 or 26.
     pub fn roots<'a>(&'a self, m: &'a ModelSheet) -> Vec<&'a str> {
         if self.root.trim() == ALL_ROOTS {
             m.skeleton.iter().filter(|b| b.parent < 0).map(|b| b.name.as_str()).collect()
