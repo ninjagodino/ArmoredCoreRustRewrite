@@ -9,6 +9,31 @@ task, and add any new tasks it uncovered. Per-system data/runtime status also li
 
 Rough priority order; reorder freely.
 
+**Goal: a playable AC test demo** (garage AC TEST: map m4000 + `m4000_actest.msb`, see Done
+"AC test scene"). Gameplay should match the 360 build; menus may stay partial. Tasks toward it,
+in order:
+
+- **AC vs world collision** (blocks the demo): the AC walks through walls and objects; only a
+  downward ground ray exists (`collision.rs`). No paramdef carries an AC body size (`q name
+  Radius` finds only bullets, `ENEMY_GRAPHICS_ST.CollisionRadius` and camera `HitRadius`). Find
+  the 360 AC-vs-map query: the ground ray filter 0x100002 (`0x829e7b68`) and the eye-floor ray
+  0x200002 (`0x829e7be0`) are in the collision layer, so their neighbours / callers from the AC
+  update `0x828bef18` should include the horizontal sweep and its shape (capsule / spheres per
+  part?). Then a Xenia probe walking into a wall. Also wall kick (`ackickrhit` material) and
+  slopes too steep to stand on. `Collision` now has an XZ grid (16 m cells) for the queries.
+- **AC test targets**: `m4000_actest.msb` parts of kind 2 (22: ACs `a0000`-`a0003` at the vs
+  UNAC start (-797.168, 17, 616.934), enemies `e0010` / `e0110` / `e0210` / `e1020` / `e2030`)
+  on layers `actest2`-`actest8` (LAYER_PARAM_ST; the layer link in the part record is unread),
+  with `param/actestdata.bin` (+ `actestdata.def`, unread) choosing the test; AI in
+  `script/enemy/*_actest.lc`, `script/arena/actest_*.lc`. Draw them, take hits and damage.
+- **Damage model**: AP, bullet hit vs AC / enemy hit shapes, `damage_power`, impact, the
+  weapons' open units (see Weapons leftovers).
+- **Lock-on / FCS** (see FCS / lock-on HUD), energy and boost gauges (UI).
+- **Map look**: map lighting / fog / sky (`ch_env/m4000_env.msb` is not an MSB: another format,
+  77 of them), LOD (`_l1` / `_l2` FLVERs), broken models (`_b.flv` / `_b_h.hmd`), the `movie`
+  texture (a runtime video surface), the area bounds (POINT kinds 100-102: operation / warning
+  / caution area) and the water return point (kind 50).
+
 - **Animation**: TAE event reader; core control (upper body faces the aim while legs strafe);
   upper/lower body layering; boost_a and part `*_a` clips (`Booster_Frame` waits on these).
   - TAE lead: `motioncollate` `motion_ow_disarm` / `motion_ow_equip` are the TAE owner ids
@@ -150,6 +175,33 @@ Rough priority order; reorder freely.
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- AC test scene: `acvd-game` now starts in the garage AC TEST map, drawn from the disc.
+  - **Which map**: the 360 exe has `AcTestScene` (`garagescene.lua` `Scr_CreateScene(2008,
+    "AcTestScene")`) and `AcTestSortieScene` (0x825dbcd8, load step 0x825dcb68); the disc has
+    `model/map/m4000/m4000_actest.msb` (and `m4000_aitest.msb`) next to `m4000_map.msb`, plus
+    `param/actestdata.bin`. The actest MSB has no terrain: 10 points (AC初期位置 start
+    (-324.65, 29, 649.5) yaw 90, the vs-UNAC start, operation / warning / caution areas, a
+    water return point, 3 ambient sounds), 10 layers (`actest2`-`actest8`, `normal`, `tmp`) and
+    22 kind-2 parts (test ACs and enemies). The terrain is `m4000_map.msb` (550 parts: 57 map
+    pieces, the rest `o####` objects).
+  - **MSB** (`acvd-formats::msb`): sections are chained by header (`magic, type-name offset, n,
+    n offsets`: n-1 records then the next section), replacing the backward scan (which missed
+    the actest parts); `points()` reads POINT_PARAM_ST. Point kinds across the disc: 0, 1, 50,
+    100-102, 200 (1790 start points), 250, 270, 500, 850, 1000, 1100, 2000, 3000.
+  - **HMD** multi-mesh (`acvd-formats::hmd`, `sheets/hmd.csv`): +0x10 is the mesh count; 0x3c
+    mesh records (transform, parent at +0x28, node / vertex offsets) after the strings; each
+    mesh's triangles are contiguous and index its own vertices; `Hmd::model_vertices` applies
+    the hierarchy. Object hit models (`o0006` 5 meshes, up to 78) now load. `examples/mapcheck`:
+    349/349 MSB, 2755/2847 HMD (the rest are version 0x492, enemies only).
+  - **Runtime**: `acvd-game::map` draws every map piece (`{map}_m.dcx.bnd|m####.flv`) and object
+    (`model/obj/o/o_m.bnd.dcx|o.flv`) with the map's own `{map}_htdcx.bnd|{tex}.tpf.dcx` textures
+    (only `movie` is missing); collision takes the same parts' `_h.hmd` (42,384 triangles on
+    m4000, 16,241 before objects) in a 16 m XZ grid. The AC spawns at the layout's start point
+    (`--layout`, default `actest`; yaw negated for the X mirror), facing the test area. Fix: an
+    airborne ground ray now starts at last tick's height, so a fast fall off the overpass no
+    longer steps through the ground. `--hits` shows the hit meshes. Checked by `--shot` at the
+    start and after 6 s of `--hold w,shift`.
 
 - Delete the PS3 paths (migration 4): every tool reads the 360 ISO by default
   (`vfs::default_disc`), and `vfs::Disc` is ISO-only (directory reader, `usrdir`, `PS3_DUMP` and

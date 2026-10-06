@@ -939,11 +939,13 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         p.velocity.y = p.velocity.y.max(-c.fall_max_tick);
     }
     p.velocity = Vec3::new(horizontal.x, p.velocity.y, horizontal.y);
+    let before_y = position.y;
     *position += p.velocity;
     // Snap puts y on the triangle, so a grounded ray has to start above it. The lift is this
     // tick's travel (slopes) or 5 cm when still — a hit farther down than that is a drop.
+    // Airborne, the ray starts at last tick's height so a fast fall cannot step past a floor.
     let lift = if p.airborne {
-        0.0
+        (before_y - position.y).max(0.0)
     } else {
         horizontal.length().max(0.05)
     };

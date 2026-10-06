@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{flver, hmd, msb};
-use anyhow::{Context, Result};
+use acvd_formats::{hmd, msb};
+use anyhow::Result;
 use bevy::prelude::*;
 
 /// Half the length of the eye-floor ray, above and below its start (360 0x8371914c).
@@ -39,9 +39,50 @@ pub struct Hit {
 pub struct Collision {
     pub planes: Vec<Plane>,
     pub hits: Vec<Hit>,
+    /// Built by [`Collision::with_hits`]; empty means every query scans all of `hits`.
+    grid: Grid,
+}
+
+/// Triangle indices per `CELL`-metre square of the XZ plane.
+#[derive(Default)]
+struct Grid {
+    cells: HashMap<(i32, i32), Vec<u32>>,
+}
+
+/// Grid cell size in metres. Not game data.
+const CELL: f32 = 16.0;
+
+fn cell(v: f32) -> i32 {
+    (v / CELL).floor() as i32
 }
 
 impl Collision {
+    pub fn with_hits(planes: Vec<Plane>, hits: Vec<Hit>) -> Self {
+        let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        for (i, h) in hits.iter().enumerate() {
+            let (lo, hi) = (h.a.min(h.b).min(h.c), h.a.max(h.b).max(h.c));
+            for x in cell(lo.x)..=cell(hi.x) {
+                for z in cell(lo.z)..=cell(hi.z) {
+                    cells.entry((x, z)).or_default().push(i as u32);
+                }
+            }
+        }
+        Self {
+            planes,
+            hits,
+            grid: Grid { cells },
+        }
+    }
+
+    /// Triangles whose XZ bounds may contain the point (`x`, `z`).
+    fn near(&self, x: f32, z: f32) -> Box<dyn Iterator<Item = &Hit> + '_> {
+        if self.grid.cells.is_empty() {
+            return Box::new(self.hits.iter());
+        }
+        let ids = self.grid.cells.get(&(cell(x), cell(z))).map_or(&[][..], Vec::as_slice);
+        Box::new(ids.iter().map(|&i| &self.hits[i as usize]))
+    }
+
     /// Height of the first `layer` surface a ray straight down from `from` meets before `to`.
     pub fn ray_down(&self, from: Vec3, to: f32, layer: Layer) -> Option<f32> {
         let plane = self
@@ -51,8 +92,7 @@ impl Collision {
             .map(|p| p.y)
             .reduce(f32::max);
         let mesh = self
-            .hits
-            .iter()
+            .near(from.x, from.z)
             .filter(|h| h.layer == layer)
             .filter_map(|h| tri_y(h.a, h.b, h.c, from.x, from.z, from.y, to))
             .reduce(f32::max);
@@ -107,40 +147,35 @@ fn mirror(v: [f32; 3]) -> Vec3 {
     Vec3::new(-v[0], v[1], v[2])
 }
 
-/// Load `{map}_map.msb` (else `{map}.msb`) and every part whose `{model}_h.hmd` is in the map binder.
+/// Load the terrain MSB (`map::terrain_msb`) and every map piece or object whose `{model}_h.hmd`
+/// is in its binder (`map::binder`).
 pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
-    let folder = format!("model/map/{map}");
-    let msb_path = {
-        let named = format!("{folder}/{map}_map.msb");
-        if disc.exists(&named) {
-            named
-        } else {
-            format!("{folder}/{map}.msb")
-        }
-    };
-    let binder = format!("{folder}/{map}_m.dcx.bnd");
-    let parts = msb::parts(&vfs::open(disc, &msb_path)?)?;
-    let mut cache: HashMap<String, hmd::Hmd> = HashMap::new();
+    let parts = msb::parts(&vfs::open(disc, &crate::map::terrain_msb(disc, map))?)?;
+    let mut cache: HashMap<String, Option<(hmd::Hmd, Vec<hmd::Vec3>)>> = HashMap::new();
     let mut hits = Vec::new();
     for part in &parts {
-        let h = match cache.get(&part.model) {
-            Some(h) => h,
-            None => {
-                let asset = format!("{binder}|{}_h.hmd", part.model);
-                let Ok(bytes) = vfs::open(disc, &asset) else {
-                    continue;
-                };
-                cache.insert(
-                    part.model.clone(),
-                    hmd::read(&bytes).with_context(|| asset)?,
-                );
-                cache.get(&part.model).unwrap()
-            }
-        };
-        let rot = part.rotation_deg.map(f32::to_radians);
-        let xf = flver::Xform::local(part.translation, rot, part.scale);
+        let Some(binder) = crate::map::binder(map, part) else { continue };
+        let asset = format!("{binder}|{}_h.hmd", part.model);
+        if !cache.contains_key(&asset) {
+            let h = match vfs::open(disc, &asset) {
+                Ok(bytes) => match hmd::read(&bytes) {
+                    Ok(h) => {
+                        let verts = h.model_vertices();
+                        Some((h, verts))
+                    }
+                    Err(e) => {
+                        warn!("{asset}: {e:#}");
+                        None
+                    }
+                },
+                Err(_) => None,
+            };
+            cache.insert(asset.clone(), h);
+        }
+        let Some((h, verts)) = cache[&asset].as_ref() else { continue };
+        let xf = crate::map::xform(part);
         for tri in &h.triangles {
-            let [a, b, c] = tri.verts.map(|i| mirror(xf.apply(h.vertices[i as usize])));
+            let [a, b, c] = tri.verts.map(|i| mirror(xf.apply(verts[i as usize])));
             let mat = h
                 .materials
                 .get(tri.material as usize)
@@ -154,10 +189,7 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
             });
         }
     }
-    Ok(Collision {
-        planes: Vec::new(),
-        hits,
-    })
+    Ok(Collision::with_hits(Vec::new(), hits))
 }
 
 #[cfg(test)]
@@ -172,13 +204,13 @@ mod tests {
             c: Vec3::new(0.0, 1.0, 2.0),
             layer: Layer::Ground,
         };
-        let c = Collision {
-            planes: vec![Plane {
+        let c = Collision::with_hits(
+            vec![Plane {
                 y: 0.5,
                 layer: Layer::Ground,
             }],
-            hits: vec![tri],
-        };
+            vec![tri],
+        );
         assert_eq!(c.ground_below(Vec3::new(0.25, 10.0, 0.25)), Some(1.0));
         assert_eq!(
             c.ray_down(Vec3::new(0.25, 0.8, 0.25), f32::NEG_INFINITY, Layer::Ground),

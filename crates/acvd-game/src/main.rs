@@ -15,9 +15,12 @@
 //! P switches to the clip browser: Up/Down previous/next clip, Space pause. Left/Right: previous/next design,
 //! drag left mouse: orbit, wheel: zoom, R: reframe. `--clip`/`--frame` start in the browser,
 //! `--frame` paused on that frame. `--hold w,shift,space,f` holds keys for the whole run, and
-//! `--wait` delays `--shot` that long. Default collision is map `m3100` from the disc; `--map`
-//! picks another `model/map` folder, `--plane` is the old infinite floor, `--water` adds a test
-//! water plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
+//! `--wait` delays `--shot` that long. The default scene is the garage AC test: map `m4000`
+//! (drawn and collided from the disc, see `map`) with the AC at the start point of
+//! `m4000_actest.msb`. `--map` picks another `model/map` folder, `--layout <name>` another
+//! `{map}_{name}.msb` start point (`none`: the terrain MSB's), `--hits` draws the hit meshes
+//! instead of the map models, `--plane` is the old infinite floor, `--water` adds a test water
+//! plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
 //! Boosters, muzzle flashes, tracers and hits play FFX effects (see `sfx`); `--sfx <id>` keeps
 //! effect `id` playing in front of the AC. Shots, boost and jump play their FMOD cues (see
 //! `sound`). `--burst <n>` makes `--shot` save `n` frames 0.05 s apart (`<stem>_<i>.png`).
@@ -27,6 +30,7 @@ mod blur;
 mod collision;
 mod control;
 mod hud;
+mod map;
 mod pose;
 mod sfx;
 mod sound;
@@ -77,11 +81,18 @@ struct Hud {
 #[derive(Resource)]
 struct StartYaw(f32);
 
+/// The map whose models are drawn (`None`: draw the hit meshes or the floor plane).
+#[derive(Resource)]
+struct Scene {
+    map: Option<String>,
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut wanted, mut disc, mut shot, mut flat, mut yaw) = (None, None, None, false, None);
     let (mut clip, mut frame, mut held, mut wait) = (None, None, Vec::new(), 0.0);
-    let (mut map, mut plane, mut water) = (Some("m3100".to_string()), false, None);
+    let (mut map, mut plane, mut water) = (Some("m4000".to_string()), false, None);
+    let (mut layout, mut hits) = (Some("actest".to_string()), false);
     let (mut preview, mut burst) = (None, 1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -111,6 +122,8 @@ fn main() {
                     .unwrap_or(0.0)
             }
             "--map" => map = args.next().filter(|s| s != "none"),
+            "--layout" => layout = args.next().filter(|s| s != "none"),
+            "--hits" => hits = true,
             "--plane" => plane = true,
             "--water" => water = args.next().and_then(|s| s.parse::<f32>().ok()),
             "--sfx" => preview = args.next().and_then(|s| s.parse::<i32>().ok()),
@@ -126,14 +139,14 @@ fn main() {
         .join("..");
     let disc = Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
     let mut collision = if plane {
-        Collision {
-            planes: vec![Plane {
+        Collision::with_hits(
+            vec![Plane {
                 y: 0.0,
                 layer: Layer::Ground,
             }],
-            hits: Vec::new(),
-        }
-    } else if let Some(id) = map {
+            Vec::new(),
+        )
+    } else if let Some(id) = &map {
         match collision::load_map(&disc, &id) {
             Ok(c) => {
                 eprintln!("map {id}: {} hit triangles", c.hits.len());
@@ -141,24 +154,35 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("map {id}: {e:#}; using a flat plane");
-                Collision {
-                    planes: vec![Plane {
+                Collision::with_hits(
+                    vec![Plane {
                         y: 0.0,
                         layer: Layer::Ground,
                     }],
-                    hits: Vec::new(),
-                }
+                    Vec::new(),
+                )
             }
         }
     } else {
-        Collision {
-            planes: vec![Plane {
+        Collision::with_hits(
+            vec![Plane {
                 y: 0.0,
                 layer: Layer::Ground,
             }],
-            hits: Vec::new(),
-        }
+            Vec::new(),
+        )
     };
+    let start = match map.as_deref().filter(|_| !plane) {
+        Some(id) => map::start(&disc, id, layout.as_deref()).unwrap_or_else(|e| {
+            eprintln!("map {id} start point: {e:#}");
+            None
+        }),
+        None => None,
+    };
+    let start = start.unwrap_or(map::Start {
+        position: Vec3::ZERO,
+        yaw: 0.0,
+    });
     if let Some(y) = water {
         collision.planes.push(Plane {
             y,
@@ -210,6 +234,10 @@ fn main() {
         status: String::new(),
     })
     .insert_resource(StartYaw(yaw))
+    .insert_resource(start)
+    .insert_resource(Scene {
+        map: map.filter(|_| !plane && !hits),
+    })
     .insert_resource(collision)
     .insert_resource(control::Piloting(piloting))
     .insert_resource(control::Held(held))
@@ -285,9 +313,14 @@ fn setup(
     garage: Res<Garage>,
     yaw: Res<StartYaw>,
     collision: Res<Collision>,
+    scene: Res<Scene>,
 ) {
     commands.spawn((
         Camera3d::default(),
+        Projection::Perspective(PerspectiveProjection {
+            far: VIEW_FAR,
+            ..default()
+        }),
         Transform::default(),
         Orbit::new(yaw.0, 0.25),
         blur::ZoomBlur::default(),
@@ -307,7 +340,19 @@ fn setup(
         },
         Transform::from_xyz(-6.0, 3.0, -4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    if collision.hits.is_empty() {
+    let drawn = scene.map.as_deref().map_or(0, |id| {
+        match map::spawn(&mut commands, &mut meshes, &mut materials, &mut images, &garage.disc, id) {
+            Ok(n) => {
+                info!("map {id}: {n} parts drawn");
+                n
+            }
+            Err(e) => {
+                warn!("map {id}: {e:#}");
+                0
+            }
+        }
+    });
+    if drawn == 0 && collision.hits.is_empty() {
         commands.spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))),
             MeshMaterial3d(materials.add(StandardMaterial {
@@ -316,7 +361,7 @@ fn setup(
                 ..default()
             })),
         ));
-    } else {
+    } else if drawn == 0 {
         for (layer, color) in [
             (Layer::Ground, Color::srgb(0.22, 0.23, 0.25)),
             (Layer::Water, Color::srgba(0.15, 0.35, 0.6, 0.5)),
@@ -410,6 +455,8 @@ fn debug_mesh<'a>(hits: impl Iterator<Item = &'a collision::Hit>) -> Option<Mesh
 }
 
 const FLOOR: f32 = 1000.0;
+/// Camera far plane in metres; m4000's MSB parts span about 1.6 km. Not game data.
+const VIEW_FAR: f32 = 6000.0;
 const PILLAR_SPACING: f32 = 40.0;
 
 fn browse(keys: Res<ButtonInput<KeyCode>>, mut garage: ResMut<Garage>) {
@@ -440,6 +487,7 @@ fn show(
     labels: Query<Entity, With<text::Label>>,
     hud: Option<Res<Hud>>,
     collision: Res<Collision>,
+    start: Res<map::Start>,
     shot: Option<ResMut<Shot>>,
 ) {
     if garage.shown == Some(garage.current) {
@@ -460,11 +508,12 @@ fn show(
     commands.remove_resource::<weapons::WeaponAnims>();
 
     let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design.data);
-    let spawn_y = collision.ground_below(Vec3::new(0.0, RAY_HALF, 0.0));
+    let spawn_y = collision.ground_below(start.position + Vec3::Y * RAY_HALF);
     let ac = commands
         .spawn((
             Ac,
-            Transform::from_xyz(0.0, spawn_y.unwrap_or(0.0), 0.0),
+            Transform::from_translation(start.position.with_y(spawn_y.unwrap_or(start.position.y)))
+                .with_rotation(Quat::from_rotation_y(start.yaw)),
             Visibility::default(),
         ))
         .id();
@@ -583,6 +632,7 @@ fn show(
     let ctrl = AcCtrlParam::calculate(&design.data);
     let legs_motion_id = acvd_data::part_field(design.data.legs as i64, 3, "legs_motion_id") as u8;
     let mut pilot = control::Pilot::new(ctrl, legs_motion_id);
+    pilot.yaw = start.yaw;
     if spawn_y.is_none() && !collision.hits.is_empty() {
         pilot.airborne = true;
     }

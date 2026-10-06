@@ -29,7 +29,7 @@ the owned 360 disc image. `README.md` covers the legal boundary and the sheet pi
 | `crates/acvd-data` | generated structs/rows from the sheets (`src/generated/` is never committed) |
 | `crates/acvd-render` | disc → Bevy meshes/textures, orbit camera, `--shot` screenshot mode |
 | `crates/acvd-viewer` | FLVER model browser |
-| `crates/acvd-game` | runtime: AC assembly (`assemble`), posing/motion (`pose`), piloting + follow camera (`control`), map `.hmd` collision (`collision`), DRB lock-sight HUD (`hud`) |
+| `crates/acvd-game` | runtime: AC assembly (`assemble`), posing/motion (`pose`), piloting + follow camera (`control`), map models and start point (`map`, default the AC test map m4000), map `.hmd` collision (`collision`), DRB lock-sight HUD (`hud`) |
 | `tools/acvd-sheets` | `extract` → `preflight` → `gen` (`all` runs every step); preflight errors block gen |
 | `tools/acvd-index` | static fact index of `ACV2.pe` (`build` → `private/index`, `q ...` lookups, `audit` of sheet citations) |
 | `tools/ghidra` | Ghidra scripts (`X360Pdata.java`, `DecompileRefs.java`, ...) |

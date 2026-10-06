@@ -20,7 +20,7 @@ extension,magic,format,system,parser,evidence
 .fmg,00 01 00 00,FMG message bank,text,done,"acvd-formats::fmg: 1265 banks; encoding byte 1 = UTF-16BE (1250) or 0 = Shift-JIS (15 partsname_*.fmg); id groups then string offsets"
 .fpo,10 2A 11 xx,Xenos pixel shader microcode,shaders,todo,"inside binders only: shader/*.bnd (Font.fpo; ZoomBlur_* in shader/filter_shader.bnd, read by hand for zoom_blur.wgsl); 679 entries"
 .fsb,FSB4,FMOD Ex sound bank,sound,"done: acvd-formats::fsb reads the 48-byte header and each sample (name, length, loop, mode, payload); payloads are XMA2 (mode 0x01002020, acvd-formats::xma) or 16-bit PCM (mode 0x2130, big-endian when bank mode has 0x08); xmacheck example: 3316 samples decode",sound/**/*.fsb (94)
-.hmd,10 00 01 17,hit model (*_h.hmd),models;maps,done,acvd-formats::hmd: nodes 0x34 / triangles 10 bytes (vertex = u16>>1) / f32x3 verts; sheets/hmd.csv; 45/45 m3100 *_h.hmd; 2993 entries on disc
+.hmd,10 00 01 17,hit model (*_h.hmd),models;maps,partial: version 0x4A9,acvd-formats::hmd: mesh records 0x3c (transform + parent + node/vertex offsets) / nodes 0x34 / triangles 10 bytes (vertex = u16>>1) / f32x3 verts; sheets/hmd.csv; examples/mapcheck: 2755 of 2847 *_h.hmd read (1-78 meshes); the 92 left are version 0x492 enemy hit models (model/ene)
 .hnav,HNAV,navigation mesh,navigation,todo,model/map/ch_nav/*.hnav (59)
 .htr,HTR\0 + '0001',height/terrain route data,navigation,todo,model/map/ch_nav/*.htr (59)
 .ini,text,INI configuration,config;sound,todo,system/acv.ini [PATH]; sound/magicorchestra.ini
@@ -28,7 +28,7 @@ extension,magic,format,system,parser,evidence
 .manifest,XMNP,Xbox 360 system update manifest,disc,n/a,$SystemUpdate/system.manifest on the 360 ISO (30980 bytes; dashboard update; not game data)
 .mlb,00 00 00 10,unidentified model companion (*_m.mlb),models,todo,inside binders only: first entry of every model/**/*_m.bnd.dcx (am0010_m.mlb 5832 bytes); 2182 entries
 .mqb,MQB ,MQB cutscene sequence,events,todo,inside binders only: model/poly/*.bnd (s100_100.mqb); 163 entries; all zlib-compressed in the binder
-.msb,0098 9a6a,MSB map layout (param-based sections),maps,partial: PARTS_PARAM_ST,acvd-formats::msb::parts reads placements (name model kind translation rotation-deg scale); MODEL/EVENT/POINT/ROUTE/LAYER/TREE unread; magic 0x00989a6a on every map msb
+.msb,0098 9a6a,MSB map layout (param-based sections),maps,partial: PARTS_PARAM_ST + POINT_PARAM_ST,"acvd-formats::msb: sections chained by header (magic, type-name offset, n, n offsets: n-1 records then the next section); parts (name model kind translation rotation-deg scale; kind 0 map piece, 1 object, 2 enemy/AC) and points (name kind kind-index shape translation rotation-deg; kind 200 = start position); MODEL/EVENT/ROUTE/LAYER/TREE unread; examples/mapcheck: 349/349 read, the 77 model/map/ch_env/*_env.msb are another format"
 .mtd,00 00 00 00,MTD material definition,models;shaders,todo,inside binders only: material/*.bnd (Map_Sky.mtd ...); 588 entries; material/mtd.bnd repeats 45 names with distinct ids
 .param,PARAM header,PARAM table,params,done,_unknown/param/<hash>.param (972) + param/ (3)
 .png,89 PNG,PNG image,ui,n/a,standard PNG; readable with the png crate
