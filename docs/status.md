@@ -118,13 +118,7 @@ Rough priority order; reorder freely.
 - **360 disc data migration** (in this order; one task per chat). Game code is already 360-only,
   and `vfs::Disc` reads the 360 ISO (Done, "360 disc VFS"); the default disc stays the PS3 dump
   until 3 and 4 land, then `vfs::default_disc` flips to the ISO:
-  1. **Re-run extract from the 360 disc**: port `acvd-sheets extract` (and `archives.rs`) from
-     walking the dump directory to `Disc::files()` / `Disc::read` (it refuses an ISO today);
-     every PARAM row still round-trips byte for byte; diff the generated sheets against the
-     PS3 ones and record every difference. The 2,283 unnamed entries (and PS3 paths with no
-     360 hash: PARAM / FMG / menu tables, mostly inside binders such as `/param/regulation.bin`
-     or `/bind/boot.bnd`) get named here. The `.bdt` / `.bhd` `formats.not_on_disc` warnings
-     clear once the inventory comes from the ISO.
+  1. Done: extract from the 360 disc (see Done, "360 extract").
   2. **Xenos TPF and 360 FLVER**: 360 texture formats (tiled DXT) and FLVER vertex / index
      buffers without Edge compression; `texture_formats.csv`, `formats.csv` rows updated.
      From the ISO today every AC part FLVER fails `header 0x4B at 0x4b is nonzero` and every
@@ -137,7 +131,22 @@ Rough priority order; reorder freely.
      zoom-blur Xenos shaders (`speed_blur_draw`).
   4. **Delete the PS3 paths**: remove Edge / PAMF / RSX code, the `ACVD Unbound` defaults and
      the directory side of `vfs::Disc`, PS3 rows in `target.csv` (title id, PARAM.SFO),
-     `formats.csv`, `texture_formats.csv`.
+     `formats.csv`, `texture_formats.csv`. The 360 extract's preflight then needs the 9
+     PS3-only exception rows dropped (`texture_formats.csv` 33, `vertex_types.csv` 0x10/3,
+     0x10/6, 0x2f/2, 0xf0/0, `container_exceptions.csv` m7540 / m7770 / e9120: PS3-only maps
+     and enemy) and the 4 PS3-only `formats.csv` rows (`.list`, `.pam`, `.pem`, `.sdat`).
+  - **The two discs ship different balance data** (see Done, "360 extract"): 112 of 622
+    `acvparts.bin` records, 95 rows of 6 PARAM files and 6 tuning values differ. The generated
+    data (`acvd-data`) still comes from the PS3 dump, while every Xenia probe runs the 360
+    data. Until the default disc flips, check any value derived from those fields (legs
+    `walk` / `turn` / `std_gravity` / `max_load_downer`, weapon `weight` / `init_speed` /
+    `reload_time` / `missile_lock_time` / `en_drain` / `no_decay_range` / `damage_power`,
+    generator `power`) against `private/tmp/acparts_ps3_x360.txt` before comparing it with a
+    probe. Which disc is the later regulation is not known.
+  - **Unnamed 360 entries left**: 38 TPF (`_unknown/image/<hash>.tpf.dcx`, sizes 5-370 KB, often
+    in identical pairs), 3 DRB menus (`_unknown/lang/<hash>.drb.dcx`) and 1 PNG. Not found
+    under `/lang/<l>/menu/`, `nowload/`, `model/image/`, `image/` with the exe / Lua / named
+    stems (`private/tmp/guess360d.py`).
 - **Xenia re-checks of earlier emulator captures** (rows say "Xenia re-check pending"):
   `camera_follow.csv` `look_at_height`, `base_transform`, `pitch` (probe the AC+0x234 pitch
   update; its 360 address is still to find from the AC update `0x828bef18`), `follow_ease`,
@@ -149,6 +158,47 @@ Rough priority order; reorder freely.
 
 ## Done
 
+- 360 extract: `acvd-sheets extract` (and `archives.rs`, tuning, AC parts) reads through
+  `vfs::Disc` (`files` / `read` / new `size` / `head`), so `--disc` takes the dump or the ISO;
+  the default stays the PS3 dump. `extract --disc <iso>`: 18,855 files, 160 tables, 65,984
+  rows, every PARAM row round-trips, 0 orphan params / def errors (30 s; the dump takes 2 min).
+  The ported code gives the PS3 dump's old output except list order (paths sort as `/` strings).
+  - **Naming**: every BHD5 entry now has a path in `private/x360/dvdbnd_names.csv`
+    (`private/tmp/name360.py write`). 2,080 of the 2,283 unnamed hashes are the PS3 dump's
+    `_unknown/<dir>/<decimal hash>.<ext>` files (same path hash): all 972 `_unknown/param`
+    (mission `EVENT_MESSAGE_ST` / `EVENT_MESSAGE_TEXT_MAP_ST` tables) and 498 FMG among them.
+    `vfs::Disc` reads such a name by its hash, so 360 and PS3 sheet ids match. 161 real names
+    come from the 360 exe's path formats (`private/tmp/guess360c.py`: `$(Data)\bind\mission\ch%04d.bnd`
+    151, `bind/boot.bnd`, `bind/boot_2nd.bnd`; chance hits expected 0.12) plus 8 type-matched
+    hits (`lang/jp/menu/{gameboot,betaversion_msg,copyrightlogo_xbox}.{drb,tpf}.dcx`,
+    `material/menu03{20,50}_mtd.bnd`). The last 42 are named by magic (Open, migration).
+    Guessing the event PARAM / FMG names (`/lang/<l>/text/mission/<id>_comNN`, AiResource
+    roots from `system/acv2.ini`) found nothing above chance.
+  - **Load bundles** (`vfs::BUNDLES`): `bind/boot.bnd` (6.5 MB, `system/paramlist.xml`,
+    `font/fontdef.xml`, every `dbmenu/*.dbp`, shader binders ...), `bind/boot_2nd.bnd` and the
+    151 `bind/mission/chNNNN.bnd` (mission XML, MSB, `.hnav` / `.htr`, `.evd`, material) are
+    BND3 whose member names are disc paths. 6,297 members, 2,781 paths; 611 exist nowhere
+    else on the disc, the other 5,185 are byte-identical to their BHD5 copy, and no path
+    differs between bundles. `Disc` indexes the members (headers only, `bnd3::read_header`) as
+    the last lookup source; the archive walk skips the bundles (`vfs::is_bundle`).
+  - **Preflight from the ISO**: the `.bdt` / `.bhd` `formats.not_on_disc` warnings clear;
+    new `formats.csv` rows `.wmv`, `.xex`, `.manifest` (`$SystemUpdate`), `.xpr` (XPR2 in
+    `model/break/*_t.bnd`, 11; the PS3 has `.tpf` there). Left: FLVER / TPF / vertex errors
+    (task 2) and 9 PS3-only exception rows (task 4).
+  - **PS3 vs 360 data** (`private/tmp/sheetdiff.py`, `paramdiff.py`; outputs
+    `private/tmp/{sheetdiff,paramdiff,acparts}_ps3_x360.txt`): same 160 types, layouts and
+    def versions. Value differences: `acvparts.bin` 112 records (legs: 5 `turn`, 14
+    reverse-joint `walk` -120..-900 with `std_gravity` 0.02 to 0.033 and `max_load_downer`
+    0.85 to 0.83; generators `power` / `weight`; weapons `weight` +30..+350, `init_speed`
+    -10..-250, `reload_time`, `missile_lock_time`, `en_drain`, `no_decay_range`,
+    `damage_power`), `growpartsarmunitparam` 66 rows (shootPrecision / initSpeed),
+    `growpartsbladeparam` 6, `hometowninfo_as` areaId (cn/en/kr), `partsshoplineup_trial` 8,
+    tuning `MenuParam` (4) and `ServerSystemParam` (2). Only on the PS3: `param/bullet{arise,
+    blade,explosion,missile}.bin` (copies of `bullet/*`, 723 rows), maps m1640 / m7540 /
+    m7770 with their online maps, enemy e9120, object o7775, `font/s1_ps3*` (360:
+    `s1_xbox*`). Only on the 360: the 3 menus above. `airesource/AIAcWeaponChipParameter.bin`
+    differs only in case.
+
 - 360 disc VFS (`acvd-formats`: `xdvdfs`, `bhd5`, `bnd3::read_bhf3`, `dcx` DFLT, `vfs::Disc`).
   - **`vfs::Disc`** opens a dump directory or the 360 ISO (`vfs::X360_ISO`); every consumer
     (`acvd-render`, `acvd-game`, `acvd-viewer`, `acvd-menu`, `acvd-sheets dump`, the
@@ -159,8 +209,8 @@ Rough priority order; reorder freely.
     `$SystemUpdate`, `NxeArt`), then BHD5 path hash in layer 0 then 1, then `script/<name>`
     in `bind/script.bhd` (BHF3, format 0x2c: names + sizes, no ids, 0x14-byte entries; 1303
     zlib Lua entries named relative to `script/` with `\`; data in `script.bdt`, BDF3 header,
-    offsets absolute). Listings come from `private/x360/dvdbnd_names.csv` (2,283 rows with an
-    empty path are the unnamed hashes) plus the script names and loose files.
+    offsets absolute). Listings come from `private/x360/dvdbnd_names.csv` (the 2,283 rows that
+    had no path are named since "360 extract") plus the script names and loose files.
   - **DCX DFLT** (360): same `DCX`/`DCS`/`DCP`/`DCA` header as EDGE with `0x14` = 0x2C, `DCP`
     `DFLT`, `0x20, 0x09000000, 0, 0, 0, 0x00010100`, `DCA` size 8, then one zlib stream of
     `compressed_size` at 0x4C (ends at end of file on `am0010_m.bnd.dcx`: 0x4C + 0x38d21 =

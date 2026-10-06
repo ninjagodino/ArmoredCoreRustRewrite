@@ -18,7 +18,7 @@ use anyhow::{bail, Result};
 
 use model::Paths;
 
-const USAGE: &str = "usage: acvd-sheets <extract|preflight|gen|all|dump <asset>> [--disc <dump root, or 360 ISO for dump>] [--root <repo root>]";
+const USAGE: &str = "usage: acvd-sheets <extract|preflight|gen|all|dump <asset>> [--disc <dump root or 360 ISO>] [--root <repo root>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -45,18 +45,13 @@ fn run() -> Result<ExitCode> {
         }
     }
     let root = root.canonicalize()?;
-    let (disc, any_disc) = match disc {
-        Some(d) => (d.clone(), d),
-        None => (root.join(acvd_formats::vfs::PS3_DUMP), acvd_formats::vfs::default_disc(&root)),
-    };
-    if cmd != "dump" && disc.is_file() {
-        bail!("extract reads a dump directory; extracting from the 360 ISO is not ported yet ({})", disc.display());
-    }
+    let disc = disc.unwrap_or_else(|| acvd_formats::vfs::default_disc(&root));
+    let open = || acvd_formats::vfs::Disc::open(&disc);
     let paths = Paths { root };
 
     let clean = |paths: &Paths| -> Result<bool> { Ok(preflight::run(paths)?.errors == 0) };
     match cmd.as_str() {
-        "extract" => extract::run(&paths, &disc)?,
+        "extract" => extract::run(&paths, &open()?)?,
         "preflight" => {
             if !clean(&paths)? {
                 return Ok(ExitCode::FAILURE);
@@ -64,7 +59,7 @@ fn run() -> Result<ExitCode> {
         }
         "gen" | "all" => {
             if cmd == "all" {
-                extract::run(&paths, &disc)?;
+                extract::run(&paths, &open()?)?;
             }
             if !clean(&paths)? {
                 eprintln!("gen: preflight has errors; fix the sheets and re-run");
@@ -74,7 +69,7 @@ fn run() -> Result<ExitCode> {
         }
         "dump" => {
             let Some(asset) = asset else { bail!(USAGE) };
-            let data = acvd_formats::vfs::Disc::open(&any_disc)?.asset(&asset)?;
+            let data = open()?.asset(&asset)?;
             let dir = paths.root.join("private").join("dump");
             std::fs::create_dir_all(&dir)?;
             let out = dir.join(asset.replace(['/', '|'], "_"));

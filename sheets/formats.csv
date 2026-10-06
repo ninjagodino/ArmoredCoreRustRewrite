@@ -26,6 +26,7 @@ extension,magic,format,system,parser,evidence
 .ini,text,INI configuration,config;sound,todo,system/acv.ini [PATH]; sound/magicorchestra.ini
 .lc,1B 4C 75 61 50,Lua 5.0 compiled chunk,ai,todo,airesource/script (1269); scene (18); script (11); param (2)
 .list,text,install file list,config,todo,system/install.list
+.manifest,XMNP,Xbox 360 system update manifest,disc,n/a,$SystemUpdate/system.manifest on the 360 ISO (30980 bytes; dashboard update; not game data)
 .mlb,00 00 00 10,unidentified model companion (*_m.mlb),models,todo,inside binders only: first entry of every model/**/*_m.bnd.dcx (am0010_m.mlb 5832 bytes); 2182 entries
 .mqb,MQB ,MQB cutscene sequence,events,todo,inside binders only: model/poly/*.bnd (s100_100.mqb); 163 entries; all zlib-compressed in the binder
 .msb,0098 9a6a,MSB map layout (param-based sections),maps,partial: PARTS_PARAM_ST,acvd-formats::msb::parts reads placements (name model kind translation rotation-deg scale); MODEL/EVENT/POINT/ROUTE/LAYER/TREE unread; magic 0x00989a6a on every map msb
@@ -44,4 +45,7 @@ extension,magic,format,system,parser,evidence
 .tsmap,PARAM header,PARAM (AI_MESSAGE_SOUND_MAP),params;sound,done,type string AI_MESSAGE_SOUND_MAP at 0x0C
 .txt,text,plain text lists,config,todo,system/deletechar.txt (UTF-16LE); oneshotsfxlist.txt
 .vpo,FF 0F 00 11,RSX vertex program object,shaders,todo,inside binders only: shader/*.bnd (Font.vpo ...); 806 entries
+.wmv,30 26 B2 75 (ASF),Windows Media video (360 movies),movies,todo,movie/jp/*.wmv (23) loose on the 360 ISO; the PS3 build ships PAMF .pam instead
+.xex,XEX2,Xbox 360 executable,executable,done,default.xex on the 360 ISO; unpacked to private/x360/vd/ACV2.pe (base 0x82000000) for static RE
 .xml,<?xml,XML definitions,missions;config;fonts,"partial: font/fontdef.xml read by acvd-formats::fontdef (ID -> CcmFile, RefFontID); others todo","mission (154); model (131); param (4); font (2); system (2); shader/flver_shader.bnd FlverShader.xml"
+.xpr,XPR2,Xbox packed resource (360 texture),textures,todo,inside binders only on the 360 disc: model/break/*/*_t.bnd (b9000.xpr 67596 bytes ...); 11 entries

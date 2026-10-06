@@ -2,12 +2,13 @@
 //! binders nested in binders), recording one row per entry with how it decodes and what it holds.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use acvd_formats::vfs::Disc;
 use acvd_formats::{bnd3, dcx, flver, tpf};
 use anyhow::{Context, Result};
 
-use crate::extract::{dup_original, ext_of, magic_of, rel};
+use crate::extract::{dup_original, ext_of, magic_of};
 use crate::model::*;
 
 pub struct Summary {
@@ -29,22 +30,24 @@ struct Walk {
     entries: usize,
 }
 
-pub fn run(paths: &Paths, usrdir: &Path, files: &[PathBuf]) -> Result<Summary> {
+pub fn run(paths: &Paths, disc: &Disc, files: &[String]) -> Result<Summary> {
     let mut index = ArchiveIndex::default();
     let mut walk = Walk::default();
-    for path in files {
-        let mut head = [0u8; 4];
-        let n = std::io::Read::read(&mut std::fs::File::open(path)?, &mut head)?;
-        if !(dcx::is_dcx(&head[..n]) || bnd3::is_bnd3(&head[..n]) || tpf::is_tpf(&head[..n]) || head[..n] == b"FLVE"[..]) {
+    for file in files {
+        if acvd_formats::vfs::is_bundle(file) {
             continue;
         }
-        let data = std::fs::read(path)?;
-        if let Some(orig) = dup_original(path).filter(|o| o.is_file()) {
-            if std::fs::read(&orig)? == data {
+        let head = disc.head(file, 4)?;
+        if !(dcx::is_dcx(&head) || bnd3::is_bnd3(&head) || tpf::is_tpf(&head) || head == b"FLVE"[..]) {
+            continue;
+        }
+        let data = disc.read(file)?;
+        if let Some(orig) = dup_original(file).filter(|o| disc.exists(o)) {
+            if disc.read(&orig)? == data {
                 continue;
             }
         }
-        let file = rel(usrdir, path);
+        let file = file.clone();
         let data = if dcx::is_dcx(&data) {
             let read = dcx::read(&data).and_then(|d| Ok((d.decompress(&data)?, d)));
             match read {

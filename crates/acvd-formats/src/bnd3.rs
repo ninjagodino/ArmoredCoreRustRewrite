@@ -90,6 +90,13 @@ pub fn read_bhf3(header: &[u8]) -> Result<Bnd3> {
     parse(header, false)
 }
 
+/// The header, entry table and names of a BND3 (its first `headers_end` bytes); entry data is
+/// not checked. Offsets stay relative to the whole binder.
+pub fn read_header(header: &[u8]) -> Result<Bnd3> {
+    ensure!(header.starts_with(MAGIC), "not a BND3");
+    parse(header, false)
+}
+
 fn parse(data: &[u8], inline_data: bool) -> Result<Bnd3> {
     let r = Be(data);
     let raw_format = r.u8(0x0C)?;

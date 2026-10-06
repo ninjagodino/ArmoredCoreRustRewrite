@@ -1,32 +1,16 @@
-//! Disc -> sheets. Reads every PARAMDEF and PARAM on the owned disc and writes
-//! `private/sheets/{json,csv,schema}` plus the disc inventory.
+//! Disc -> sheets. Reads every PARAMDEF and PARAM on the owned disc (a dump directory or the
+//! 360 ISO, through [`Disc`]) and writes `private/sheets/{json,csv,schema}` plus the disc inventory.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use acvd_formats::layout::{self, ColumnSpec, Prim};
+use acvd_formats::vfs::Disc;
 use acvd_formats::{param, paramdef};
 use anyhow::{Context, Result};
 
 use crate::model::*;
 use crate::names::{self, DexDef, NameSpec};
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            walk(&entry.path(), out)?;
-        } else {
-            out.push(entry.path());
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn rel(base: &Path, p: &Path) -> String {
-    p.strip_prefix(base).unwrap_or(p).to_string_lossy().replace('\\', "/")
-}
 
 /// Lowercase extension; DCX containers keep their inner extension (`.tpf.dcx`).
 pub(crate) fn ext_of(p: &Path) -> String {
@@ -48,10 +32,15 @@ pub(crate) fn magic_of(head: &[u8]) -> String {
 }
 
 /// `foo (2).bin` -> `foo.bin`, for the duplicate copies present in the dump.
-pub(crate) fn dup_original(p: &Path) -> Option<PathBuf> {
+pub(crate) fn dup_original(file: &str) -> Option<String> {
+    let p = Path::new(file);
     let stem = p.file_stem()?.to_str()?;
     let base = stem.strip_suffix(')')?.rsplit_once(" (")?.0;
-    Some(p.with_file_name(format!("{base}{}", p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default())))
+    let name = format!("{base}{}", p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default());
+    Some(match file.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{name}"),
+        None => name,
+    })
 }
 
 const PARAMDEX_GAMES: [&str; 3] = ["ACVD", "ACV", "ACFA"];
@@ -62,12 +51,9 @@ struct DefEntry {
     def: paramdef::ParamDef,
 }
 
-pub fn run(paths: &Paths, disc: &Path) -> Result<()> {
-    let usrdir = acvd_formats::vfs::usrdir(disc);
-    println!("extract: scanning {}", usrdir.display());
-    let mut files = Vec::new();
-    walk(&usrdir, &mut files)?;
-    files.sort();
+pub fn run(paths: &Paths, disc: &Disc) -> Result<()> {
+    println!("extract: scanning {}", disc.path().display());
+    let files = disc.files();
 
     let rules: Vec<GroupRule> = read_csv(&paths.sheets().join("groups.csv"))?;
     let overrides: Vec<ColumnOverride> = read_csv(&paths.sheets().join("column_overrides.csv"))?;
@@ -84,43 +70,42 @@ pub fn run(paths: &Paths, disc: &Path) -> Result<()> {
     let mut inv = Inventory::default();
     let mut by_ext: BTreeMap<String, (usize, u64, HashMap<String, usize>)> = BTreeMap::new();
     let mut defs: HashMap<String, Vec<DefEntry>> = HashMap::new();
-    let mut params: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut params: Vec<(String, Vec<u8>)> = Vec::new();
 
-    for path in &files {
+    for file in &files {
+        let path = Path::new(file);
         let ext = ext_of(path);
-        let len = std::fs::metadata(path)?.len();
-        let mut head = [0u8; 64];
-        let n = std::fs::File::open(path)?.read(&mut head)?;
+        let len = disc.size(file)?;
+        let head = disc.head(file, 64)?;
         let slot = by_ext.entry(ext.clone()).or_default();
         slot.0 += 1;
         slot.1 += len;
-        *slot.2.entry(magic_of(&head[..n])).or_default() += 1;
+        *slot.2.entry(magic_of(&head)).or_default() += 1;
 
         if ext == ".def" {
-            let data = std::fs::read(path)?;
+            let data = disc.read(file)?;
             match paramdef::read(&data) {
                 Ok(def) => defs.entry(def.param_type.clone()).or_default().push(DefEntry {
-                    file: rel(&usrdir, path),
+                    file: file.clone(),
                     stem: path.file_stem().unwrap().to_string_lossy().to_ascii_lowercase(),
                     def,
                 }),
-                Err(e) => inv.def_errors.push(format!("{}: {e:#}", rel(&usrdir, path))),
+                Err(e) => inv.def_errors.push(format!("{file}: {e:#}")),
             }
-        } else if param::looks_like_param(&head[..n]) {
-            let file = rel(&usrdir, path);
-            if excluded.iter().any(|x| x.file.eq_ignore_ascii_case(&file)) {
-                inv.excluded.push(file);
+        } else if param::looks_like_param(&head) {
+            if excluded.iter().any(|x| x.file.eq_ignore_ascii_case(file)) {
+                inv.excluded.push(file.clone());
                 continue;
             }
-            let data = std::fs::read(path)?;
-            if let Some(orig) = dup_original(path).filter(|o| o.is_file()) {
-                let identical = std::fs::read(&orig)? == data;
-                inv.duplicates.push(Duplicate { file: rel(&usrdir, path), original: rel(&usrdir, &orig), identical });
+            let data = disc.read(file)?;
+            if let Some(orig) = dup_original(file).filter(|o| disc.exists(o)) {
+                let identical = disc.read(&orig)? == data;
+                inv.duplicates.push(Duplicate { file: file.clone(), original: orig, identical });
                 if identical {
                     continue;
                 }
             }
-            params.push((path.clone(), data));
+            params.push((file.clone(), data));
         }
     }
 
@@ -139,7 +124,7 @@ pub fn run(paths: &Paths, disc: &Path) -> Result<()> {
     };
 
     let mut groups: BTreeMap<String, Vec<TableSheet>> = BTreeMap::new();
-    let mut by_type: BTreeMap<String, Vec<(PathBuf, Vec<u8>)>> = BTreeMap::new();
+    let mut by_type: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
     for (path, data) in params {
         let ty = param::read(&data).map(|p| p.param_type).unwrap_or_else(|_| "<unreadable>".into());
         by_type.entry(ty).or_default().push((path, data));
@@ -155,7 +140,7 @@ pub fn run(paths: &Paths, disc: &Path) -> Result<()> {
     let mut total_rows = 0usize;
     for (ty, files) in by_type {
         let Some(def_entry) = defs.get(&def_type_of(&ty)).and_then(|v| v.first()) else {
-            inv.orphan_params.extend(files.iter().map(|(p, _)| format!("{} ({ty})", rel(&usrdir, p))));
+            inv.orphan_params.extend(files.iter().map(|(p, _)| format!("{p} ({ty})")));
             continue;
         };
         let group = rules
@@ -171,7 +156,7 @@ pub fn run(paths: &Paths, disc: &Path) -> Result<()> {
         let specs = specs_of(&table);
 
         for (path, data) in &files {
-            let inst = decode_instance(&usrdir, path, data, specs.as_ref());
+            let inst = decode_instance(path, data, specs.as_ref());
             total_rows += inst.rows.len();
             table.instances.push(inst);
         }
@@ -197,14 +182,14 @@ pub fn run(paths: &Paths, disc: &Path) -> Result<()> {
         inv.orphan_params.len(),
         inv.def_errors.len()
     );
-    let a = crate::archives::run(paths, &usrdir, &files)?;
+    let a = crate::archives::run(paths, disc, &files)?;
     println!(
         "extract: {} DCX files, {} binders, {} binder entries, {} textures, {} models, {} motion clips",
         a.dcx, a.binders, a.entries, a.textures, a.models, a.clips
     );
-    let parts = ac_parts(paths, &usrdir)?;
+    let parts = ac_parts(paths, disc)?;
     println!("extract: {} AC part records{}", parts.records.len(), parts.error.map(|e| format!(" ({e})")).unwrap_or_default());
-    let tuning = tuning(paths, &usrdir)?;
+    let tuning = tuning(paths, disc)?;
     println!(
         "extract: {} tuning files, {} fields{}",
         tuning.files.len(),
@@ -224,10 +209,10 @@ fn elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
 
 /// Every `<Resource>` of `system/paramlist.xml` with a `<Dbp>`: the debug-menu layout and the
 /// tuning binary it describes, decoded together.
-fn tuning(paths: &Paths, usrdir: &Path) -> Result<TuningSheet> {
+fn tuning(paths: &Paths, disc: &Disc) -> Result<TuningSheet> {
     let roots: Vec<TuningRootRow> = read_csv(&paths.sheets().join("tuning_roots.csv"))?;
     let mut sheet = TuningSheet { source: PARAM_LIST.into(), ..Default::default() };
-    let raw = std::fs::read(usrdir.join(PARAM_LIST))?;
+    let raw = disc.read(PARAM_LIST)?;
     let Some(body) = raw.strip_prefix(&[0xff, 0xfe]) else {
         sheet.error = Some("not UTF-16LE with a byte-order mark".into());
         write_json(&paths.tuning(), &sheet)?;
@@ -257,8 +242,8 @@ fn tuning(paths: &Paths, usrdir: &Path) -> Result<TuningSheet> {
         file.dbp = dbp_path.clone().unwrap_or_else(|| dbp.to_owned());
         let decoded = (|| -> Result<()> {
             let (Some(bin_path), Some(dbp_path)) = (bin_path, dbp_path) else { anyhow::bail!("a path variable has no tuning_roots.csv row") };
-            let layout = acvd_formats::dbp::read(&std::fs::read(usrdir.join(&dbp_path)).with_context(|| dbp_path.clone())?)?;
-            let data = std::fs::read(usrdir.join(&bin_path)).with_context(|| bin_path.clone())?;
+            let layout = acvd_formats::dbp::read(&disc.read(&dbp_path).with_context(|| dbp_path.clone())?)?;
+            let data = disc.read(&bin_path).with_context(|| bin_path.clone())?;
             let values = layout.values(&data)?;
             let tail = &data[layout.bin_size()..];
             file.tail = tail.len();
@@ -292,10 +277,10 @@ fn tuning(paths: &Paths, usrdir: &Path) -> Result<TuningSheet> {
 
 const AC_PARTS_FILE: &str = "param/acvparts.bin";
 
-fn ac_parts(paths: &Paths, usrdir: &Path) -> Result<AcPartsSheet> {
+fn ac_parts(paths: &Paths, disc: &Disc) -> Result<AcPartsSheet> {
     let categories: Vec<AcPartCategoryRow> = read_csv(&paths.sheets().join("ac_part_categories.csv"))?;
     let fields: Vec<AcPartFieldRow> = read_csv(&paths.sheets().join("ac_part_fields.csv"))?;
-    let data = std::fs::read(usrdir.join(AC_PARTS_FILE))?;
+    let data = disc.read(AC_PARTS_FILE)?;
     let size = |c: usize| categories.iter().find(|r| r.category == c).map(|r| r.record_size);
     let mut sheet = AcPartsSheet { path: AC_PARTS_FILE.into(), size: data.len(), ..Default::default() };
     match acvd_formats::acv_parts::read(&data, size) {
@@ -450,13 +435,8 @@ fn specs_of(t: &TableSheet) -> Option<(Vec<ColumnSpec>, Vec<layout::Placement>, 
     Some((specs, placed, size))
 }
 
-fn decode_instance(
-    usrdir: &Path,
-    path: &Path,
-    data: &[u8],
-    specs: Option<&(Vec<ColumnSpec>, Vec<layout::Placement>, usize)>,
-) -> Instance {
-    let file = rel(usrdir, path);
+fn decode_instance(file: &str, data: &[u8], specs: Option<&(Vec<ColumnSpec>, Vec<layout::Placement>, usize)>) -> Instance {
+    let file = file.to_owned();
     let id = file.clone();
     let p = match param::read(data) {
         Ok(p) => p,
