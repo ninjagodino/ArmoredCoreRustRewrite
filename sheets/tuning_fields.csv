@@ -18,3 +18,12 @@ param/newacbehavior.bin,507,重量1万時の飛翔影響,fly_weight_10000,AcCtrl
 param/newacbehavior.bin,526,空気抵抗,air_drag_base,AcCtrlParamCalc input,done,GetExcelParam(32); Lua line 1050 airRegistance_BoostOn
 param/newacbehavior.bin,544,重量飛翔影響が摩擦に影響する率,fly_friction_rate,AcCtrlParamCalc input,done,GetExcelParam(50); Lua line 921 totalWeigthFrictionEff
 param/acanimparam.bin,0,旋回再生スピード,turn_clip_speed,multiplier,done,Playback speed of the turn-on-the-spot clips.
+param/staticdrawparam.bin,298,FEのAPゲージなどで色変更するときの時間(秒),gauge_color_time,s,done,"HUD setup 0x829d0290 copies +0x428 into each gauge controller (+0x18); the gauge update 0x82599090 moves the low-colour blend by dt / it toward 1 while the red-zone flag is set (0 otherwise), clamped 0..1, and lerps the gauge and digit colours from normal (+8/+0xc) to the low colour (+0x10)"
+param/staticdrawparam.bin,305,FEのゲージが少なくなったときの色R,gauge_low_r,0-255,done,"HUD setup 0x829d0290 reads +0x444..+0x447 as the gauge controllers' low colour (RGBA, +0x10), the colour 0x82599090 fades to below the red zone"
+param/staticdrawparam.bin,306,FEのゲージが少なくなったときの色G,gauge_low_g,0-255,done,"+0x445, see gauge_low_r"
+param/staticdrawparam.bin,307,FEのゲージが少なくなったときの色B,gauge_low_b,0-255,done,"+0x446, see gauge_low_r"
+param/staticdrawparam.bin,308,FEのゲージが少なくなったときの色A,gauge_low_a,0-255,done,"+0x447, see gauge_low_r"
+param/staticdrawparam.bin,322,APゲージレッドゾーン割合,ap_red_zone,fraction of max AP,done,"+0x478; HUD per-frame update 0x829d0b30 (vtable 0x820c3010 slot 0x5c) passes 0x825b0510 (status AP +8 / max +0xc to 0x82593918: low when max != 0 and cur/max < it) as the AP gauge's low flag to 0x82599090"
+param/staticdrawparam.bin,323,ENゲージレッドゾーン割合,en_red_zone,fraction of max EN,done,"+0x47c; HUD per-frame update 0x829d0b30 (vtable 0x820c3010 slot 0x5c) passes 0x825b0560 (status EN +0x10 / max +0x14 to 0x82593980, same test) as the EN gauge's low flag"
+param/staticdrawparam.bin,324,残弾数ゲージレッドゾーン割合,ammo_red_zone,fraction of magazine,done,"+0x480; 0x825939e8 is the same cur/max < it test as AP and EN; its use by the weapon gauge update 0x829d0580 -> 0x829cfea0 is not traced (the rewrite applies it to rounds left / magazine)"
+param/staticdrawparam.bin,299,ロックサイトの表示時のゲージアニメ時間(秒）,gauge_show_time,s,done,"+0x42c; HUD per-frame update 0x829d0b30 eases its show scale (this+0x3f0) over it and multiplies every gauge fill by that scale (Gauge_AP/EN via 0x82599090, Gauge_APEffect directly)"

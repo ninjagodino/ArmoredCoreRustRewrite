@@ -45,3 +45,7 @@ category,offset,type,name,evidence
 10,380,u16,no_decay_range,"growpartsarmunitparam.bin no_decay_range_org equals this u16 on 215 of 222 records (part 1010 = 14, 410 = 138)"
 10,396,f32,damage_power,"growpartsarmunitparam.bin damage_power_org equals this f32 on 215 of 222 records (part 1010 = 722, 410 = 1164)"
 10,400,f32,damage_recoil,"growpartsarmunitparam.bin damage_recoil_org equals this f32 on 171 of 222 records (part 1010 = 1002, 410 = 791); 0 on energy guns"
+0,312,u16,ap,"0x8286a600 sums the u16 at +0x138 over the AC's part list (this+0x2b0, count +0x3e8) and is the first stat of the spec-sheet builder 0x82870770, also stored at +0x3f0 by 0x8286af98 and graded by 0x8286b8b8 (Assemble.bin +0x1b0..+0x1b8); head values 698-4001"
+1,312,u16,ap,"same sum as head ap (0x8286a600); core values 4329-18662"
+2,312,u16,ap,"same sum as head ap (0x8286a600); arms values 1499-7352"
+3,312,u16,ap,"same sum as head ap (0x8286a600); legs values 11436-32574"

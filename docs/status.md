@@ -28,7 +28,8 @@ in order:
   `script/enemy/*_actest.lc`, `script/arena/actest_*.lc`. Draw them, take hits and damage.
 - **Damage model**: AP, bullet hit vs AC / enemy hit shapes, `damage_power`, impact, the
   weapons' open units (see Weapons leftovers).
-- **Lock-on / FCS** (see FCS / lock-on HUD), energy and boost gauges (UI).
+- **Lock-on / FCS** (see FCS / lock-on HUD). Energy drain (the lock-sight EN gauge is drawn
+  full; see UI leftovers). Boost gauge.
 - **Map look**: map lighting / fog / sky (`ch_env/m4000_env.msb` is not an MSB: another format,
   77 of them), LOD (`_l1` / `_l2` FLVERs), broken models (`_b.flv` / `_b_h.hmd`), the `movie`
   texture (a runtime video surface), the area bounds (POINT kinds 100-102: operation / warning
@@ -122,7 +123,8 @@ in order:
   - Not done: bullet max/min speed and brake, hit/damage (`hit_id`, `damage_power`), energy
     drain, missiles (`bulletmissile`), blades, shoulder weapons (category 12 bullet ids at
     +356/+360), weapon modes, bay shift, core aim (shots follow the camera pitch, not a posed
-    upper body). The lock-sight HUD shows the hand-weapon ammo counts (`acvd-game::hud`).
+    upper body). The lock-sight HUD shows AP, energy, the `AlphaAnimSprite` gauges and the
+    hand-weapon ammo counts (`acvd-game::hud`).
   - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
     360 call that starts `a00_001` on a held trigger was not found (joint-control bit 31 at
     `0x82456f68` selects `sniper_$(LR)` vs `gun_$(LR)` and was not tied back to +0x153).
@@ -168,7 +170,17 @@ in order:
     `0x82bee808 kick_start r3 f1 f2 lr`, `0x82beeb38 kick_weight max=400 r31 f30 [r31+0x8]:f32 [r31+0x10]:f32`,
     `0x82c42048 blend_time max=200 r3 f1 lr`, `0x8287f348 gun_ctrl r30`,
     `0x8287f33c sniper_ctrl r30`.
-- **UI**: in-game HUD next steps: AP / energy state for the hidden `AP*` / `EN*` digits, the `AlphaAnimSprite` gauges (`Gauge_LWeapon` ...; record layout unread), the side `Weapon` panels (part name + `CurAmmo` runtime text at the `ACV_FE_Normal` LeftArm / Shoulder / RightArm anchors); trace the Dialog color tint (inferred, see Notes); animation tables (PINA/KINA/OINA/MINA...). Open: Text word +0x0c (0, 502, 1000-1004, 1030, 1200-1204; not a scale), Text flags byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0). **Param enums**: TDF reader.
+- **UI leftovers**: DRB animation tables (PINA/KINA/OINA/MINA); runtime image slots (emblems,
+  maps, movies); `NoiseSprite` and the other undecoded shape classes; Dialog color tint (inferred,
+  see Notes). Open: Text word +0x0c (0, 502, 1000-1004, 1030, 1200-1204; not a scale), Text flags
+  byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0).
+  HUD: `Gauge_APEffect` damage blink (StaticDrawParam +0x430 / +0x434), the lock-sight show scale
+  (StaticDrawParam +0x448 = 0.53, not applied), the weapon-gauge fill formula inside `0x829d0580`,
+  shoulder / hanger panels (no weapons there yet), generator EN capacity (Lua `gene_owen_out` =
+  `Scr_GetACVParam(5, Float32(3))` = generator f32 +0x20, values 25300–99100; the HUD digits are
+  percent so a full bar is 100.00 either way). Xenia re-check pending: `private/xenia/hud_apen.txt`
+  (`0x829d0b30` status AP/EN, `0x8286a668` AP sum) in the AC test while boosting. **Param enums**:
+  TDF reader.
 - **Effects leftovers** (FFX player done, see Done): every slot meaning in
   `sheets/ffx_actions.csv` is inferred from the effect files. The 360 action-id to class map
   is still missing. Class names (`FXClusterEmitter_Cone`, `FXClusterAppearance_Model`,
@@ -614,7 +626,7 @@ in order:
 - Text: FMG reader (`acvd-formats::fmg`); 1250 UTF-16BE banks, 15 Shift-JIS `partsname_*.fmg`.
 - Fonts: CCM/CCF reader (`acvd-formats::ccm`); versions 0x10000/1 (24-byte glyphs) and 0x10002
   (28-byte). `acvd-game` draws `fontdef.xml` ID 1 (`e1_ext`) plus `partsname_en.fmg` as a HUD
-  overlay. DRB: `acvd-formats::drb` decodes dialogs (GLD), objects (OGLD), shapes (Sprite, MonoRect/Frame, GouraudRect/Frame, Text, Dialog, Null) and textures on all 69 layouts; the module doc has every record layout. Sprite texture ids >= 1000 are runtime slots (emblems 10000+, movies 101xx, maps 102xx). `acvd-render::menu` + the `acvd-menu` viewer (`cargo run -p acvd-viewer --bin acvd-menu -- staffroll`) draw a dialog tree with its sibling `.tpf.dcx` textures; verified on staffroll (rotated strip seamless) and vssortie timer / Data_Rule (flipped corners and arrows). Text (360 `DrbShape_createText` 0x824ac270): byte +0x15 font (`fontdef.xml` ID, read by `acvd-formats::fontdef`), +0x16 align (low 2 bits left/right/center, 0x8 vertical center), +0x17 mode: 0 static RTS string at +0x1c, 1 message (bank +0x1c, id +0x20; 36-byte record; bank 1 = `menu.fmg`, e.g. PauseLabel 0x109a = PAUSE; `TextMgr_getMessage` 0x82b1a8b0, bank 2 code-filled), 2 runtime (capacity +0x1c), 3 special classes. `acvd-render::menu` draws them; fonts load the exact `CcmFile` (e10 ships a .ccm and the .ccf fontdef names, with different advances). Sprite blend byte: 1 alpha, 2 additive (`menu::AdditiveSprite`; `piece1/2` and `rocksight_insight` are art on black that only works added). A Dialog shape's color is applied as a multiplicative tint of its sub-dialog: inferred from `ACV_FE_LockSightCenter`, whose digit plates are the white `FE_font_base` nine-slice under `000000ff` Dialogs (360 Dialog factory 0x824ac1f8 is shared with FormSprite; the tint is not traced). In-game HUD (`acvd-game::hud`): `sortie.drb.dcx` `Top_outline` + `ACV_LockSight_base` + `ACV_FE_LockSightCenter` (laid out around (0,0), placed at screen center), letterboxed 1280x720; ammo digits `LWep*` / `RWep*` follow `Armament` (digit sprites are authored '0' at (317,135)-(330,151) of `ACV_FE_Locksight_02`, 0-9 in 13-texel steps; read with `acvd-menu sortie --atlas ACV_FE_Locksight_02`).
+  overlay. DRB: `acvd-formats::drb` decodes dialogs (GLD), objects (OGLD), shapes (Sprite, MonoRect/Frame, GouraudRect/Frame, Text, Dialog, Null, AlphaAnimSprite) and textures on all 69 layouts; the module doc has every record layout. Sprite texture ids >= 1000 are runtime slots (emblems 10000+, movies 101xx, maps 102xx). `acvd-render::menu` + the `acvd-menu` viewer (`cargo run -p acvd-viewer --bin acvd-menu -- staffroll`) draw a dialog tree with its sibling `.tpf.dcx` textures; verified on staffroll (rotated strip seamless) and vssortie timer / Data_Rule (flipped corners and arrows). Text (360 `DrbShape_createText` 0x824ac270): byte +0x15 font (`fontdef.xml` ID, read by `acvd-formats::fontdef`), +0x16 align (low 2 bits left/right/center, 0x8 vertical center), +0x17 mode: 0 static RTS string at +0x1c, 1 message (bank +0x1c, id +0x20; 36-byte record; bank 1 = `menu.fmg`, e.g. PauseLabel 0x109a = PAUSE; `TextMgr_getMessage` 0x82b1a8b0, bank 2 code-filled), 2 runtime (capacity +0x1c, filled via `MenuText`), 3 special classes. `acvd-render::menu` draws them; fonts load the exact `CcmFile` (e10 ships a .ccm and the .ccf fontdef names, with different advances). Sprite blend byte: 1 alpha, 2 additive (`menu::AdditiveSprite`; `piece1/2` and `rocksight_insight` are art on black that only works added). A Dialog shape's color is applied as a multiplicative tint of its sub-dialog: inferred from `ACV_FE_LockSightCenter`, whose digit plates are the white `FE_font_base` nine-slice under `000000ff` Dialogs (360 Dialog factory 0x824ac1f8 is shared with FormSprite; the tint is not traced). `AlphaAnimSprite` (factory `0x824abaf8`, ctor `0x824ced28`, draw `0x824cedd0`, `Sprite_AlphaRef.fpo`): sprite plus mask uv / index / mirror; fill 0..1 at object +0x44 (vtable slot 0x3c `0x824cecf8`); a texel shows where mask alpha ≥ 1 − fill (`menu::MenuGauge`). In-game HUD (`acvd-game::hud`): `sortie.drb.dcx` `Top_outline` + `ACV_LockSight_base` + `ACV_FE_LockSightCenter` (laid out around (0,0), placed at screen center), letterboxed 1280x720. Setup `0x829d0290`, per-frame `0x829d0b30` (vtable `0x820c3010` slot 0x5c). AP digits are the frame-part `ap` sum (`sheets/ac_part_fields.csv` +0x138; `0x8286a600`; design 5001 = 34695); EN digits are `int(EN/ENmax × 10000)` as EN1..EN3 . EN4 EN5 (`0x82596b48`), 100.00 at full. Gauges fill AP / EN at 1.0 and L/R remaining/magazine, times a show scale over StaticDrawParam `gauge_show_time` (+0x42c); below `ap_red_zone` / `en_red_zone` / `ammo_red_zone` they fade to `gauge_low_*` over `gauge_color_time` (`0x82599090`). Side `Weapon` panels at `ACV_FE_Normal` LeftArm / RightArm (`0x82598b30`) show `CurAmmo` (`0x825970f0`, `%d` ≤ 9999). Digit sprites are authored '0' at (317,135)-(330,151) of `ACV_FE_Locksight_02`, 0-9 in 13-texel steps (`0x82598218`). AP and energy stay full until damage and energy drain exist.
 
 - Animation timing: clips play at 60 fps (was 30, too slow) and acanimhokan blend values are read as milliseconds (was 60 Hz frames, 2-20 s fades). User-confirmed walking looks right; still unverified against the 360 code.
 

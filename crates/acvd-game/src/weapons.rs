@@ -77,6 +77,7 @@ pub struct Armament {
 #[derive(Clone, Copy, Debug)]
 pub struct Gun {
     pub remaining: u16,
+    pub magazine: u16,
     pub reload_time: f32,
     pub cooldown: f32,
     pub init_speed: f32,
@@ -523,6 +524,7 @@ fn gun(id: i64) -> Gun {
     let (kind, gravity, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
     Gun {
         remaining: magazine,
+        magazine,
         reload_time: part_field(id, 10, "reload_time"),
         cooldown: 0.0,
         init_speed: speed,

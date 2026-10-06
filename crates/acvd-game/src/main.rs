@@ -258,7 +258,9 @@ fn main() {
     )
     .add_systems(
         Update,
-        (hud::layout, hud::readouts).chain().after(weapons::fire),
+        (hud::layout, hud::tick, hud::readouts, hud::panels)
+            .chain()
+            .after(weapons::fire),
     );
     if let Some(id) = preview {
         app.insert_resource(sfx::Preview(id));
@@ -640,7 +642,11 @@ fn show(
     }
     commands
         .entity(ac)
-        .insert((pilot, weapons::Armament::from_design(&design.data)));
+        .insert((
+            pilot,
+            weapons::Armament::from_design(&design.data),
+            hud::Status::from_design(&design.data),
+        ));
     if min.x <= max.x {
         garage.bounds = (min, max);
         if let Ok(mut o) = orbit.single_mut() {

@@ -30,7 +30,13 @@
 //! | `GouraudRect`, `GouraudFrame` | `u32 flags`, four corner colors |
 //! | `Text` | `u32 flags`, `u32 unk`, `color`, `u8 0, u8 font, u8 align, u8 mode`, `u32 0x1c`, then by mode: 0 `u32 string`; 1 `u32 bank, u32 id` (36 bytes); 2 `u32 capacity` |
 //! | `Dialog` | `u16 dialog` (`GLD` index drawn at the rect, 0xffff = set at runtime), `u16 flags`, `u32 0`, `color` |
+//! | `AlphaAnimSprite` | the `Sprite` fields, then `i16 u0, v0, u1, v1` (+0x1c, texel rect of the mask), `u16 mask` (+0x24, `IXET` index), `u8 mirror` (+0x26; nonzero: the mask takes the sprite's flips); 39 bytes |
 //!
+//! `AlphaAnimSprite` (360 factory `0x824abaf8`, ctor `0x824ced28`, draw `0x824cedd0`) is a gauge:
+//! the draw binds the sprite texture and the mask, puts `1 - fill` in pixel constant c0 and
+//! draws with shader mode 3, `shader/boot_shader.bnd` `Sprite_AlphaRef.fpo` (kills texels whose
+//! mask alpha is below c0.x). `fill` (+0x44, 0..1, starts at 1) is set through vtable slot
+//! 0x3c (`0x824cecf8`).
 //! Sprite flags: low byte = blend (1, 2), 0x100 flip X, 0x200 flip Y, bits 0xc00 = quarter turns
 //! clockwise (screen corners of the frame pieces in `vssortie.drb` match only this reading).
 //! Frame flags: low byte = line width.
@@ -105,6 +111,9 @@ pub enum Shape {
     /// `font` is a `fontdef.xml` ID; `align` low two bits = 0 left, 1 right, 2 center; bit 0x8 = vertical center (bit 0x4, likely bottom, is unverified).
     Text { rect: Rect, flags: u32, color: u32, font: u8, align: u8, source: TextSource, unk: u32 },
     Dialog { rect: Rect, dialog: Option<u16>, flags: u16, color: u32 },
+    /// A gauge: `texture` drawn where the `mask` texture's alpha (over `mask_uv`) is at least
+    /// `1 - fill`; `mirror` applies the sprite's flip flags to the mask too.
+    AlphaAnimSprite { rect: Rect, uv: Rect, texture: Option<u16>, flags: u16, color: u32, mask_uv: Rect, mask: Option<u16>, mirror: bool },
     Other { class: String, rect: Rect },
 }
 
@@ -119,6 +128,7 @@ impl Shape {
             | Shape::GouraudFrame { rect, .. }
             | Shape::Text { rect, .. }
             | Shape::Dialog { rect, .. }
+            | Shape::AlphaAnimSprite { rect, .. }
             | Shape::Other { rect, .. } => *rect,
         }
     }
@@ -202,6 +212,19 @@ impl<'a> Ctx<'a> {
                 Shape::Text { rect, flags: r.u32(o + 8)?, color: r.u32(o + 16)?, font: r.u8(o + 0x15)?, align: r.u8(o + 0x16)?, source, unk: r.u32(o + 12)? }
             }
             "Dialog" => Shape::Dialog { rect, dialog: Some(r.u16(o + 8)?).filter(|&d| d != 0xffff), flags: r.u16(o + 10)?, color: r.u32(o + 16)? },
+            "AlphaAnimSprite" => {
+                let (texture, mask) = (r.u16(o + 16)?, r.u16(o + 0x24)?);
+                Shape::AlphaAnimSprite {
+                    rect,
+                    uv: Self::rect(&r, o + 8)?,
+                    texture: (texture != 0xffff).then_some(texture),
+                    flags: r.u16(o + 18)?,
+                    color: r.u32(o + 24)?,
+                    mask_uv: Self::rect(&r, o + 0x1c)?,
+                    mask: (mask != 0xffff).then_some(mask),
+                    mirror: r.u8(o + 0x26)? != 0,
+                }
+            }
             _ => Shape::Other { class, rect },
         })
     }
@@ -321,6 +344,11 @@ mod tests {
             for o in d.dialogs.iter().flat_map(|d| &d.objects) {
                 match o.shape {
                     Shape::Sprite { texture: Some(t), .. } => assert!((t as usize) < d.textures.len() || t >= 1000, "{name}: `{}` texture {t}", o.name),
+                    Shape::AlphaAnimSprite { texture, mask, .. } => {
+                        for t in [texture, mask].into_iter().flatten() {
+                            assert!((t as usize) < d.textures.len() || t >= 1000, "{name}: `{}` texture {t}", o.name);
+                        }
+                    }
                     Shape::Dialog { dialog: Some(dialog), .. } => assert!((dialog as usize) < d.dialogs.len(), "{name}: `{}` dialog {dialog}", o.name),
                     _ => {}
                 }
@@ -342,5 +370,13 @@ mod tests {
         };
         assert_eq!(text("en/menu/staffroll.drb.dcx", "@TermOfServiceItem", "@Text_1"), (0, 0x09, TextSource::Runtime { capacity: 0x80 }));
         assert_eq!(text("en/menu/vssortie.drb.dcx", "SelfScore Ex", "Slash"), (0x0c, 0x09, TextSource::Static("/".into())));
+        let d = read(&disc.asset("lang/en/menu/sortie.drb.dcx").unwrap()).unwrap();
+        let gauge = |name: &str| d.dialog("ACV_FE_LockSightCenter").unwrap().objects.iter().find(|o| o.name == name).unwrap().shape.clone();
+        let Shape::AlphaAnimSprite { rect, uv, texture, flags, color, mask_uv, mask, mirror } = gauge("Gauge_LWeapon") else { panic!("Gauge_LWeapon") };
+        assert_eq!((rect, uv, texture, flags, color), ([-149, -149, -8, -22], [361, 3, 502, 130], Some(18), 2, 0x00ff_a232));
+        assert_eq!((mask_uv, mask, mirror), ([0, 0, 128, 128], Some(20), false));
+        assert_eq!(d.textures[20].name, "ACV_FE_SightGaugeAnim2");
+        let Shape::AlphaAnimSprite { flags, mask, mirror, .. } = gauge("Gauge_EN") else { panic!("Gauge_EN") };
+        assert_eq!((flags, mask, mirror), (0x102, Some(16), true));
     }
 }

@@ -213,6 +213,12 @@ pub struct TuningField {
     pub value: f64,
 }
 
+/// Field `index` (its `sheets/tuning_fields.csv` index) of the tuning file named `name`
+/// (`system/paramlist.xml`'s `<Bin>` stem, e.g. `StaticDrawParam`).
+pub fn tuning(name: &str, index: usize) -> Option<f64> {
+    generated::tuning::TUNING.iter().find(|f| f.name == name)?.fields.get(index).map(|f| f.value)
+}
+
 /// The model at asset path `path`.
 pub fn model(path: &str) -> Option<&'static ModelRef> {
     generated::models::ALL.iter().flat_map(|g| g.iter()).find(|m| m.path == path)
