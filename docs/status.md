@@ -114,6 +114,15 @@ in order:
     does not plant the rest of the arm back on the clip bind: those tracks are two identical
     identity keys, and writing them was erasing acmotion 78's `r_arm01` pose. The arm's
     `a00_001`/`a00_003` play on that side's bones while a ready weapon is deployed.
+  - Arm raise / aim (todo, separate from the kick): the arm lifts and points the weapon at the
+    aim when firing and lowers after a few seconds idle. Chain found so far: AC vtable
+    `0x82044fc0` +0x90 = `0x8284a570(unit, target point, f1 weight)` → `0x8289e808` →
+    `0x8289e468` → `0x8287f448` (activates the control with blend time from tuning record
+    `0x82330c38` index 0x10 field +4, via `0x82bf1778`) → `0x82befb98` → `0x82bef6e0`
+    (control +0x28 = weight, +0x2c = dt, per-object target at runtime +0x80). Solver
+    `0x82cb4d98`: base angle = TraceAng + (LockAng − TraceAng) × weight, then aimed at the target
+    within LockMin/Max X/Y at LimitRotAngVel 180°/s. Next: the virtual `+0x90` caller that
+    computes the weight and the lower-after-idle timer.
   - Shot kick (done, see Done): read from `param/jcondata.bin` (`acvd-formats::jcon`), not the
     stale `jcondata.xml`. Open: (1) which weapons take `sniper_$(LR)`: bit 31 from `0x82456f68`
     is set when `0x82479820` (weapon record byte +0x13c == 3) is false and `0x82475ac0`
