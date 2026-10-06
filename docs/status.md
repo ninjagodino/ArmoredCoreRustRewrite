@@ -54,8 +54,13 @@ Rough priority order; reorder freely.
     hold time scales jump height smoothly (only a tap 0.159 and a full 0.714 seen); the fall
     cap (not reached); over-max decay and air drag per frame vs per tick; the boost/fall
     switch is decided per 1/30 s frame in the game, per tick here.
-- **Paint**: map `_c` mask regions to accolor channels via the ACColor fragment programs in
-  `shader/flver_shader.bnd`.
+- **Paint**: map `_c` mask regions to accolor channels. Shader side decoded from the 360 build
+  (see Done); open: which accolor channel feeds each `FC_AC_OverlayCol` slot (c180..c188,
+  slots 0-6 reachable). Leads: accolor loader `0x82331478` (reads `$(Data)\Param\AcColor\color%04d.bin`
+  into an 0x358-byte struct; cache wrapper `0x82331680`, called from `0x82331bb0` and
+  `0x8249ca7c`); the code that writes PS constants 180-188 is not found (a Xenia dump of c180-188
+  during an AC draw is the quicker route). Then apply it in `acvd-game` (overlay blend, a
+  `StandardMaterial` extension or custom material over the diffuse map).
 - **Assembly gaps**: shoulder attach flag 5 (VMX `0x8288a058`; the parallel-to-+Y case
   rotates the up hint by ±90° and that axis is still unread), recon mounts, LOD switching;
   8 pending FLVERs (`0x20007` and FLVER0).
@@ -294,6 +299,35 @@ Rough priority order; reorder freely.
   - Helpers (one-time, `private/tmp`): `ps3cites.py`, `ps3to360.py`, `bhd5names.py`,
     `bhd5more.py`, `rewrite360.py` (the sheet edits), `requote.py` (keeps unchanged CSV
     records byte-identical), `idxfind.py` / `idxhas.py` (offset queries over the index).
+
+- 360 shader access and ACColor pixel shader decode (partial paint task; tools in `private/tmp`).
+  - **360 archives**: `bind/dvdbnd5_layer{0,1}.bhd` (BHD5, big-endian: header `u32` bucket count
+    at 0x10, bucket table offset at 0x14, buckets `(count, offset)`, entries 16 bytes
+    `hash, size, offset64`) index `bind/dvdbnd_layer{0,1}.bdt`, read straight from the ISO
+    (`py private/tmp/x360bnd.py get /path OUT`). Path hash: lowercase, `/` separators, leading `/`,
+    `h = h*37 + c` in 32 bits (checked: `/param/accolor/color5001.bin` 856 bytes,
+    `/param/coloringset.bin` 2121). Not every PS3 path exists loose; `flver_shader.bnd`,
+    `filter_shader.bnd`, `static_shader.bnd`, `debug_shader.bnd` and `material/mtd.bnd` are members of
+    `/bind/boot.bnd` (BND3, 1035 entries); `flver_shader.bnd` is a zlib stream whose BND3 members
+    (1217) are each zlib too, `FlverShader.xml` listing material shader to VS/PS (`ACParts_g`,
+    `ACParts_g_Glow`, `ACParts_Wep_g`, `ACParts_Wep_g_Glow` use the `Flver_ACColor*` shaders).
+  - **Shader container** (`.fpo` / `.vpo`, magic `0x102A1100`): constant table (D3DX CTAB) at
+    0x28 with register names and sampler names; the microcode is the last `u32` at
+    `header[+0x18] + 4` bytes of the file; three literal `vec4`s sit just before it (c253 =
+    2, 8, 6, 0; c254 = 0.5, -0.5, 0.3, 1; c255 = 0.299, 0.587, 0.114, 0.4375).
+    `private/tmp/xenosdis.py` disassembles it (ported from xenia-canary `ucode.h` /
+    `shader_translator*.cc`; output for the whole set is under `private/tmp/x360_fl2/`).
+  - **ACColor decode** (all four variants, `Normal/Flver_ACColor*.fpo`): samples `g_AC_ColorMap`
+    (s13, the `_c` mask) and `g_AC_CamouflageMap` (s15; the decal variant also `g_AC_DecalMap`
+    s3). `L = R`; where `R >= 0.4375` (`c255.w`, separates levels 6/12 from 20/24/27) `L =
+    lerp(R, camouflage.x, B)`. Index = `floor(L*8 + 0.3)` (levels 6/12/20/24/27 of 31 give 1, 3, 5,
+    6, 7); `a0 = clamp(index, 0, 6)`; colour = `FC_AC_OverlayCol[a0]` (`c[180+a0]`, 9 registers).
+    The colour is an overlay blend over the diffuse: `2*d*c` below d = 0.5, `1 - 2*(1-d)*(1-c)`
+    above, mixed back by mask G (`result = d + G*(overlay - d)`), then lit as usual. Read from
+    the disassembly only: `d` is the diffuse rgb times its alpha and a `FC_HTTextureRenge_0` range
+    factor, the exact blend order is unverified against a render.
+  - **Not done**: the CPU fill of c180-c188 (which accolor channel feeds which slot) and the
+    material hookup in `acvd-game`; see the Paint item under Open.
 
 - Socket facing and hanger racks (`acvd-game::assemble`, `sheets/assembly_slots.csv`).
   `param/acattachinfo.bin` is 30 records of 16 bytes at `0x10` (string table at `0x1F0`):
