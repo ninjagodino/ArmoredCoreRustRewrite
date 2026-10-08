@@ -59,13 +59,20 @@ pub fn is_dcx(data: &[u8]) -> bool {
 
 fn expect_u32(r: &Be, at: usize, want: u32) -> Result<()> {
     let got = r.u32(at)?;
-    ensure!(got == want, "DCX field at {at:#x} is {got:#x}, expected {want:#x}");
+    ensure!(
+        got == want,
+        "DCX field at {at:#x} is {got:#x}, expected {want:#x}"
+    );
     Ok(())
 }
 
 fn expect_tag(r: &Be, at: usize, want: &[u8; 4]) -> Result<()> {
     let got = r.bytes(at, 4)?;
-    ensure!(got == want, "DCX tag at {at:#x} is {got:02x?}, expected {:?}", String::from_utf8_lossy(want));
+    ensure!(
+        got == want,
+        "DCX tag at {at:#x} is {got:02x?}, expected {:?}",
+        String::from_utf8_lossy(want)
+    );
     Ok(())
 }
 
@@ -81,12 +88,25 @@ pub fn read(data: &[u8]) -> Result<Dcx> {
         return read_dflt(&r);
     }
     expect_tag(&r, 0x28, b"EDGE")?;
-    for (at, want) in [(0x2C, 0x20), (0x30, 0x0900_0000), (0x34, 0x10000), (0x38, 0), (0x3C, 0), (0x40, 0x0010_0100)] {
+    for (at, want) in [
+        (0x2C, 0x20),
+        (0x30, 0x0900_0000),
+        (0x34, 0x10000),
+        (0x38, 0),
+        (0x3C, 0),
+        (0x40, 0x0010_0100),
+    ] {
         expect_u32(&r, at, want)?;
     }
     expect_tag(&r, DCA_AT, b"DCA\0")?;
     expect_tag(&r, 0x4C, b"EgdT")?;
-    for (at, want) in [(0x50, 0x0001_0100), (0x54, 0x24), (0x58, 0x10), (0x5C, CHUNK_SIZE), (0x6C, 0x10_0000)] {
+    for (at, want) in [
+        (0x50, 0x0001_0100),
+        (0x54, 0x24),
+        (0x58, 0x10),
+        (0x5C, CHUNK_SIZE),
+        (0x6C, 0x10_0000),
+    ] {
         expect_u32(&r, at, want)?;
     }
 
@@ -95,15 +115,28 @@ pub fn read(data: &[u8]) -> Result<Dcx> {
     let last_chunk_size = r.u32(0x60)?;
     let egdt_size = r.u32(0x64)?;
     let count = r.u32(0x68)?;
-    ensure!(egdt_size == 0x24 + 0x10 * count, "EgdT size {egdt_size:#x} does not fit {count} chunks");
+    ensure!(
+        egdt_size == 0x24 + 0x10 * count,
+        "EgdT size {egdt_size:#x} does not fit {count} chunks"
+    );
     expect_u32(&r, 0x14, 0x2C + egdt_size)?;
     expect_u32(&r, 0x48, 8 + egdt_size)?;
     let want_count = uncompressed_size.div_ceil(CHUNK_SIZE);
-    ensure!(count == want_count, "{count} chunks for {uncompressed_size:#x} bytes, expected {want_count}");
+    ensure!(
+        count == want_count,
+        "{count} chunks for {uncompressed_size:#x} bytes, expected {want_count}"
+    );
     let want_last = uncompressed_size - (count.max(1) - 1) * CHUNK_SIZE;
-    ensure!(last_chunk_size == want_last, "last chunk size {last_chunk_size:#x}, expected {want_last:#x}");
+    ensure!(
+        last_chunk_size == want_last,
+        "last chunk size {last_chunk_size:#x}, expected {want_last:#x}"
+    );
     let end = DCA_AT + 8 + egdt_size as usize + compressed_size as usize;
-    ensure!(data.len() >= end, "file is {:#x} bytes, header implies {end:#x}", data.len());
+    ensure!(
+        data.len() >= end,
+        "file is {:#x} bytes, header implies {end:#x}",
+        data.len()
+    );
 
     let mut chunks = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
@@ -111,21 +144,52 @@ pub fn read(data: &[u8]) -> Result<Dcx> {
         expect_u32(&r, at, 0)?;
         let flag = r.u32(at + 12)?;
         ensure!(flag <= 1, "chunk {i} compression flag {flag}");
-        chunks.push(Chunk { offset: r.u32(at + 4)?, size: r.u32(at + 8)?, deflated: flag == 1 });
+        chunks.push(Chunk {
+            offset: r.u32(at + 4)?,
+            size: r.u32(at + 8)?,
+            deflated: flag == 1,
+        });
     }
-    Ok(Dcx { variant: Variant::Edge, uncompressed_size, compressed_size, last_chunk_size, trailing_bytes: data.len() - end, chunks })
+    Ok(Dcx {
+        variant: Variant::Edge,
+        uncompressed_size,
+        compressed_size,
+        last_chunk_size,
+        trailing_bytes: data.len() - end,
+        chunks,
+    })
 }
 
 fn read_dflt(r: &Be) -> Result<Dcx> {
-    for (at, want) in [(0x14, 0x2C), (0x2C, 0x20), (0x30, 0x0900_0000), (0x34, 0), (0x38, 0), (0x3C, 0), (0x40, 0x0001_0100), (0x48, 8)] {
+    for (at, want) in [
+        (0x14, 0x2C),
+        (0x2C, 0x20),
+        (0x30, 0x0900_0000),
+        (0x34, 0),
+        (0x38, 0),
+        (0x3C, 0),
+        (0x40, 0x0001_0100),
+        (0x48, 8),
+    ] {
         expect_u32(r, at, want)?;
     }
     expect_tag(r, DCA_AT, b"DCA\0")?;
     let uncompressed_size = r.u32(0x1C)?;
     let compressed_size = r.u32(0x20)?;
     let end = DFLT_DATA_AT + compressed_size as usize;
-    ensure!(r.len() >= end, "file is {:#x} bytes, header implies {end:#x}", r.len());
-    Ok(Dcx { variant: Variant::Dflt, uncompressed_size, compressed_size, last_chunk_size: 0, trailing_bytes: r.len() - end, chunks: Vec::new() })
+    ensure!(
+        r.len() >= end,
+        "file is {:#x} bytes, header implies {end:#x}",
+        r.len()
+    );
+    Ok(Dcx {
+        variant: Variant::Dflt,
+        uncompressed_size,
+        compressed_size,
+        last_chunk_size: 0,
+        trailing_bytes: r.len() - end,
+        chunks: Vec::new(),
+    })
 }
 
 impl Dcx {
@@ -138,17 +202,30 @@ impl Dcx {
         let r = Be(data);
         if self.variant == Variant::Dflt {
             let want = self.uncompressed_size as usize;
-            let out = match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(r.bytes(DFLT_DATA_AT, self.compressed_size as usize)?, want) {
+            let out = match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+                r.bytes(DFLT_DATA_AT, self.compressed_size as usize)?,
+                want,
+            ) {
                 Ok(v) => v,
                 Err(e) => bail!("inflate failed: {e:?}"),
             };
-            ensure!(out.len() == want, "expanded to {:#x} bytes, expected {want:#x}", out.len());
+            ensure!(
+                out.len() == want,
+                "expanded to {:#x} bytes, expected {want:#x}",
+                out.len()
+            );
             return Ok(out);
         }
         let mut out = Vec::with_capacity(self.uncompressed_size as usize);
         for (i, c) in self.chunks.iter().enumerate() {
-            let want = if i + 1 == self.chunks.len() { self.last_chunk_size } else { CHUNK_SIZE } as usize;
-            let raw = r.bytes(self.data_at() + c.offset as usize, c.size as usize).with_context(|| format!("chunk {i}"))?;
+            let want = if i + 1 == self.chunks.len() {
+                self.last_chunk_size
+            } else {
+                CHUNK_SIZE
+            } as usize;
+            let raw = r
+                .bytes(self.data_at() + c.offset as usize, c.size as usize)
+                .with_context(|| format!("chunk {i}"))?;
             let before = out.len();
             if c.deflated {
                 match miniz_oxide::inflate::decompress_to_vec_with_limit(raw, want) {
@@ -158,7 +235,11 @@ impl Dcx {
             } else {
                 out.extend_from_slice(raw);
             }
-            ensure!(out.len() - before == want, "chunk {i} expanded to {:#x} bytes, expected {want:#x}", out.len() - before);
+            ensure!(
+                out.len() - before == want,
+                "chunk {i} expanded to {:#x} bytes, expected {want:#x}",
+                out.len() - before
+            );
         }
         Ok(out)
     }
@@ -178,7 +259,8 @@ mod tests {
         let chunks: Vec<&[u8]> = plain.chunks(CHUNK_SIZE as usize).collect();
         let egdt = 0x24 + 0x10 * chunks.len() as u32;
         let mut out = Vec::new();
-        let u32s = |out: &mut Vec<u8>, vals: &[u32]| vals.iter().for_each(|v| out.extend(v.to_be_bytes()));
+        let u32s =
+            |out: &mut Vec<u8>, vals: &[u32]| vals.iter().for_each(|v| out.extend(v.to_be_bytes()));
         out.extend(MAGIC);
         u32s(&mut out, &[0x10000, 0x18, 0x24, 0x24, 0x2C + egdt]);
         out.extend(b"DCS\0");
@@ -189,7 +271,19 @@ mod tests {
         u32s(&mut out, &[8 + egdt]);
         out.extend(b"EgdT");
         let last = chunks.last().map_or(0, |c| c.len() as u32);
-        u32s(&mut out, &[0x0001_0100, 0x24, 0x10, CHUNK_SIZE, last, egdt, chunks.len() as u32, 0x10_0000]);
+        u32s(
+            &mut out,
+            &[
+                0x0001_0100,
+                0x24,
+                0x10,
+                CHUNK_SIZE,
+                last,
+                egdt,
+                chunks.len() as u32,
+                0x10_0000,
+            ],
+        );
         let mut offset = 0;
         for c in &chunks {
             u32s(&mut out, &[0, offset, c.len() as u32, 0]);
@@ -216,7 +310,8 @@ mod tests {
         let plain: Vec<u8> = (0..0x18000u32).map(|i| (i % 251) as u8).collect();
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
         let mut file = Vec::new();
-        let u32s = |out: &mut Vec<u8>, vals: &[u32]| vals.iter().for_each(|v| out.extend(v.to_be_bytes()));
+        let u32s =
+            |out: &mut Vec<u8>, vals: &[u32]| vals.iter().for_each(|v| out.extend(v.to_be_bytes()));
         file.extend(MAGIC);
         u32s(&mut file, &[0x10000, 0x18, 0x24, 0x24, 0x2C]);
         file.extend(b"DCS\0");

@@ -331,6 +331,9 @@ impl Packs {
         let format = match row.map(|f| f.name) {
             Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,
             Some("bc3") => TextureFormat::Bc3RgbaUnormSrgb,
+            // DXN is two BC4 blocks, x then y (sheets/texture_formats.csv code 23). Bevy treats
+            // Bc5RgUnorm as a two-component normal map.
+            Some("dxn") => TextureFormat::Bc5RgUnorm,
             other => bail!("texture `{name}` format {other:?}"),
         };
         ensure!(tex.faces() == 1, "texture `{name}` is a cube map");

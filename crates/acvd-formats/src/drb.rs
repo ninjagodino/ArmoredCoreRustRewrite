@@ -102,19 +102,68 @@ pub enum TextSource {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum Shape {
-    Null { rect: Rect },
-    Sprite { rect: Rect, uv: Rect, texture: Option<u16>, flags: u16, color: u32 },
-    MonoRect { rect: Rect, flags: u32, color: u32 },
-    MonoFrame { rect: Rect, flags: u32, color: u32 },
-    GouraudRect { rect: Rect, flags: u32, colors: [u32; 4] },
-    GouraudFrame { rect: Rect, flags: u32, colors: [u32; 4] },
+    Null {
+        rect: Rect,
+    },
+    Sprite {
+        rect: Rect,
+        uv: Rect,
+        texture: Option<u16>,
+        flags: u16,
+        color: u32,
+    },
+    MonoRect {
+        rect: Rect,
+        flags: u32,
+        color: u32,
+    },
+    MonoFrame {
+        rect: Rect,
+        flags: u32,
+        color: u32,
+    },
+    GouraudRect {
+        rect: Rect,
+        flags: u32,
+        colors: [u32; 4],
+    },
+    GouraudFrame {
+        rect: Rect,
+        flags: u32,
+        colors: [u32; 4],
+    },
     /// `font` is a `fontdef.xml` ID; `align` low two bits = 0 left, 1 right, 2 center; bit 0x8 = vertical center (bit 0x4, likely bottom, is unverified).
-    Text { rect: Rect, flags: u32, color: u32, font: u8, align: u8, source: TextSource, unk: u32 },
-    Dialog { rect: Rect, dialog: Option<u16>, flags: u16, color: u32 },
+    Text {
+        rect: Rect,
+        flags: u32,
+        color: u32,
+        font: u8,
+        align: u8,
+        source: TextSource,
+        unk: u32,
+    },
+    Dialog {
+        rect: Rect,
+        dialog: Option<u16>,
+        flags: u16,
+        color: u32,
+    },
     /// A gauge: `texture` drawn where the `mask` texture's alpha (over `mask_uv`) is at least
     /// `1 - fill`; `mirror` applies the sprite's flip flags to the mask too.
-    AlphaAnimSprite { rect: Rect, uv: Rect, texture: Option<u16>, flags: u16, color: u32, mask_uv: Rect, mask: Option<u16>, mirror: bool },
-    Other { class: String, rect: Rect },
+    AlphaAnimSprite {
+        rect: Rect,
+        uv: Rect,
+        texture: Option<u16>,
+        flags: u16,
+        color: u32,
+        mask_uv: Rect,
+        mask: Option<u16>,
+        mirror: bool,
+    },
+    Other {
+        class: String,
+        rect: Rect,
+    },
 }
 
 impl Shape {
@@ -143,16 +192,33 @@ fn sections(data: &[u8]) -> Result<Vec<Section>> {
     let (mut at, mut out) = (0usize, Vec::new());
     loop {
         let raw = r.bytes(at, 4)?;
-        let tag = String::from_utf8_lossy(&raw.iter().copied().filter(|&c| c != 0).collect::<Vec<_>>()).into_owned();
-        ensure!(!tag.is_empty() && tag.bytes().all(|c| c.is_ascii_uppercase()), "section at {at:#x} has tag {raw:02x?}");
+        let tag =
+            String::from_utf8_lossy(&raw.iter().copied().filter(|&c| c != 0).collect::<Vec<_>>())
+                .into_owned();
+        ensure!(
+            !tag.is_empty() && tag.bytes().all(|c| c.is_ascii_uppercase()),
+            "section at {at:#x} has tag {raw:02x?}"
+        );
         let (size, count) = (r.u32(at + 4)? as usize, r.u32(at + 8)?);
-        ensure!(r.u32(at + 12)? == 0, "section `{tag}` header word 3 is nonzero");
+        ensure!(
+            r.u32(at + 12)? == 0,
+            "section `{tag}` header word 3 is nonzero"
+        );
         r.bytes(at + SECTION_HEADER, size)?;
         let end = tag == "DNE";
-        out.push(Section { tag, count, offset: at + SECTION_HEADER, size });
+        out.push(Section {
+            tag,
+            count,
+            offset: at + SECTION_HEADER,
+            size,
+        });
         at += SECTION_HEADER + size;
         if end {
-            ensure!(at == data.len(), "{} bytes after the DNE section", data.len() - at);
+            ensure!(
+                at == data.len(),
+                "{} bytes after the DNE section",
+                data.len() - at
+            );
             return Ok(out);
         }
     }
@@ -165,13 +231,19 @@ struct Ctx<'a> {
 
 impl<'a> Ctx<'a> {
     fn body(&self, tag: &str) -> Result<Be<'a>> {
-        let Some(s) = self.sections.iter().find(|s| s.tag == tag) else { bail!("no `{tag}` section") };
+        let Some(s) = self.sections.iter().find(|s| s.tag == tag) else {
+            bail!("no `{tag}` section")
+        };
         Ok(Be(Be(self.data).bytes(s.offset, s.size)?))
     }
 
     fn string(&self, at: u32) -> Result<String> {
         let body = self.body("RTS")?.0;
-        ensure!((at as usize) < body.len(), "string offset {at:#x} past the {:#x}-byte table", body.len());
+        ensure!(
+            (at as usize) < body.len(),
+            "string offset {at:#x} past the {:#x}-byte table",
+            body.len()
+        );
         Ok(utf16be(&body[at as usize..]))
     }
 
@@ -190,28 +262,79 @@ impl<'a> Ctx<'a> {
             "Null" => Shape::Null { rect },
             "Sprite" => {
                 let texture = r.u16(o + 16)?;
-                Shape::Sprite { rect, uv: Self::rect(&r, o + 8)?, texture: (texture != 0xffff).then_some(texture), flags: r.u16(o + 18)?, color: r.u32(o + 24)? }
+                Shape::Sprite {
+                    rect,
+                    uv: Self::rect(&r, o + 8)?,
+                    texture: (texture != 0xffff).then_some(texture),
+                    flags: r.u16(o + 18)?,
+                    color: r.u32(o + 24)?,
+                }
             }
-            "MonoRect" => Shape::MonoRect { rect, flags: r.u32(o + 8)?, color: r.u32(o + 16)? },
-            "MonoFrame" => Shape::MonoFrame { rect, flags: r.u32(o + 8)?, color: r.u32(o + 16)? },
+            "MonoRect" => Shape::MonoRect {
+                rect,
+                flags: r.u32(o + 8)?,
+                color: r.u32(o + 16)?,
+            },
+            "MonoFrame" => Shape::MonoFrame {
+                rect,
+                flags: r.u32(o + 8)?,
+                color: r.u32(o + 16)?,
+            },
             "GouraudRect" | "GouraudFrame" => {
-                let (flags, colors) = (r.u32(o + 8)?, [r.u32(o + 12)?, r.u32(o + 16)?, r.u32(o + 20)?, r.u32(o + 24)?]);
+                let (flags, colors) = (
+                    r.u32(o + 8)?,
+                    [
+                        r.u32(o + 12)?,
+                        r.u32(o + 16)?,
+                        r.u32(o + 20)?,
+                        r.u32(o + 24)?,
+                    ],
+                );
                 if class == "GouraudRect" {
-                    Shape::GouraudRect { rect, flags, colors }
+                    Shape::GouraudRect {
+                        rect,
+                        flags,
+                        colors,
+                    }
                 } else {
-                    Shape::GouraudFrame { rect, flags, colors }
+                    Shape::GouraudFrame {
+                        rect,
+                        flags,
+                        colors,
+                    }
                 }
             }
             "Text" => {
                 let source = match r.u8(o + 0x17)? {
                     0 => TextSource::Static(self.string(r.u32(o + 0x1c)?)?),
-                    1 => TextSource::Message { bank: r.u32(o + 0x1c)?, id: r.u32(o + 0x20)? },
-                    2 => TextSource::Runtime { capacity: r.u32(o + 0x1c)? },
-                    m => TextSource::Special { mode: m, kind: r.u32(o + 0x1c)? },
+                    1 => TextSource::Message {
+                        bank: r.u32(o + 0x1c)?,
+                        id: r.u32(o + 0x20)?,
+                    },
+                    2 => TextSource::Runtime {
+                        capacity: r.u32(o + 0x1c)?,
+                    },
+                    m => TextSource::Special {
+                        mode: m,
+                        kind: r.u32(o + 0x1c)?,
+                    },
                 };
-                Shape::Text { rect, flags: r.u32(o + 8)?, color: r.u32(o + 16)?, font: r.u8(o + 0x15)?, align: r.u8(o + 0x16)?, source, unk: r.u32(o + 12)? }
+                Shape::Text {
+                    rect,
+                    flags: r.u32(o + 8)?,
+                    color: r.u32(o + 16)?,
+                    font: r.u8(o + 0x15)?,
+                    align: r.u8(o + 0x16)?,
+                    source,
+                    unk: r.u32(o + 12)?,
+                }
             }
-            "Dialog" => Shape::Dialog { rect, dialog: Some(r.u16(o + 8)?).filter(|&d| d != 0xffff), flags: r.u16(o + 10)?, color: r.u32(o + 16)? },
+            "Dialog" => Shape::Dialog {
+                rect,
+                dialog: Some(r.u16(o + 8)?).filter(|&d| d != 0xffff),
+                flags: r.u16(o + 10)?,
+                color: r.u32(o + 16)?,
+            },
             "AlphaAnimSprite" => {
                 let (texture, mask) = (r.u16(o + 16)?, r.u16(o + 0x24)?);
                 Shape::AlphaAnimSprite {
@@ -237,9 +360,19 @@ impl<'a> Ctx<'a> {
 pub fn read(data: &[u8]) -> Result<Drb> {
     ensure!(is_drb(data), "not a DRB");
     let sections = sections(data)?;
-    let c = Ctx { data, sections: &sections };
+    let c = Ctx {
+        data,
+        sections: &sections,
+    };
     let tex = c.body("IXET")?;
-    let textures = (0..tex.len() / 16).map(|i| Ok(Texture { name: c.string(tex.u32(16 * i)?)?, path: c.string(tex.u32(16 * i + 4)?)? })).collect::<Result<_>>()?;
+    let textures = (0..tex.len() / 16)
+        .map(|i| {
+            Ok(Texture {
+                name: c.string(tex.u32(16 * i)?)?,
+                path: c.string(tex.u32(16 * i + 4)?)?,
+            })
+        })
+        .collect::<Result<_>>()?;
     let (dlg, obj) = (c.body("GLD")?, c.body("OGLD")?);
     let mut dialogs = Vec::with_capacity(dlg.len() / 0x40);
     for i in 0..dlg.len() / 0x40 {
@@ -249,13 +382,25 @@ pub fn read(data: &[u8]) -> Result<Drb> {
         let objects = (0..count)
             .map(|j| {
                 let o = first + 0x20 * j;
-                Ok(Object { name: c.string(obj.u32(o)?)?, shape: c.shape(obj.u32(o + 4)?)?, control: c.control(obj.u32(o + 8)?)? })
+                Ok(Object {
+                    name: c.string(obj.u32(o)?)?,
+                    shape: c.shape(obj.u32(o + 4)?)?,
+                    control: c.control(obj.u32(o + 8)?)?,
+                })
             })
             .collect::<Result<_>>()
             .with_context(|| format!("dialog `{name}`"))?;
-        dialogs.push(Dialog { name, size: [dlg.u16(at + 0x2c)?, dlg.u16(at + 0x2e)?], objects });
+        dialogs.push(Dialog {
+            name,
+            size: [dlg.u16(at + 0x2c)?, dlg.u16(at + 0x2e)?],
+            objects,
+        });
     }
-    Ok(Drb { sections, textures, dialogs })
+    Ok(Drb {
+        sections,
+        textures,
+        dialogs,
+    })
 }
 
 impl Drb {
@@ -278,7 +423,10 @@ impl Drb {
                 _ => None,
             })
             .collect();
-        self.dialogs.iter().enumerate().filter(move |(i, _)| !placed.contains(&(*i as u16)))
+        self.dialogs
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| !placed.contains(&(*i as u16)))
     }
 }
 
@@ -287,7 +435,10 @@ mod tests {
     use super::*;
 
     fn utf16(s: &str) -> Vec<u8> {
-        s.encode_utf16().chain([0]).flat_map(u16::to_be_bytes).collect()
+        s.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_be_bytes)
+            .collect()
     }
 
     fn words(w: &[u32]) -> Vec<u8> {
@@ -319,37 +470,107 @@ mod tests {
         file.extend(section(b"PAHS", 1, &words(&[off[1], 0])));
         file.extend(section(b"LRTC", 1, &words(&[off[2], 0])));
         file.extend(section(b"OGLD", 1, &words(&[off[5], 0, 0, 0, 0, 0, 0, 0])));
-        file.extend(section(b"\0GLD", 1, &words(&[off[0], 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0x0500_02d0, 0, 0, 0, 0])));
+        file.extend(section(
+            b"\0GLD",
+            1,
+            &words(&[
+                off[0],
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0x0500_02d0,
+                0,
+                0,
+                0,
+                0,
+            ]),
+        ));
         file.extend(section(b"\0DNE", 0, &[]));
         let d = read(&file).unwrap();
-        assert_eq!((d.textures[0].name.as_str(), d.textures[0].path.as_str()), ("Back", "c:\\Back_TM.tga"));
+        assert_eq!(
+            (d.textures[0].name.as_str(), d.textures[0].path.as_str()),
+            ("Back", "c:\\Back_TM.tga")
+        );
         let dlg = d.dialog("Root").unwrap();
         assert_eq!(dlg.size, [1280, 720]);
-        assert_eq!((dlg.objects[0].name.as_str(), dlg.objects[0].control.as_str()), ("BG", "Static"));
-        let Shape::Sprite { rect, uv, texture, flags, color } = dlg.objects[0].shape else { panic!() };
-        assert_eq!((rect, uv, texture, flags, color), ([0, 0, 1280, 720], [0, 0, 1024, 720], Some(0), 0x0c01, 0xffff_ffff));
+        assert_eq!(
+            (
+                dlg.objects[0].name.as_str(),
+                dlg.objects[0].control.as_str()
+            ),
+            ("BG", "Static")
+        );
+        let Shape::Sprite {
+            rect,
+            uv,
+            texture,
+            flags,
+            color,
+        } = dlg.objects[0].shape
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (rect, uv, texture, flags, color),
+            (
+                [0, 0, 1280, 720],
+                [0, 0, 1024, 720],
+                Some(0),
+                0x0c01,
+                0xffff_ffff
+            )
+        );
         assert_eq!(d.roots().count(), 1);
     }
 
     #[test]
     fn disc_layouts() {
-        let Some(disc) = crate::vfs::test_disc() else { return };
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
         let mut n = 0;
         for name in disc.files() {
             let lower = name.to_ascii_lowercase();
-            if !lower.starts_with("lang/") || !lower.contains("/menu/") || !lower.ends_with(".drb.dcx") {
+            if !lower.starts_with("lang/")
+                || !lower.contains("/menu/")
+                || !lower.ends_with(".drb.dcx")
+            {
                 continue;
             }
             let d = read(&disc.asset(&name).unwrap()).unwrap_or_else(|e| panic!("{name}: {e:#}"));
             for o in d.dialogs.iter().flat_map(|d| &d.objects) {
                 match o.shape {
-                    Shape::Sprite { texture: Some(t), .. } => assert!((t as usize) < d.textures.len() || t >= 1000, "{name}: `{}` texture {t}", o.name),
+                    Shape::Sprite {
+                        texture: Some(t), ..
+                    } => assert!(
+                        (t as usize) < d.textures.len() || t >= 1000,
+                        "{name}: `{}` texture {t}",
+                        o.name
+                    ),
                     Shape::AlphaAnimSprite { texture, mask, .. } => {
                         for t in [texture, mask].into_iter().flatten() {
-                            assert!((t as usize) < d.textures.len() || t >= 1000, "{name}: `{}` texture {t}", o.name);
+                            assert!(
+                                (t as usize) < d.textures.len() || t >= 1000,
+                                "{name}: `{}` texture {t}",
+                                o.name
+                            );
                         }
                     }
-                    Shape::Dialog { dialog: Some(dialog), .. } => assert!((dialog as usize) < d.dialogs.len(), "{name}: `{}` dialog {dialog}", o.name),
+                    Shape::Dialog {
+                        dialog: Some(dialog),
+                        ..
+                    } => assert!(
+                        (dialog as usize) < d.dialogs.len(),
+                        "{name}: `{}` dialog {dialog}",
+                        o.name
+                    ),
                     _ => {}
                 }
             }
@@ -360,23 +581,95 @@ mod tests {
         let d = read(&disc.asset("lang/en/menu/staffroll.drb.dcx").unwrap()).unwrap();
         assert_eq!(d.textures[0].name, "Titleback");
         let base = &d.dialogs[0];
-        assert_eq!((base.name.as_str(), base.size, base.objects.len()), ("@StaffRollBase", [1280, 720], 2));
-        assert!(matches!(base.objects[1].shape, Shape::Sprite { rect: [1024, 0, 1280, 720], uv: [0, 736, 720, 992], texture: Some(0), flags: 0x0c01, .. }));
+        assert_eq!(
+            (base.name.as_str(), base.size, base.objects.len()),
+            ("@StaffRollBase", [1280, 720], 2)
+        );
+        assert!(matches!(
+            base.objects[1].shape,
+            Shape::Sprite {
+                rect: [1024, 0, 1280, 720],
+                uv: [0, 736, 720, 992],
+                texture: Some(0),
+                flags: 0x0c01,
+                ..
+            }
+        ));
         let text = |file: &str, dialog: &str, object: &str| {
             let d = read(&disc.asset(&format!("lang/{file}")).unwrap()).unwrap();
-            let o = d.dialog(dialog).unwrap().objects.iter().find(|o| o.name == object).unwrap().shape.clone();
-            let Shape::Text { font, align, source, .. } = o else { panic!("{object} is not Text") };
+            let o = d
+                .dialog(dialog)
+                .unwrap()
+                .objects
+                .iter()
+                .find(|o| o.name == object)
+                .unwrap()
+                .shape
+                .clone();
+            let Shape::Text {
+                font,
+                align,
+                source,
+                ..
+            } = o
+            else {
+                panic!("{object} is not Text")
+            };
             (font, align, source)
         };
-        assert_eq!(text("en/menu/staffroll.drb.dcx", "@TermOfServiceItem", "@Text_1"), (0, 0x09, TextSource::Runtime { capacity: 0x80 }));
-        assert_eq!(text("en/menu/vssortie.drb.dcx", "SelfScore Ex", "Slash"), (0x0c, 0x09, TextSource::Static("/".into())));
+        assert_eq!(
+            text("en/menu/staffroll.drb.dcx", "@TermOfServiceItem", "@Text_1"),
+            (0, 0x09, TextSource::Runtime { capacity: 0x80 })
+        );
+        assert_eq!(
+            text("en/menu/vssortie.drb.dcx", "SelfScore Ex", "Slash"),
+            (0x0c, 0x09, TextSource::Static("/".into()))
+        );
         let d = read(&disc.asset("lang/en/menu/sortie.drb.dcx").unwrap()).unwrap();
-        let gauge = |name: &str| d.dialog("ACV_FE_LockSightCenter").unwrap().objects.iter().find(|o| o.name == name).unwrap().shape.clone();
-        let Shape::AlphaAnimSprite { rect, uv, texture, flags, color, mask_uv, mask, mirror } = gauge("Gauge_LWeapon") else { panic!("Gauge_LWeapon") };
-        assert_eq!((rect, uv, texture, flags, color), ([-149, -149, -8, -22], [361, 3, 502, 130], Some(18), 2, 0x00ff_a232));
+        let gauge = |name: &str| {
+            d.dialog("ACV_FE_LockSightCenter")
+                .unwrap()
+                .objects
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap()
+                .shape
+                .clone()
+        };
+        let Shape::AlphaAnimSprite {
+            rect,
+            uv,
+            texture,
+            flags,
+            color,
+            mask_uv,
+            mask,
+            mirror,
+        } = gauge("Gauge_LWeapon")
+        else {
+            panic!("Gauge_LWeapon")
+        };
+        assert_eq!(
+            (rect, uv, texture, flags, color),
+            (
+                [-149, -149, -8, -22],
+                [361, 3, 502, 130],
+                Some(18),
+                2,
+                0x00ff_a232
+            )
+        );
         assert_eq!((mask_uv, mask, mirror), ([0, 0, 128, 128], Some(20), false));
         assert_eq!(d.textures[20].name, "ACV_FE_SightGaugeAnim2");
-        let Shape::AlphaAnimSprite { flags, mask, mirror, .. } = gauge("Gauge_EN") else { panic!("Gauge_EN") };
+        let Shape::AlphaAnimSprite {
+            flags,
+            mask,
+            mirror,
+            ..
+        } = gauge("Gauge_EN")
+        else {
+            panic!("Gauge_EN")
+        };
         assert_eq!((flags, mask, mirror), (0x102, Some(16), true));
     }
 }

@@ -55,9 +55,15 @@ pub fn field_stride(format_version: u16) -> Option<usize> {
 pub fn read(data: &[u8]) -> Result<ParamDef> {
     let r = Be(data);
     let header_size = r.u16(0x04)?;
-    ensure!(header_size == 0x30, "unexpected PARAMDEF header size {header_size:#x}");
+    ensure!(
+        header_size == 0x30,
+        "unexpected PARAMDEF header size {header_size:#x}"
+    );
     ensure!(r.u8(0x2C)? == 0xFF, "PARAMDEF is not big-endian");
-    ensure!(r.u8(0x2D)? == 0, "unicode PARAMDEF strings are not used by this game");
+    ensure!(
+        r.u8(0x2D)? == 0,
+        "unicode PARAMDEF strings are not used by this game"
+    );
     let format_version = r.u16(0x2E)?;
     let Some(stride) = field_stride(format_version) else {
         bail!("unsupported PARAMDEF format version {format_version}");
@@ -78,9 +84,15 @@ pub fn read(data: &[u8]) -> Result<ParamDef> {
             increment: r.f32(o + 0x5C)?,
             edit_flags: r.i32(o + 0x60)?,
             byte_count: r.i32(o + 0x64)?,
-            description: if description_offset > 0 { r.cstr_sjis(description_offset as usize)? } else { String::new() },
+            description: if description_offset > 0 {
+                r.cstr_sjis(description_offset as usize)?
+            } else {
+                String::new()
+            },
             internal_type: r.fixstr(o + 0x6C, 0x20)?,
-            internal_name: (stride >= 0xAC).then(|| r.fixstr(o + 0x8C, 0x20)).transpose()?,
+            internal_name: (stride >= 0xAC)
+                .then(|| r.fixstr(o + 0x8C, 0x20))
+                .transpose()?,
             sort_id: (stride >= 0xB0).then(|| r.i32(o + 0xAC)).transpose()?,
         });
     }

@@ -13,23 +13,6 @@ Rough priority order; reorder freely.
 "AC test scene"). Gameplay should match the 360 build; menus may stay partial. Tasks toward it,
 in order:
 
-- **AC vs world collision** (blocks the demo): the AC walks through walls and objects; only a
-  downward ground ray exists (`collision.rs`). No paramdef carries an AC body size (`q name
-  Radius` finds only bullets, `ENEMY_GRAPHICS_ST.CollisionRadius` and camera `HitRadius`). Find
-  the 360 AC-vs-map query: the ground ray filter 0x100002 (`0x829e7b68`) and the eye-floor ray
-  0x200002 (`0x829e7be0`) are in the collision layer, so their neighbours / callers from the AC
-  update `0x828bef18` should include the horizontal sweep and its shape (capsule / spheres per
-  part?). Then a Xenia probe walking into a wall. Also wall kick (`ackickrhit` material) and
-  slopes too steep to stand on. `Collision` now has an XZ grid (16 m cells) for the queries.
-- **AC test targets**: `m4000_actest.msb` parts of kind 2 (22: ACs `a0000`-`a0003` at the vs
-  UNAC start (-797.168, 17, 616.934), enemies `e0010` / `e0110` / `e0210` / `e1020` / `e2030`)
-  on layers `actest2`-`actest8` (LAYER_PARAM_ST; the layer link in the part record is unread),
-  with `param/actestdata.bin` (+ `actestdata.def`, unread) choosing the test; AI in
-  `script/enemy/*_actest.lc`, `script/arena/actest_*.lc`. Draw them, take hits and damage.
-- **Damage model**: AP, bullet hit vs AC / enemy hit shapes, `damage_power`, impact, the
-  weapons' open units (see Weapons leftovers).
-- **Lock-on / FCS** (see FCS / lock-on HUD). Energy drain (the lock-sight EN gauge is drawn
-  full; see UI leftovers). Boost gauge.
 - **Map look**: lighting / fog / sky are in (see below); still open: broken models (`_b.flv` /
   `_b_h.hmd`), the `movie` texture (a runtime video surface), the area bounds (POINT kinds
   100-102: operation / warning / caution area) and the water return point (kind 50).
@@ -78,13 +61,9 @@ in order:
   weapons' open units (see Weapons leftovers).
 - **Lock-on / FCS** (see FCS / lock-on HUD). Energy drain (the lock-sight EN gauge is drawn
   full; see UI leftovers). Boost gauge.
-- **Map look**: map lighting / fog / sky (`ch_env/m4000_env.msb` is not an MSB: another format,
-  77 of them), LOD (`_l1` / `_l2` FLVERs), broken models (`_b.flv` / `_b_h.hmd`), the `movie`
-  texture (a runtime video surface), the area bounds (POINT kinds 100-102: operation / warning
-  / caution area) and the water return point (kind 50).
 
 - **Animation**: TAE event reader; core control (upper body faces the aim while legs strafe);
-  upper/lower body layering; boost_a and part `*_a` clips (`Booster_Frame` waits on these).
+  upper/lower body layering; part `*_a` clips beyond the hand weapons, arms and boosters.
   - TAE lead: `motioncollate` `motion_ow_disarm` / `motion_ow_equip` are the TAE owner ids
     (100, 1100, 1200, 4100, 7100, 8100, ... = `tae/ac/action_ow_disarm/own000100.tae` ...); the
     360 TAE event dispatcher is `0x8238eb08` (switch on event type: 10, 20, 100-104, 150-152,
@@ -116,9 +95,12 @@ in order:
     above the glide max. Done: the vertical update `0x82820168` skips the gravity loop
     (`0x8281f960`) in states 4/5 (`0x8281f3d0` at `0x828201b4`), so a glide holds its height
     and now carries on over a drop; `0x8281dd28` caps rising at glide block (+0x288) +0x0 +
-    +0x2c (not modelled, a glide never rises). Clips: `glide_start` (acmotion row 217) then
-    `glide` (row 218, 360-frame wheel), camera action 26, cue b00000006 (taken as the start).
-    What ends a glide in the air (EN, the 222 air-float / 223-230 transition rows) is open.
+    +0x2c (not modelled, a glide never rises). On the ground: `glide_start` (acmotion row 217)
+    then `glide` (row 218, 360-frame wheel, booster clip 1). In the air: one directional entry
+    (rows 223-230, anims 63-70, 30 frames, sector `0x82825918` / builder `0x82883c80`) then
+    `glide_air` (row 222 空中浮遊, anim 62, 360-frame wheel, booster clip 3, builder
+    `0x82883d30`). Camera action 26, cue b00000006 (taken as the start). What ends a glide
+    in the air (EN) is open. The damage rows 239-242 / 246-247 are not played.
   - High Boost (quick boost, manual id 20301, □; V / pad West): impulse = movement slot +0x68
     `0x82822980` (velocity = direction x +0x118 x f2, +0x118 = `quick_boost_max_tick`, Lua
     param 133 = glide max x 1.25); clips rows 285-292 by direction, camera action 50, cues
@@ -154,7 +136,8 @@ in order:
   during an AC draw is the quicker route). Then apply it in `acvd-game` (overlay blend, a
   `StandardMaterial` extension or custom material over the diffuse map).
 - **Assembly gaps**: shoulder attach flag 5 (VMX `0x8288a058`; the parallel-to-+Y case
-  rotates the up hint by ±90° and that axis is still unread), recon mounts, LOD switching;
+  rotates the up hint by ±90° and that axis is still unread), recon mounts, character LOD
+  (`_l2` / `_l3`; map pieces are done, see Done);
   8 pending FLVERs (`0x20007` and FLVER0).
 - **Maps leftovers**: rest of MSB (MODEL/EVENT/POINT/ROUTE/LAYER/TREE), `.smd`, map FLVER
   visuals, water-layer materials (none named water on m3100), collision filters 0x100002 /
@@ -168,9 +151,12 @@ in order:
     (`acvd-index q field` on the `BulletRigidSt` offsets), then a Xenia probe on a fired round's
     velocity (user at the controls, firing).
   - `magazine` (+0x138) name unconfirmed: may be total ammo.
+  - Bay shift is in (`acvd-game::bay`, `sheets/ac_states.csv`): hold R (△) and press that
+    arm's fire button. Ready-position weapons purge instead of moving onto the rack. The
+    rack holds the stow until the hand weapon is seated (frame 40), then `a00_011` turns the prong (`sheets/hanger_anim.csv`).
   - Not done: bullet max/min speed and brake, hit/damage (`hit_id`, `damage_power`), energy
     drain, missiles (`bulletmissile`), blades, shoulder weapons (category 12 bullet ids at
-    +356/+360), weapon modes, bay shift, core aim (shots follow the camera pitch, not a posed
+    +356/+360), weapon modes, core aim (shots follow the camera pitch, not a posed
     upper body). The lock-sight HUD shows AP, energy, the `AlphaAnimSprite` gauges and the
     hand-weapon ammo counts (`acvd-game::hud`).
   - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
@@ -243,14 +229,13 @@ in order:
   - Not drawn: distortion (43), radial blur, tracer/line actions, actions 2031/2035/2118/3000.
 
   Gameplay gaps:
-  - Which motion fires which booster is a guess: main 300 boosting forward, back 302 boosting
-    backward on leg points 25-28, foot 301 rising.
-  - Wired (inferred): high boost QB normal 303 one-shot on main nozzles 31-34 (boosting
-    ahead) or legs back 25-28; booster light 299 (a point light only, see
-    `crates/acvd-formats/examples/ffxtree.rs`) on bs0010 points 41/42 while the boosters fire.
-  - Not wired: QB shortage 304 / large 305 (EN shortage and Boost Charge, neither modelled),
-    ground dust (`groundsfxparam.bin` walk/landing rows), water splashes, cartridges
-    (`cartridge_sfx_id`). Boost Charge (□ held, row 284 wind-up) is not implemented.
+  - Booster routing is traced (see Done). Still open: heat-haze distortion (action 43) draws
+    as a refractive quad; the 360 shot's blown-out white core is the additive stack plus the
+    engine bloom, which Bevy's tonemap does not match. QB shortage 304 and QB large 305 are
+    built into lists at the sfx object `+0xb0` and the four `0x82891c50` slots, and
+    `0x82892f08` never plays them (EN shortage and Boost Charge are not modelled). Also not
+    wired: ground dust from `groundsfxparam.bin` (walk/landing rows), water splashes,
+    cartridges (`cartridge_sfx_id`). Boost Charge (□ held, row 284 wind-up) is not implemented.
   - Muzzle scale: f0001218 as stored is a 16 m flash and a 20 m sprite (user: far too
     large), so the game scales weapon effects at spawn. `weapons::MUZZLE_SCALE` 0.25 is a
     guess; find the spawn call that reads `muzzle_sfx_id` (+0x02 of the weaponsfx row) and its
@@ -291,10 +276,65 @@ in order:
 
 ## Done
 
+- Booster VFX groups (`acvd-game::sfx::boosters`, probe `private/xenia/boost_vfx.txt`,
+  recipe `tools/xenia/recipes/boost_vfx.txt`). The sfx controller (`vtable 0x82098d10`)
+  builds the lists in `0x82893ec0` from `MAP_SFXPARAM_ST` copied to object `+0x740`, and
+  `0x828932a0` plays them through `0x82892f08`. Ground boost is movement slot `+0x10`
+  (`0x828225e8`, mode 0, f2 = 0); air boost is slot `+0x2c` (`0x828234f0`, mode 0, f2 = 1);
+  glide is slots `+0x34` / `+0x38` (mode 1, both intensities = stick length clamped to global
+  param 0 `+0x498`, full stick = 0.6); non-boost air is slot `+0x14` (mode 2); slot `+0x44`
+  is mode 4 with both intensities = param 0 `+0x4e0` (0.7). Flags: 1 and 2 play main 300 on
+  dummies 31-34 (2 is the rear stick sectors 6/7/8 from `0x82825918`), 0x40 plays foot 301
+  on those same nozzles, 4/8 play back 302 on side dummies 11/12 and 13/14 at scale |stick x|
+  past 0.1. Mode 1 also plays 303 on leg points 21-24 and effect 1379 (`li 0x563`) on dummy
+  31; every other mode plays 302 on 21-24. Light 299 rides 41 with the main/foot lists and
+  42/43 with the side lists. Quick boost (`0x82822980`) does not call the dispatcher. The
+  live FX scale is uniform `(f, f, f, 1)` (`0x830e8ef8`). Bevy's `AlphaMode::Add` shader already
+  does `rgb * alpha` and writes alpha 0, so a second premultiply squared the cyan nozzle
+  (alpha about 0.8) and left alpha-1 orange at full strength. f0000301's 2020 copies are model
+  61 (s1020 / s1011), not cluster 108. UVs already sit in one atlas cell, so the frame index
+  slides them. Each copy keeps the spawner's world matrix from birth (`private/shots/boost_glide_axis.png`:
+  45 copies, span 160.8 m along velocity, axis about (-0.8, 0.5, -0.3) against vel (1, 0, 0)).
+  The orange streak on that frame is f1379 on dummy 31: s1011 scale z peaks at 5 (mesh about
+  4 m, so roughly 20 m) and the colour key is (1, 0.47, 0). f301's own meshes stay small
+  (s1020 about 0.8 m, persistent s1011 scale z 0.1–0.25, effect scale 0.6), so they do not
+  form the 360's blue-white beams (`private/xenia/shots/boost_glide.png`). Model builder
+  `0x8311a928` reads action 61 through slot 34 (slot 21 is the draw-mode switch; 2 is the
+  plain scaled model at `0x82c711d8`); slot 44 (4 on the spawned flame, 6 on the core) is not
+  read. `param/FilterParamList.xml` has no bloom entry. Normal boost is still the small cyan
+  nozzle plus f0000300 ground dust (`private/xenia/shots/boost_fwd.png`); it was not re-shot
+  after the trail change. The glide shot still does not match.
+
 - Map lighting, fog and sky dome (`sheets/map_env.csv`, `acvd-formats::env`, `acvd-game::env`):
   env light sets / fog / scene record read and matched to the 360's probed shader uploads; map
   pieces lit with the Flver_ColDif maths; `o9705` sky dome behind everything, centred under
   the camera at the env sky scale like the 360 sky pass. Open leftovers under Map look.
+- Map piece LOD (`sheets/map_lod.csv`, `acvd-game::map`). m4000's piece binder has 57 full
+  FLVERs and 39 `{model}_l1.flv` (54 of 72 kind-0 parts; no `_l2`; face flags 0). The model
+  LOD metric is `max(distance - radius, 0.1) / (2 * radius)` (`0x82d13e70`, radius at model
+  +0x5c, 2 at `0x820b005c`). `0x82d10640` (vtable `0x8210c7c8` +0x68) maps that to level 0
+  below 0.1, 1 below 0.4, 2 below 2, 3 through 15 (floats `0x82013518`, `0x82052b18`,
+  `0x820b005c`, `0x82039608`). Levels 1-3 share `_l1`. Above 15 the function returns 0
+  before picking a level; using that as a world-distance cull hid 481 of 550 parts at the
+  actest camera, so those parts stay up and use `_l1` too. At that camera the run is
+  232 full and 318 `_l1` (`private/shots/m4000_lod.png`). The distance is the VMX length
+  stored as distance±radius at the LOD object +4/+8; that block is not instruction-decoded.
+  The model-pointer fetch `0x82d134b0` is `li r3, 0; blr`. Loader `0x82d0eee0`.
+
+- Air glide clips (`sheets/ac_states.csv` `glide_air_in` / `glide_air`, `acvd-game` `glide_clip`).
+  Off the ground a glide plays the directional 30-frame entry (acmotion 223-230, builder
+  `0x82883c80`) and then the air-float wheel (row 222, anim 62, booster clip 3, builder
+  `0x82883d30`). Landing returns to the ground wheel.
+
+- Booster nozzles pivot with the move (`acvd-game::boost`, `sheets/booster_anim.csv`).
+  The four roots stay on the core sockets (`sheets/assembly_slots.csv`, flag 3). The bank
+  `model/ac/motion/boost/boost_a.bnd.dcx` is `model_ac:\motion\%s%s\%s` with `""` and `boost`
+  (360 `0x8284e078`, call `0x8284ec18`). `BoosterAnimID` (acmotion byte +8, read at `0x82882d80`)
+  selects `a00_<id>.ani`. Clips of 360 frames are direction wheels and use the body lean's eased
+  heading (or the velocity heading, for high boost); the others hold one pose. `Booster_Frame`
+  (hokan +0x10) is the blend, read as milliseconds. The mounted rotation stays, plus the
+  parent-space change from the clip's rest pose. `boost_la` is the light set and is not played.
+
 - AC test scene: `acvd-game` now starts in the garage AC TEST map, drawn from the disc.
   - **Which map**: the 360 exe has `AcTestScene` (`garagescene.lua` `Scr_CreateScene(2008,
     "AcTestScene")`) and `AcTestSortieScene` (0x825dbcd8, load step 0x825dcb68); the disc has
@@ -555,11 +595,20 @@ in order:
   The flag byte is switched at 360 `0x8288cea0`. Flags 0/1 (`0x8288c0b8`) build a basis on
   the socket forward against world +Y; flags 2/3 (`0x8288bef8`) against world +Z, so a
   booster nozzle (local -Y) lies along the socket forward. Each booster root uses its own
-  socket (`l_boost` 8, `l2_boost` 25, `r_boost` 9, `r2_boost` 26); a missing 25/26 copies
-  the inner booster's place. Hanger racks are the fixed models `hgl0001` / `hgr0001` on arm
-  dummies 80/81; the hanger weapon then sits on rack dummies 85/87 with the rack's rotation
-  (flag 4 shares the unread VMX path, so it copies the rack instead). Checked on designs
-  5013 and 6003 from the front, side, back and three-quarter.
+  socket (`l_boost` 8 and `r_boost` 9 on the back, `l2_boost` 25 and `r2_boost` 26 on the
+  front). 31 cores have no 25/26 (cr0230, cr04xx-06xx, cr1010, cr2230, cr24x0, cr25x0,
+  cr2620, cr3010, cr4010). There no record attaches, and `0x8288db60` (booster category 6
+  only) calls model vtable `0x82044bec` slot 8 = `0x8258aed8` with `(bone, 0, children)`;
+  `0x82c92688` clears the draw bit of each mesh on that bone, so the front pair is not
+  drawn. `acvd-game` lists those roots in `Placement::hidden` and zeroes their joint scale
+  (`boost::Folded`). Vtable from `private/xenia/boost_front.txt` (AC TEST recipe); the hide
+  branch itself did not fire there (that AC's core has 25/26). Hanger racks are the fixed models `hgl0001` / `hgr0001` on arm
+  dummies 80/81; the hanger weapon then sits on rack dummies 85/87. Flag 4
+  (`0x8288a058` → `0x827ce358`) points the weapon's local -Z along the socket forward, with
+  world +Y as the up hint (±90° about X when they are parallel, `0x82d4ee50`). Rack dummies
+  85/87 point along +Y. The rack's own clip then pitches that bone (`sheets/hanger_anim.csv`,
+  `acvd-game::hanger`). The stow clip is `a00_(30 + 6*hanger_pose)` held on its last
+  frame; `hanger_pose` is category-10 byte +0x0a (`sheets/ac_part_fields.csv`).
 
 - Sound, the first free-play cues (`acvd-formats::fsb` / `::fev`, `acvd-game::sound`,
   `sheets/sound_cues.csv`). PS3 banks are FSB4 MPEG; the 360 build names the cue.
@@ -678,7 +727,7 @@ in order:
 - Text: FMG reader (`acvd-formats::fmg`); 1250 UTF-16BE banks, 15 Shift-JIS `partsname_*.fmg`.
 - Fonts: CCM/CCF reader (`acvd-formats::ccm`); versions 0x10000/1 (24-byte glyphs) and 0x10002
   (28-byte). `acvd-game` draws `fontdef.xml` ID 1 (`e1_ext`) plus `partsname_en.fmg` as a HUD
-  overlay. DRB: `acvd-formats::drb` decodes dialogs (GLD), objects (OGLD), shapes (Sprite, MonoRect/Frame, GouraudRect/Frame, Text, Dialog, Null, AlphaAnimSprite) and textures on all 69 layouts; the module doc has every record layout. Sprite texture ids >= 1000 are runtime slots (emblems 10000+, movies 101xx, maps 102xx). `acvd-render::menu` + the `acvd-menu` viewer (`cargo run -p acvd-viewer --bin acvd-menu -- staffroll`) draw a dialog tree with its sibling `.tpf.dcx` textures; verified on staffroll (rotated strip seamless) and vssortie timer / Data_Rule (flipped corners and arrows). Text (360 `DrbShape_createText` 0x824ac270): byte +0x15 font (`fontdef.xml` ID, read by `acvd-formats::fontdef`), +0x16 align (low 2 bits left/right/center, 0x8 vertical center), +0x17 mode: 0 static RTS string at +0x1c, 1 message (bank +0x1c, id +0x20; 36-byte record; bank 1 = `menu.fmg`, e.g. PauseLabel 0x109a = PAUSE; `TextMgr_getMessage` 0x82b1a8b0, bank 2 code-filled), 2 runtime (capacity +0x1c, filled via `MenuText`), 3 special classes. `acvd-render::menu` draws them; fonts load the exact `CcmFile` (e10 ships a .ccm and the .ccf fontdef names, with different advances). Sprite blend byte: 1 alpha, 2 additive (`menu::AdditiveSprite`; `piece1/2` and `rocksight_insight` are art on black that only works added). A Dialog shape's color is applied as a multiplicative tint of its sub-dialog: inferred from `ACV_FE_LockSightCenter`, whose digit plates are the white `FE_font_base` nine-slice under `000000ff` Dialogs (360 Dialog factory 0x824ac1f8 is shared with FormSprite; the tint is not traced). `AlphaAnimSprite` (factory `0x824abaf8`, ctor `0x824ced28`, draw `0x824cedd0`, `Sprite_AlphaRef.fpo`): sprite plus mask uv / index / mirror; fill 0..1 at object +0x44 (vtable slot 0x3c `0x824cecf8`); a texel shows where mask alpha ≥ 1 − fill (`menu::MenuGauge`). In-game HUD (`acvd-game::hud`): `sortie.drb.dcx` `Top_outline` + `ACV_LockSight_base` + `ACV_FE_LockSightCenter` (laid out around (0,0), placed at screen center), letterboxed 1280x720. Setup `0x829d0290`, per-frame `0x829d0b30` (vtable `0x820c3010` slot 0x5c). AP digits are the frame-part `ap` sum (`sheets/ac_part_fields.csv` +0x138; `0x8286a600`; design 5001 = 34695); EN digits are `int(EN/ENmax × 10000)` as EN1..EN3 . EN4 EN5 (`0x82596b48`), 100.00 at full. Gauges fill AP / EN at 1.0 and L/R remaining/magazine, times a show scale over StaticDrawParam `gauge_show_time` (+0x42c); below `ap_red_zone` / `en_red_zone` / `ammo_red_zone` they fade to `gauge_low_*` over `gauge_color_time` (`0x82599090`). Side `Weapon` panels at `ACV_FE_Normal` LeftArm / RightArm (`0x82598b30`) show `CurAmmo` (`0x825970f0`, `%d` ≤ 9999). Digit sprites are authored '0' at (317,135)-(330,151) of `ACV_FE_Locksight_02`, 0-9 in 13-texel steps (`0x82598218`). AP and energy stay full until damage and energy drain exist.
+  overlay. DRB: `acvd-formats::drb` decodes dialogs (GLD), objects (OGLD), shapes (Sprite, MonoRect/Frame, GouraudRect/Frame, Text, Dialog, Null, AlphaAnimSprite) and textures on all 69 layouts; the module doc has every record layout. Sprite texture ids >= 1000 are runtime slots (emblems 10000+, movies 101xx, maps 102xx). `acvd-render::menu` + the `acvd-menu` viewer (`cargo run -p acvd-viewer --bin acvd-menu -- staffroll`) draw a dialog tree with its sibling `.tpf.dcx` textures; verified on staffroll (rotated strip seamless) and vssortie timer / Data_Rule (flipped corners and arrows). Text (360 `DrbShape_createText` 0x824ac270): byte +0x15 font (`fontdef.xml` ID, read by `acvd-formats::fontdef`), +0x16 align (low 2 bits left/right/center, 0x8 vertical center), +0x17 mode: 0 static RTS string at +0x1c, 1 message (bank +0x1c, id +0x20; 36-byte record; bank 1 = `menu.fmg`, e.g. PauseLabel 0x109a = PAUSE; `TextMgr_getMessage` 0x82b1a8b0, bank 2 code-filled), 2 runtime (capacity +0x1c, filled via `MenuText`), 3 special classes. `acvd-render::menu` draws them; fonts load the exact `CcmFile` (e10 ships a .ccm and the .ccf fontdef names, with different advances). Sprite blend byte: 1 alpha, 2 additive (`menu::AdditiveSprite`; `piece1/2` and `rocksight_insight` are art on black that only works added). A Dialog shape's color is applied as a multiplicative tint of its sub-dialog: inferred from `ACV_FE_LockSightCenter`, whose digit plates are the white `FE_font_base` nine-slice under `000000ff` Dialogs (360 Dialog factory 0x824ac1f8 is shared with FormSprite; the tint is not traced). `AlphaAnimSprite` (factory `0x824abaf8`, ctor `0x824ced28`, draw `0x824cedd0`, `Sprite_AlphaRef.fpo`): sprite plus mask uv / index / mirror; fill 0..1 at object +0x44 (vtable slot 0x3c `0x824cecf8`); a texel shows where mask alpha ≥ 1 − fill (`menu::MenuGauge`). In-game HUD (`acvd-game::hud`): `sortie.drb.dcx` `ACV_LockSight_base` + `ACV_FE_LockSightCenter` (laid out around (0,0), placed at screen center), letterboxed 1280x720. `Top_outline` is not drawn (a faint frame around the screen). Setup `0x829d0290`, per-frame `0x829d0b30` (vtable `0x820c3010` slot 0x5c). AP digits are the frame-part `ap` sum (`sheets/ac_part_fields.csv` +0x138; `0x8286a600`; design 5001 = 34695); EN digits are `int(EN/ENmax × 10000)` as EN1..EN3 . EN4 EN5 (`0x82596b48`), 100.00 at full. Gauges fill AP / EN at 1.0 and L/R remaining/magazine, times a show scale over StaticDrawParam `gauge_show_time` (+0x42c); below `ap_red_zone` / `en_red_zone` / `ammo_red_zone` they fade to `gauge_low_*` over `gauge_color_time` (`0x82599090`). Side `Weapon` panels at `ACV_FE_Normal` LeftArm / RightArm (`0x82598b30`) show `CurAmmo` (`0x825970f0`, `%d` ≤ 9999). Digit sprites are authored '0' at (317,135)-(330,151) of `ACV_FE_Locksight_02`, 0-9 in 13-texel steps (`0x82598218`). AP and energy stay full until damage and energy drain exist. The filled quarters in `ACV_LockSight_base` (white, alpha 10) are not drawn: stacked on the arcs their edge is a white disc. `Locksight_bar` is not drawn: it is a solid band across the crosshair. The arcs and the gauge tracks (`AP_ENBar_base`, `WeaponBar_base`) use the lock-sight digit color `0x00ffa5ff`. Player coloring and gauge shading (the options swatch; 100 is opaque) are not applied, so the ring is that green rather than the selected swatch.
 
 - Animation timing: clips play at 60 fps (was 30, too slow) and acanimhokan blend values are read as milliseconds (was 60 Hz frames, 2-20 s fades). User-confirmed walking looks right; still unverified against the 360 code.
 

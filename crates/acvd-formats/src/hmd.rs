@@ -116,23 +116,47 @@ pub fn is_hmd(data: &[u8]) -> bool {
 pub fn read(data: &[u8]) -> Result<Hmd> {
     let r = Be(data);
     ensure!(r.u32(0)? == MAGIC, "not an HMD");
-    ensure!(r.u32(4)? == VERSION, "HMD version {:#x}, expected {VERSION:#x}", r.u32(4)?);
+    ensure!(
+        r.u32(4)? == VERSION,
+        "HMD version {:#x}, expected {VERSION:#x}",
+        r.u32(4)?
+    );
     let size = r.u32(8)? as usize;
-    ensure!(size == data.len(), "HMD size {size:#x} != buffer {:#x}", data.len());
+    ensure!(
+        size == data.len(),
+        "HMD size {size:#x} != buffer {:#x}",
+        data.len()
+    );
     let nmat = r.u32(0x0C)? as usize;
     let nmesh = r.u32(0x10)? as usize;
     ensure!(nmesh <= 256, "HMD mesh count {nmesh}");
     let nv = r.u32(0x14)? as usize;
-    ensure!(r.u32(0x18)? == 0, "HMD +0x18 is {:#x}, expected 0", r.u32(0x18)?);
+    ensure!(
+        r.u32(0x18)? == 0,
+        "HMD +0x18 is {:#x}, expected 0",
+        r.u32(0x18)?
+    );
     let nn = r.u32(0x1C)? as usize;
     let nt = r.u32(0x20)? as usize;
-    ensure!(r.u32(0x24)? == 0x40, "HMD string table at {:#x}, expected 0x40", r.u32(0x24)?);
+    ensure!(
+        r.u32(0x24)? == 0x40,
+        "HMD string table at {:#x}, expected 0x40",
+        r.u32(0x24)?
+    );
     let records = (r.u32(0x28)? as usize).next_multiple_of(4);
     let tri_off = r.u32(0x2C)? as usize;
-    let node_off = tri_off.checked_sub(nn * NODE).context("HMD triangle offset is before its nodes")?;
+    let node_off = tri_off
+        .checked_sub(nn * NODE)
+        .context("HMD triangle offset is before its nodes")?;
     let first_vert = (tri_off + nt * TRIANGLE).next_multiple_of(4);
-    ensure!(first_vert + nv * VERTEX == size, "HMD vertices do not end at the file size");
-    ensure!(records + nmesh * MESH <= node_off, "HMD mesh records run into the nodes");
+    ensure!(
+        first_vert + nv * VERTEX == size,
+        "HMD vertices do not end at the file size"
+    );
+    ensure!(
+        records + nmesh * MESH <= node_off,
+        "HMD mesh records run into the nodes"
+    );
 
     let mut materials = Vec::with_capacity(nmat);
     for i in 0..nmat {
@@ -150,7 +174,9 @@ pub fn read(data: &[u8]) -> Result<Hmd> {
             translation: v3(o)?,
             rotation: v3(o + 0x0C)?,
             scale: v3(o + 0x18)?,
-            parent: usize::try_from(parent).ok().filter(|&p| p < nmesh && p != k),
+            parent: usize::try_from(parent)
+                .ok()
+                .filter(|&p| p < nmesh && p != k),
             first_vertex: 0,
             vertex_count: 0,
         });
@@ -159,16 +185,34 @@ pub fn read(data: &[u8]) -> Result<Hmd> {
             spans.push((k, nodes_at, verts_at));
         }
     }
-    ensure!(spans.first().is_none_or(|s| s.1 == node_off && s.2 == first_vert), "HMD first mesh does not start at the first node / vertex");
-    ensure!(spans.windows(2).all(|w| w[0].1 < w[1].1 && w[0].2 <= w[1].2), "HMD mesh spans out of order");
+    ensure!(
+        spans
+            .first()
+            .is_none_or(|s| s.1 == node_off && s.2 == first_vert),
+        "HMD first mesh does not start at the first node / vertex"
+    );
+    ensure!(
+        spans
+            .windows(2)
+            .all(|w| w[0].1 < w[1].1 && w[0].2 <= w[1].2),
+        "HMD mesh spans out of order"
+    );
     let mut geometry = Vec::with_capacity(spans.len());
     for (i, &(k, nodes_at, verts_at)) in spans.iter().enumerate() {
         let (nodes_end, verts_end) = spans.get(i + 1).map_or((tri_off, size), |s| (s.1, s.2));
-        ensure!((nodes_end - nodes_at) % NODE == 0 && (verts_end - verts_at) % VERTEX == 0, "HMD mesh {k} span is not whole nodes / vertices");
+        ensure!(
+            (nodes_end - nodes_at) % NODE == 0 && (verts_end - verts_at) % VERTEX == 0,
+            "HMD mesh {k} span is not whole nodes / vertices"
+        );
         let first = (verts_at - first_vert) / VERTEX;
         let count = (verts_end - verts_at) / VERTEX;
         (meshes[k].first_vertex, meshes[k].vertex_count) = (first, count);
-        geometry.push(((nodes_at - node_off) / NODE, (nodes_end - node_off) / NODE, first, count));
+        geometry.push((
+            (nodes_at - node_off) / NODE,
+            (nodes_end - node_off) / NODE,
+            first,
+            count,
+        ));
     }
 
     let mut nodes = Vec::with_capacity(nn);
@@ -190,8 +234,14 @@ pub fn read(data: &[u8]) -> Result<Hmd> {
     let mut owner: Vec<Option<(usize, usize)>> = vec![None; nt];
     for &(n0, n1, first, count) in &geometry {
         for n in &nodes[n0..n1] {
-            let (start, len) = (usize::try_from(n.first).unwrap_or(0), usize::try_from(n.count).unwrap_or(0));
-            ensure!(start + len <= nt, "HMD node triangles {start}+{len} past {nt}");
+            let (start, len) = (
+                usize::try_from(n.first).unwrap_or(0),
+                usize::try_from(n.count).unwrap_or(0),
+            );
+            ensure!(
+                start + len <= nt,
+                "HMD node triangles {start}+{len} past {nt}"
+            );
             for o in &mut owner[start..start + len] {
                 *o = Some((first, count));
             }
@@ -221,7 +271,13 @@ pub fn read(data: &[u8]) -> Result<Hmd> {
         vertices.push([r.f32(o)?, r.f32(o + 4)?, r.f32(o + 8)?]);
     }
 
-    Ok(Hmd { materials, meshes, nodes, triangles, vertices })
+    Ok(Hmd {
+        materials,
+        meshes,
+        nodes,
+        triangles,
+        vertices,
+    })
 }
 
 #[cfg(test)]
@@ -273,7 +329,10 @@ mod tests {
         put_u16(&mut d, TRI_OFF, 0);
         put_u16(&mut d, TRI_OFF + 2, 2);
         put_u16(&mut d, TRI_OFF + 4, 4);
-        for (i, v) in [0.0f32, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0].into_iter().enumerate() {
+        for (i, v) in [0.0f32, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0]
+            .into_iter()
+            .enumerate()
+        {
             put_f32(&mut d, VERT_OFF + 4 * i, v);
         }
         d
@@ -292,14 +351,24 @@ mod tests {
 
     #[test]
     fn multi_mesh_object_from_disc() {
-        let Some(disc) = crate::vfs::test_disc() else { return };
-        let h = read(&crate::vfs::open(&disc, "model/obj/o0006/o0006_m.bnd.dcx|o0006_h.hmd").unwrap()).unwrap();
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
+        let h =
+            read(&crate::vfs::open(&disc, "model/obj/o0006/o0006_m.bnd.dcx|o0006_h.hmd").unwrap())
+                .unwrap();
         assert_eq!(h.meshes.len(), 5);
-        assert_eq!(h.meshes.iter().map(|m| m.vertex_count).collect::<Vec<_>>(), [0, 16, 40, 32, 32]);
+        assert_eq!(
+            h.meshes.iter().map(|m| m.vertex_count).collect::<Vec<_>>(),
+            [0, 16, 40, 32, 32]
+        );
         assert_eq!(h.meshes[3].parent, Some(0));
         assert_eq!(h.triangles.len(), 148);
         let (m3, world) = (&h.meshes[3], h.model_vertices());
         let (local, placed) = (h.vertices[m3.first_vertex], world[m3.first_vertex]);
-        assert_eq!([placed[0] - local[0], placed[2] - local[2]], [22.0, -21.75592]);
+        assert_eq!(
+            [placed[0] - local[0], placed[2] - local[2]],
+            [22.0, -21.75592]
+        );
     }
 }

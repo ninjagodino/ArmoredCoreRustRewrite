@@ -15,13 +15,20 @@ fn main() -> anyhow::Result<()> {
     };
     let disc = vfs::Disc::open(&path)?;
     let name = args.first().cloned().unwrap_or_else(|| "sortie".into());
-    let asset = if name.ends_with(".drb.dcx") { name } else { format!("lang/en/menu/{name}.drb.dcx") };
+    let asset = if name.ends_with(".drb.dcx") {
+        name
+    } else {
+        format!("lang/en/menu/{name}.drb.dcx")
+    };
     let data = disc.asset(&asset)?;
     let d = drb::read(&data)?;
     let wanted = &args[1.min(args.len())..];
     if wanted.is_empty() {
         for s in &d.sections {
-            println!("section {:5} count {:5} size {:#x} at {:#x}", s.tag, s.count, s.size, s.offset);
+            println!(
+                "section {:5} count {:5} size {:#x} at {:#x}",
+                s.tag, s.count, s.size, s.offset
+            );
         }
         for (i, t) in d.textures.iter().enumerate() {
             println!("texture {i}: {} ({})", t.name, t.path);
@@ -31,7 +38,13 @@ fn main() -> anyhow::Result<()> {
         if !wanted.is_empty() && !wanted.iter().any(|w| w == &dlg.name) {
             continue;
         }
-        println!("dialog {i} `{}` {}x{} ({} objects)", dlg.name, dlg.size[0], dlg.size[1], dlg.objects.len());
+        println!(
+            "dialog {i} `{}` {}x{} ({} objects)",
+            dlg.name,
+            dlg.size[0],
+            dlg.size[1],
+            dlg.objects.len()
+        );
         for o in &dlg.objects {
             println!("  {:24} {:16} {:?}", o.name, o.control, o.shape);
             if let Shape::Other { class, .. } = &o.shape {
@@ -48,10 +61,17 @@ fn main() -> anyhow::Result<()> {
 /// that `object` uses (found by scanning `OGLD` for the object name).
 fn raw_record(data: &[u8], d: &drb::Drb, class: &str, object: &str) -> Option<String> {
     let body = |tag: &str| d.section(tag).map(|s| &data[s.offset..s.offset + s.size]);
-    let be = |b: &[u8], at: usize| b.get(at..at + 4).map(|w| u32::from_be_bytes(w.try_into().unwrap()));
+    let be = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|w| u32::from_be_bytes(w.try_into().unwrap()))
+    };
     let (rts, ogld, pahs, rphs) = (body("RTS")?, body("OGLD")?, body("PAHS")?, body("RPHS")?);
     let string = |at: u32| -> String {
-        let units: Vec<u16> = rts[at as usize..].chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
+        let units: Vec<u16> = rts[at as usize..]
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
         String::from_utf16_lossy(&units)
     };
     for o in (0..ogld.len()).step_by(0x20) {
@@ -64,7 +84,13 @@ fn raw_record(data: &[u8], d: &drb::Drb, class: &str, object: &str) -> Option<St
         }
         let at = be(pahs, shape + 4)? as usize;
         let end = (at + 64).min(rphs.len());
-        return Some(rphs[at..end].chunks(4).map(|w| w.iter().map(|b| format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>().join(" "));
+        return Some(
+            rphs[at..end]
+                .chunks(4)
+                .map(|w| w.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     None
 }

@@ -62,16 +62,36 @@ const MAX_LIFE: f32 = 5.0;
 /// Shoot id `FUN_82891e18` writes when the weapon has no `acweaponsoundparam` row.
 const DEFAULT_SHOOT: i16 = 0x12B;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hand {
     Right,
     Left,
 }
 
-/// The two hand weapons of the shown design, with magazine and fire cooldown.
+/// The two hand weapons and the two bay weapons of the shown design.
+/// `hands` / `bays` are `[right, left]`.
 #[derive(Component)]
 pub struct Armament {
     pub hands: [Gun; 2],
+    pub bays: [Gun; 2],
+}
+
+/// A bay shift in progress. While this exists the fire buttons do not shoot: they already
+/// started the exchange (`sheets/ac_states.csv` `bay_shift_*` / `bay_purge_*`).
+#[derive(Resource)]
+pub(crate) struct Shift {
+    pub hand: Hand,
+    pub purge: bool,
+    /// Body-clip frame where the equipped weapon is parented onto the rack.
+    pub swap_at: f32,
+    /// Body-clip frame where the hand, up at the shoulder again, takes the weapon that rode the spin.
+    pub grab_at: f32,
+    pub swapped: bool,
+    pub grabbed: bool,
+    /// 0 = stowed prong, 1 = swung forward (`a00_011` around frame 90).
+    pub present: f32,
+    /// The weapon that started on the rack. It stays there until `grab_at`.
+    pub racked: Option<Entity>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -239,6 +259,7 @@ impl Armament {
     pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
         Self {
             hands: [gun(design.armwep_r as i64), gun(design.armwep_l as i64)],
+            bays: [gun(design.hanger_r as i64), gun(design.hanger_l as i64)],
         }
     }
 }
@@ -288,6 +309,7 @@ pub(crate) struct Body<'w> {
     anims: Option<ResMut<'w, WeaponAnims>>,
     garage: Res<'w, crate::Garage>,
     motion: Option<ResMut<'w, Motion>>,
+    shift: Option<Res<'w, Shift>>,
 }
 
 /// World transforms of the weapon roots and of any joint (last frame's propagation).
@@ -359,6 +381,15 @@ pub fn fire(
         want[0] |= pad.pressed(GamepadButton::RightTrigger2);
         want[1] |= pad.pressed(GamepadButton::LeftTrigger2);
     }
+    // Bay shift (manual 20403): while the modifier is held, the fire buttons exchange that
+    // arm with its bay weapon instead of shooting. The clip keeps the block after release.
+    let shifting = body.shift.is_some()
+        || keys.pressed(KeyCode::KeyR)
+        || held.0.contains(&KeyCode::KeyR)
+        || pads.iter().any(|pad| pad.pressed(GamepadButton::North));
+    if shifting {
+        want = [false, false];
+    }
     let aim = pilot.aim_direction();
     let frames = dt * TICK_RATE;
     let sniper_hand = (0..2).find(|&i| arms.hands[i].stance && want[i]).map(|i| {
@@ -369,11 +400,11 @@ pub fn fire(
         }
     });
     let disc = body.garage.disc.clone();
-    if let Some(motion) = body.motion.as_mut() {
-        if let Some(anims) = body.anims.as_mut() {
-            anims
-                .sniper
-                .update(sniper_hand, motion, &disc, &mut *pilot);
+    if body.shift.is_none() {
+        if let Some(motion) = body.motion.as_mut() {
+            if let Some(anims) = body.anims.as_mut() {
+                anims.sniper.update(sniper_hand, motion, &disc, &mut *pilot);
+            }
         }
     }
     for (i, gun) in arms.hands.iter_mut().enumerate() {
@@ -385,7 +416,11 @@ pub fn fire(
             || body.motion.is_none()
             || body.anims.as_ref().is_none_or(|a| a.sniper.allows(hand));
         let fired = if let Some(anims) = body.anims.as_mut() {
-            let (fired, deploy) = match anims.rigs.iter_mut().find(|r| r.hand == hand) {
+            let (fired, deploy) = match anims
+                .rigs
+                .iter_mut()
+                .find(|r| r.hand == hand && !r.bay && !r.retired)
+            {
                 Some(rig) => {
                     let fired = rig.playback.tick(want[i], can, frames);
                     let deploy = rig.playback.deploys();
@@ -472,25 +507,27 @@ pub fn fire(
             commands.spawn((Mesh3d(assets.mesh.clone()), MeshMaterial3d(material), shot));
         }
     }
-    if let Some(anims) = body.anims.as_mut() {
-        for (i, gun) in arms.hands.iter().enumerate() {
-            let (hand, column) = if i == 0 {
-                (Hand::Right, "armwep_r")
-            } else {
-                (Hand::Left, "armwep_l")
-            };
-            let muzzle = points
-                .iter()
-                .find(|(_, p)| p.column == column && p.id == MUZZLE_POINT)
-                .map(|(e, _)| e);
-            let arm = &mut anims.aim[i];
-            arm.sniper = gun.sniper;
-            arm.step(want[i] && gun.kind != Kind::Skip && !gun.stance, frames);
-            arm.frame = arm
-                .shoulder
-                .and_then(|s| rigging.aim_frame(s, hand, muzzle, aim));
+    if body.shift.is_none() {
+        if let Some(anims) = body.anims.as_mut() {
+            for (i, gun) in arms.hands.iter().enumerate() {
+                let (hand, column) = if i == 0 {
+                    (Hand::Right, "armwep_r")
+                } else {
+                    (Hand::Left, "armwep_l")
+                };
+                let muzzle = points
+                    .iter()
+                    .find(|(_, p)| p.column == column && p.id == MUZZLE_POINT)
+                    .map(|(e, _)| e);
+                let arm = &mut anims.aim[i];
+                arm.sniper = gun.sniper;
+                arm.step(want[i] && gun.kind != Kind::Skip && !gun.stance, frames);
+                arm.frame = arm
+                    .shoulder
+                    .and_then(|s| rigging.aim_frame(s, hand, muzzle, aim));
+            }
+            anims.apply_recoil(frames, &mut posed);
         }
-        anims.apply_recoil(frames, &mut posed);
     }
     for (e, mut shot, mut transform) in &mut shots {
         shot.life -= dt;
@@ -518,7 +555,26 @@ pub fn fire(
     }
 }
 
+pub(crate) fn silent() -> Gun {
+    Gun {
+        remaining: 0,
+        magazine: 0,
+        reload_time: 0.0,
+        cooldown: 0.0,
+        init_speed: 0.0,
+        kind: Kind::Skip,
+        gravity: 0.0,
+        fx: Fx::default(),
+        shoot: 0,
+        stance: false,
+        sniper: false,
+    }
+}
+
 fn gun(id: i64) -> Gun {
+    if id <= 0 {
+        return silent();
+    }
     let magazine = part_field(id, 10, "magazine").max(0.0) as u16;
     let init_speed = part_field(id, 10, "init_speed");
     let (kind, gravity, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
@@ -717,6 +773,10 @@ impl Playback {
 
 struct WeaponRig {
     hand: Hand,
+    /// On the rack until a bay shift brings it to the hand.
+    bay: bool,
+    /// The weapon was purged: it stays off the hand and off the rack.
+    retired: bool,
     playback: Playback,
     /// Pose over the locomotion clip. Weapon meshes leave body-driven joints alone.
     body: bool,
@@ -727,13 +787,7 @@ struct WeaponRig {
 }
 
 impl SniperStance {
-    fn update(
-        &mut self,
-        want: Option<Hand>,
-        motion: &mut Motion,
-        disc: &Disc,
-        pilot: &mut Pilot,
-    ) {
+    fn update(&mut self, want: Option<Hand>, motion: &mut Motion, disc: &Disc, pilot: &mut Pilot) {
         match want {
             Some(hand) => {
                 let restart = self.phase == SniperPhase::Off
@@ -777,13 +831,7 @@ impl SniperStance {
 }
 
 /// `sniper_ready_*` / `sniper_stow_*` in `sheets/ac_states.csv`.
-fn play_stance(
-    hand: Hand,
-    release: bool,
-    motion: &mut Motion,
-    disc: &Disc,
-    pilot: &Pilot,
-) -> bool {
+fn play_stance(hand: Hand, release: bool, motion: &mut Motion, disc: &Disc, pilot: &Pilot) -> bool {
     let state = match (hand, release) {
         (Hand::Right, false) => "sniper_ready_r",
         (Hand::Right, true) => "sniper_stow_r",
@@ -805,14 +853,37 @@ fn play_stance(
 }
 
 impl WeaponAnims {
-    /// Loads hand `a00` clips, the arm deploy clips on that side, and the rifle kick bones.
-    pub fn load(&mut self, disc: &Disc, placement: &Placement, rig: &Rig, joints: &[Entity]) {
-        let hands = placement_hands(placement.column);
-        if hands.is_empty() {
-            return;
+    /// The weapon that was in the hand and the one on the bay trade places. A purge retires
+    /// the hand weapon instead of parking it on the rack.
+    pub(crate) fn transfer(&mut self, hand: Hand, purge: bool) {
+        for rig in &mut self.rigs {
+            if rig.hand != hand || rig.retired {
+                continue;
+            }
+            if purge && !rig.bay {
+                rig.retired = true;
+            } else {
+                rig.bay = !rig.bay;
+            }
         }
-        // `arm_l` and `arm_r` share one placement (assembly_slots.csv column `arms`).
+    }
+
+    /// Loads hand and bay `a00` clips, the arm deploy clips on that side, and the rifle kick bones.
+    pub fn load(&mut self, disc: &Disc, placement: &Placement, rig: &Rig, joints: &[Entity]) {
         let arm = placement.column == "arms";
+        let placed = placement_place(placement.column);
+        let hands: &[Hand] = if arm {
+            &[Hand::Right, Hand::Left]
+        } else if let Some((hand, _)) = placed {
+            match hand {
+                Hand::Right => &[Hand::Right],
+                Hand::Left => &[Hand::Left],
+            }
+        } else {
+            return;
+        };
+        let bay = placed.is_some_and(|(_, bay)| bay);
+        // `arm_l` and `arm_r` share one placement (assembly_slots.csv column `arms`).
         if arm {
             let controls = vfs::open(disc, "param/jcondata.bin")
                 .and_then(|d| jcon::read(&d))
@@ -876,6 +947,11 @@ impl WeaponAnims {
                     continue;
                 }
                 if let Some(b) = rig.bones.iter().position(|x| x.name == name) {
+                    // The part root's local is the socket mount. A weapon clip's root sits at
+                    // the origin, and writing it would pull the gun off the dummy.
+                    if !arm && rig.bones[b].parent.is_none() {
+                        continue;
+                    }
                     if let Some(&entity) = joints.get(b) {
                         pairs.push((entity, i));
                     }
@@ -883,6 +959,7 @@ impl WeaponAnims {
             }
             if pairs.is_empty() && !arm && skeleton.bones.len() == rig.bones.len() {
                 pairs = (0..rig.bones.len())
+                    .filter(|i| rig.bones[*i].parent.is_some())
                     .filter_map(|i| joints.get(i).copied().map(|entity| (entity, i)))
                     .collect();
             }
@@ -893,6 +970,8 @@ impl WeaponAnims {
                 || part_field(placement.part as i64, placement.category, "ready_position") != 0.0;
             let built = WeaponRig {
                 hand,
+                bay,
+                retired: false,
                 playback: Playback::new(ready, frames),
                 body: arm,
                 joints: pairs,
@@ -909,7 +988,13 @@ impl WeaponAnims {
 
     /// Kicking bones of this arm's `gun_$(LR)` and `sniper_$(LR)` controls. The kick axis is
     /// not a field; LockMinX/LockMaxX is the wide limit on `*_arm01`, so it is a local X rotation.
-    fn note_recoil(&mut self, hand: Hand, controls: &[jcon::Control], rig: &Rig, joints: &[Entity]) {
+    fn note_recoil(
+        &mut self,
+        hand: Hand,
+        controls: &[jcon::Control],
+        rig: &Rig,
+        joints: &[Entity],
+    ) {
         let side = match hand {
             Hand::Right => "R",
             Hand::Left => "L",
@@ -930,7 +1015,11 @@ impl WeaponAnims {
                     aim.limit = object.lock[0][0].abs().max(object.lock[0][1].abs());
                 }
             }
-            for object in control.objects.iter().filter(|o| o.react_ang != 0.0 && o.react_time > 0.0) {
+            for object in control
+                .objects
+                .iter()
+                .filter(|o| o.react_ang != 0.0 && o.react_time > 0.0)
+            {
                 let Some(entity) = rig
                     .bones
                     .iter()
@@ -1040,7 +1129,11 @@ impl RecoilBone {
 impl ArmAim {
     /// Advances `frames` 60 Hz frames; `want` is fire held on this side this frame.
     fn step(&mut self, want: bool, frames: f32) {
-        self.hold = if want { AIM_HOLD } else { (self.hold - frames).max(0.0) };
+        self.hold = if want {
+            AIM_HOLD
+        } else {
+            (self.hold - frames).max(0.0)
+        };
         self.weight = if self.hold > 0.0 {
             (self.weight + frames / AIM_RAISE).min(1.0)
         } else {
@@ -1205,12 +1298,14 @@ impl WeaponRig {
 }
 
 /// Which hands a placement carries. The two arm slots share the `arms` column.
-fn placement_hands(column: &str) -> &'static [Hand] {
+/// `(hand, on the bay rack)`.
+fn placement_place(column: &str) -> Option<(Hand, bool)> {
     match column {
-        "armwep_r" => &[Hand::Right],
-        "armwep_l" => &[Hand::Left],
-        "arms" => &[Hand::Right, Hand::Left],
-        _ => &[],
+        "armwep_r" => Some((Hand::Right, false)),
+        "armwep_l" => Some((Hand::Left, false)),
+        "hanger_r" => Some((Hand::Right, true)),
+        "hanger_l" => Some((Hand::Left, true)),
+        _ => None,
     }
 }
 
@@ -1272,15 +1367,27 @@ mod tests {
         assert_eq!(kick.step(1.0), 0.0, "idle joint is untouched");
         kick.trigger();
         let frames: Vec<f32> = (0..60).map(|_| kick.step(1.0)).collect();
-        assert!(frames[..5].iter().all(|&a| a == 0.0), "nothing before ReactDelay");
+        assert!(
+            frames[..5].iter().all(|&a| a == 0.0),
+            "nothing before ReactDelay"
+        );
         let (peak_at, peak) = frames
             .iter()
             .enumerate()
             .min_by(|a, b| a.1.total_cmp(b.1))
             .unwrap();
-        assert!((peak + 10.0).abs() < 1e-4 && (10..=12).contains(&peak_at), "{frames:?}");
-        assert!(frames[peak_at + 15] > -6.0 && frames[peak_at + 15] < -4.0, "halfway back");
-        assert_eq!(frames[59], 0.0, "settled {KICK_RETURN} frames after the kick");
+        assert!(
+            (peak + 10.0).abs() < 1e-4 && (10..=12).contains(&peak_at),
+            "{frames:?}"
+        );
+        assert!(
+            frames[peak_at + 15] > -6.0 && frames[peak_at + 15] < -4.0,
+            "halfway back"
+        );
+        assert_eq!(
+            frames[59], 0.0,
+            "settled {KICK_RETURN} frames after the kick"
+        );
     }
 
     #[test]
@@ -1302,29 +1409,44 @@ mod tests {
             let angle = bone.kick.step(1.0);
             bone.rest_on(&mut transform, angle);
             let off = pose.inverse() * transform.rotation;
-            assert!(off.angle_between(Quat::IDENTITY).to_degrees() <= 10.01, "frame {frame}");
+            assert!(
+                off.angle_between(Quat::IDENTITY).to_degrees() <= 10.01,
+                "frame {frame}"
+            );
         }
         for _ in 0..60 {
             let angle = bone.kick.step(1.0);
             bone.rest_on(&mut transform, angle);
         }
-        assert!(transform.rotation.angle_between(pose) < 1e-4, "returns to the pose");
+        assert!(
+            transform.rotation.angle_between(pose) < 1e-4,
+            "returns to the pose"
+        );
     }
 
     #[test]
     fn arm_raises_on_fire_holds_then_lowers() {
         let mut arm = ArmAim::default();
         arm.step(true, 5.0);
-        assert!((arm.weight - 0.5).abs() < 1e-4, "half raised after 5 of {AIM_RAISE} frames");
+        assert!(
+            (arm.weight - 0.5).abs() < 1e-4,
+            "half raised after 5 of {AIM_RAISE} frames"
+        );
         arm.step(true, 5.0);
         assert_eq!(arm.weight, 1.0);
         for _ in 1..AIM_HOLD as usize {
             arm.step(false, 1.0);
         }
-        assert_eq!(arm.weight, 1.0, "held {AIM_HOLD} frames after fire is let go");
+        assert_eq!(
+            arm.weight, 1.0,
+            "held {AIM_HOLD} frames after fire is let go"
+        );
         arm.step(false, 1.0);
         arm.step(false, 29.0);
-        assert!((arm.weight - 0.5).abs() < 1e-4, "half lowered after 30 of {AIM_LOWER}");
+        assert!(
+            (arm.weight - 0.5).abs() < 1e-4,
+            "half lowered after 30 of {AIM_LOWER}"
+        );
         arm.step(false, 30.0);
         assert_eq!(arm.weight, 0.0);
     }
@@ -1347,14 +1469,23 @@ mod tests {
         let full = arm.turn(base);
         let off = barrel(Quat::IDENTITY).angle_between(frame.aim).to_degrees();
         assert!(off < 85.0, "test setup: start {off} deg off");
-        assert!(barrel(full).angle_between(frame.aim) < 1e-3, "points along the aim");
+        assert!(
+            barrel(full).angle_between(frame.aim) < 1e-3,
+            "points along the aim"
+        );
         arm.weight = 0.5;
         let half = barrel(arm.turn(base)).angle_between(frame.aim).to_degrees();
         assert!((half - off / 2.0).abs() < 0.1, "{half} vs {off}");
-        arm.frame = Some(AimFrame { aim: Vec3::Y, ..frame });
+        arm.frame = Some(AimFrame {
+            aim: Vec3::Y,
+            ..frame
+        });
         arm.weight = 1.0;
         let turned = barrel(arm.turn(base)).angle_between(barrel(Quat::IDENTITY));
-        assert!((turned.to_degrees() - 85.0).abs() < 0.1, "clamped to LockMaxX");
+        assert!(
+            (turned.to_degrees() - 85.0).abs() < 0.1,
+            "clamped to LockMaxX"
+        );
     }
 
     #[test]
@@ -1372,9 +1503,9 @@ mod tests {
 
     #[test]
     fn arms_slot_covers_both_hands() {
-        assert!(placement_hands("arms") == [Hand::Right, Hand::Left]);
-        assert!(placement_hands("armwep_r") == [Hand::Right]);
-        assert!(placement_hands("core").is_empty());
+        assert_eq!(placement_place("armwep_r"), Some((Hand::Right, false)));
+        assert_eq!(placement_place("hanger_l"), Some((Hand::Left, true)));
+        assert_eq!(placement_place("core"), None);
     }
 
     #[test]

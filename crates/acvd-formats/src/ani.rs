@@ -47,15 +47,29 @@ pub struct Layout {
 
 impl Layout {
     pub fn fields(&self) -> usize {
-        1 + 3 * self.translation as usize + 2 * self.rotation_tangents as usize + self.scale as usize
+        1 + 3 * self.translation as usize
+            + 2 * self.rotation_tangents as usize
+            + self.scale as usize
     }
     pub fn row_size(&self) -> usize {
         (2 + self.width * self.fields()).next_multiple_of(4)
     }
 }
 
-const fn layout(kind: u32, width: usize, translation: bool, rotation_tangents: bool, scale: bool) -> Layout {
-    Layout { kind, width, translation, rotation_tangents, scale }
+const fn layout(
+    kind: u32,
+    width: usize,
+    translation: bool,
+    rotation_tangents: bool,
+    scale: bool,
+) -> Layout {
+    Layout {
+        kind,
+        width,
+        translation,
+        rotation_tangents,
+        scale,
+    }
 }
 
 pub const LAYOUTS: [Layout; 6] = [
@@ -92,7 +106,10 @@ pub fn euler_quat([x, y, z]: [f32; 3]) -> [f32; 4] {
     let (sx, cx) = (x / 2.0).sin_cos();
     let (sy, cy) = (y / 2.0).sin_cos();
     let (sz, cz) = (z / 2.0).sin_cos();
-    mul(mul([0.0, sy, 0.0, cy], [0.0, 0.0, sz, cz]), [sx, 0.0, 0.0, cx])
+    mul(
+        mul([0.0, sy, 0.0, cy], [0.0, 0.0, sz, cz]),
+        [sx, 0.0, 0.0, cx],
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,9 +147,16 @@ impl Track {
     fn bracket(&self, frame: f32) -> Option<(&Key, &Key, f32, f32)> {
         let last = self.keys.len().checked_sub(1)?;
         let i = self.keys.partition_point(|k| k.frame as f32 <= frame);
-        let (a, b) = (&self.keys[i.saturating_sub(1).min(last)], &self.keys[i.min(last)]);
+        let (a, b) = (
+            &self.keys[i.saturating_sub(1).min(last)],
+            &self.keys[i.min(last)],
+        );
         let span = b.frame as f32 - a.frame as f32;
-        let t = if span > 0.0 { ((frame - a.frame as f32) / span).clamp(0.0, 1.0) } else { 0.0 };
+        let t = if span > 0.0 {
+            ((frame - a.frame as f32) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         Some((a, b, t, span))
     }
 
@@ -143,7 +167,11 @@ impl Track {
             (Some(ta), Some(tb)) => hermite(a.rotation, ta[1], b.rotation, tb[0], t, span),
             _ => std::array::from_fn(|i| a.rotation[i] + (b.rotation[i] - a.rotation[i]) * t),
         };
-        Some(if self.euler { euler_quat(xyz) } else { quat(xyz) })
+        Some(if self.euler {
+            euler_quat(xyz)
+        } else {
+            quat(xyz)
+        })
     }
 
     /// Local translation at `frame`, if the track carries one.
@@ -163,14 +191,24 @@ impl Track {
 
 fn hermite(p0: [f32; 3], m0: [f32; 3], p1: [f32; 3], m1: [f32; 3], t: f32, span: f32) -> [f32; 3] {
     let (t2, t3) = (t * t, t * t * t);
-    let (h00, h10, h01, h11) = (2.0 * t3 - 3.0 * t2 + 1.0, t3 - 2.0 * t2 + t, -2.0 * t3 + 3.0 * t2, t3 - t2);
+    let (h00, h10, h01, h11) = (
+        2.0 * t3 - 3.0 * t2 + 1.0,
+        t3 - 2.0 * t2 + t,
+        -2.0 * t3 + 3.0 * t2,
+        t3 - t2,
+    );
     std::array::from_fn(|i| h00 * p0[i] + h10 * span * m0[i] + h01 * p1[i] + h11 * span * m1[i])
 }
 
 /// Unit quaternion from stored x, y, z with w >= 0.
 pub fn quat([x, y, z]: [f32; 3]) -> [f32; 4] {
     let q = [x, y, z, (1.0 - x * x - y * y - z * z).max(0.0).sqrt()];
-    let n = q.iter().map(|c| c * c).sum::<f32>().sqrt().max(f32::EPSILON);
+    let n = q
+        .iter()
+        .map(|c| c * c)
+        .sum::<f32>()
+        .sqrt()
+        .max(f32::EPSILON);
     q.map(|c| c / n)
 }
 
@@ -205,15 +243,27 @@ impl Anim {
 
 pub fn read(data: &[u8]) -> Result<Anim> {
     let r = Be(data);
-    ensure!(is_ani(data), "not an .ani clip (magic {:#010x})", r.u32(0).unwrap_or(0));
+    ensure!(
+        is_ani(data),
+        "not an .ani clip (magic {:#010x})",
+        r.u32(0).unwrap_or(0)
+    );
     let magic = r.u32(0)?;
     let euler = magic == OLDER;
     let (frames, table, count) = (r.u32(8)?, r.u32(0x0C)? as usize, r.u32(0x10)? as usize);
     let (vpool, kpool) = (r.u32(0x14)? as usize, r.u32(0x18)? as usize);
     let (vectors, keys) = (r.u32(0x1C)? as usize, r.u32(0x20)? as usize);
-    let key_end = if euler { (kpool + keys * 6).next_multiple_of(4) } else { 0 };
+    let key_end = if euler {
+        (kpool + keys * 6).next_multiple_of(4)
+    } else {
+        0
+    };
     for (at, want) in [(0x04, 0), (0x24, key_end), (0x28, 0)] {
-        ensure!(r.u32(at)? as usize == want, "header word {at:#x} is {:#x}, expected {want:#x}", r.u32(at)?);
+        ensure!(
+            r.u32(at)? as usize == want,
+            "header word {at:#x} is {:#x}, expected {want:#x}",
+            r.u32(at)?
+        );
     }
     let (quantized, scale_quantized) = match (r.u32(0x2C)?, r.bytes(0x30, 3)?) {
         (1, [1, 1, s @ (0 | 1)]) => (true, *s == 1),
@@ -241,10 +291,19 @@ pub fn read(data: &[u8]) -> Result<Anim> {
     for b in 0..count {
         let (rest, track_at, camera) = if named {
             let e = table + b * NAMED_ENTRY;
-            ensure!(r.u16(e + 8)? as usize == b, "bone {b} entry carries index {}", r.u16(e + 8)?);
-            let f3 = |at: usize| -> Result<[f32; 3]> { Ok([r.f32(at)?, r.f32(at + 4)?, r.f32(at + 8)?]) };
+            ensure!(
+                r.u16(e + 8)? as usize == b,
+                "bone {b} entry carries index {}",
+                r.u16(e + 8)?
+            );
+            let f3 = |at: usize| -> Result<[f32; 3]> {
+                Ok([r.f32(at)?, r.f32(at + 4)?, r.f32(at + 8)?])
+            };
             let parent = r.u16(e + 0x0C)?;
-            ensure!(parent == NONE || (parent as usize) < count, "bone {b} parent {parent} out of range");
+            ensure!(
+                parent == NONE || (parent as usize) < count,
+                "bone {b} parent {parent} out of range"
+            );
             let rest = Rest {
                 name: r.cstr_sjis(r.u32(e)? as usize)?,
                 kind: r.u32(e + 4)?,
@@ -253,20 +312,48 @@ pub fn read(data: &[u8]) -> Result<Anim> {
                 euler: f3(e + 0x20)?,
                 scale: f3(e + 0x2C)?,
             };
-            (Some(rest), r.u32(e + 0x38)? as usize, Some(r.u32(e + 0x3C)?).filter(|&c| c != 0))
+            (
+                Some(rest),
+                r.u32(e + 0x38)? as usize,
+                Some(r.u32(e + 0x3C)?).filter(|&c| c != 0),
+            )
         } else {
             let e = table + b * UNNAMED_ENTRY;
-            ensure!(r.u32(e + 4)? == 0, "bone {b} entry word 4 is {:#x}", r.u32(e + 4)?);
+            ensure!(
+                r.u32(e + 4)? == 0,
+                "bone {b} entry word 4 is {:#x}",
+                r.u32(e + 4)?
+            );
             (None, r.u32(e)? as usize, None)
         };
         if track_at == 0 {
-            bones.push(Bone { rest, track: Track { kind: 0, euler, keys: Vec::new() }, cached: [0.0; 6], camera });
+            bones.push(Bone {
+                rest,
+                track: Track {
+                    kind: 0,
+                    euler,
+                    keys: Vec::new(),
+                },
+                cached: [0.0; 6],
+                camera,
+            });
             continue;
         }
-        let (rows, n, kind) = (r.u32(track_at)? as usize, r.u32(track_at + 4)? as usize, r.u32(track_at + 8)?);
-        let cached: [f32; 6] = std::array::from_fn(|i| r.f32(track_at + 12 + 4 * i).unwrap_or(f32::NAN));
-        ensure!(r.u32(track_at + 36)? == 0, "bone {b} track word 0x24 is {:#x}", r.u32(track_at + 36)?);
-        let Some(l) = layout_of(kind) else { bail!("bone {b} track kind {kind} has no known row layout") };
+        let (rows, n, kind) = (
+            r.u32(track_at)? as usize,
+            r.u32(track_at + 4)? as usize,
+            r.u32(track_at + 8)?,
+        );
+        let cached: [f32; 6] =
+            std::array::from_fn(|i| r.f32(track_at + 12 + 4 * i).unwrap_or(f32::NAN));
+        ensure!(
+            r.u32(track_at + 36)? == 0,
+            "bone {b} track word 0x24 is {:#x}",
+            r.u32(track_at + 36)?
+        );
+        let Some(l) = layout_of(kind) else {
+            bail!("bone {b} track kind {kind} has no known row layout")
+        };
         let mut list = Vec::with_capacity(n);
         for k in 0..n {
             let at = rows + k * l.row_size();
@@ -274,20 +361,62 @@ pub fn read(data: &[u8]) -> Result<Anim> {
             let mut next = || -> Result<usize> {
                 let p = at + 2 + f * l.width;
                 f += 1;
-                Ok(if l.width == 1 { r.u8(p)? as usize } else { r.u16(p)? as usize })
+                Ok(if l.width == 1 {
+                    r.u8(p)? as usize
+                } else {
+                    r.u16(p)? as usize
+                })
             };
-            let translation = if l.translation { Some([vec3(next()?)?, vec3(next()?)?, vec3(next()?)?]) } else { None };
+            let translation = if l.translation {
+                Some([vec3(next()?)?, vec3(next()?)?, vec3(next()?)?])
+            } else {
+                None
+            };
             let rotation = rot(next()?)?;
-            let rotation_tangents = if l.rotation_tangents { Some([rot(next()?)?, rot(next()?)?]) } else { None };
+            let rotation_tangents = if l.rotation_tangents {
+                Some([rot(next()?)?, rot(next()?)?])
+            } else {
+                None
+            };
             let scale = if l.scale { Some(scl(next()?)?) } else { None };
             let frame = r.u16(at)?;
-            ensure!(list.last().is_none_or(|p: &Key| frame >= p.frame), "bone {b} key frames decrease at {frame}");
-            ensure!(frame as u32 <= frames, "bone {b} key frame {frame} past clip length {frames}");
-            list.push(Key { frame, translation, rotation, rotation_tangents, scale });
+            ensure!(
+                list.last().is_none_or(|p: &Key| frame >= p.frame),
+                "bone {b} key frames decrease at {frame}"
+            );
+            ensure!(
+                frame as u32 <= frames,
+                "bone {b} key frame {frame} past clip length {frames}"
+            );
+            list.push(Key {
+                frame,
+                translation,
+                rotation,
+                rotation_tangents,
+                scale,
+            });
         }
-        bones.push(Bone { rest, track: Track { kind, euler, keys: list }, cached, camera });
+        bones.push(Bone {
+            rest,
+            track: Track {
+                kind,
+                euler,
+                keys: list,
+            },
+            cached,
+            camera,
+        });
     }
-    Ok(Anim { magic, frames, quantized, scale_quantized, euler, vectors, keys, bones })
+    Ok(Anim {
+        magic,
+        frames,
+        quantized,
+        scale_quantized,
+        euler,
+        vectors,
+        keys,
+        bones,
+    })
 }
 
 #[cfg(test)]
@@ -300,9 +429,21 @@ mod tests {
     /// Vectors: (0,0,0), (1,2,3), (0.1,0,0). Keys: identity, x -90 deg, scale 1.
     fn clip(kind: u32) -> Vec<u8> {
         let mut d = vec![0u8; 0x200];
-        let w = |d: &mut Vec<u8>, at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_be_bytes());
-        let h = |d: &mut Vec<u8>, at: usize, v: u16| d[at..at + 2].copy_from_slice(&v.to_be_bytes());
-        for (at, v) in [(0, 0x6010_0910), (8, 10), (0x0C, 0x40), (0x10, 1), (0x14, 0x100), (0x18, 0x140), (0x1C, 3), (0x20, 3), (0x2C, 1)] {
+        let w =
+            |d: &mut Vec<u8>, at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        let h =
+            |d: &mut Vec<u8>, at: usize, v: u16| d[at..at + 2].copy_from_slice(&v.to_be_bytes());
+        for (at, v) in [
+            (0, 0x6010_0910),
+            (8, 10),
+            (0x0C, 0x40),
+            (0x10, 1),
+            (0x14, 0x100),
+            (0x18, 0x140),
+            (0x1C, 3),
+            (0x20, 3),
+            (0x2C, 1),
+        ] {
             w(&mut d, at, v);
         }
         d[0x30..0x33].copy_from_slice(&[1, 1, 1]);
@@ -351,11 +492,23 @@ mod tests {
     fn every_layout_reads_and_samples() {
         for l in LAYOUTS {
             let a = read(&clip(l.kind)).unwrap();
-            assert_eq!((a.frames, a.bones.len(), a.quantized), (10, 1, true), "kind {}", l.kind);
+            assert_eq!(
+                (a.frames, a.bones.len(), a.quantized),
+                (10, 1, true),
+                "kind {}",
+                l.kind
+            );
             let tr = &a.bones[0].track;
             let q = tr.rotation(10.0).unwrap();
-            assert!((q[0] + FRAC_1_SQRT_2).abs() < 1e-4 && (q[3] - FRAC_1_SQRT_2).abs() < 1e-4, "kind {} {q:?}", l.kind);
-            assert_eq!(tr.translation(10.0), l.translation.then_some([1.0, 2.0, 3.0]));
+            assert!(
+                (q[0] + FRAC_1_SQRT_2).abs() < 1e-4 && (q[3] - FRAC_1_SQRT_2).abs() < 1e-4,
+                "kind {} {q:?}",
+                l.kind
+            );
+            assert_eq!(
+                tr.translation(10.0),
+                l.translation.then_some([1.0, 2.0, 3.0])
+            );
             assert_eq!(tr.scale(5.0), l.scale.then_some([1.0; 3]));
         }
     }
@@ -369,10 +522,22 @@ mod tests {
             rotation_tangents: None,
             scale: None,
         };
-        let tr = Track { kind: 6, euler: false, keys: vec![k(0, 0.0, 0.1), k(10, 1.0, 0.1)] };
+        let tr = Track {
+            kind: 6,
+            euler: false,
+            keys: vec![k(0, 0.0, 0.1), k(10, 1.0, 0.1)],
+        };
         assert!((tr.translation(5.0).unwrap()[0] - 0.5).abs() < 1e-6);
         assert!((tr.translation(2.0).unwrap()[0] - 0.2).abs() < 1e-6);
-        assert_eq!(Track { kind: 9, euler: false, keys: vec![] }.rotation(0.0), None);
+        assert_eq!(
+            Track {
+                kind: 9,
+                euler: false,
+                keys: vec![]
+            }
+            .rotation(0.0),
+            None
+        );
     }
 
     #[test]
@@ -385,10 +550,21 @@ mod tests {
         let a = read(&d).unwrap();
         assert!(a.euler && a.named());
         let q = a.bones[0].track.rotation(10.0).unwrap();
-        assert!((q[0] + FRAC_1_SQRT_2).abs() < 1e-3 && (q[3] - FRAC_1_SQRT_2).abs() < 1e-3, "{q:?}");
+        assert!(
+            (q[0] + FRAC_1_SQRT_2).abs() < 1e-3 && (q[3] - FRAC_1_SQRT_2).abs() < 1e-3,
+            "{q:?}"
+        );
         let yz = euler_quat([0.0, 0.5, 0.25]);
-        let expect = [(0.25f32).sin() * (0.125f32).sin(), (0.25f32).sin() * (0.125f32).cos(), (0.25f32).cos() * (0.125f32).sin(), (0.25f32).cos() * (0.125f32).cos()];
-        assert!(yz.iter().zip(expect).all(|(a, b)| (a - b).abs() < 1e-6), "{yz:?}");
+        let expect = [
+            (0.25f32).sin() * (0.125f32).sin(),
+            (0.25f32).sin() * (0.125f32).cos(),
+            (0.25f32).cos() * (0.125f32).sin(),
+            (0.25f32).cos() * (0.125f32).cos(),
+        ];
+        assert!(
+            yz.iter().zip(expect).all(|(a, b)| (a - b).abs() < 1e-6),
+            "{yz:?}"
+        );
     }
 
     #[test]

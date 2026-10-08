@@ -15,7 +15,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
         println!("{asset}: bounds {min:?} .. {max:?}");
-        let bone = |i: i16| usize::try_from(i).ok().and_then(|i| f.bones.get(i)).map_or("-", |b| b.name.as_str());
+        let bone = |i: i16| {
+            usize::try_from(i)
+                .ok()
+                .and_then(|i| f.bones.get(i))
+                .map_or("-", |b| b.name.as_str())
+        };
         for (i, d) in f.dummies.iter().enumerate() {
             println!(
                 "{i:3} ref {:5} color {:?} parent {:<12} attach {:<12} pos {:?} fwd {:?} up {:?}",

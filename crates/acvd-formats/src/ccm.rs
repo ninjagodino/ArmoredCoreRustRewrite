@@ -48,25 +48,48 @@ pub struct Glyph {
 pub fn read(data: &[u8]) -> Result<Ccm> {
     let r = Be(data);
     let version = r.u32(0)?;
-    ensure!(matches!(version, 0x10000..=0x10002), "CCM version {version:#x}");
+    ensure!(
+        matches!(version, 0x10000..=0x10002),
+        "CCM version {version:#x}"
+    );
     let size = r.u32(4)? as usize;
-    ensure!(size <= data.len(), "CCM size {size:#x} past file end {:#x}", data.len());
+    ensure!(
+        size <= data.len(),
+        "CCM size {size:#x} past file end {:#x}",
+        data.len()
+    );
     let group_count = r.i16(0x10)?.max(0) as usize;
     let glyph_count = r.i16(0x12)?.max(0) as usize;
     ensure!(r.u32(0x14)? == 0x20, "CCM groups not at 0x20");
     let glyph_at = r.u32(0x18)? as usize;
-    ensure!(glyph_at == 0x20 + 12 * group_count, "CCM glyphs at {glyph_at:#x}, expected after {group_count} groups");
+    ensure!(
+        glyph_at == 0x20 + 12 * group_count,
+        "CCM glyphs at {glyph_at:#x}, expected after {group_count} groups"
+    );
     let texture_count = r.u8(0x1E)?;
     let groups: Vec<CodeGroup> = (0..group_count)
-        .map(|i| Ok(CodeGroup { first: r.i32(0x20 + 12 * i)?, last: r.i32(0x24 + 12 * i)?, glyph: r.i32(0x28 + 12 * i)? }))
+        .map(|i| {
+            Ok(CodeGroup {
+                first: r.i32(0x20 + 12 * i)?,
+                last: r.i32(0x24 + 12 * i)?,
+                glyph: r.i32(0x28 + 12 * i)?,
+            })
+        })
         .collect::<Result<_>>()?;
     let stride = if version == 0x10002 { 28 } else { 24 };
-    ensure!(glyph_at + stride * glyph_count == size, "CCM glyph table ends at {:#x}, size {size:#x}", glyph_at + stride * glyph_count);
+    ensure!(
+        glyph_at + stride * glyph_count == size,
+        "CCM glyph table ends at {:#x}, size {size:#x}",
+        glyph_at + stride * glyph_count
+    );
     let glyphs: Vec<Glyph> = (0..glyph_count)
         .map(|i| {
             let at = glyph_at + stride * i;
             let texture = r.i16(at + 22)?;
-            ensure!((0..texture_count as i16).contains(&texture), "glyph {i} texture {texture} of {texture_count}");
+            ensure!(
+                (0..texture_count as i16).contains(&texture),
+                "glyph {i} texture {texture} of {texture_count}"
+            );
             Ok(Glyph {
                 uv0: [r.f32(at)?, r.f32(at + 4)?],
                 uv1: [r.f32(at + 8)?, r.f32(at + 12)?],
@@ -74,17 +97,34 @@ pub fn read(data: &[u8]) -> Result<Ccm> {
                 width: r.i16(at + 18)?,
                 advance: r.i16(at + 20)?,
                 texture,
-                unk: (stride == 28).then(|| Ok::<_, anyhow::Error>([r.i16(at + 24)?, r.i16(at + 26)?])).transpose()?,
+                unk: (stride == 28)
+                    .then(|| Ok::<_, anyhow::Error>([r.i16(at + 24)?, r.i16(at + 26)?]))
+                    .transpose()?,
             })
         })
         .collect::<Result<_>>()?;
     let mut next = 0;
     for (i, g) in groups.iter().enumerate() {
-        ensure!(g.glyph == next && g.first <= g.last, "code group {i} out of order");
+        ensure!(
+            g.glyph == next && g.first <= g.last,
+            "code group {i} out of order"
+        );
         next += g.last - g.first + 1;
     }
-    ensure!(next as usize == glyph_count, "code groups cover {next} of {glyph_count} glyphs");
-    Ok(Ccm { version, line_height: r.i16(8)?, tex_width: r.i16(0x0A)?, tex_height: r.i16(0x0C)?, unk0e: r.i16(0x0E)?, texture_count, groups, glyphs })
+    ensure!(
+        next as usize == glyph_count,
+        "code groups cover {next} of {glyph_count} glyphs"
+    );
+    Ok(Ccm {
+        version,
+        line_height: r.i16(8)?,
+        tex_width: r.i16(0x0A)?,
+        tex_height: r.i16(0x0C)?,
+        unk0e: r.i16(0x0E)?,
+        texture_count,
+        groups,
+        glyphs,
+    })
 }
 
 impl Ccm {
@@ -137,11 +177,14 @@ mod tests {
 
     #[test]
     fn disc_fonts() {
-        let Some(disc) = crate::vfs::test_disc() else { return };
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
         let mut n = 0;
         for file in disc.files() {
             let lower = file.to_ascii_lowercase();
-            if !lower.starts_with("font/") || !(lower.ends_with(".ccm") || lower.ends_with(".ccf")) {
+            if !lower.starts_with("font/") || !(lower.ends_with(".ccm") || lower.ends_with(".ccf"))
+            {
                 continue;
             }
             let c = read(&disc.asset(&file).unwrap()).unwrap_or_else(|e| panic!("{file}: {e:#}"));

@@ -60,7 +60,10 @@ pub fn read(data: &[u8]) -> Result<Tpf> {
     let r = Be(data);
     ensure!(r.bytes(0, 4)? == MAGIC, "not a TPF");
     let platform = r.u8(0x0C)?;
-    ensure!(platform == PLATFORM_PS3 || platform == PLATFORM_X360, "TPF platform {platform} is neither 1 nor 2");
+    ensure!(
+        platform == PLATFORM_PS3 || platform == PLATFORM_X360,
+        "TPF platform {platform} is neither 1 nor 2"
+    );
     let flag2 = r.u8(0x0D)?;
     let encoding = r.u8(0x0E)?;
     ensure!(r.u8(0x0F)? == 0, "TPF byte 0x0F is nonzero");
@@ -70,7 +73,8 @@ pub fn read(data: &[u8]) -> Result<Tpf> {
     for i in 0..count {
         let offset = r.u32(at)?;
         let size = r.u32(at + 4)?;
-        let (format, kind, mipmaps, flags1) = (r.u8(at + 8)?, r.u8(at + 9)?, r.u8(at + 10)?, r.u8(at + 11)?);
+        let (format, kind, mipmaps, flags1) =
+            (r.u8(at + 8)?, r.u8(at + 9)?, r.u8(at + 10)?, r.u8(at + 11)?);
         let (width, height) = (r.u16(at + 12)?, r.u16(at + 14)?);
         let unk1 = r.u32(at + 16)?;
         at += 20;
@@ -88,8 +92,13 @@ pub fn read(data: &[u8]) -> Result<Tpf> {
         if has_floats == 1 {
             floats_unk = Some(r.u32(at)?);
             let len = r.u32(at + 4)? as usize;
-            ensure!(len.is_multiple_of(4), "texture {i} float block length {len}");
-            floats = (0..len / 4).map(|k| r.f32(at + 8 + 4 * k)).collect::<Result<_>>()?;
+            ensure!(
+                len.is_multiple_of(4),
+                "texture {i} float block length {len}"
+            );
+            floats = (0..len / 4)
+                .map(|k| r.f32(at + 8 + 4 * k))
+                .collect::<Result<_>>()?;
             at += 8 + len;
         }
         let name = match encoding {
@@ -97,9 +106,29 @@ pub fn read(data: &[u8]) -> Result<Tpf> {
             1 => utf16be(r.bytes(name_offset, data.len().saturating_sub(name_offset))?),
             e => bail!("TPF name encoding {e}"),
         };
-        textures.push(Texture { name, offset, size, format, kind, mipmaps, flags1, width, height, unk1, unk2, floats_unk, floats });
+        textures.push(Texture {
+            name,
+            offset,
+            size,
+            format,
+            kind,
+            mipmaps,
+            flags1,
+            width,
+            height,
+            unk1,
+            unk2,
+            floats_unk,
+            floats,
+        });
     }
-    Ok(Tpf { data_size: r.u32(0x04)?, platform, flag2, encoding, textures })
+    Ok(Tpf {
+        data_size: r.u32(0x04)?,
+        platform,
+        flag2,
+        encoding,
+        textures,
+    })
 }
 
 impl Texture {
@@ -128,18 +157,37 @@ impl Texture {
 
     /// The image in the linear layout (every level of each face, little-endian blocks, faces back
     /// to back): the untiled Xenos image, or the stored bytes of a platform 2 pack.
-    pub fn linear<'a>(&self, platform: u8, tpf: &'a [u8], block_bytes: u32) -> Result<Cow<'a, [u8]>> {
+    pub fn linear<'a>(
+        &self,
+        platform: u8,
+        tpf: &'a [u8],
+        block_bytes: u32,
+    ) -> Result<Cow<'a, [u8]>> {
         let data = self.data(tpf)?;
         if platform != PLATFORM_X360 {
             return Ok(Cow::Borrowed(data));
         }
-        Ok(Cow::Owned(xenos::untile(data, self.width as u32, self.height as u32, self.levels(), self.faces(), block_bytes)?))
+        Ok(Cow::Owned(xenos::untile(
+            data,
+            self.width as u32,
+            self.height as u32,
+            self.levels(),
+            self.faces(),
+            block_bytes,
+        )?))
     }
 }
 
 /// Bytes a block-compressed image takes in a pack of `platform` ([`xenos::size`], or the linear
 /// chains of a platform 2 pack).
-pub fn stored_size(platform: u8, width: u16, height: u16, levels: u32, faces: u32, block_bytes: u32) -> u64 {
+pub fn stored_size(
+    platform: u8,
+    width: u16,
+    height: u16,
+    levels: u32,
+    faces: u32,
+    block_bytes: u32,
+) -> u64 {
     if platform == PLATFORM_X360 {
         xenos::size(width as u32, height as u32, levels, faces, block_bytes)
     } else {
@@ -172,13 +220,27 @@ pub mod xenos {
     fn slice(width: u32, height: u32, level: u32, block_bytes: u32) -> (u32, u32, u64) {
         let (w, h) = if level == 0 {
             let packed = packed_level(width, height) == 0;
-            (width, if packed { height.next_power_of_two() } else { height })
+            (
+                width,
+                if packed {
+                    height.next_power_of_two()
+                } else {
+                    height
+                },
+            )
         } else {
-            ((width.next_power_of_two() >> level).max(1), (height.next_power_of_two() >> level).max(1))
+            (
+                (width.next_power_of_two() >> level).max(1),
+                (height.next_power_of_two() >> level).max(1),
+            )
         };
         let pitch = w.div_ceil(4).next_multiple_of(TILE);
         let rows = h.div_ceil(4).next_multiple_of(TILE);
-        (pitch, rows, (pitch as u64 * rows as u64 * block_bytes as u64).next_multiple_of(SLICE_ALIGN))
+        (
+            pitch,
+            rows,
+            (pitch as u64 * rows as u64 * block_bytes as u64).next_multiple_of(SLICE_ALIGN),
+        )
     }
 
     fn stored_levels(width: u32, height: u32, levels: u32) -> u32 {
@@ -187,7 +249,9 @@ pub mod xenos {
 
     /// Bytes of a tiled image of `levels` levels and `faces` faces.
     pub fn size(width: u32, height: u32, levels: u32, faces: u32, block_bytes: u32) -> u64 {
-        (0..stored_levels(width, height, levels)).map(|l| slice(width, height, l, block_bytes).2 * faces.max(1) as u64).sum()
+        (0..stored_levels(width, height, levels))
+            .map(|l| slice(width, height, l, block_bytes).2 * faces.max(1) as u64)
+            .sum()
     }
 
     /// Byte offset of block (`x`, `y`) in a tiled slice `pitch` blocks wide (Xenia `Tiled2D`).
@@ -198,7 +262,13 @@ pub mod xenos {
         let bytes = ((outer | inner) as u64) << log2;
         let bank = ((y >> 4) & 1) as u64;
         let pipe = (((x >> 3) & 3) ^ (((y >> 3) & 1) << 1)) as u64;
-        ((y as u64 & 1) << 4) | (pipe << 6) | (bank << 11) | (bytes & 0xF) | (((bytes >> 4) & 1) << 5) | (((bytes >> 5) & 7) << 8) | (bytes >> 8 << 12)
+        ((y as u64 & 1) << 4)
+            | (pipe << 6)
+            | (bank << 11)
+            | (bytes & 0xF)
+            | (((bytes >> 4) & 1) << 5)
+            | (((bytes >> 5) & 7) << 8)
+            | (bytes >> 8 << 12)
     }
 
     /// Block offset of `level` inside the packed tail slice (Xenia `GetPackedMipOffset`, 2D).
@@ -207,7 +277,11 @@ pub mod xenos {
         let base = lw.min(lh).saturating_sub(4);
         let m = level - base;
         let (x, y) = if m < 3 {
-            if lw > lh { (0, 16 >> m) } else { (16 >> m, 0) }
+            if lw > lh {
+                (0, 16 >> m)
+            } else {
+                (16 >> m, 0)
+            }
         } else if lw > lh {
             ((1 << (lw - base)) >> (m - 2), 0)
         } else {
@@ -218,10 +292,21 @@ pub mod xenos {
 
     /// The linear little-endian block image (every level of face 0, then face 1, ...) of a
     /// tiled one.
-    pub fn untile(data: &[u8], width: u32, height: u32, levels: u32, faces: u32, block_bytes: u32) -> Result<Vec<u8>> {
+    pub fn untile(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        levels: u32,
+        faces: u32,
+        block_bytes: u32,
+    ) -> Result<Vec<u8>> {
         let faces = faces.max(1);
         let want = size(width, height, levels, faces, block_bytes);
-        ensure!(data.len() as u64 >= want, "tiled {width}x{height} image is {} bytes, needs {want}", data.len());
+        ensure!(
+            data.len() as u64 >= want,
+            "tiled {width}x{height} image is {} bytes, needs {want}",
+            data.len()
+        );
         let packed = packed_level(width, height);
         let bb = block_bytes as usize;
         let mut starts = Vec::new();
@@ -236,9 +321,16 @@ pub mod xenos {
             for level in 0..levels {
                 let stored = level.min(packed) as usize;
                 let (start, pitch, bytes) = starts[stored];
-                let (ox, oy) = if level >= packed { packed_offset(width, height, level) } else { (0, 0) };
+                let (ox, oy) = if level >= packed {
+                    packed_offset(width, height, level)
+                } else {
+                    (0, 0)
+                };
                 let base = (start + face * bytes) as usize;
-                let (bw, bh) = ((width >> level).max(1).div_ceil(4), (height >> level).max(1).div_ceil(4));
+                let (bw, bh) = (
+                    (width >> level).max(1).div_ceil(4),
+                    (height >> level).max(1).div_ceil(4),
+                );
                 for y in 0..bh {
                     for x in 0..bw {
                         let src = base + tiled_offset(x + ox, y + oy, pitch, block_bytes) as usize;
@@ -266,7 +358,14 @@ fn chain(width: u16, height: u16, levels: u32, block_bytes: u32) -> u64 {
 
 /// Byte offset of mip `level` of `face` inside a [`Texture::linear`] image of `levels` levels,
 /// and that level's size.
-pub fn block_level_span(width: u16, height: u16, levels: u32, face: u32, level: u32, block_bytes: u32) -> (u64, u64) {
+pub fn block_level_span(
+    width: u16,
+    height: u16,
+    levels: u32,
+    face: u32,
+    level: u32,
+    block_bytes: u32,
+) -> (u64, u64) {
     let stride = chain(width, height, levels, block_bytes);
     let before = chain(width, height, level, block_bytes);
     let this = chain(width, height, level + 1, block_bytes) - before;
@@ -301,16 +400,29 @@ mod tests {
         }
         let disc = vfs::Disc::open(&iso).unwrap();
         // am9000: 8 tiled BC1/BC3 textures. e9110: a platform 2 pack of linear chains.
-        for (pack, platform, count) in [("model/ac/parts/arm/am9000/am9000.tpf.dcx", PLATFORM_X360, 8), ("model/ene/e9110/e9110.tpf.dcx", PLATFORM_PS3, 4)] {
+        for (pack, platform, count) in [
+            ("model/ac/parts/arm/am9000/am9000.tpf.dcx", PLATFORM_X360, 8),
+            ("model/ene/e9110/e9110.tpf.dcx", PLATFORM_PS3, 4),
+        ] {
             let data = disc.asset(pack).unwrap();
             let t = read(&data).unwrap();
             assert_eq!(t.platform, platform, "{pack}");
             let mut n = 0;
             for a in t.textures.iter().filter(|a| a.format == 0 || a.format == 5) {
                 let bb = if a.format == 0 { 8 } else { 16 };
-                assert_eq!(a.size as u64, stored_size(t.platform, a.width, a.height, a.levels(), a.faces(), bb), "{}", a.name);
+                assert_eq!(
+                    a.size as u64,
+                    stored_size(t.platform, a.width, a.height, a.levels(), a.faces(), bb),
+                    "{}",
+                    a.name
+                );
                 let lin = a.linear(t.platform, &data, bb).unwrap();
-                assert_eq!(lin.len() as u64, chain(a.width, a.height, a.levels(), bb) * a.faces() as u64, "{}", a.name);
+                assert_eq!(
+                    lin.len() as u64,
+                    chain(a.width, a.height, a.levels(), bb) * a.faces() as u64,
+                    "{}",
+                    a.name
+                );
                 n += 1;
             }
             assert_eq!(n, count, "{pack}");

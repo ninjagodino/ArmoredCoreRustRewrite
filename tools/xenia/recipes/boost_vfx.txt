@@ -1,0 +1,28 @@
+# AC TEST, then boost forward / side / back / strafe, glide, quick boost and a boost jump.
+# L1 is LB, glide is LS (L3), high boost is X (west / square). Shots are the guest framebuffer.
+run ac_test.txt
+wait 2
+press LB
+wait 0.4
+stick L 0 1 3
+shot private/xenia/shots/boost_fwd.png
+stick R 1 0 1.2
+stick L 0 1 2
+shot private/xenia/shots/boost_side.png
+stick L 0 -1 2.5
+shot private/xenia/shots/boost_back.png
+stick L 1 0 2
+shot private/xenia/shots/boost_strafe.png
+stick L 0 1
+press LS
+wait 1.6
+shot private/xenia/shots/boost_glide.png
+stick L 0 1
+press X
+wait 0.4
+shot private/xenia/shots/boost_qb.png
+stick L 0 1
+hold A 1.4
+shot private/xenia/shots/boost_jump.png
+release
+wait 1

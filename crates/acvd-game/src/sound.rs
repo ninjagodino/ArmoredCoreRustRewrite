@@ -122,7 +122,10 @@ impl Cues {
             }
             return None;
         };
-        let wav = match sample.decode().map(|pcm| wav_pcm(&pcm.to_i16(), pcm.channels, sample.frequency)) {
+        let wav = match sample
+            .decode()
+            .map(|pcm| wav_pcm(&pcm.to_i16(), pcm.channels, sample.frequency))
+        {
             Ok(wav) => wav,
             Err(err) => {
                 eprintln!("sound: {}#{}: {err:#}", wave.bank, wave.index);
@@ -281,15 +284,41 @@ mod tests {
         let Ok(disc) = Disc::open(&iso) else { return };
         let mut cues = Cues::load(&disc);
         assert_eq!(cues.projects.len(), 3);
-        for cue in ["w00000034", BOOST_ON, BOOST_LOOP, "c00000024", QUICK_BOOST[0], QUICK_BOOST[1], GLIDE_ON] {
-            let waves: Vec<fev::Wave> = cues.projects.iter().find_map(|p| p.event(cue).map(|_| p.waves(cue).into_iter().cloned().collect())).unwrap();
+        for cue in [
+            "w00000034",
+            BOOST_ON,
+            BOOST_LOOP,
+            "c00000024",
+            QUICK_BOOST[0],
+            QUICK_BOOST[1],
+            GLIDE_ON,
+        ] {
+            let waves: Vec<fev::Wave> = cues
+                .projects
+                .iter()
+                .find_map(|p| {
+                    p.event(cue)
+                        .map(|_| p.waves(cue).into_iter().cloned().collect())
+                })
+                .unwrap();
             let wave = &waves[0];
             let sample = cues.bank(&wave.bank).unwrap().samples[wave.index as usize].clone();
-            assert!(sample.xma(), "{cue}: {} mode {:#x}", sample.name, sample.mode);
+            assert!(
+                sample.xma(),
+                "{cue}: {} mode {:#x}",
+                sample.name,
+                sample.mode
+            );
             let pcm = sample.decode().unwrap();
             assert_eq!(pcm.errors, 0, "{cue}");
-            assert_eq!(pcm.samples.len(), sample.length as usize * sample.channels as usize);
-            assert!(pcm.to_i16().iter().any(|&s| s.unsigned_abs() > 1000), "{cue} decoded to silence");
+            assert_eq!(
+                pcm.samples.len(),
+                sample.length as usize * sample.channels as usize
+            );
+            assert!(
+                pcm.to_i16().iter().any(|&s| s.unsigned_abs() > 1000),
+                "{cue} decoded to silence"
+            );
         }
     }
 }

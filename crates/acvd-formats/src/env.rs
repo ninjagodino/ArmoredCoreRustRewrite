@@ -113,7 +113,10 @@ fn light(r: &Be, name: String, d: usize) -> Result<LightSet> {
     Ok(LightSet {
         name,
         slot: r.u8(d + 1)? as u32 * 32 + r.u8(d)? as u32,
-        angles: [[r.i16(d + 2)?, r.i16(d + 4)?], [r.i16(d + 0x28)?, r.i16(d + 0x2a)?]],
+        angles: [
+            [r.i16(d + 2)?, r.i16(d + 4)?],
+            [r.i16(d + 0x28)?, r.i16(d + 0x2a)?],
+        ],
         colors: [vec4(r, d + 8)?, vec4(r, d + 0x2c)?],
         colors_b: [vec4(r, d + 0x18)?, vec4(r, d + 0x3c)?],
         sky: vec4(r, d + 0x70)?,
@@ -144,7 +147,10 @@ pub fn read(data: &[u8]) -> Result<Env> {
     };
     for off in msb::section(data, "EVENT_PARAM_ST")? {
         let name_rel = r.u32(off)? as usize;
-        ensure!(name_rel < 0x400, "env event at {off:#x} name offset {name_rel:#x}");
+        ensure!(
+            name_rel < 0x400,
+            "env event at {off:#x} name offset {name_rel:#x}"
+        );
         let e = Event {
             name: r.cstr_sjis(off + name_rel)?,
             id: r.i32(off + 4)?,
@@ -180,8 +186,11 @@ mod tests {
     /// Values the 360 uploaded for m4000's map set (`private/xenia/envlook_mission2.jsonl`).
     #[test]
     fn m4000_env_from_disc() {
-        let Some(disc) = crate::vfs::test_disc() else { return };
-        let env = read(&crate::vfs::open(&disc, "model/map/ch_env/m4000_env.msb").unwrap()).unwrap();
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
+        let env =
+            read(&crate::vfs::open(&disc, "model/map/ch_env/m4000_env.msb").unwrap()).unwrap();
         assert_eq!(env.events.len(), 21);
         assert_eq!(env.events.iter().filter(|e| e.kind == EVENT_BGM).count(), 1);
         let slots: Vec<u32> = env.lights.iter().map(|l| l.slot).collect();
@@ -190,16 +199,25 @@ mod tests {
 
         let map = env.light(1).unwrap();
         let d = map.direction(0);
-        assert!(near(d[0], -0.4777) && near(d[1], 0.6691) && near(d[2], 0.5693), "{d:?}");
+        assert!(
+            near(d[0], -0.4777) && near(d[1], 0.6691) && near(d[2], 0.5693),
+            "{d:?}"
+        );
         assert_eq!(map.angles, [[42, 140], [-6, 30]]);
         assert_eq!(map.colors[0], [1.5, 1.5, 1.4, 1.6]);
         assert_eq!(map.fog.color, [0.8, 0.8, 0.8, 0.6]);
-        assert_eq!((map.fog.start, map.fog.range, map.fog.falloff), (30.0, 375.0, 10.0));
+        assert_eq!(
+            (map.fog.start, map.fog.range, map.fog.falloff),
+            (30.0, 375.0, 10.0)
+        );
         assert!(map.fog.rising);
         assert_eq!(map.fog.height_range, 0.0);
 
         let mountain = env.light(2).unwrap();
-        assert_eq!((mountain.fog.height_range, mountain.fog.height_base), (20.0, 50.0));
+        assert_eq!(
+            (mountain.fog.height_range, mountain.fog.height_base),
+            (20.0, 50.0)
+        );
         assert!(near(mountain.fog.height_color[3], 0.14));
 
         let scene = env.scene.unwrap();

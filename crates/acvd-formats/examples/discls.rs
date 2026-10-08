@@ -26,7 +26,10 @@ fn main() -> anyhow::Result<()> {
         let entries = acvd_formats::bnd3::read(&binder)?.entries;
         for (i, e) in entries.iter().enumerate() {
             let name = e.name.clone().unwrap_or_else(|| format!("{i}"));
-            let path = name.rsplit_once(':').map_or(name.as_str(), |(_, p)| p).replace('\\', "/");
+            let path = name
+                .rsplit_once(':')
+                .map_or(name.as_str(), |(_, p)| p)
+                .replace('\\', "/");
             let dest = out.join(path.trim_start_matches('/'));
             std::fs::create_dir_all(dest.parent().unwrap())?;
             std::fs::write(&dest, vfs::entry(&binder, &format!("#{i}"))?)?;
@@ -35,9 +38,16 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("--extract") {
-        let (prefix, out) = (args[1].to_ascii_lowercase(), std::path::PathBuf::from(&args[2]));
+        let (prefix, out) = (
+            args[1].to_ascii_lowercase(),
+            std::path::PathBuf::from(&args[2]),
+        );
         let mut n = 0;
-        for file in disc.files().into_iter().filter(|f| f.to_ascii_lowercase().starts_with(&prefix)) {
+        for file in disc
+            .files()
+            .into_iter()
+            .filter(|f| f.to_ascii_lowercase().starts_with(&prefix))
+        {
             let dest = out.join(&file);
             std::fs::create_dir_all(dest.parent().unwrap())?;
             std::fs::write(&dest, disc.read(&file)?)?;
@@ -46,9 +56,21 @@ fn main() -> anyhow::Result<()> {
         println!("{n} files -> {}", out.display());
         return Ok(());
     }
-    let prefix = args.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
-    for file in disc.files().into_iter().filter(|f| f.to_ascii_lowercase().starts_with(&prefix)) {
-        println!("{:>10} {file}", disc.size(&file).map(|s| s.to_string()).unwrap_or_else(|_| "?".into()));
+    let prefix = args
+        .first()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    for file in disc
+        .files()
+        .into_iter()
+        .filter(|f| f.to_ascii_lowercase().starts_with(&prefix))
+    {
+        println!(
+            "{:>10} {file}",
+            disc.size(&file)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "?".into())
+        );
     }
     Ok(())
 }

@@ -40,16 +40,33 @@ pub fn read(data: &[u8], record_size: impl Fn(usize) -> Option<usize>) -> Result
     }
     let (mut at, mut records) = (HEADER_SIZE, Vec::new());
     for (category, &count) in counts.iter().enumerate().filter(|(_, &c)| c > 0) {
-        let Some(size) = record_size(category) else { bail!("category {category} has {count} records but no record size") };
-        ensure!(size >= 4, "category {category} record size {size} is shorter than its ids");
+        let Some(size) = record_size(category) else {
+            bail!("category {category} has {count} records but no record size")
+        };
+        ensure!(
+            size >= 4,
+            "category {category} record size {size} is shorter than its ids"
+        );
         for index in 0..count as usize {
             let rec = r.bytes(at, size)?;
-            records.push(Record { category, index, offset: at, id: r.u16(at)?, model_id: r.u16(at + 2)?, data: rec });
+            records.push(Record {
+                category,
+                index,
+                offset: at,
+                id: r.u16(at)?,
+                model_id: r.u16(at + 2)?,
+                data: rec,
+            });
             at += size;
         }
     }
     let tail = data[at..].iter().position(|&b| b != 0).map(|i| at + i);
-    Ok(Parts { counts, records, end: at, tail })
+    Ok(Parts {
+        counts,
+        records,
+        end: at,
+        tail,
+    })
 }
 
 #[cfg(test)]
@@ -67,9 +84,16 @@ mod tests {
 
     #[test]
     fn walks_categories_in_order() {
-        let d = file(&[(0, 1), (2, 2)], &[&[0, 1, 0, 1, 9, 9], &[0, 5, 0, 6], &[0, 7, 0, 7], &[0, 0]]);
+        let d = file(
+            &[(0, 1), (2, 2)],
+            &[&[0, 1, 0, 1, 9, 9], &[0, 5, 0, 6], &[0, 7, 0, 7], &[0, 0]],
+        );
         let p = read(&d, |c| [Some(6), None, Some(4)][c]).unwrap();
-        let ids: Vec<_> = p.records.iter().map(|r| (r.category, r.id, r.model_id)).collect();
+        let ids: Vec<_> = p
+            .records
+            .iter()
+            .map(|r| (r.category, r.id, r.model_id))
+            .collect();
         assert_eq!(ids, [(0, 1, 1), (2, 5, 6), (2, 7, 7)]);
         assert_eq!((p.end, p.tail), (d.len() - 2, None));
     }

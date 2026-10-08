@@ -12,7 +12,10 @@ fn main() -> anyhow::Result<()> {
         None => vfs::repo_root().join(vfs::X360_ISO),
     };
     let disc = vfs::Disc::open(&path)?;
-    let name = args.first().cloned().unwrap_or_else(|| "acv2_se_booster".into());
+    let name = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "acv2_se_booster".into());
     let project = fev::read(&disc.read(&format!("sound/{name}.fev"))?)?;
     for event in &project.events {
         let layers: Vec<String> = event

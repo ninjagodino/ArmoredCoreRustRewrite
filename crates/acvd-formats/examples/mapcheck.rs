@@ -8,7 +8,10 @@ use acvd_formats::{bnd3, hmd, msb, vfs};
 
 fn main() -> anyhow::Result<()> {
     let root = vfs::repo_root();
-    let path = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| root.join(vfs::X360_ISO));
+    let path = std::env::args()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join(vfs::X360_ISO));
     let disc = vfs::Disc::open(&path)?;
     let (mut msbs, mut other_msb, mut hmds, mut failed) = (0, 0, 0, 0);
     let mut meshes: BTreeMap<usize, usize> = BTreeMap::new();
@@ -26,7 +29,9 @@ fn main() -> anyhow::Result<()> {
     for file in disc.files() {
         let lower = file.to_ascii_lowercase();
         if lower.ends_with(".msb") {
-            let Ok(data) = vfs::open(&disc, &file) else { continue };
+            let Ok(data) = vfs::open(&disc, &file) else {
+                continue;
+            };
             if !msb::is_msb(&data) {
                 other_msb += 1;
                 continue;
@@ -34,11 +39,17 @@ fn main() -> anyhow::Result<()> {
             msbs += 1;
             let r = Ok(&data).and_then(|d| Ok((msb::parts(d)?, msb::points(d)?)));
             match r {
-                Ok((_, points)) => points.iter().for_each(|p| *kinds.entry(p.kind).or_default() += 1),
+                Ok((_, points)) => points
+                    .iter()
+                    .for_each(|p| *kinds.entry(p.kind).or_default() += 1),
                 Err(e) => fail(&file, e),
             }
-        } else if lower.starts_with("model/") && (lower.ends_with(".bnd") || lower.ends_with(".bnd.dcx")) {
-            let Ok(data) = vfs::open(&disc, &file) else { continue };
+        } else if lower.starts_with("model/")
+            && (lower.ends_with(".bnd") || lower.ends_with(".bnd.dcx"))
+        {
+            let Ok(data) = vfs::open(&disc, &file) else {
+                continue;
+            };
             let Ok(b) = bnd3::read(&data) else { continue };
             for e in &b.entries {
                 let name = e.name.as_deref().unwrap_or_default();
@@ -46,7 +57,11 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 hmds += 1;
-                let r = e.contents(&data).map_err(anyhow::Error::from).and_then(|c| vfs::undcx(c.into_owned())).and_then(|d| hmd::read(&d));
+                let r = e
+                    .contents(&data)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|c| vfs::undcx(c.into_owned()))
+                    .and_then(|d| hmd::read(&d));
                 match r {
                     Ok(h) => *meshes.entry(h.meshes.len()).or_default() += 1,
                     Err(err) => fail(&format!("{file}|{name}"), err),

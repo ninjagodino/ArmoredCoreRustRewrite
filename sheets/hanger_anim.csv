@@ -1,0 +1,4 @@
+name,unit,expr,evidence
+binder,path,model/ac/parts/hanger/hgr0001/hgr0001_a.bnd.dcx and hgl0001_a.bnd.dcx,"The rack models are hgr0001 / hgl0001 (assembly_slots.csv). Each ships an _a binder beside the _m mesh. a00_000 is named (bones 81, r_hg01, r_hg02, r_hg_f, r_hg03, r_hg_b on the right; 80 and l_hg* on the left). Unnamed clips share that bone order"
+stowed,pose,a00_(30+6*hanger_pose) plus shoulder pitch,"Category-10 byte +0x0a is 0..4 and selects arrive clip 30+6*n. That clip still has the muzzle up; the rack shoulder (r_hg01 / l_hg01) then takes another 100° about parent X, counterclockwise in the side view, so the muzzle points down the back"
+swing,clip,a00_011,"180 frames. r_hg02 and r_hg03 spin 179°, r_hg_f 152°. Frame 0 is the stowed prong. Played on bones 2.. only after the hand weapon is seated (bay shift frame 40, acmotion 280/281). Out and back across the remaining body frames, so the rack does not move on the click. Bones 0 and 1 stay on the stow"

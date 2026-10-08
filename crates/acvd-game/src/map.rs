@@ -6,10 +6,10 @@
 //! `{texture}.tpf.dcx` per texture; `{map}_l.tpf.dcx` is the low-resolution copy). Objects
 //! (part kind 1) load from `model/obj/{o}/{o}_m.bnd.dcx`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{flver, msb};
+use acvd_formats::{bnd3, flver, msb};
 use acvd_render::{LoadedMesh, Packs};
 use anyhow::Result;
 use bevy::prelude::*;
@@ -43,7 +43,11 @@ pub fn binder(map: &str, part: &msb::Part) -> Option<String> {
 
 /// The part's placement in FLVER (game) axes.
 pub fn xform(part: &msb::Part) -> flver::Xform {
-    flver::Xform::local(part.translation, part.rotation_deg.map(f32::to_radians), part.scale)
+    flver::Xform::local(
+        part.translation,
+        part.rotation_deg.map(f32::to_radians),
+        part.scale,
+    )
 }
 
 /// Where the player AC starts: Bevy position and yaw (radians, as `control::Pilot::yaw`).
@@ -63,7 +67,10 @@ pub fn start(disc: &Disc, map: &str, layout: Option<&str>) -> Result<Option<Star
     sources.push(terrain_msb(disc, map));
     for path in sources.into_iter().filter(|p| disc.exists(p)) {
         let points = msb::points(&vfs::open(disc, &path)?)?;
-        if let Some(p) = points.iter().find(|p| p.kind == msb::POINT_START && p.kind_index == 0) {
+        if let Some(p) = points
+            .iter()
+            .find(|p| p.kind == msb::POINT_START && p.kind_index == 0)
+        {
             let [x, y, z] = p.translation;
             return Ok(Some(Start {
                 position: Vec3::new(-x, y, z),
@@ -78,7 +85,58 @@ pub fn start(disc: &Disc, map: &str, layout: Option<&str>) -> Result<Option<Star
 #[derive(Component)]
 pub struct MapPart;
 
+/// One placed part's two meshes. The full mesh is `{model}.flv`; `low` is `{model}_l1.flv`
+/// when the binder has one (`sheets/map_lod.csv`).
+#[derive(Component)]
+pub(crate) struct MapLod {
+    /// Bounding-sphere centre, world metres.
+    center: Vec3,
+    radius: f32,
+    full: Entity,
+    low: Option<Entity>,
+}
+
+/// LOD metric `max(distance - radius, 0.1) / (2 * radius)` (`0x82d13e70`, `0x82d107f0`).
+/// Level 0 below 0.1, level 1 below 0.4, level 2 below 2, level 3 through 15, hidden past 15
+/// (`0x82d10640`). Map pieces only ship level 0 and `_l1`, so levels 1-3 share that mesh.
+fn lod_metric(distance: f32, radius: f32) -> f32 {
+    (distance - radius).max(0.1) / (2.0 * radius)
+}
+
+fn sphere(xf: &Transform, min: Vec3, max: Vec3) -> (Vec3, f32) {
+    let center = (min + max) * 0.5;
+    let extent = (max - min) * 0.5;
+    let world = xf.transform_point(center);
+    let mut radius = 0.5f32;
+    for (sx, sy, sz) in [
+        (1.0, 1.0, 1.0),
+        (1.0, 1.0, -1.0),
+        (1.0, -1.0, 1.0),
+        (1.0, -1.0, -1.0),
+        (-1.0, 1.0, 1.0),
+        (-1.0, 1.0, -1.0),
+        (-1.0, -1.0, 1.0),
+        (-1.0, -1.0, -1.0),
+    ] {
+        let corner =
+            xf.transform_point(center + Vec3::new(extent.x * sx, extent.y * sy, extent.z * sz));
+        radius = radius.max(world.distance(corner));
+    }
+    (world, radius)
+}
+
+fn mesh_bounds(list: &[(Handle<Mesh>, Handle<StandardMaterial>, Vec3, Vec3)]) -> (Vec3, Vec3) {
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    for (_, _, a, b) in list {
+        min = min.min(*a);
+        max = max.max(*b);
+    }
+    (min, max)
+}
+
 /// Spawns every map piece and object of `map`'s terrain MSB. Returns how many parts drew.
+/// A part whose binder also has `{model}_l1.flv` keeps that mesh for the lower LOD levels.
 pub fn spawn(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -88,43 +146,203 @@ pub fn spawn(
     map: &str,
 ) -> Result<usize> {
     let parts = msb::parts(&vfs::open(disc, &terrain_msb(disc, map))?)?;
-    let mut models: HashMap<String, Option<Vec<(Handle<Mesh>, Handle<StandardMaterial>)>>> = HashMap::new();
+    let mut models: HashMap<String, Option<Vec<Loaded>>> = HashMap::new();
+    let mut members: HashMap<String, HashSet<String>> = HashMap::new();
     let mut textures = Textures {
         own: format!("{}/{map}_htdcx.bnd", folder(map)),
         ..default()
     };
     let mut drawn = 0;
+    let mut low_parts = 0;
     for part in &parts {
-        let Some(binder) = binder(map, part) else { continue };
+        let Some(binder) = binder(map, part) else {
+            continue;
+        };
         let asset = format!("{binder}|{}.flv", part.model);
-        let loaded = models.entry(asset.clone()).or_insert_with(|| match acvd_render::model(disc, &asset) {
-            Ok(list) => Some(
-                list.into_iter()
-                    .map(|m| {
-                        let material = textures.material(disc, &m, materials, images);
-                        (meshes.add(m.mesh), material)
-                    })
-                    .collect(),
-            ),
-            Err(e) => {
-                warn!("{asset}: {e:#}");
-                None
+        let Some(list) = load_model(
+            &mut models,
+            &mut textures,
+            meshes,
+            materials,
+            images,
+            disc,
+            &asset,
+        ) else {
+            continue;
+        };
+        if list.is_empty() {
+            continue;
+        }
+        let low_file = format!("{}_l1.flv", part.model);
+        let low = if binder_has(&mut members, disc, &binder, &low_file) {
+            low_parts += 1;
+            load_model(
+                &mut models,
+                &mut textures,
+                meshes,
+                materials,
+                images,
+                disc,
+                &format!("{binder}|{low_file}"),
+            )
+        } else {
+            None
+        };
+        drawn += 1;
+        let xf = bevy_transform(&xform(part));
+        let (min, max) = mesh_bounds(&list);
+        let (center, radius) = sphere(&xf, min, max);
+        let mut full = Entity::PLACEHOLDER;
+        let mut low_entity = None;
+        let parent = commands
+            .spawn((
+                MapPart,
+                xf,
+                Visibility::default(),
+                Name::new(part.name.clone()),
+            ))
+            .id();
+        commands.entity(parent).with_children(|c| {
+            full = spawn_lod(c, &list, Visibility::Inherited);
+            if let Some(low) = &low {
+                low_entity = Some(spawn_lod(c, low, Visibility::Hidden));
             }
         });
-        let Some(list) = loaded else { continue };
-        drawn += 1;
-        commands
-            .spawn((MapPart, bevy_transform(&xform(part)), Visibility::default(), Name::new(part.name.clone())))
-            .with_children(|c| {
-                for (mesh, material) in list {
-                    c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())));
-                }
-            });
+        commands.entity(parent).insert(MapLod {
+            center,
+            radius,
+            full,
+            low: low_entity,
+        });
     }
     if textures.missing > 0 {
         warn!("map {map}: {} textures missing", textures.missing);
     }
+    info!("map {map}: {drawn} parts, {low_parts} with an _l1 mesh");
     Ok(drawn)
+}
+
+type Loaded = (Handle<Mesh>, Handle<StandardMaterial>, Vec3, Vec3);
+
+fn load_model(
+    models: &mut HashMap<String, Option<Vec<Loaded>>>,
+    textures: &mut Textures,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    disc: &Disc,
+    asset: &str,
+) -> Option<Vec<Loaded>> {
+    if let Some(cached) = models.get(asset) {
+        return cached.clone();
+    }
+    let loaded = match acvd_render::model(disc, asset) {
+        Ok(list) => Some(
+            list.into_iter()
+                .map(|m| {
+                    let material = textures.material(disc, &m, materials, images);
+                    (
+                        meshes.add(m.mesh),
+                        material,
+                        Vec3::from_array(m.min),
+                        Vec3::from_array(m.max),
+                    )
+                })
+                .collect(),
+        ),
+        Err(e) => {
+            warn!("{asset}: {e:#}");
+            None
+        }
+    };
+    models.insert(asset.to_string(), loaded.clone());
+    loaded
+}
+
+fn binder_has(
+    cache: &mut HashMap<String, HashSet<String>>,
+    disc: &Disc,
+    binder: &str,
+    file: &str,
+) -> bool {
+    let names = cache.entry(binder.to_string()).or_insert_with(|| {
+        vfs::open(disc, binder)
+            .ok()
+            .and_then(|data| bnd3::read(&data).ok())
+            .map(|b| {
+                b.entries
+                    .iter()
+                    .filter_map(|e| e.name.as_deref())
+                    .map(|name| {
+                        name.rsplit(['\\', '/', ':'])
+                            .next()
+                            .unwrap_or(name)
+                            .to_ascii_lowercase()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    names.contains(&file.to_ascii_lowercase())
+}
+
+fn spawn_lod(
+    commands: &mut ChildSpawnerCommands,
+    list: &[Loaded],
+    visibility: Visibility,
+) -> Entity {
+    commands
+        .spawn((Transform::default(), visibility))
+        .with_children(|c| {
+            for (mesh, material, _, _) in list {
+                c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())));
+            }
+        })
+        .id()
+}
+
+/// Shows the full mesh inside the near band and `{model}_l1` past it (`sheets/map_lod.csv`).
+/// The classifier's `> 15` return is not a world-distance cull: at the actest camera that
+/// reading hid 481 of 550 parts, the small objects, and left the ground under the AC.
+pub fn lod(
+    camera: Query<&Transform, With<Camera3d>>,
+    parts: Query<&MapLod>,
+    mut vis: Query<&mut Visibility>,
+    mut logged: Local<bool>,
+) {
+    let Ok(camera) = camera.single() else { return };
+    let eye = camera.translation;
+    let (mut n_full, mut n_low) = (0, 0);
+    for part in &parts {
+        let metric = lod_metric(eye.distance(part.center), part.radius);
+        let full = metric < 0.1 || part.low.is_none();
+        set_vis(&mut vis, part.full, full);
+        if let Some(low) = part.low {
+            set_vis(&mut vis, low, !full);
+        }
+        if !*logged {
+            if full {
+                n_full += 1;
+            } else {
+                n_low += 1;
+            }
+        }
+    }
+    if !*logged {
+        info!("map lod: {n_full} full, {n_low} _l1");
+        *logged = true;
+    }
+}
+
+fn set_vis(vis: &mut Query<&mut Visibility>, entity: Entity, on: bool) {
+    let Ok(mut vis) = vis.get_mut(entity) else {
+        return;
+    };
+    vis.set_if_neq(if on {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    });
 }
 
 /// `xf` (FLVER axes) acting on meshes that `acvd-render` already mirrored on X: `S xf S` with
@@ -152,7 +370,13 @@ struct Textures {
 }
 
 impl Textures {
-    fn material(&mut self, disc: &Disc, mesh: &LoadedMesh, materials: &mut Assets<StandardMaterial>, images: &mut Assets<Image>) -> Handle<StandardMaterial> {
+    fn material(
+        &mut self,
+        disc: &Disc,
+        mesh: &LoadedMesh,
+        materials: &mut Assets<StandardMaterial>,
+        images: &mut Assets<Image>,
+    ) -> Handle<StandardMaterial> {
         if let Some(h) = self.by_name.get(&mesh.diffuse) {
             return h.clone();
         }
@@ -173,7 +397,11 @@ impl Textures {
             }
         });
         let handle = materials.add(StandardMaterial {
-            base_color: if image.is_some() { Color::WHITE } else { Color::srgb(0.55, 0.56, 0.58) },
+            base_color: if image.is_some() {
+                Color::WHITE
+            } else {
+                Color::srgb(0.55, 0.56, 0.58)
+            },
             base_color_texture: image,
             perceptual_roughness: 0.9,
             ..default()
@@ -203,5 +431,15 @@ mod tests {
         let game = xf.apply(p);
         let bevy = t.transform_point(Vec3::new(-p[0], p[1], p[2]));
         assert!((bevy - Vec3::new(-game[0], game[1], game[2])).length() < 1e-4);
+    }
+
+    #[test]
+    fn lod_bands_match_the_actest_pieces() {
+        // m0012 sits on the start camera (full). m0010 is a few hundred metres out (_l1).
+        let near = lod_metric(36.0, 144.0);
+        let far = lod_metric(242.0, 128.0);
+        assert!(near < 0.1, "{near}");
+        assert!((0.4..2.0).contains(&far), "{far}");
+        assert!(lod_metric(10_000.0, 128.0) > 15.0);
     }
 }

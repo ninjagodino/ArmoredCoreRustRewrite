@@ -14,22 +14,42 @@ fn main() -> anyhow::Result<()> {
         }
         let d = vfs::undcx(e.contents(&data)?.into_owned())?;
         let Ok(f) = flver::read(&d) else { continue };
-        let mtds: std::collections::BTreeSet<&str> = f.materials.iter().map(|m| m.mtd.rsplit(['\\', '/']).next().unwrap_or("")).collect();
+        let mtds: std::collections::BTreeSet<&str> = f
+            .materials
+            .iter()
+            .map(|m| m.mtd.rsplit(['\\', '/']).next().unwrap_or(""))
+            .collect();
         println!(
             "{name:40} 4a={} 4b={} 4c={} 5c={} 5d={} 68={} bbox={:?}..{:?} {:?}",
             f.unk4a, f.unk4b, f.unk4c, f.unk5c, f.unk5d, f.unk68, f.bbox_min, f.bbox_max, mtds
         );
-        if std::env::args().nth(2).is_some_and(|m| name.starts_with(&m)) {
+        if std::env::args()
+            .nth(2)
+            .is_some_and(|m| name.starts_with(&m))
+        {
             for m in &f.materials {
-                println!("    mat {:24} {:24} flags={:#x} gx={:#x} unk18={}", m.name, m.mtd.rsplit(['\\', '/']).next().unwrap_or(""), m.flags, m.gx_offset, m.unk18);
+                println!(
+                    "    mat {:24} {:24} flags={:#x} gx={:#x} unk18={}",
+                    m.name,
+                    m.mtd.rsplit(['\\', '/']).next().unwrap_or(""),
+                    m.flags,
+                    m.gx_offset,
+                    m.unk18
+                );
             }
             if let Some(m) = f.materials.first() {
                 let at = m.gx_offset as usize;
-                let hex: Vec<String> = d[at..(at + 0x60).min(d.len())].chunks(4).map(|c| c.iter().map(|b| format!("{b:02x}")).collect()).collect();
+                let hex: Vec<String> = d[at..(at + 0x60).min(d.len())]
+                    .chunks(4)
+                    .map(|c| c.iter().map(|b| format!("{b:02x}")).collect())
+                    .collect();
                 println!("    gx@{at:#x}: {}", hex.join(" "));
             }
             for m in &f.meshes {
-                println!("    mesh dyn={} flags={:?} mat={} unk08={} bone={}", m.dynamic, m.flags, m.material, m.unk08, m.default_bone);
+                println!(
+                    "    mesh dyn={} flags={:?} mat={} unk08={} bone={}",
+                    m.dynamic, m.flags, m.material, m.unk08, m.default_bone
+                );
             }
         }
     }

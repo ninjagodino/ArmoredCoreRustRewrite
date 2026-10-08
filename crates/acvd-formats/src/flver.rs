@@ -31,17 +31,36 @@ pub struct Xform {
 }
 
 impl Xform {
-    pub const IDENTITY: Self = Self { m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], t: [0.0; 3] };
+    pub const IDENTITY: Self = Self {
+        m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        t: [0.0; 3],
+    };
 
     /// `translate * rot_y * rot_z * rot_x * scale`.
     pub fn local(translation: Vec3, rotation: Vec3, scale: Vec3) -> Self {
         let (sx, cx) = rotation[0].sin_cos();
         let (sy, cy) = rotation[1].sin_cos();
         let (sz, cz) = rotation[2].sin_cos();
-        let rx = Self { m: [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], t: [0.0; 3] };
-        let ry = Self { m: [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], t: [0.0; 3] };
-        let rz = Self { m: [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], t: [0.0; 3] };
-        let s = Self { m: [[scale[0], 0.0, 0.0], [0.0, scale[1], 0.0], [0.0, 0.0, scale[2]]], t: [0.0; 3] };
+        let rx = Self {
+            m: [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]],
+            t: [0.0; 3],
+        };
+        let ry = Self {
+            m: [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]],
+            t: [0.0; 3],
+        };
+        let rz = Self {
+            m: [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]],
+            t: [0.0; 3],
+        };
+        let s = Self {
+            m: [
+                [scale[0], 0.0, 0.0],
+                [0.0, scale[1], 0.0],
+                [0.0, 0.0, scale[2]],
+            ],
+            t: [0.0; 3],
+        };
         let mut out = ry.then(&rz).then(&rx).then(&s);
         out.t = translation;
         out
@@ -55,7 +74,10 @@ impl Xform {
                 *v = (0..3).map(|k| self.m[r][k] * inner.m[k][c]).sum();
             }
         }
-        Self { m, t: self.apply(inner.t) }
+        Self {
+            m,
+            t: self.apply(inner.t),
+        }
     }
 
     pub fn apply(&self, p: Vec3) -> Vec3 {
@@ -224,26 +246,38 @@ fn offset(r: Be, at: usize, what: &str) -> Result<usize> {
 }
 
 fn zero(r: Be, at: usize, len: usize, what: &str) -> Result<()> {
-    ensure!(r.bytes(at, len)?.iter().all(|&b| b == 0), "{what} at {at:#x} is nonzero");
+    ensure!(
+        r.bytes(at, len)?.iter().all(|&b| b == 0),
+        "{what} at {at:#x} is nonzero"
+    );
     Ok(())
 }
 
 fn indices(r: Be, at: usize, n: usize, what: &str) -> Result<Vec<i32>> {
-    (0..n).map(|i| r.i32(at + 4 * i)).collect::<Result<_>>().with_context(|| format!("{what} list"))
+    (0..n)
+        .map(|i| r.i32(at + 4 * i))
+        .collect::<Result<_>>()
+        .with_context(|| format!("{what} list"))
 }
 
 pub fn read(data: &[u8]) -> Result<Flver> {
     let r = Be(data);
     ensure!(r.bytes(0, 8)? == MAGIC, "not a big-endian FLVER");
     let version = r.u32(8)?;
-    ensure!((0x20000..0x30000).contains(&version), "FLVER version {version:#x} is not FLVER2");
+    ensure!(
+        (0x20000..0x30000).contains(&version),
+        "FLVER version {version:#x} is not FLVER2"
+    );
     let n_dummies = count(r, 0x14, "dummy")?;
     let n_materials = count(r, 0x18, "material")?;
     let n_bones = count(r, 0x1C, "bone")?;
     let n_meshes = count(r, 0x20, "mesh")?;
     let n_buffers = count(r, 0x24, "vertex buffer")?;
     let index_size = r.u8(0x48)?;
-    ensure!(matches!(index_size, 0 | 16 | 32), "header index size {index_size}");
+    ensure!(
+        matches!(index_size, 0 | 16 | 32),
+        "header index size {index_size}"
+    );
     let unicode = match r.u8(0x49)? {
         0 => false,
         1 => true,
@@ -326,7 +360,9 @@ pub fn read(data: &[u8]) -> Result<Flver> {
         let vb_n = count(r, at + 0x28, "mesh vertex buffer")?;
         ensure!(r.i32(at + 0x0C)? == 0, "mesh {m} 0x0C is nonzero");
         let to_usize = |v: Vec<i32>, what: &str| -> Result<Vec<usize>> {
-            v.into_iter().map(|i| usize::try_from(i).with_context(|| format!("mesh {m} {what} index {i}"))).collect()
+            v.into_iter()
+                .map(|i| usize::try_from(i).with_context(|| format!("mesh {m} {what} index {i}")))
+                .collect()
         };
         meshes.push(Mesh {
             dynamic: r.u8(at)?,
@@ -335,9 +371,24 @@ pub fn read(data: &[u8]) -> Result<Flver> {
             unk08: r.i32(at + 8)?,
             default_bone: r.i32(at + 0x10)?,
             bone_indices: indices(r, offset(r, at + 0x1C, "mesh bones")?, bone_n, "bone")?,
-            bbox: if bbox_at == 0 { None } else { Some((vec3(r, bbox_at)?, vec3(r, bbox_at + 12)?)) },
-            face_sets: to_usize(indices(r, offset(r, at + 0x24, "mesh face sets")?, fs_n, "face set")?, "face set")?,
-            vertex_buffers: to_usize(indices(r, offset(r, at + 0x2C, "mesh vertex buffers")?, vb_n, "vertex buffer")?, "vertex buffer")?,
+            bbox: if bbox_at == 0 {
+                None
+            } else {
+                Some((vec3(r, bbox_at)?, vec3(r, bbox_at + 12)?))
+            },
+            face_sets: to_usize(
+                indices(r, offset(r, at + 0x24, "mesh face sets")?, fs_n, "face set")?,
+                "face set",
+            )?,
+            vertex_buffers: to_usize(
+                indices(
+                    r,
+                    offset(r, at + 0x2C, "mesh vertex buffers")?,
+                    vb_n,
+                    "vertex buffer",
+                )?,
+                "vertex buffer",
+            )?,
         });
         at += 0x30;
     }
@@ -362,7 +413,10 @@ pub fn read(data: &[u8]) -> Result<Flver> {
     let mut vertex_buffers = Vec::with_capacity(n_buffers);
     for i in 0..n_buffers {
         let layout = r.i32(at + 4)?;
-        ensure!((0..n_layouts as i32).contains(&layout), "vertex buffer {i} layout {layout} of {n_layouts}");
+        ensure!(
+            (0..n_layouts as i32).contains(&layout),
+            "vertex buffer {i} layout {layout} of {n_layouts}"
+        );
         vertex_buffers.push(VertexBuffer {
             buffer_index: r.i32(at)?,
             layout: layout as usize,
@@ -379,12 +433,21 @@ pub fn read(data: &[u8]) -> Result<Flver> {
     let mut layouts = Vec::with_capacity(n_layouts);
     for i in 0..n_layouts {
         let n = count(r, at, "layout member")?;
-        ensure!(r.u32(at + 4)? == 0 && r.u32(at + 8)? == 0, "layout {i} 0x04..0x0C is nonzero");
+        ensure!(
+            r.u32(at + 4)? == 0 && r.u32(at + 8)? == 0,
+            "layout {i} 0x04..0x0C is nonzero"
+        );
         let members_at = offset(r, at + 0xC, "layout members")?;
         let members = (0..n)
             .map(|k| {
                 let m = members_at + 0x14 * k;
-                Ok(Member { unk00: r.i32(m)?, offset: r.u32(m + 4)?, kind: r.u32(m + 8)?, semantic: r.u32(m + 0xC)?, index: r.i32(m + 0x10)? })
+                Ok(Member {
+                    unk00: r.i32(m)?,
+                    offset: r.u32(m + 4)?,
+                    kind: r.u32(m + 8)?,
+                    semantic: r.u32(m + 0xC)?,
+                    index: r.i32(m + 0x10)?,
+                })
             })
             .collect::<Result<_>>()
             .with_context(|| format!("layout {i}"))?;
@@ -483,7 +546,11 @@ impl Flver {
     pub fn triangles(&self, data: &[u8], fs: &FaceSet) -> Result<Vec<[u32; 3]>> {
         let idx = self.indices(data, fs)?;
         if fs.strip == 0 {
-            ensure!(idx.len().is_multiple_of(3), "triangle list of {} indices", idx.len());
+            ensure!(
+                idx.len().is_multiple_of(3),
+                "triangle list of {} indices",
+                idx.len()
+            );
             return Ok(idx.as_chunks::<3>().0.to_vec());
         }
         let mut out = Vec::new();
@@ -494,7 +561,11 @@ impl Flver {
                 continue;
             }
             if w[0] != w[1] && w[1] != w[2] && w[0] != w[2] {
-                out.push(if flip { [w[2], w[1], w[0]] } else { [w[0], w[1], w[2]] });
+                out.push(if flip {
+                    [w[2], w[1], w[0]]
+                } else {
+                    [w[0], w[1], w[2]]
+                });
             }
             flip = !flip;
         }
@@ -538,7 +609,9 @@ impl Flver {
             .map(|k| {
                 let local = match v.bone_indices.get(k) {
                     Some(b) => {
-                        let heaviest = v.bone_weights.get(k).map_or(0, |w| (0..4).fold(0, |best, j| if w[j] > w[best] { j } else { best }));
+                        let heaviest = v.bone_weights.get(k).map_or(0, |w| {
+                            (0..4).fold(0, |best, j| if w[j] > w[best] { j } else { best })
+                        });
                         Some(b[heaviest] as usize)
                     }
                     None => v.normal_w.get(k).map(|&w| w as usize),
@@ -548,24 +621,37 @@ impl Flver {
                     Some(l) => Some(l as i32),
                     None => Some(mesh.default_bone),
                 };
-                bone.and_then(|b| usize::try_from(b).ok()).filter(|&b| b < self.bones.len())
+                bone.and_then(|b| usize::try_from(b).ok())
+                    .filter(|&b| b < self.bones.len())
             })
             .collect()
     }
 
     /// Non-dynamic meshes store each vertex relative to its bone; this moves positions and
     /// normals into model space with the bones' rest transforms (`bone_transforms`).
-    pub fn to_model_space(&self, mesh: &Mesh, v: &mut Vertices, bones: &[Option<usize>], world: &[Xform]) {
+    pub fn to_model_space(
+        &self,
+        mesh: &Mesh,
+        v: &mut Vertices,
+        bones: &[Option<usize>],
+        world: &[Xform],
+    ) {
         if mesh.dynamic != 0 {
             return;
         }
         for (k, bone) in bones.iter().enumerate() {
-            let Some(x) = bone.and_then(|b| world.get(b)) else { continue };
+            let Some(x) = bone.and_then(|b| world.get(b)) else {
+                continue;
+            };
             if let Some(p) = v.positions.get_mut(k) {
                 *p = x.apply(*p);
             }
             if let Some(n) = v.normals.get_mut(k) {
-                let r = Xform { m: x.m, t: [0.0; 3] }.apply(*n);
+                let r = Xform {
+                    m: x.m,
+                    t: [0.0; 3],
+                }
+                .apply(*n);
                 let len = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
                 *n = if len > 0.0 { r.map(|c| c / len) } else { r };
             }
@@ -589,7 +675,9 @@ impl Flver {
 
     pub fn main_face_set(&self, mesh: &Mesh) -> Option<&FaceSet> {
         let sets = mesh.face_sets.iter().map(|&i| &self.face_sets[i]);
-        sets.clone().find(|f| f.flags & (FS_LOD1 | FS_LOD2 | FS_MOTION_BLUR) == 0).or_else(|| sets.clone().next())
+        sets.clone()
+            .find(|f| f.flags & (FS_LOD1 | FS_LOD2 | FS_MOTION_BLUR) == 0)
+            .or_else(|| sets.clone().next())
     }
 
     /// Decodes the mesh's vertex attributes from every buffer it references.
@@ -600,15 +688,29 @@ impl Flver {
             Some(&b) => self.vertex_buffers[b].vertex_count.max(0) as usize,
             None => return Ok(v),
         };
-        let uv_scale = if self.version >= 0x2000F { 2048.0 } else { 1024.0 };
+        let uv_scale = if self.version >= 0x2000F {
+            2048.0
+        } else {
+            1024.0
+        };
         for &b in &mesh.vertex_buffers {
             let vb = &self.vertex_buffers[b];
-            ensure!(vb.vertex_count as usize == count, "vertex buffer {b} has {} vertices, mesh has {count}", vb.vertex_count);
+            ensure!(
+                vb.vertex_count as usize == count,
+                "vertex buffer {b} has {} vertices, mesh has {count}",
+                vb.vertex_count
+            );
             let layout = &self.layouts[vb.layout];
             let size = layout.size()?;
-            ensure!(size == vb.vertex_size as usize, "layout {} is {size} bytes, buffer {b} says {}", vb.layout, vb.vertex_size);
+            ensure!(
+                size == vb.vertex_size as usize,
+                "layout {} is {size} bytes, buffer {b} says {}",
+                vb.layout,
+                vb.vertex_size
+            );
             let base = self.data_offset as usize + vb.offset as usize;
-            r.bytes(base, size * count).with_context(|| format!("vertex buffer {b}"))?;
+            r.bytes(base, size * count)
+                .with_context(|| format!("vertex buffer {b}"))?;
             for m in &layout.members {
                 let kind = MemberKind::of(m)?;
                 for i in 0..count {
@@ -625,7 +727,11 @@ impl Layout {
     pub fn size(&self) -> Result<usize> {
         let mut end = 0;
         for m in &self.members {
-            ensure!(m.offset as usize == end, "member at {:#x}, expected {end:#x}", m.offset);
+            ensure!(
+                m.offset as usize == end,
+                "member at {:#x}, expected {end:#x}",
+                m.offset
+            );
             end += MemberKind::of(m)?.size();
         }
         Ok(end)
@@ -703,20 +809,41 @@ fn channel<T>(sets: &mut Vec<Vec<T>>, index: usize) -> &mut Vec<T> {
 }
 
 impl Vertices {
-    fn push(&mut self, kind: MemberKind, m: &Member, r: Be, at: usize, uv_scale: f32) -> Result<()> {
+    fn push(
+        &mut self,
+        kind: MemberKind,
+        m: &Member,
+        r: Be,
+        at: usize,
+        uv_scale: f32,
+    ) -> Result<()> {
         let idx = m.index.max(0) as usize;
         let b = |k: usize| r.u8(at + k);
-        let uv = |k: usize| -> Result<[f32; 2]> { Ok([r.i16(at + k)? as f32 / uv_scale, r.i16(at + k + 2)? as f32 / uv_scale]) };
+        let uv = |k: usize| -> Result<[f32; 2]> {
+            Ok([
+                r.i16(at + k)? as f32 / uv_scale,
+                r.i16(at + k + 2)? as f32 / uv_scale,
+            ])
+        };
         match kind {
             MemberKind::Position => self.positions.push(vec3(r, at)?),
             MemberKind::NormalS8 => {
-                self.normals.push([snorm(b(3)?), snorm(b(2)?), snorm(b(1)?)]);
+                self.normals
+                    .push([snorm(b(3)?), snorm(b(2)?), snorm(b(1)?)]);
                 self.normal_w.push(b(0)?);
             }
-            MemberKind::TangentS8 => channel(&mut self.tangents, idx).push([snorm(b(3)?), snorm(b(2)?), snorm(b(1)?), snorm(b(0)?)]),
-            MemberKind::Color => {
-                channel(&mut self.colors, idx).push([b(0)? as f32 / 255.0, b(1)? as f32 / 255.0, b(2)? as f32 / 255.0, b(3)? as f32 / 255.0])
-            }
+            MemberKind::TangentS8 => channel(&mut self.tangents, idx).push([
+                snorm(b(3)?),
+                snorm(b(2)?),
+                snorm(b(1)?),
+                snorm(b(0)?),
+            ]),
+            MemberKind::Color => channel(&mut self.colors, idx).push([
+                b(0)? as f32 / 255.0,
+                b(1)? as f32 / 255.0,
+                b(2)? as f32 / 255.0,
+                b(3)? as f32 / 255.0,
+            ]),
             MemberKind::Uv => channel(&mut self.uvs, idx).push(uv(0)?),
             MemberKind::UvPair => {
                 channel(&mut self.uvs, 2 * idx).push(uv(0)?);
@@ -758,15 +885,26 @@ mod tests {
             return;
         }
         let disc = crate::vfs::Disc::open(&path).unwrap();
-        let data = disc.asset("model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv").unwrap();
+        let data = disc
+            .asset("model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv")
+            .unwrap();
         let f = read(&data).unwrap();
-        assert_eq!((f.index_size, f.unk4a, f.unk4b, f.unk4c), (16, 1, 1, 0xFFFF));
+        assert_eq!(
+            (f.index_size, f.unk4a, f.unk4b, f.unk4c),
+            (16, 1, 1, 0xFFFF)
+        );
         let mesh = &f.meshes[0];
         let v = f.vertices(&data, mesh).unwrap();
         assert_eq!(v.positions.len(), 10273);
-        assert!(v.normals.iter().all(|n| (n.iter().map(|c| c * c).sum::<f32>().sqrt() - 1.0).abs() < 0.03));
+        assert!(v
+            .normals
+            .iter()
+            .all(|n| (n.iter().map(|c| c * c).sum::<f32>().sqrt() - 1.0).abs() < 0.03));
         let tris = f.triangles(&data, f.main_face_set(mesh).unwrap()).unwrap();
-        assert!(tris.iter().flatten().all(|&i| (i as usize) < v.positions.len()));
+        assert!(tris
+            .iter()
+            .flatten()
+            .all(|&i| (i as usize) < v.positions.len()));
         assert!(!tris.is_empty());
     }
 

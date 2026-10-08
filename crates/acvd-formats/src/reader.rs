@@ -16,7 +16,10 @@ impl<'a> Be<'a> {
     pub fn bytes(&self, at: usize, len: usize) -> Result<&'a [u8]> {
         match at.checked_add(len).and_then(|end| self.0.get(at..end)) {
             Some(b) => Ok(b),
-            None => bail!("read of {len} bytes at {at:#x} runs past end of {:#x}-byte buffer", self.0.len()),
+            None => bail!(
+                "read of {len} bytes at {at:#x} runs past end of {:#x}-byte buffer",
+                self.0.len()
+            ),
         }
     }
 
@@ -48,7 +51,9 @@ impl<'a> Be<'a> {
 
     /// Fixed-width ASCII field: text up to the first NUL, trailing space padding removed.
     pub fn fixstr(&self, at: usize, len: usize) -> Result<String> {
-        Ok(String::from_utf8_lossy(until_nul(self.bytes(at, len)?)).trim_end().to_owned())
+        Ok(String::from_utf8_lossy(until_nul(self.bytes(at, len)?))
+            .trim_end()
+            .to_owned())
     }
 
     /// Fixed-width Shift-JIS field, terminated by the first NUL.
@@ -59,7 +64,10 @@ impl<'a> Be<'a> {
     /// NUL-terminated Shift-JIS string starting at `at`.
     pub fn cstr_sjis(&self, at: usize) -> Result<String> {
         let Some(tail) = self.0.get(at..) else {
-            bail!("string offset {at:#x} past end of {:#x}-byte buffer", self.0.len());
+            bail!(
+                "string offset {at:#x} past end of {:#x}-byte buffer",
+                self.0.len()
+            );
         };
         Ok(sjis(until_nul(tail)))
     }
@@ -70,7 +78,10 @@ pub fn until_nul(b: &[u8]) -> &[u8] {
 }
 
 pub fn sjis(b: &[u8]) -> String {
-    encoding_rs::SHIFT_JIS.decode_without_bom_handling(b).0.into_owned()
+    encoding_rs::SHIFT_JIS
+        .decode_without_bom_handling(b)
+        .0
+        .into_owned()
 }
 
 /// UTF-16BE text up to the first NUL code unit.

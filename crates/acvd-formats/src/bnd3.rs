@@ -76,7 +76,10 @@ fn has(format: u8, bit: u8) -> bool {
 }
 
 pub fn entry_size(format: u8) -> usize {
-    0x0C + 4 * [IDS, NAMES1 | NAMES2, COMPRESSION].iter().filter(|&&b| has(format, b)).count()
+    0x0C + 4 * [IDS, NAMES1 | NAMES2, COMPRESSION]
+        .iter()
+        .filter(|&&b| has(format, b))
+        .count()
 }
 
 pub fn read(data: &[u8]) -> Result<Bnd3> {
@@ -102,10 +105,20 @@ fn parse(data: &[u8], inline_data: bool) -> Result<Bnd3> {
     let raw_format = r.u8(0x0C)?;
     let big_endian = r.u8(0x0D)?;
     let bit_big_endian = r.u8(0x0E)?;
-    ensure!(r.u8(0x0F)? == 0, "BND3 byte 0x0F is {:#x}, expected 0", r.u8(0x0F)?);
+    ensure!(
+        r.u8(0x0F)? == 0,
+        "BND3 byte 0x0F is {:#x}, expected 0",
+        r.u8(0x0F)?
+    );
     let format = canonical_format(raw_format, bit_big_endian != 0);
-    ensure!(big_endian != 0 || has(format, BIG_ENDIAN), "little-endian BND3 (format {raw_format:#04x}) is not on the ACVD disc");
-    ensure!(!has(format, LONG_OFFSETS), "BND3 format {raw_format:#04x} has 64-bit offsets, not on the ACVD disc");
+    ensure!(
+        big_endian != 0 || has(format, BIG_ENDIAN),
+        "little-endian BND3 (format {raw_format:#04x}) is not on the ACVD disc"
+    );
+    ensure!(
+        !has(format, LONG_OFFSETS),
+        "BND3 format {raw_format:#04x} has 64-bit offsets, not on the ACVD disc"
+    );
 
     let count = r.u32(0x10)? as usize;
     let stride = entry_size(format);
@@ -113,7 +126,10 @@ fn parse(data: &[u8], inline_data: bool) -> Result<Bnd3> {
     for i in 0..count {
         let mut at = 0x20 + i * stride;
         let flags = r.u8(at)?;
-        ensure!(r.bytes(at + 1, 3)? == [0, 0, 0], "entry {i} has nonzero padding after flags");
+        ensure!(
+            r.bytes(at + 1, 3)? == [0, 0, 0],
+            "entry {i} has nonzero padding after flags"
+        );
         let stored_size = r.u32(at + 4)?;
         let offset = r.u32(at + 8)?;
         at += 0x0C;
@@ -128,11 +144,23 @@ fn parse(data: &[u8], inline_data: bool) -> Result<Bnd3> {
         let id = next(has(format, IDS))?.map(|v| v as i32);
         let name_offset = next(has(format, NAMES1 | NAMES2))?;
         let size = next(has(format, COMPRESSION))?;
-        let name = name_offset.map(|o| r.cstr_sjis(o as usize)).transpose().with_context(|| format!("entry {i} name"))?;
+        let name = name_offset
+            .map(|o| r.cstr_sjis(o as usize))
+            .transpose()
+            .with_context(|| format!("entry {i} name"))?;
         if inline_data {
-            r.bytes(offset as usize, stored_size as usize).with_context(|| format!("entry {i} data"))?;
+            r.bytes(offset as usize, stored_size as usize)
+                .with_context(|| format!("entry {i} data"))?;
         }
-        entries.push(Entry { flags, stored_size, offset, id, name_offset, name, size });
+        entries.push(Entry {
+            flags,
+            stored_size,
+            offset,
+            id,
+            name_offset,
+            name,
+            size,
+        });
     }
 
     Ok(Bnd3 {
@@ -165,12 +193,18 @@ impl Entry {
         if !self.is_zlib() {
             return Ok(Cow::Borrowed(raw));
         }
-        let want = self.size.context("zlib entry in a binder without a size field")? as usize;
+        let want = self
+            .size
+            .context("zlib entry in a binder without a size field")? as usize;
         let out = match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(raw, want) {
             Ok(v) => v,
             Err(e) => bail!("zlib inflate failed: {e:?}"),
         };
-        ensure!(out.len() == want, "zlib entry expanded to {:#x} bytes, expected {want:#x}", out.len());
+        ensure!(
+            out.len() == want,
+            "zlib entry expanded to {:#x} bytes, expected {want:#x}",
+            out.len()
+        );
         Ok(Cow::Owned(out))
     }
 }
@@ -182,14 +216,25 @@ impl Bnd3 {
     pub fn first_unexplained_byte(&self, binder: &[u8]) -> Result<Option<usize>> {
         let mut out = vec![0u8; binder.len()];
         let put = |out: &mut Vec<u8>, at: usize, b: &[u8]| -> Result<()> {
-            let dst = out.get_mut(at..at + b.len()).with_context(|| format!("rebuild write at {at:#x} past end"))?;
+            let dst = out
+                .get_mut(at..at + b.len())
+                .with_context(|| format!("rebuild write at {at:#x} past end"))?;
             dst.copy_from_slice(b);
             Ok(())
         };
         put(&mut out, 0, MAGIC)?;
         put(&mut out, 4, &self.version_raw)?;
-        put(&mut out, 0x0C, &[self.raw_format, self.big_endian, self.bit_big_endian, 0])?;
-        for (at, v) in [(0x10, self.entries.len() as u32), (0x14, self.headers_end), (0x18, self.unk18), (0x1C, self.unk1c)] {
+        put(
+            &mut out,
+            0x0C,
+            &[self.raw_format, self.big_endian, self.bit_big_endian, 0],
+        )?;
+        for (at, v) in [
+            (0x10, self.entries.len() as u32),
+            (0x14, self.headers_end),
+            (0x18, self.unk18),
+            (0x1C, self.unk1c),
+        ] {
             put(&mut out, at, &v.to_be_bytes())?;
         }
         let stride = entry_size(self.format);
@@ -197,10 +242,17 @@ impl Bnd3 {
             let mut rec = vec![e.flags, 0, 0, 0];
             rec.extend(e.stored_size.to_be_bytes());
             rec.extend(e.offset.to_be_bytes());
-            for v in [e.id.map(|v| v as u32), e.name_offset, e.size].into_iter().flatten() {
+            for v in [e.id.map(|v| v as u32), e.name_offset, e.size]
+                .into_iter()
+                .flatten()
+            {
                 rec.extend(v.to_be_bytes());
             }
-            ensure!(rec.len() == stride, "entry {i} rebuilt to {} bytes, stride {stride}", rec.len());
+            ensure!(
+                rec.len() == stride,
+                "entry {i} rebuilt to {} bytes, stride {stride}",
+                rec.len()
+            );
             put(&mut out, 0x20 + i * stride, &rec)?;
             if let (Some(at), Some(name)) = (e.name_offset, &e.name) {
                 let (enc, _, lossy) = encoding_rs::SHIFT_JIS.encode(name);
@@ -235,7 +287,17 @@ mod tests {
         for v in [2u32, names_end as u32, 0, 0] {
             out.extend(v.to_be_bytes());
         }
-        let entries = [(0x02u8, 4u32, data0, 1u32, table_end, 4u32), (0x03, packed.len() as u32, data1, 2, table_end + 6, plain.len() as u32)];
+        let entries = [
+            (0x02u8, 4u32, data0, 1u32, table_end, 4u32),
+            (
+                0x03,
+                packed.len() as u32,
+                data1,
+                2,
+                table_end + 6,
+                plain.len() as u32,
+            ),
+        ];
         for (flags, stored, offset, id, name, size) in entries {
             out.extend([flags, 0, 0, 0]);
             for v in [stored, offset as u32, id, name as u32, size] {
@@ -267,7 +329,10 @@ mod tests {
         let (mut file, _) = sample();
         let gap = 0x20 + 2 * 0x18 + 12;
         file[gap] = 0x55;
-        assert_eq!(read(&file).unwrap().first_unexplained_byte(&file).unwrap(), Some(gap));
+        assert_eq!(
+            read(&file).unwrap().first_unexplained_byte(&file).unwrap(),
+            Some(gap)
+        );
     }
 
     #[test]

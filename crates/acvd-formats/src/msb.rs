@@ -58,17 +58,28 @@ pub(crate) fn section(data: &[u8], name: &str) -> Result<Vec<usize>> {
     let r = Be(data);
     let mut at = 0usize;
     for _ in 0..64 {
-        ensure!(matches!(r.u32(at)?, MAGIC | MAGIC_ENV), "MSB section at {at:#x} has no header");
+        ensure!(
+            matches!(r.u32(at)?, MAGIC | MAGIC_ENV),
+            "MSB section at {at:#x} has no header"
+        );
         let count = r.u32(at + 8)? as usize;
-        ensure!(count >= 1 && at + 12 + 4 * count <= data.len(), "MSB section at {at:#x} count {count}");
-        let offs: Vec<usize> = (0..count).map(|i| r.u32(at + 12 + 4 * i).map(|v| v as usize)).collect::<Result<_>>()?;
+        ensure!(
+            count >= 1 && at + 12 + 4 * count <= data.len(),
+            "MSB section at {at:#x} count {count}"
+        );
+        let offs: Vec<usize> = (0..count)
+            .map(|i| r.u32(at + 12 + 4 * i).map(|v| v as usize))
+            .collect::<Result<_>>()?;
         if r.cstr_sjis(r.u32(at + 4)? as usize)? == name {
             return Ok(offs[..count - 1].to_vec());
         }
         match offs[count - 1] {
             0 => break,
             next => {
-                ensure!(next > at && next < data.len(), "MSB section link {next:#x} from {at:#x}");
+                ensure!(
+                    next > at && next < data.len(),
+                    "MSB section link {next:#x} from {at:#x}"
+                );
                 at = next;
             }
         }
@@ -89,7 +100,10 @@ pub fn parts(data: &[u8]) -> Result<Vec<Part>> {
         .map(|off| {
             let name_rel = r.u32(off)? as usize;
             let model_rel = r.u32(off + 0x0C)? as usize;
-            ensure!(name_rel < 0x400 && model_rel < 0x400, "MSB part at {off:#x} name offsets {name_rel:#x}/{model_rel:#x}");
+            ensure!(
+                name_rel < 0x400 && model_rel < 0x400,
+                "MSB part at {off:#x} name offsets {name_rel:#x}/{model_rel:#x}"
+            );
             Ok(Part {
                 name: r.cstr_sjis(off + name_rel)?,
                 model: r.cstr_sjis(off + model_rel)?,
@@ -110,9 +124,14 @@ pub fn points(data: &[u8]) -> Result<Vec<Point>> {
         .into_iter()
         .map(|off| {
             let name_rel = r.u32(off)? as usize;
-            ensure!(name_rel < 0x400, "MSB point at {off:#x} name offset {name_rel:#x}");
+            ensure!(
+                name_rel < 0x400,
+                "MSB point at {off:#x} name offset {name_rel:#x}"
+            );
             Ok(Point {
-                name: r.cstr_sjis(off + name_rel).with_context(|| format!("MSB point at {off:#x}"))?,
+                name: r
+                    .cstr_sjis(off + name_rel)
+                    .with_context(|| format!("MSB point at {off:#x}"))?,
                 kind: r.u32(off + 8)?,
                 kind_index: r.u32(off + 0x0C)?,
                 shape: r.u32(off + 0x10)?,
@@ -187,12 +206,21 @@ mod tests {
 
     #[test]
     fn actest_layout_from_disc() {
-        let Some(disc) = crate::vfs::test_disc() else { return };
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
         let data = crate::vfs::open(&disc, "model/map/m4000/m4000_actest.msb").unwrap();
-        let start = points(&data).unwrap().into_iter().find(|p| p.kind == POINT_START && p.kind_index == 0).unwrap();
+        let start = points(&data)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.kind == POINT_START && p.kind_index == 0)
+            .unwrap();
         assert_eq!(start.translation, [-324.65, 29.0, 649.5]);
         assert_eq!(start.rotation_deg[1], 90.0);
-        assert_eq!(parts(&data).unwrap().iter().filter(|p| p.kind == 2).count(), 22);
+        assert_eq!(
+            parts(&data).unwrap().iter().filter(|p| p.kind == 2).count(),
+            22
+        );
         let map = crate::vfs::open(&disc, "model/map/m4000/m4000_map.msb").unwrap();
         assert_eq!(parts(&map).unwrap().len(), 550);
     }

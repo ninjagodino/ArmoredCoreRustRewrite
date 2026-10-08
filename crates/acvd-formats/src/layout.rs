@@ -114,13 +114,25 @@ pub fn place(cols: &[ColumnSpec]) -> Result<(Vec<Placement>, usize)> {
         match col.bits {
             None => {
                 unit = None;
-                out.push(Placement { offset, bit_offset: None });
+                out.push(Placement {
+                    offset,
+                    bit_offset: None,
+                });
                 offset += col.byte_len();
             }
             Some(bits) => {
-                ensure!(col.count == 1 && !col.prim.is_text() && !col.prim.is_float(), "column {i}: bitfield on {} x{}", col.prim.name(), col.count);
+                ensure!(
+                    col.count == 1 && !col.prim.is_text() && !col.prim.is_float(),
+                    "column {i}: bitfield on {} x{}",
+                    col.prim.name(),
+                    col.count
+                );
                 let limit = (col.prim.size() * 8) as u8;
-                ensure!(bits > 0 && bits <= limit, "column {i}: {bits}-bit field does not fit {}", col.prim.name());
+                ensure!(
+                    bits > 0 && bits <= limit,
+                    "column {i}: {bits}-bit field does not fit {}",
+                    col.prim.name()
+                );
                 let (prim, at, used) = match unit {
                     Some((p, at, used)) if p == col.prim && used + bits <= limit => (p, at, used),
                     _ => {
@@ -129,7 +141,10 @@ pub fn place(cols: &[ColumnSpec]) -> Result<(Vec<Placement>, usize)> {
                         (col.prim, at, 0)
                     }
                 };
-                out.push(Placement { offset: at, bit_offset: Some(used) });
+                out.push(Placement {
+                    offset: at,
+                    bit_offset: Some(used),
+                });
                 unit = Some((prim, at, used + bits));
             }
         }
@@ -163,7 +178,10 @@ impl Serialize for Value {
 }
 
 pub fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+    b.iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn scalar(r: Be, prim: Prim, at: usize) -> Result<Value> {
@@ -203,7 +221,12 @@ fn put_scalar(out: &mut [u8], prim: Prim, at: usize, v: &Value) -> Result<()> {
 }
 
 /// Inverse of [`decode`]; used to prove the decoded values represent the row bytes exactly.
-pub fn encode(cols: &[ColumnSpec], placed: &[Placement], size: usize, values: &[Value]) -> Result<Vec<u8>> {
+pub fn encode(
+    cols: &[ColumnSpec],
+    placed: &[Placement],
+    size: usize,
+    values: &[Value],
+) -> Result<Vec<u8>> {
     let mut out = vec![0u8; size];
     for ((col, p), v) in cols.iter().zip(placed).zip(values) {
         if let (Some(_), Some(shift), Value::Int(n)) = (col.bits, p.bit_offset, v) {
@@ -251,18 +274,48 @@ mod tests {
 
     #[test]
     fn bitfields_share_a_unit() {
-        let cols = [col(Prim::U8, 1, Some(1)), col(Prim::U8, 1, Some(7)), col(Prim::U16, 1, None), col(Prim::U8, 1, Some(4))];
+        let cols = [
+            col(Prim::U8, 1, Some(1)),
+            col(Prim::U8, 1, Some(7)),
+            col(Prim::U16, 1, None),
+            col(Prim::U8, 1, Some(4)),
+        ];
         let (placed, size) = place(&cols).unwrap();
-        assert_eq!(placed.iter().map(|p| p.offset).collect::<Vec<_>>(), [0, 0, 1, 3]);
+        assert_eq!(
+            placed.iter().map(|p| p.offset).collect::<Vec<_>>(),
+            [0, 0, 1, 3]
+        );
         assert_eq!(placed[1].bit_offset, Some(1));
         assert_eq!(size, 4);
     }
 
     #[test]
     fn round_trip_is_exact_and_detects_loss() {
-        let cols = [col(Prim::U8, 1, Some(3)), col(Prim::U8, 1, Some(5)), col(Prim::FixStr, 4, None), col(Prim::F32, 2, None), col(Prim::Dummy8, 2, None)];
+        let cols = [
+            col(Prim::U8, 1, Some(3)),
+            col(Prim::U8, 1, Some(5)),
+            col(Prim::FixStr, 4, None),
+            col(Prim::F32, 2, None),
+            col(Prim::Dummy8, 2, None),
+        ];
         let (placed, size) = place(&cols).unwrap();
-        let row = [0b1010_1101, b'A', b'B', 0, 0, 0x3f, 0x80, 0, 0, 0x7f, 0xc0, 0, 1, 0xaa, 0xbb];
+        let row = [
+            0b1010_1101,
+            b'A',
+            b'B',
+            0,
+            0,
+            0x3f,
+            0x80,
+            0,
+            0,
+            0x7f,
+            0xc0,
+            0,
+            1,
+            0xaa,
+            0xbb,
+        ];
         let vals = decode(&cols, &placed, &row).unwrap();
         assert_eq!(encode(&cols, &placed, size, &vals).unwrap(), row);
 
@@ -279,8 +332,14 @@ pub fn decode(cols: &[ColumnSpec], placed: &[Placement], row: &[u8]) -> Result<V
         .zip(placed)
         .map(|(col, p)| {
             if let (Some(bits), Some(shift)) = (col.bits, p.bit_offset) {
-                let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
-                return Ok(Value::Int(((unit_value(r, col.prim, p.offset)? >> shift) & mask) as i64));
+                let mask = if bits == 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << bits) - 1
+                };
+                return Ok(Value::Int(
+                    ((unit_value(r, col.prim, p.offset)? >> shift) & mask) as i64,
+                ));
             }
             let bytes = r.bytes(p.offset, col.byte_len())?;
             Ok(match col.prim {
@@ -288,7 +347,11 @@ pub fn decode(cols: &[ColumnSpec], placed: &[Placement], row: &[u8]) -> Result<V
                 Prim::FixStr => Value::Text(sjis(until_nul(bytes))),
                 Prim::FixStrW => Value::Text(utf16be(bytes)),
                 prim if col.count == 1 => scalar(r, prim, p.offset)?,
-                prim => Value::List((0..col.count).map(|k| scalar(r, prim, p.offset + k * prim.size())).collect::<Result<_>>()?),
+                prim => Value::List(
+                    (0..col.count)
+                        .map(|k| scalar(r, prim, p.offset + k * prim.size()))
+                        .collect::<Result<_>>()?,
+                ),
             })
         })
         .collect()

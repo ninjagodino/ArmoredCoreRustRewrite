@@ -119,9 +119,15 @@ fn records(r: Be, at: usize, count: usize) -> Option<(Vec<Record>, usize)> {
 pub fn read(data: &[u8]) -> Result<Dbp> {
     let r = Be(data);
     let count = r.u32(0)? as usize;
-    ensure!(count > 0 && count * RECORD_HEAD < data.len(), "field count {count} does not fit a {}-byte file", data.len());
+    ensure!(
+        count > 0 && count * RECORD_HEAD < data.len(),
+        "field count {count} does not fit a {}-byte file",
+        data.len()
+    );
     for at in (4..data.len()).step_by(4) {
-        let Some((recs, end)) = records(r, at, count) else { continue };
+        let Some((recs, end)) = records(r, at, count) else {
+            continue;
+        };
         let strings: Vec<&[u8]> = data[end..].split(|&b| b == 0).collect();
         if !strings.get(1).is_some_and(|f| f.starts_with(b"%")) || strings.len() < 2 * count {
             continue;
@@ -141,7 +147,12 @@ pub fn read(data: &[u8]) -> Result<Dbp> {
                 format: sjis(strings[2 * i + 1]),
             })
             .collect();
-        return Ok(Dbp { fields, records: at, labels: end, extra_strings });
+        return Ok(Dbp {
+            fields,
+            records: at,
+            labels: end,
+            extra_strings,
+        });
     }
     bail!("no offset holds {count} records followed by a label table")
 }
@@ -149,14 +160,21 @@ pub fn read(data: &[u8]) -> Result<Dbp> {
 impl Dbp {
     /// Bytes the paired `.bin` must hold.
     pub fn bin_size(&self) -> usize {
-        self.fields.iter().fold(0, |at, f| at.next_multiple_of(f.kind.width()) + f.kind.width())
+        self.fields.iter().fold(0, |at, f| {
+            at.next_multiple_of(f.kind.width()) + f.kind.width()
+        })
     }
 
     /// Every field's value in the paired `.bin`, in field order. Some retail binaries run past
     /// their layout (fields added after the menu was saved, or padding); the caller sees that as
     /// `bin.len() - bin_size()`.
     pub fn values(&self, bin: &[u8]) -> Result<Vec<f64>> {
-        ensure!(bin.len() >= self.bin_size(), "{} bytes, the layout packs {}", bin.len(), self.bin_size());
+        ensure!(
+            bin.len() >= self.bin_size(),
+            "{} bytes, the layout packs {}",
+            bin.len(),
+            self.bin_size()
+        );
         let r = Be(bin);
         let mut at = 0usize;
         self.fields
@@ -187,14 +205,27 @@ mod tests {
         let mut d = 2u32.to_be_bytes().to_vec();
         d.extend_from_slice(&[0; 4]);
         d.extend(record(1, &[7, 1, 0, 9]));
-        let floats: Vec<u8> = [1.5f32, 0.5, 0.0, 10.0].iter().flat_map(|v| v.to_be_bytes()).collect();
+        let floats: Vec<u8> = [1.5f32, 0.5, 0.0, 10.0]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
         d.extend(record(6, &floats));
         d.extend_from_slice(b"speed\0%d\0gravity\0%.1f\0");
         let dbp = read(&d).unwrap();
         assert_eq!(dbp.records, 8);
         assert_eq!(dbp.fields.len(), 2);
-        assert_eq!((dbp.fields[0].kind, dbp.fields[0].value, dbp.fields[0].max), (Kind::U8, 7.0, 9.0));
-        assert_eq!((dbp.fields[1].label.as_str(), dbp.fields[1].format.as_str(), dbp.fields[1].value), ("gravity", "%.1f", 1.5));
+        assert_eq!(
+            (dbp.fields[0].kind, dbp.fields[0].value, dbp.fields[0].max),
+            (Kind::U8, 7.0, 9.0)
+        );
+        assert_eq!(
+            (
+                dbp.fields[1].label.as_str(),
+                dbp.fields[1].format.as_str(),
+                dbp.fields[1].value
+            ),
+            ("gravity", "%.1f", 1.5)
+        );
         assert_eq!(dbp.bin_size(), 8);
         let mut bin = vec![3, 0, 0, 0];
         bin.extend_from_slice(&2.5f32.to_be_bytes());

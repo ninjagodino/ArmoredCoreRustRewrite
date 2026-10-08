@@ -28,8 +28,16 @@ pub struct Fmg {
 
 pub fn read(data: &[u8]) -> Result<Fmg> {
     let r = Be(data);
-    ensure!(r.u8(0)? == 0 && r.u8(1)? == 1 && r.u8(2)? == 0, "not a big-endian version-0 FMG");
-    ensure!(r.u32(4)? as usize == data.len(), "FMG size field {:#x} != file size {:#x}", r.u32(4)?, data.len());
+    ensure!(
+        r.u8(0)? == 0 && r.u8(1)? == 1 && r.u8(2)? == 0,
+        "not a big-endian version-0 FMG"
+    );
+    ensure!(
+        r.u32(4)? as usize == data.len(),
+        "FMG size field {:#x} != file size {:#x}",
+        r.u32(4)?,
+        data.len()
+    );
     let encoding = match r.u8(8)? {
         0 => Encoding::ShiftJis,
         1 => Encoding::Utf16Be,
@@ -38,12 +46,18 @@ pub fn read(data: &[u8]) -> Result<Fmg> {
     let groups = r.u32(0x0C)? as usize;
     let strings = r.u32(0x10)? as usize;
     let offsets = r.u32(0x14)? as usize;
-    ensure!(offsets == 0x1C + 12 * groups, "string offsets at {offsets:#x}, expected after {groups} groups");
+    ensure!(
+        offsets == 0x1C + 12 * groups,
+        "string offsets at {offsets:#x}, expected after {groups} groups"
+    );
     let mut entries = Vec::with_capacity(strings);
     for g in 0..groups {
         let at = 0x1C + 12 * g;
         let (first, lo, hi) = (r.u32(at)? as usize, r.i32(at + 4)?, r.i32(at + 8)?);
-        ensure!(first == entries.len() && lo <= hi, "group {g} ({first}, {lo}..={hi}) out of order");
+        ensure!(
+            first == entries.len() && lo <= hi,
+            "group {g} ({first}, {lo}..={hi}) out of order"
+        );
         for (k, id) in (lo..=hi).enumerate() {
             let i = first + k;
             ensure!(i < strings, "group {g} runs past {strings} strings");
@@ -60,13 +74,20 @@ pub fn read(data: &[u8]) -> Result<Fmg> {
             entries.push((id, text));
         }
     }
-    ensure!(entries.len() == strings, "groups cover {} of {strings} strings", entries.len());
+    ensure!(
+        entries.len() == strings,
+        "groups cover {} of {strings} strings",
+        entries.len()
+    );
     Ok(Fmg { encoding, entries })
 }
 
 impl Fmg {
     pub fn get(&self, id: i32) -> Option<&str> {
-        self.entries.iter().find(|(i, _)| *i == id).and_then(|(_, t)| t.as_deref())
+        self.entries
+            .iter()
+            .find(|(i, _)| *i == id)
+            .and_then(|(_, t)| t.as_deref())
     }
 }
 
@@ -75,7 +96,10 @@ mod tests {
     use super::*;
 
     fn utf16(s: &str) -> Vec<u8> {
-        s.encode_utf16().chain([0]).flat_map(u16::to_be_bytes).collect()
+        s.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_be_bytes)
+            .collect()
     }
 
     #[test]
@@ -100,7 +124,12 @@ mod tests {
         let mut out = vec![0, 1, 0, 0];
         out.extend(((at) as u32).to_be_bytes());
         out.extend([1, 0xFF, 0, 0]);
-        for v in [groups.len() as u32, texts.len() as u32, offsets_at as u32, 0] {
+        for v in [
+            groups.len() as u32,
+            texts.len() as u32,
+            offsets_at as u32,
+            0,
+        ] {
             out.extend(v.to_be_bytes());
         }
         for (f, lo, hi) in groups {
@@ -141,16 +170,25 @@ mod tests {
 
     #[test]
     fn disc_banks() {
-        let Some(disc) = crate::vfs::test_disc() else { return };
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
         let mut n = 0;
         for file in disc.files() {
             let lower = file.to_ascii_lowercase();
-            if !(lower.starts_with("lang/en/text/") || lower.starts_with("lang/jp/text/")) || !lower.ends_with(".fmg") {
+            if !(lower.starts_with("lang/en/text/") || lower.starts_with("lang/jp/text/"))
+                || !lower.ends_with(".fmg")
+            {
                 continue;
             }
-            let f = read(&disc.asset(&file).unwrap()).unwrap_or_else(|err| panic!("{file}: {err:#}"));
+            let f =
+                read(&disc.asset(&file).unwrap()).unwrap_or_else(|err| panic!("{file}: {err:#}"));
             n += 1;
-            if lower.rsplit('/').next().is_some_and(|n| n.starts_with("partsname")) {
+            if lower
+                .rsplit('/')
+                .next()
+                .is_some_and(|n| n.starts_with("partsname"))
+            {
                 assert_eq!(f.encoding, Encoding::ShiftJis, "{file}");
             }
         }

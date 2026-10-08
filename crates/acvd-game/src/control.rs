@@ -1,7 +1,8 @@
 //! Piloting the shown AC, with the pad layout of the game's manual (`lang/en/text/menu/manual.fmg`):
 //! WASD / left stick move relative to its facing, Q/E / right stick X turn, Up/Down / right stick Y
 //! pitch the follow camera, Shift / L1 toggles boost mode, Space / South (×) jumps and turns boost
-//! mode on, Ctrl / L3 glides while boosting on the ground, V / West (□) high-boosts (quick boost)
+//! mode on, Ctrl / L3 glides while boosting on the ground (the air clips take over once it
+//! leaves the ground), V / West (□) high-boosts (quick boost)
 //! along the stick, forward without one. Movement steps at the game's 60 Hz tick
 //! in metres per tick with the AC's `AcCtrlParam`
 //! (`sheets/ac_ctrl_calc.csv`: its parts and build weight through the game's
@@ -61,6 +62,19 @@ pub struct Held(pub Vec<KeyCode>);
 
 /// Where an unturned AC faces: the assembled models' fronts point down -Z in Bevy axes.
 const FORWARD: Vec3 = Vec3::NEG_Z;
+
+/// Heading of the move, degrees clockwise from forward, for a direction-wheel clip.
+///
+/// Velocity (m/tick) against the body wins once it is moving; `stick` covers the frames before
+/// that. The sign is mirrored: the clip's 90 degree key matches a left stick (checked by eye
+/// on the body lean). The booster nozzles use the same heading (`sheets/booster_anim.csv`).
+pub(crate) fn lean_heading(yaw: f32, velocity: Vec3, stick: Vec2) -> f32 {
+    let forward = Quat::from_rotation_y(yaw) * FORWARD;
+    let right = forward.cross(Vec3::Y);
+    let v = Vec2::new(velocity.dot(right), velocity.dot(forward));
+    let local = if v.length() > 0.02 { v } else { stick };
+    (-local.x).atan2(local.y).to_degrees().rem_euclid(360.0)
+}
 
 /// Movement state of the AC root. Velocity is in metres per tick, Bevy axes; `yaw` turns
 /// about +Y (positive turns left), 0 facing `FORWARD`.
@@ -289,7 +303,7 @@ fn camera_action(state: &str, boost: bool, airborne: bool) -> u32 {
         "walk" | "dash" => 2,
         "turn_left" | "turn_right" => 3,
         "land" => 9,
-        "glide_start" | "glide" => 0x1a,
+        "glide_start" | "glide" | "glide_air_in" | "glide_air" => 0x1a,
         "quick_boost" => 0x32,
         _ => 8,
     };
@@ -612,7 +626,12 @@ impl FollowCam {
         };
         debug!(
             "camera action {action}: eye follow {:?}, eye distance {}, fade-in {}",
-            [row.eye_follow_rate_x, row.eye_follow_rate_y, row.eye_follow_rate_f, row.eye_follow_rate_b],
+            [
+                row.eye_follow_rate_x,
+                row.eye_follow_rate_y,
+                row.eye_follow_rate_f,
+                row.eye_follow_rate_b
+            ],
             row.eye_distance,
             row.eye_fade_in_frame
         );
@@ -748,6 +767,12 @@ impl FollowCam {
 }
 
 impl Pilot {
+    /// The locomotion state playing, and the hokan block its legs select (`motioncollate`
+    /// `HokanParamID`: 0, or 500 for tanks).
+    pub(crate) fn pose(&self) -> (Option<(&'static str, Option<u8>)>, u32) {
+        (self.state, self.hokan_base)
+    }
+
     /// A standing AC moving by `ctrl`, with the default follow camera for its legs' motion set.
     pub fn new(ctrl: AcCtrlParam, legs_motion_id: u8) -> Self {
         Self {
@@ -892,6 +917,42 @@ fn direction(stick: Vec2) -> u8 {
     ((angle / std::f32::consts::FRAC_PI_4).round() as u8) % 8
 }
 
+/// Travel eighth for the air-glide entry (`0x82825918`: 0 forward, clockwise). Velocity in the
+/// body's frame, the stick when nearly still. `x` is right, `y` is forward, the same axes as
+/// [`direction`].
+fn travel_eighth(p: &Pilot, stick: Vec2) -> u8 {
+    let forward = Quat::from_rotation_y(p.yaw) * FORWARD;
+    let right = forward.cross(Vec3::Y);
+    let v = Vec2::new(p.velocity.dot(right), p.velocity.dot(forward));
+    direction(if v.length() > 0.02 { v } else { stick })
+}
+
+/// Glide clip while `glide` is held. On the ground: the start, then the ground wheel. In the
+/// air: one directional entry (`glide_air_in`), then the air-float wheel (`glide_air`). Landing
+/// returns to the ground wheel without replaying the start.
+fn glide_clip(
+    current: (&'static str, Option<u8>),
+    airborne: bool,
+    clip_ok: bool,
+    finished: bool,
+    eighth: u8,
+) -> (&'static str, Option<u8>) {
+    if airborne {
+        return match current.0 {
+            "glide_air" => current,
+            "glide_air_in" if clip_ok && !finished => current,
+            "glide_air_in" => ("glide_air", None),
+            _ => ("glide_air_in", Some(eighth)),
+        };
+    }
+    match current.0 {
+        "glide" => current,
+        "glide_start" if clip_ok && !finished => current,
+        "glide_start" | "glide_air" | "glide_air_in" => ("glide", None),
+        _ => ("glide_start", None),
+    }
+}
+
 fn approach(v: Vec2, target: Vec2, step: f32) -> Vec2 {
     let d = target - v;
     if d.length() <= step {
@@ -1032,14 +1093,16 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
     if current.0 == "quick_boost" && p.clip_ok && !motion.finished() {
         return current;
     }
-    // A glide keeps its clip over a drop too.
+    // On the ground a glide is the start, then the ground wheel. Off the ground it is the
+    // directional air entry, then the air-float wheel (acmotion 223-230, then 222).
     if p.glide {
-        return match current.0 {
-            "glide" => current,
-            "glide_start" if p.clip_ok && !motion.finished() => current,
-            "glide_start" => ("glide", None),
-            _ => ("glide_start", None),
-        };
+        return glide_clip(
+            current,
+            p.airborne,
+            p.clip_ok,
+            motion.finished(),
+            travel_eighth(p, input.stick),
+        );
     }
     // Take-off and touchdown play out unless input moves the AC on.
     let holding = matches!(current.0, "jump" | "land") && p.clip_ok && !motion.finished();
@@ -1054,10 +1117,9 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
             Some(d) => ("air_move", Some(d)),
             // A direction change lets the stick pass through zero for a frame. Keep the wheel
             // while the AC is still moving, or that frame cuts to rise/fall and the lean snaps.
-            None
-                if current.0 == "air_move"
-                    && p.boost
-                    && Vec2::new(p.velocity.x, p.velocity.z).length() > 0.05 =>
+            None if current.0 == "air_move"
+                && p.boost
+                && Vec2::new(p.velocity.x, p.velocity.z).length() > 0.05 =>
             {
                 current
             }
@@ -1078,10 +1140,9 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
         None if input.turn < 0.0 => ("turn_right", None),
         // Same as the air case: keyboard direction changes zero the stick for a frame.
         // Dropping to idle restarts the clip, which is the strafe twitch.
-        None
-            if current.0 == "dash"
-                && p.boost
-                && Vec2::new(p.velocity.x, p.velocity.z).length() > 0.05 =>
+        None if current.0 == "dash"
+            && p.boost
+            && Vec2::new(p.velocity.x, p.velocity.z).length() > 0.05 =>
         {
             current
         }
@@ -1257,16 +1318,15 @@ pub fn pilot(
 
     // Dash / air-move / glide lean: one 360-frame clip whose frame is the heading in degrees (a
     // key per 45 degrees = the eight directions), so it blends smoothly between them.
-    if matches!(next.0, "dash" | "air_move" | "glide") && motion.clip.frames == 360 && p.clip_ok {
+    if matches!(next.0, "dash" | "air_move" | "glide" | "glide_air")
+        && motion.clip.frames == 360
+        && p.clip_ok
+    {
         // Mirrored: the clip's 90 degree key leans the way the stick's left does (checked by eye).
         // Heading of the actual velocity (m/tick) against the body, not the stick: the AC's
         // acceleration (its weight) then sets how fast the lean swings between directions.
         // Falls back to the stick while nearly still.
-        let forward = Quat::from_rotation_y(p.yaw) * FORWARD;
-        let right = forward.cross(Vec3::Y);
-        let v = Vec2::new(p.velocity.dot(right), p.velocity.dot(forward));
-        let local = if v.length() > 0.02 { v } else { body.stick };
-        let target = (-local.x).atan2(local.y).to_degrees().rem_euclid(360.0);
+        let target = lean_heading(p.yaw, p.velocity, body.stick);
         if motion.wheel.is_none() {
             motion.frame = target;
         }
@@ -1373,8 +1433,14 @@ mod tests {
             let mut position = Vec3::new(0.0, 500.0, 0.0);
             p.airborne = airborne;
             quick_boost(&mut p, Vec2::Y);
-            assert!(p.velocity.length() > ctrl.boost_max_tick, "impulse above boost max");
-            let right = Input { stick: Vec2::X, ..Input::default() };
+            assert!(
+                p.velocity.length() > ctrl.boost_max_tick,
+                "impulse above boost max"
+            );
+            let right = Input {
+                stick: Vec2::X,
+                ..Input::default()
+            };
             for _ in 0..30 {
                 step(&mut p, &right, &mut position, &collision);
             }
@@ -1416,5 +1482,56 @@ mod tests {
             .length(),
             walk
         );
+    }
+
+    #[test]
+    fn air_glide_plays_the_entry_then_the_float() {
+        let ground = glide_clip(("glide", None), false, true, false, 2);
+        assert_eq!(ground, ("glide", None));
+        let entry = glide_clip(("glide", None), true, true, false, 2);
+        assert_eq!(entry, ("glide_air_in", Some(2)));
+        let held = glide_clip(("glide_air_in", Some(2)), true, true, false, 0);
+        assert_eq!(held, ("glide_air_in", Some(2)));
+        let float = glide_clip(("glide_air_in", Some(2)), true, true, true, 0);
+        assert_eq!(float, ("glide_air", None));
+        let landed = glide_clip(("glide_air", None), false, true, false, 0);
+        assert_eq!(landed, ("glide", None));
+        assert_eq!(acvd_data::ac_state("glide_air", None).unwrap().row, 222);
+        assert_eq!(
+            acvd_data::ac_state("glide_air_in", Some(0)).unwrap().row,
+            223
+        );
+        assert_eq!(
+            acvd_data::ac_state("glide_air_in", Some(1)).unwrap().row,
+            230
+        );
+        assert_eq!(
+            acvd_data::ac_state("glide_air_in", Some(6)).unwrap().row,
+            225
+        );
+        assert_eq!(
+            acvd_data::ac_state("glide_air_in", Some(7)).unwrap().row,
+            224
+        );
+    }
+
+    #[test]
+    fn travel_eighth_is_clockwise_from_forward() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find_map(|r| AcCtrlParam::buildable(&r.data).then(|| AcCtrlParam::calculate(&r.data)))
+            .expect("a buildable preset");
+        let mut p = Pilot::new(ctrl, 0);
+        p.velocity = FORWARD;
+        assert_eq!(travel_eighth(&p, Vec2::ZERO), 0);
+        p.velocity = Vec3::NEG_X;
+        assert_eq!(travel_eighth(&p, Vec2::ZERO), 6);
+        p.velocity = Vec3::X;
+        assert_eq!(travel_eighth(&p, Vec2::ZERO), 2);
+        p.velocity = Vec3::ZERO;
+        assert_eq!(travel_eighth(&p, Vec2::Y), 0);
+        assert_eq!(travel_eighth(&p, Vec2::new(1.0, 1.0)), 1);
     }
 }

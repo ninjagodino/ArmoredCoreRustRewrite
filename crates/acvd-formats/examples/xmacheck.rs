@@ -17,7 +17,10 @@ fn main() -> anyhow::Result<()> {
     });
     let disc = vfs::Disc::open(&vfs::repo_root().join(vfs::X360_ISO))?;
     let banks: Vec<String> = if args.is_empty() {
-        disc.list("sound").into_iter().filter(|f| f.ends_with(".fsb")).collect()
+        disc.list("sound")
+            .into_iter()
+            .filter(|f| f.ends_with(".fsb"))
+            .collect()
     } else {
         args.iter().map(|a| format!("sound/{a}.fsb")).collect()
     };
@@ -25,8 +28,11 @@ fn main() -> anyhow::Result<()> {
     for bank_path in &banks {
         let start = Instant::now();
         let bank = fsb::read(&disc.read(bank_path)?)?;
-        let stem = bank_path.trim_start_matches("sound/").trim_end_matches(".fsb");
-        let (mut bank_errors, mut peak, mut channels) = (0, 0f32, std::collections::BTreeSet::new());
+        let stem = bank_path
+            .trim_start_matches("sound/")
+            .trim_end_matches(".fsb");
+        let (mut bank_errors, mut peak, mut channels) =
+            (0, 0f32, std::collections::BTreeSet::new());
         for (i, s) in bank.samples.iter().enumerate() {
             channels.insert(s.channels);
             match s.decode() {
@@ -35,9 +41,19 @@ fn main() -> anyhow::Result<()> {
                     peak = pcm.samples.iter().fold(peak, |p, v| p.max(v.abs()));
                     if let Some(dir) = &wav {
                         std::fs::create_dir_all(dir)?;
-                        std::fs::write(dir.join(format!("{stem}_{i:03}.wav")), wav_bytes(&pcm.to_i16(), pcm.channels, s.frequency))?;
-                        std::fs::write(dir.join(format!("{stem}_{i:03}_{}ch_{}.xma", s.channels, s.frequency)), &s.data)?;
-                        let f32s: Vec<u8> = pcm.samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        std::fs::write(
+                            dir.join(format!("{stem}_{i:03}.wav")),
+                            wav_bytes(&pcm.to_i16(), pcm.channels, s.frequency),
+                        )?;
+                        std::fs::write(
+                            dir.join(format!(
+                                "{stem}_{i:03}_{}ch_{}.xma",
+                                s.channels, s.frequency
+                            )),
+                            &s.data,
+                        )?;
+                        let f32s: Vec<u8> =
+                            pcm.samples.iter().flat_map(|v| v.to_le_bytes()).collect();
                         std::fs::write(dir.join(format!("{stem}_{i:03}.f32")), f32s)?;
                     }
                 }
@@ -51,7 +67,10 @@ fn main() -> anyhow::Result<()> {
         errors += bank_errors;
         println!("{stem}: {} samples, channels {channels:?}, {bank_errors} frame errors, peak {peak:.3}, {:.1} s", bank.samples.len(), start.elapsed().as_secs_f32());
     }
-    println!("{} banks, {samples} samples, {failed} failed, {errors} frame errors", banks.len());
+    println!(
+        "{} banks, {samples} samples, {failed} failed, {errors} frame errors",
+        banks.len()
+    );
     Ok(())
 }
 

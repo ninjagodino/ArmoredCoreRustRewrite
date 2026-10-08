@@ -138,7 +138,11 @@ fn params(set: &LightSet) -> EnvParams {
     let ground = conv(set.ground);
     let f = &set.fog;
     let falloff = f.falloff.max(0.1);
-    let w = if f.rising { 1.0 / falloff } else { -1.0 / falloff };
+    let w = if f.rising {
+        1.0 / falloff
+    } else {
+        -1.0 / falloff
+    };
     let inv = |v: f32| if v > 0.0 { 1.0 / v } else { 0.0 };
     EnvParams {
         dir0: bevy_dir(set.direction(0)).extend(0.0),
@@ -148,7 +152,12 @@ fn params(set: &LightSet) -> EnvParams {
         amb_mid: ((sky + ground) * 0.5).extend(0.0),
         amb_half: ((sky - ground) * 0.5).extend(0.0),
         fog_dist: Vec4::new(f.color[3] * f.density, f.start, inv(f.range), w),
-        fog_height: Vec4::new(f.height_color[3] * f.density, f.height_base, inv(f.height_range) * w, 0.0),
+        fog_height: Vec4::new(
+            f.height_color[3] * f.density,
+            f.height_base,
+            inv(f.height_range) * w,
+            0.0,
+        ),
         fog_col0: squared(f.color).extend(f.luma_tint),
         fog_col1: squared(f.height_color).extend(f.luma_tint),
     }
@@ -166,10 +175,10 @@ impl Plugin for EnvPlugin {
             MaterialPlugin::<EnvMaterial>::default(),
             MaterialPlugin::<SkyMaterial>::default(),
         ))
-            .insert_resource(EnvDisc(self.disc.clone()))
-            .add_systems(PostStartup, load)
-            .add_systems(Update, relight)
-            .add_systems(PostUpdate, follow_sky.before(TransformSystems::Propagate));
+        .insert_resource(EnvDisc(self.disc.clone()))
+        .add_systems(PostStartup, load)
+        .add_systems(Update, relight)
+        .add_systems(PostUpdate, follow_sky.before(TransformSystems::Propagate));
     }
 }
 
@@ -224,7 +233,9 @@ fn load(
     mut lights: Query<(&mut DirectionalLight, &mut Transform)>,
     cameras: Query<Entity, With<Camera3d>>,
 ) {
-    let Some(map) = scene.map.as_deref() else { return };
+    let Some(map) = scene.map.as_deref() else {
+        return;
+    };
     let disc = &disc.0;
     let path = env_path(map);
     let env = match vfs::open(disc, &path).and_then(|d| env::read(&d)) {
@@ -239,7 +250,9 @@ fn load(
         .map(|parts| parts.into_iter().map(|p| (p.name, p.model)).collect())
         .unwrap_or_default();
     if let Some(s) = env.scene {
-        commands.insert_resource(ClearColor(Color::srgb_u8(s.clear[0], s.clear[1], s.clear[2])));
+        commands.insert_resource(ClearColor(Color::srgb_u8(
+            s.clear[0], s.clear[1], s.clear[2],
+        )));
     }
     if let Some(ac) = env.light(SET_AC) {
         for (i, (mut light, mut xf)) in lights.iter_mut().enumerate().take(2) {
@@ -260,7 +273,11 @@ fn load(
     for camera in &cameras {
         commands.entity(camera).insert(Tonemapping::None);
     }
-    info!("{path}: {} light sets, scene {:?}", env.lights.len(), env.scene);
+    info!(
+        "{path}: {} light sets, scene {:?}",
+        env.lights.len(),
+        env.scene
+    );
     commands.insert_resource(MapEnv {
         env,
         models,
@@ -277,7 +294,10 @@ fn relight(
     mut commands: Commands,
     disc: Res<EnvDisc>,
     env: Option<ResMut<MapEnv>>,
-    added: Query<(Entity, &MeshMaterial3d<StandardMaterial>), Added<MeshMaterial3d<StandardMaterial>>>,
+    added: Query<
+        (Entity, &MeshMaterial3d<StandardMaterial>),
+        Added<MeshMaterial3d<StandardMaterial>>,
+    >,
     parents: Query<&ChildOf>,
     parts: Query<(&Name, &Transform), With<MapPart>>,
     standard: Res<Assets<StandardMaterial>>,
@@ -288,8 +308,9 @@ fn relight(
     let Some(mut env) = env else { return };
     let env = &mut *env;
     for (entity, material) in &added {
-        let Some((part, (name, part_xf))) =
-            parents.iter_ancestors(entity).find_map(|a| parts.get(a).ok().map(|p| (a, p)))
+        let Some((part, (name, part_xf))) = parents
+            .iter_ancestors(entity)
+            .find_map(|a| parts.get(a).ok().map(|p| (a, p)))
         else {
             continue;
         };
@@ -318,7 +339,10 @@ fn relight(
                     .remove::<MeshMaterial3d<StandardMaterial>>()
                     .insert(MeshMaterial3d(sky));
                 let scale = env.env.scene.map_or(1.0, |s| s.sky_scale);
-                commands.entity(part).insert(SkyDome { y: part_xf.translation.y, scale });
+                commands.entity(part).insert(SkyDome {
+                    y: part_xf.translation.y,
+                    scale,
+                });
                 continue;
             }
         }
@@ -326,14 +350,18 @@ fn relight(
         let Some(set) = env.env.light(slot).or_else(|| env.env.light(SET_MAP)) else {
             continue;
         };
-        let Some(base) = standard.get(&material.0) else { continue };
+        let Some(base) = standard.get(&material.0) else {
+            continue;
+        };
         let handle = env
             .made
             .entry((material.0.id(), slot))
             .or_insert_with(|| {
                 materials.add(EnvMaterial {
                     base: base.clone(),
-                    extension: EnvLit { params: params(set) },
+                    extension: EnvLit {
+                        params: params(set),
+                    },
                 })
             })
             .clone();

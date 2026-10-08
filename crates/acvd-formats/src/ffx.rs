@@ -134,9 +134,16 @@ pub fn is_ffx(data: &[u8]) -> bool {
 
 pub fn read(data: &[u8]) -> Result<Effect> {
     ensure!(is_ffx(data), "not a DLsE effect");
-    let mut r = Le { d: data, at: 4, names: Vec::new() };
+    let mut r = Le {
+        d: data,
+        at: 4,
+        names: Vec::new(),
+    };
     ensure!(r.bytes(4)? == [1, 3, 0, 0], "DLsE version bytes");
-    ensure!(r.u32()? == 0 && r.u32()? == 0 && r.u8()? == 0 && r.u32()? == 1, "DLsE header");
+    ensure!(
+        r.u32()? == 0 && r.u32()? == 0 && r.u8()? == 0 && r.u32()? == 1,
+        "DLsE header"
+    );
     let count = r.i16()?;
     for _ in 0..count {
         let len = r.u32()? as usize;
@@ -156,8 +163,16 @@ const PRIM: &str = "FXSerializablePrimitive<";
 
 impl<'a> Le<'a> {
     fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        let Some(b) = self.at.checked_add(n).and_then(|end| self.d.get(self.at..end)) else {
-            bail!("read of {n} bytes at {:#x} runs past end of {:#x}-byte effect", self.at, self.d.len())
+        let Some(b) = self
+            .at
+            .checked_add(n)
+            .and_then(|end| self.d.get(self.at..end))
+        else {
+            bail!(
+                "read of {n} bytes at {:#x} runs past end of {:#x}-byte effect",
+                self.at,
+                self.d.len()
+            )
         };
         self.at += n;
         Ok(b)
@@ -182,7 +197,11 @@ impl<'a> Le<'a> {
         let at = self.at;
         let i = self.i16()?;
         let names = &self.names;
-        usize::try_from(i - 1).ok().and_then(|i| names.get(i)).map(String::as_str).with_context(|| format!("class index {i} at {at:#x}"))
+        usize::try_from(i - 1)
+            .ok()
+            .and_then(|i| names.get(i))
+            .map(String::as_str)
+            .with_context(|| format!("class index {i} at {at:#x}"))
     }
 
     /// Opens an object of class `want`; returns where it must end.
@@ -196,7 +215,12 @@ impl<'a> Le<'a> {
     }
 
     fn close(&mut self, end: usize, what: &str) -> Result<()> {
-        ensure!(self.at == end, "{what} ends at {:#x}, read to {:#x}", end, self.at);
+        ensure!(
+            self.at == end,
+            "{what} ends at {:#x}, read to {:#x}",
+            end,
+            self.at
+        );
         Ok(())
     }
 
@@ -204,7 +228,9 @@ impl<'a> Le<'a> {
     fn prim(&mut self) -> Result<(String, Vec<f32>, i32)> {
         let start = self.at;
         let class = self.class()?.to_owned();
-        let Some(kind) = class.strip_prefix(PRIM).and_then(|k| k.strip_suffix('>')) else { bail!("expected a primitive at {start:#x}, found {class}") };
+        let Some(kind) = class.strip_prefix(PRIM).and_then(|k| k.strip_suffix('>')) else {
+            bail!("expected a primitive at {start:#x}, found {class}")
+        };
         let kind = kind.to_owned();
         let _version = self.u32()?;
         let end = start + self.u32()? as usize;
@@ -226,12 +252,18 @@ impl<'a> Le<'a> {
     }
     fn float(&mut self) -> Result<f32> {
         let (kind, f, _) = self.prim()?;
-        ensure!(f.len() == 1, "expected one float in {kind}, found {}", f.len());
+        ensure!(
+            f.len() == 1,
+            "expected one float in {kind}, found {}",
+            f.len()
+        );
         Ok(f[0])
     }
     fn color(&mut self) -> Result<[f32; 4]> {
         let (kind, f, _) = self.prim()?;
-        f.try_into().map_err(|f: Vec<f32>| anyhow::anyhow!("expected four floats in {kind}, found {}", f.len()))
+        f.try_into().map_err(|f: Vec<f32>| {
+            anyhow::anyhow!("expected four floats in {kind}, found {}", f.len())
+        })
     }
     fn keys<T>(&mut self, mut key: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<(f32, T)>> {
         let n = self.u32()?;
@@ -262,7 +294,9 @@ impl<'a> Le<'a> {
             13 | 14 => Value::CubicKeys(self.keys(|r| Ok([r.float()?, r.float()?, r.float()?]))?),
             15 => Value::Color(self.color()?),
             17..=20 => Value::ColorKeys(self.keys(Self::color)?),
-            21 | 22 => Value::CubicColorKeys(self.keys(|r| Ok([r.color()?, r.color()?, r.color()?]))?),
+            21 | 22 => {
+                Value::CubicColorKeys(self.keys(|r| Ok([r.color()?, r.color()?, r.color()?]))?)
+            }
             37 | 38 => Value::Node(self.i32()?, self.list()?),
             40 | 41 | 68 | 69 => Value::Id(self.i32()?),
             44..=47 | 59 | 60 | 66 | 71 | 87 => Value::Arg(self.i32()?, self.i32()?),
@@ -275,7 +309,11 @@ impl<'a> Le<'a> {
             85 => Value::TickPair(self.float()?, self.float()?),
             _ => Value::Raw(self.bytes(end.saturating_sub(self.at))?.to_vec()),
         };
-        ensure!(self.at <= end, "param kind {kind} ends at {end:#x}, read to {:#x}", self.at);
+        ensure!(
+            self.at <= end,
+            "param kind {kind} ends at {end:#x}, read to {:#x}",
+            self.at
+        );
         let extra = self.bytes(end - self.at)?.to_vec();
         Ok(Param { kind, value, extra })
     }
@@ -323,13 +361,19 @@ impl<'a> Le<'a> {
             let mut actions = Vec::with_capacity(na as usize);
             for _ in 0..na {
                 let e = self.open("FXSerializableAction")?;
-                actions.push(Action { id: self.i32()?, params: self.list()? });
+                actions.push(Action {
+                    id: self.i32()?,
+                    params: self.list()?,
+                });
                 self.close(e, "action")?;
             }
             let mut triggers = Vec::with_capacity(nt as usize);
             for _ in 0..nt {
                 let e = self.open("FXSerializableTrigger")?;
-                triggers.push(Trigger { state: self.i32()?, eval: self.eval()? });
+                triggers.push(Trigger {
+                    state: self.i32()?,
+                    eval: self.eval()?,
+                });
                 self.close(e, "trigger")?;
             }
             self.close(state_end, "state")?;
@@ -337,12 +381,24 @@ impl<'a> Le<'a> {
         }
         self.close(map_end, "state map")?;
         let res_end = self.open("FXResourceSet")?;
-        let resources = [self.dlvector()?, self.dlvector()?, self.dlvector()?, self.dlvector()?, self.dlvector()?];
+        let resources = [
+            self.dlvector()?,
+            self.dlvector()?,
+            self.dlvector()?,
+            self.dlvector()?,
+            self.dlvector()?,
+        ];
         self.close(res_end, "resource set")?;
         // The effect length is not exact: on sfx/f0004092.ffx it runs 3 bytes past the file.
         let _ = end;
         ensure!(self.u8()? == 0, "effect {id} tail");
-        Ok(Effect { id, params1, params2, states, resources })
+        Ok(Effect {
+            id,
+            params1,
+            params2,
+            states,
+            resources,
+        })
     }
 }
 
@@ -355,10 +411,14 @@ impl ParamList {
 impl Effect {
     /// Every param-37 node of every action of every state, outermost first.
     pub fn nodes(&self) -> impl Iterator<Item = (i32, &ParamList)> {
-        self.states.iter().flat_map(|s| &s.actions).flat_map(|a| &a.params.params).filter_map(|p| match &p.value {
-            Value::Node(id, list) if p.kind == 37 && *id != 0 => Some((*id, list)),
-            _ => None,
-        })
+        self.states
+            .iter()
+            .flat_map(|s| &s.actions)
+            .flat_map(|a| &a.params.params)
+            .filter_map(|p| match &p.value {
+                Value::Node(id, list) if p.kind == 37 && *id != 0 => Some((*id, list)),
+                _ => None,
+            })
     }
 }
 
@@ -412,7 +472,10 @@ mod tests {
 
     #[test]
     fn reads_a_minimal_effect() {
-        let mut w = W { out: Vec::new(), names: Vec::new() };
+        let mut w = W {
+            out: Vec::new(),
+            names: Vec::new(),
+        };
         w.obj("FXSerializableEffect", |w| {
             w.u32(0);
             w.u32(1218);
@@ -449,7 +512,9 @@ mod tests {
                     });
                     w.obj("FXSerializableTrigger", |w| {
                         w.u32(1);
-                        w.obj("FXSerializableEvaluatable<dl_int32>", |w| w.u32s(&[1, 3, 7]));
+                        w.obj("FXSerializableEvaluatable<dl_int32>", |w| {
+                            w.u32s(&[1, 3, 7])
+                        });
                     });
                 });
             });
@@ -473,17 +538,33 @@ mod tests {
         file.extend(&w.out);
         let e = read(&file).unwrap();
         assert_eq!(e.id, 1218);
-        assert_eq!(e.params1.get(0), Some(&Value::FloatKeys(vec![(0.0, 1.0), (0.5, 4.0)])));
-        let Some(Value::Node(59, inner)) = e.params1.get(1) else { panic!("{:?}", e.params1) };
+        assert_eq!(
+            e.params1.get(0),
+            Some(&Value::FloatKeys(vec![(0.0, 1.0), (0.5, 4.0)]))
+        );
+        let Some(Value::Node(59, inner)) = e.params1.get(1) else {
+            panic!("{:?}", e.params1)
+        };
         assert_eq!(inner.get(0), Some(&Value::Id(1036)));
-        assert_eq!(e.states[0].triggers[0], Trigger { state: 1, eval: Eval::Const(7) });
+        assert_eq!(
+            e.states[0].triggers[0],
+            Trigger {
+                state: 1,
+                eval: Eval::Const(7)
+            }
+        );
         assert_eq!(e.resources[4], [4]);
     }
 
     #[test]
     fn disc_effects() {
-        let Ok(disc) = crate::vfs::Disc::open(&crate::vfs::repo_root().join(crate::vfs::X360_ISO)) else { return };
-        let Ok(binder) = disc.read("sfx/acv_commoneffects.ffxbnd") else { return };
+        let Ok(disc) = crate::vfs::Disc::open(&crate::vfs::repo_root().join(crate::vfs::X360_ISO))
+        else {
+            return;
+        };
+        let Ok(binder) = disc.read("sfx/acv_commoneffects.ffxbnd") else {
+            return;
+        };
         let b = crate::bnd3::read(&binder).unwrap();
         let mut n = 0;
         for entry in &b.entries {
@@ -493,12 +574,24 @@ mod tests {
             }
             let name = entry.name.clone().unwrap_or_default();
             let e = read(&data).unwrap_or_else(|err| panic!("{name}: {err:#}"));
-            assert!(name.contains(&format!("{:07}", e.id)), "{name} holds effect {}", e.id);
+            assert!(
+                name.contains(&format!("{:07}", e.id)),
+                "{name} holds effect {}",
+                e.id
+            );
             n += 1;
         }
         assert!(n >= 1800, "{n} effects");
-        let muzzle = read(&disc.asset("sfx/acv_commoneffects.ffxbnd|f0001218.ffx").unwrap()).unwrap();
-        assert_eq!(muzzle.resources[1], [1038, 230, 4022, 1036, 220, 242, 232, 233]);
+        let muzzle = read(
+            &disc
+                .asset("sfx/acv_commoneffects.ffxbnd|f0001218.ffx")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            muzzle.resources[1],
+            [1038, 230, 4022, 1036, 220, 242, 232, 233]
+        );
         assert!(muzzle.nodes().any(|(id, _)| id == 2023));
     }
 }

@@ -6,7 +6,12 @@ fn main() -> anyhow::Result<()> {
     println!("{} frames, {} bones", anim.frames, anim.bones.len());
     for (i, b) in anim.bones.iter().enumerate() {
         let r = b.rest.as_ref();
-        println!("{i:3} {:<16} parent {:?} keys {}", r.map_or("?", |r| r.name.as_str()), r.and_then(|r| r.parent), b.track.keys.len());
+        println!(
+            "{i:3} {:<16} parent {:?} keys {}",
+            r.map_or("?", |r| r.name.as_str()),
+            r.and_then(|r| r.parent),
+            b.track.keys.len()
+        );
     }
     Ok(())
 }

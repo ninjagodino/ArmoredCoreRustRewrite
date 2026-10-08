@@ -72,7 +72,10 @@ pub fn read(data: &[u8]) -> Result<Vec<Control>> {
                 lock: [[f(8)?, f(9)?], [f(10)?, f(11)?], [f(12)?, f(13)?]],
             });
         }
-        controls.push(Control { name: text(b.u32(at)?)?, objects });
+        controls.push(Control {
+            name: text(b.u32(at)?)?,
+            objects,
+        });
     }
     Ok(controls)
 }
@@ -98,19 +101,47 @@ mod tests {
         }
         d.extend(b"gun_R\0r_arm01\0\0");
         let c = read(&d).unwrap();
-        assert_eq!((c[0].name.as_str(), c[0].objects[0].bone.as_str()), ("gun_R", "r_arm01"));
+        assert_eq!(
+            (c[0].name.as_str(), c[0].objects[0].bone.as_str()),
+            ("gun_R", "r_arm01")
+        );
         let o = &c[0].objects[0];
-        assert_eq!((o.axis_bone.as_str(), o.react_ang, o.react_delay, o.react_time), ("", 4.0, 6.0, 7.0));
+        assert_eq!(
+            (
+                o.axis_bone.as_str(),
+                o.react_ang,
+                o.react_delay,
+                o.react_time
+            ),
+            ("", 4.0, 6.0, 7.0)
+        );
         assert_eq!(o.lock[2], [12.0, 13.0]);
     }
 
     #[test]
     fn gun_kick_from_disc() {
-        let Some(disc) = crate::vfs::test_disc() else { return };
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
         let c = read(&crate::vfs::open(&disc, "param/jcondata.bin").unwrap()).unwrap();
         let names: Vec<_> = c.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["gun_L", "gun_R", "OW", "Core", "sniper_L", "sniper_R", "weaponArms"]);
-        let kick: Vec<_> = c[1].objects.iter().map(|o| (o.bone.as_str(), o.react_ang, o.react_delay, o.react_time)).collect();
+        assert_eq!(
+            names,
+            [
+                "gun_L",
+                "gun_R",
+                "OW",
+                "Core",
+                "sniper_L",
+                "sniper_R",
+                "weaponArms"
+            ]
+        );
+        let kick: Vec<_> = c[1]
+            .objects
+            .iter()
+            .map(|o| (o.bone.as_str(), o.react_ang, o.react_delay, o.react_time))
+            .collect();
         assert_eq!(
             kick,
             [
@@ -123,6 +154,9 @@ mod tests {
                 ("r_armhand", 0.0, 5.0, 0.0),
             ]
         );
-        assert_eq!((c[5].objects[0].bone.as_str(), c[5].objects[0].react_ang), ("r_arm01", -2.0));
+        assert_eq!(
+            (c[5].objects[0].bone.as_str(), c[5].objects[0].react_ang),
+            ("r_arm01", -2.0)
+        );
     }
 }

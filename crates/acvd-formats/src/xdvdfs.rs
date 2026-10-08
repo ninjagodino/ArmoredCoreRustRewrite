@@ -44,18 +44,22 @@ impl Image {
             let mut head = [0u8; 28];
             file.seek(SeekFrom::Start(base + 32 * SECTOR))?;
             if file.read_exact(&mut head).is_ok() && &head[..20] == MAGIC {
-                let le = |at: usize| u32::from_le_bytes(head[at..at + 4].try_into().expect("4 bytes"));
+                let le =
+                    |at: usize| u32::from_le_bytes(head[at..at + 4].try_into().expect("4 bytes"));
                 partition = Some((base, le(20), le(24)));
                 break;
             }
         }
-        let Some((base, root, root_size)) = partition else { bail!("{}: no XDVDFS volume", path.display()) };
+        let Some((base, root, root_size)) = partition else {
+            bail!("{}: no XDVDFS volume", path.display())
+        };
         let mut files = HashMap::new();
         let mut dirs = vec![(String::new(), root, root_size)];
         while let Some((prefix, sector, size)) = dirs.pop() {
             let mut table = vec![0u8; size as usize];
             file.seek(SeekFrom::Start(base + sector as u64 * SECTOR))?;
-            file.read_exact(&mut table).with_context(|| format!("directory `{prefix}`"))?;
+            file.read_exact(&mut table)
+                .with_context(|| format!("directory `{prefix}`"))?;
             for (name, start, len, attr) in nodes(&table)? {
                 let path = format!("{prefix}{}", name.to_ascii_lowercase());
                 if attr & DIRECTORY != 0 {
@@ -63,16 +67,33 @@ impl Image {
                         dirs.push((path + "/", start, len));
                     }
                 } else {
-                    files.insert(path, Extent { offset: base + start as u64 * SECTOR, size: len as u64 });
+                    files.insert(
+                        path,
+                        Extent {
+                            offset: base + start as u64 * SECTOR,
+                            size: len as u64,
+                        },
+                    );
                 }
             }
         }
-        Ok(Image { file: Mutex::new(file), partition: base, files })
+        Ok(Image {
+            file: Mutex::new(file),
+            partition: base,
+            files,
+        })
     }
 
     /// Extent of a file (case-insensitive, `/` or `\` separators).
     pub fn find(&self, path: &str) -> Option<Extent> {
-        self.files.get(&path.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase()).copied()
+        self.files
+            .get(
+                &path
+                    .replace('\\', "/")
+                    .trim_start_matches('/')
+                    .to_ascii_lowercase(),
+            )
+            .copied()
     }
 
     pub fn files(&self) -> impl Iterator<Item = (&str, Extent)> {
@@ -84,12 +105,15 @@ impl Image {
         let mut out = vec![0u8; len];
         let mut f = self.file.lock().expect("image lock");
         f.seek(SeekFrom::Start(offset))?;
-        f.read_exact(&mut out).with_context(|| format!("reading {len:#x} bytes at {offset:#x}"))?;
+        f.read_exact(&mut out)
+            .with_context(|| format!("reading {len:#x} bytes at {offset:#x}"))?;
         Ok(out)
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let e = self.find(path).with_context(|| format!("no `{path}` on the disc"))?;
+        let e = self
+            .find(path)
+            .with_context(|| format!("no `{path}` on the disc"))?;
         self.read_at(e.offset, e.size as usize)
     }
 }
@@ -106,10 +130,22 @@ fn nodes(table: &[u8]) -> Result<Vec<(String, u32, u32, u8)>> {
         let u16le = |at: usize| u16::from_le_bytes([table[at], table[at + 1]]);
         let u32le = |at: usize| u32::from_le_bytes(table[at..at + 4].try_into().expect("4 bytes"));
         let (left, right) = (u16le(off), u16le(off + 2));
-        let (start, size, attr, len) = (u32le(off + 4), u32le(off + 8), table[off + 12], table[off + 13] as usize);
-        let name = table.get(off + 14..off + 14 + len).context("directory name runs past its table")?;
+        let (start, size, attr, len) = (
+            u32le(off + 4),
+            u32le(off + 8),
+            table[off + 12],
+            table[off + 13] as usize,
+        );
+        let name = table
+            .get(off + 14..off + 14 + len)
+            .context("directory name runs past its table")?;
         ensure!(!name.is_empty(), "empty name in directory node at {off:#x}");
-        out.push((String::from_utf8_lossy(name).into_owned(), start, size, attr));
+        out.push((
+            String::from_utf8_lossy(name).into_owned(),
+            start,
+            size,
+            attr,
+        ));
         for child in [left, right] {
             if child != 0 {
                 stack.push(child as usize * 4);
@@ -143,7 +179,13 @@ mod tests {
         t.extend([0xFF; 8]);
         let mut got = nodes(&t).unwrap();
         got.sort();
-        assert_eq!(got, vec![("bind".into(), 40, 0x800, DIRECTORY), ("default.xex".into(), 41, 123, 0x80)]);
+        assert_eq!(
+            got,
+            vec![
+                ("bind".into(), 40, 0x800, DIRECTORY),
+                ("default.xex".into(), 41, 123, 0x80)
+            ]
+        );
     }
 
     #[test]

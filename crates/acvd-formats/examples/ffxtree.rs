@@ -1,10 +1,11 @@
 //! Prints the node tree of FFX effects: each state's actions, then every param-37 node (template
 //! id) and param-38 action (type id) nested under them, with their life / delay ticks.
-//! `ffxtree [--disc PATH] ID...` (effects of `sfx/acv_commoneffects.ffxbnd`).
+//! `ffxtree [--disc PATH] [--params] ID...` (effects of `sfx/acv_commoneffects.ffxbnd`);
+//! `--params` also prints every other slot's kind and value.
 use acvd_formats::ffx::{self, ParamList, Value};
 use acvd_formats::vfs;
 
-fn walk(l: &ParamList, depth: usize) {
+fn walk(l: &ParamList, depth: usize, params: bool) {
     for (i, p) in l.params.iter().enumerate() {
         if let Value::Node(id, list) = &p.value {
             let ticks: Vec<String> = list
@@ -23,7 +24,9 @@ fn walk(l: &ParamList, depth: usize) {
                 list.params.len(),
                 ticks.join(" ")
             );
-            walk(list, depth + 1);
+            walk(list, depth + 1, params);
+        } else if params {
+            println!("{}[{i}] kind {} {:?}", "  ".repeat(depth), p.kind, p.value);
         }
     }
 }
@@ -37,15 +40,29 @@ fn main() -> anyhow::Result<()> {
         }
         None => vfs::repo_root().join(vfs::X360_ISO),
     };
+    let params = match args.iter().position(|a| a == "--params") {
+        Some(i) => {
+            args.remove(i);
+            true
+        }
+        None => false,
+    };
     let disc = vfs::Disc::open(&path)?;
     for id in &args {
         let id: i32 = id.parse()?;
-        let e = ffx::read(&vfs::open(&disc, &format!("sfx/acv_commoneffects.ffxbnd|f{id:07}.ffx"))?)?;
-        println!("== effect {id}: {} states, resources {:?}", e.states.len(), e.resources);
+        let e = ffx::read(&vfs::open(
+            &disc,
+            &format!("sfx/acv_commoneffects.ffxbnd|f{id:07}.ffx"),
+        )?)?;
+        println!(
+            "== effect {id}: {} states, resources {:?}",
+            e.states.len(),
+            e.resources
+        );
         for (s, state) in e.states.iter().enumerate() {
             for a in &state.actions {
                 println!("state {s} action {}", a.id);
-                walk(&a.params, 1);
+                walk(&a.params, 1, params);
             }
         }
     }

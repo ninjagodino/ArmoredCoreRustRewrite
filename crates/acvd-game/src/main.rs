@@ -5,8 +5,12 @@
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
 //! [--water <y>]`
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump,
-//! V high boost (quick boost), Ctrl glide boost while boosting on the ground;
+//! V high boost (quick boost), Ctrl glide boost while boosting on the ground
+//! (air clips once it leaves the ground);
 //! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left (see `weapons`).
+//! Hold R (△ / gamepad North) and press that fire button to bay-shift: the hand weapon trades
+//! places with the one on the rack (see `bay`). A ready-position weapon is purged instead,
+//! because it cannot sit on the bay.
 //! A ready-position weapon (cannon, autocannon, and the other classes with `ready_position`)
 //! plays its deploy clip while fire is held and does not shoot until that clip ends; releasing
 //! fire plays the stow, and that side's arm plays its deploy clip over the walk. A ready weapon
@@ -22,15 +26,19 @@
 //! `{map}_{name}.msb` start point (`none`: the terrain MSB's), `--hits` draws the hit meshes
 //! instead of the map models, `--plane` is the old infinite floor, `--water` adds a test water
 //! plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
+//! `--no-hud` leaves that HUD and the part-name overlay out, for looking at effects.
 //! Boosters, muzzle flashes, tracers and hits play FFX effects (see `sfx`); `--sfx <id>` keeps
 //! effect `id` playing in front of the AC. Shots, boost and jump play their FMOD cues (see
 //! `sound`). `--burst <n>` makes `--shot` save `n` frames 0.05 s apart (`<stem>_<i>.png`).
 
 mod assemble;
+mod bay;
 mod blur;
+mod boost;
 mod collision;
 mod control;
 mod env;
+mod hanger;
 mod hud;
 mod map;
 mod pose;
@@ -72,6 +80,10 @@ struct Garage {
 #[derive(Component)]
 struct Ac;
 
+/// When false (`--no-hud`), the lock-sight and the part-name overlay are not drawn.
+#[derive(Resource)]
+struct ShowHud(bool);
+
 /// Disc font (`fontdef.xml` ID 1) and the English part-name bank.
 #[derive(Resource)]
 struct Hud {
@@ -95,7 +107,7 @@ fn main() {
     let (mut clip, mut frame, mut held, mut wait) = (None, None, Vec::new(), 0.0);
     let (mut map, mut plane, mut water) = (Some("m4000".to_string()), false, None);
     let (mut layout, mut hits) = (Some("actest".to_string()), false);
-    let (mut preview, mut burst) = (None, 1);
+    let (mut preview, mut burst, mut no_hud) = (None, 1, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -130,6 +142,7 @@ fn main() {
             "--water" => water = args.next().and_then(|s| s.parse::<f32>().ok()),
             "--sfx" => preview = args.next().and_then(|s| s.parse::<i32>().ok()),
             "--burst" => burst = args.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1),
+            "--no-hud" => no_hud = true,
             _ => wanted = a.parse::<u32>().ok(),
         }
     }
@@ -139,7 +152,8 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let disc = Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
+    let disc =
+        Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
     let mut collision = if plane {
         Collision::with_hits(
             vec![Plane {
@@ -217,12 +231,8 @@ fn main() {
         ..default()
     }))
     .add_plugins((blur::BlurPlugin, acvd_render::menu::MenuPlugin))
-    .add_plugins(sfx::SfxPlugin {
-        disc: disc.clone(),
-    })
-    .add_plugins(sound::SoundPlugin {
-        disc: disc.clone(),
-    })
+    .add_plugins(sfx::SfxPlugin { disc: disc.clone() })
+    .add_plugins(sound::SoundPlugin { disc: disc.clone() })
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(Garage {
@@ -244,6 +254,7 @@ fn main() {
     .insert_resource(collision)
     .insert_resource(control::Piloting(piloting))
     .insert_resource(control::Held(held))
+    .insert_resource(ShowHud(!no_hud))
     .add_systems(Startup, (setup, weapons::setup))
     .add_systems(
         Update,
@@ -252,9 +263,15 @@ fn main() {
             show,
             clips,
             control::pilot,
+            map::lod,
             pose::animate,
+            boost::pose,
+            boost::hide,
+            hanger::pose,
+            bay::shift,
             weapons::fire,
             orbit,
+            reframe,
         )
             .chain(),
     )
@@ -271,6 +288,7 @@ fn main() {
         shot.burst = burst;
         app.insert_resource(ShotDelay(wait, false))
             .insert_resource(shot)
+            .insert_resource(acvd_render::app::ShotMark::default())
             .add_systems(Update, (delay_shot, take_shot).chain().after(pose::animate));
     }
     app.run();
@@ -302,6 +320,7 @@ fn key(name: &str) -> Option<KeyCode> {
         "v" => KeyCode::KeyV,
         "f" | "fire" => KeyCode::KeyF,
         "c" => KeyCode::KeyC,
+        "r" => KeyCode::KeyR,
         "up" => KeyCode::ArrowUp,
         "down" => KeyCode::ArrowDown,
         other => {
@@ -320,6 +339,7 @@ fn setup(
     yaw: Res<StartYaw>,
     collision: Res<Collision>,
     scene: Res<Scene>,
+    show_hud: Res<ShowHud>,
 ) {
     commands.spawn((
         Camera3d::default(),
@@ -347,7 +367,14 @@ fn setup(
         Transform::from_xyz(-6.0, 3.0, -4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     let drawn = scene.map.as_deref().map_or(0, |id| {
-        match map::spawn(&mut commands, &mut meshes, &mut materials, &mut images, &garage.disc, id) {
+        match map::spawn(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut images,
+            &garage.disc,
+            id,
+        ) {
             Ok(n) => {
                 info!("map {id}: {n} parts drawn");
                 n
@@ -420,13 +447,15 @@ fn setup(
             }
         }
     }
-    match load_hud(&garage.disc, &mut images) {
-        Ok(hud) => commands.insert_resource(hud),
-        Err(e) => warn!("hud: {e:#}"),
-    }
-    match hud::load(&garage.disc, &mut images) {
-        Ok(sortie) => commands.insert_resource(sortie),
-        Err(e) => warn!("sortie hud: {e:#}"),
+    if show_hud.0 {
+        match load_hud(&garage.disc, &mut images) {
+            Ok(hud) => commands.insert_resource(hud),
+            Err(e) => warn!("hud: {e:#}"),
+        }
+        match hud::load(&garage.disc, &mut images) {
+            Ok(sortie) => commands.insert_resource(sortie),
+            Err(e) => warn!("sortie hud: {e:#}"),
+        }
     }
 }
 
@@ -465,6 +494,20 @@ const FLOOR: f32 = 1000.0;
 const VIEW_FAR: f32 = 6000.0;
 const PILLAR_SPACING: f32 = 40.0;
 
+fn reframe(
+    keys: Res<ButtonInput<KeyCode>>,
+    piloting: Res<control::Piloting>,
+    garage: Res<Garage>,
+    mut orbit: Query<&mut Orbit>,
+) {
+    if piloting.0 || !keys.just_pressed(KeyCode::KeyR) {
+        return;
+    }
+    if let Ok(mut o) = orbit.single_mut() {
+        o.frame(garage.bounds.0, garage.bounds.1);
+    }
+}
+
 fn browse(keys: Res<ButtonInput<KeyCode>>, mut garage: ResMut<Garage>) {
     let n = garage.designs.len() as isize;
     let step = [(KeyCode::ArrowRight, 1), (KeyCode::ArrowLeft, -1)]
@@ -481,7 +524,6 @@ fn browse(keys: Res<ButtonInput<KeyCode>>, mut garage: ResMut<Garage>) {
 fn show(
     mut commands: Commands,
     mut garage: ResMut<Garage>,
-    keys: Res<ButtonInput<KeyCode>>,
     acs: Query<Entity, With<Ac>>,
     shots: Query<Entity, With<weapons::Projectile>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -497,11 +539,6 @@ fn show(
     shot: Option<ResMut<Shot>>,
 ) {
     if garage.shown == Some(garage.current) {
-        if keys.just_pressed(KeyCode::KeyR) {
-            if let Ok(mut o) = orbit.single_mut() {
-                o.frame(garage.bounds.0, garage.bounds.1);
-            }
-        }
         return;
     }
     let Some(&design) = garage.designs.get(garage.current) else {
@@ -512,6 +549,9 @@ fn show(
         commands.entity(e).despawn();
     }
     commands.remove_resource::<weapons::WeaponAnims>();
+    commands.remove_resource::<weapons::Shift>();
+    commands.remove_resource::<hanger::HangerPose>();
+    commands.remove_resource::<boost::BoostPose>();
 
     let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design.data);
     let spawn_y = collision.ground_below(start.position + Vec3::Y * RAY_HALF);
@@ -556,13 +596,92 @@ fn show(
             return;
         }
     };
-    let skins = pose::spawn(&mut commands, ac, &rig, &loaded);
+    let (joint_entities, skins) = pose::spawn(&mut commands, ac, &rig, &loaded);
+    let mut loadout = bay::Loadout::default();
     let mut weapon_anims = weapons::WeaponAnims::default();
-    for (part, (joints, binds)) in loaded.into_iter().zip(skins) {
+    let mut nozzles = Vec::new();
+    let mut rack_bones: [Option<(usize, Vec<Entity>, usize)>; 2] = [None, None];
+    let mut rack_named: [Option<Vec<(String, Entity)>>; 2] = [None, None];
+    let mut rack_pose = [0u8; 2];
+    for (loaded_i, (part, (joints, binds))) in loaded.into_iter().zip(skins).enumerate() {
+        boost::note(&part.placement, &part.rig, &joints, &mut nozzles);
+        boost::fold(&mut commands, part.placement, &part.rig, &joints);
         let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
+        let root_bone = part
+            .rig
+            .bones
+            .iter()
+            .position(|b| b.parent.is_none())
+            .unwrap_or(0);
+        let root = joints.get(root_bone).copied();
         if let Some(h) = weapons::hardpoint(part.placement) {
-            if let Some(&root) = joints.first() {
+            if let Some(root) = root {
                 commands.entity(root).insert(h);
+            }
+        }
+        if part.placement.column == "rack_r" || part.placement.column == "rack_l" {
+            let right = part.placement.column == "rack_r";
+            let prong = if right { "r_hg_f" } else { "l_hg_f" };
+            if let Some(bone) = part.rig.bones.iter().position(|b| b.name == prong) {
+                let side = usize::from(!right);
+                rack_bones[side] = Some((loaded_i, joints.clone(), bone));
+                rack_named[side] = Some(
+                    part.rig
+                        .bones
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, b)| joints.get(i).copied().map(|e| (b.name.clone(), e)))
+                        .collect(),
+                );
+            }
+        }
+        if let Some((hand, on_bay)) = match part.placement.column {
+            "armwep_r" => Some((weapons::Hand::Right, false)),
+            "armwep_l" => Some((weapons::Hand::Left, false)),
+            "hanger_r" => Some((weapons::Hand::Right, true)),
+            "hanger_l" => Some((weapons::Hand::Left, true)),
+            _ => None,
+        } {
+            if on_bay {
+                rack_pose[hand as usize] =
+                    acvd_data::part_field(part.placement.part as i64, 10, "hanger_pose") as u8;
+            }
+            let on_prong = if on_bay {
+                rack_bones[hand as usize]
+                    .as_ref()
+                    .and_then(|(rack_i, rack_joints, prong)| {
+                        let local = rig.local_against(loaded_i, root_bone, *rack_i, *prong)?;
+                        let parent = *rack_joints.get(*prong)?;
+                        Some((parent, local))
+                    })
+            } else {
+                None
+            };
+            let (parent, local) = on_prong.unwrap_or_else(|| {
+                let mounted = rig.mount_local(loaded_i, root_bone);
+                (
+                    mounted
+                        .and_then(|(p, _)| p)
+                        .map(|p| joint_entities[p])
+                        .unwrap_or(ac),
+                    mounted.map(|(_, l)| l).unwrap_or(Transform::IDENTITY),
+                )
+            });
+            if on_bay {
+                if let Some(root) = root {
+                    commands.entity(root).insert((ChildOf(parent), local));
+                }
+            }
+            if root.is_some() {
+                loadout.set(
+                    hand,
+                    on_bay,
+                    bay::Mounted {
+                        weapon: root,
+                        parent,
+                        local,
+                    },
+                );
             }
         }
         weapon_anims.load(&garage.disc, part.placement, &part.rig, &joints);
@@ -578,7 +697,7 @@ fn show(
                 garage.flat,
                 &mut missing,
             ));
-            commands.spawn((
+            let mut mesh_entity = commands.spawn((
                 Mesh3d(meshes.add(mesh.mesh)),
                 MeshMaterial3d(material),
                 SkinnedMesh {
@@ -589,8 +708,33 @@ fn show(
                 Transform::default(),
                 ChildOf(ac),
             ));
+            if let Some(root) = root {
+                if matches!(
+                    part.placement.column,
+                    "armwep_r" | "armwep_l" | "hanger_r" | "hanger_l"
+                ) {
+                    mesh_entity.insert(bay::WeaponMesh { root });
+                }
+            }
         }
     }
+    commands.insert_resource(loadout);
+    let racks = rack_named
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, bones)| {
+            Some((
+                if i == 0 {
+                    weapons::Hand::Right
+                } else {
+                    weapons::Hand::Left
+                },
+                rack_pose[i],
+                bones?,
+            ))
+        })
+        .collect();
+    commands.insert_resource(hanger::HangerPose::load(&garage.disc, racks));
     for entity in weapon_anims.joints() {
         commands.entity(entity).insert(weapons::ClipJoint);
     }
@@ -598,6 +742,10 @@ fn show(
         commands.entity(entity).insert(transform);
     }
     commands.insert_resource(weapon_anims);
+    match boost::BoostPose::load(&garage.disc, nozzles) {
+        Some(boost) => commands.insert_resource(boost),
+        None => warn!("booster motion bank did not load"),
+    }
     match rig.motion {
         Some(mut motion) => {
             if let Some(name) = garage.clip.take() {
@@ -642,13 +790,11 @@ fn show(
     if spawn_y.is_none() && !collision.hits.is_empty() {
         pilot.airborne = true;
     }
-    commands
-        .entity(ac)
-        .insert((
-            pilot,
-            weapons::Armament::from_design(&design.data),
-            hud::Status::from_design(&design.data),
-        ));
+    commands.entity(ac).insert((
+        pilot,
+        weapons::Armament::from_design(&design.data),
+        hud::Status::from_design(&design.data),
+    ));
     if min.x <= max.x {
         garage.bounds = (min, max);
         if let Ok(mut o) = orbit.single_mut() {

@@ -51,8 +51,14 @@ impl Project {
 
     /// First wavetable entry of each layer, in layer order.
     pub fn waves(&self, name: &str) -> Vec<&Wave> {
-        let Some(event) = self.event(name) else { return Vec::new() };
-        event.layers.iter().filter_map(|&i| self.defs.get(i as usize).and_then(|d| d.wave.as_ref())).collect()
+        let Some(event) = self.event(name) else {
+            return Vec::new();
+        };
+        event
+            .layers
+            .iter()
+            .filter_map(|&i| self.defs.get(i as usize).and_then(|d| d.wave.as_ref()))
+            .collect()
     }
 }
 
@@ -64,7 +70,10 @@ pub fn read(data: &[u8]) -> Result<Project> {
     ensure!(is_fev(data), "not an FEV1 project");
     let mut r = Le { d: data, at: 4 };
     let version = r.u32()?;
-    ensure!(version == VERSION, "FEV version {version:#x}, want {VERSION:#x}");
+    ensure!(
+        version == VERSION,
+        "FEV version {version:#x}, want {VERSION:#x}"
+    );
     // v0x2E sound-def pool, v0x32 64-bit pool. The v0x40 object table is absent before 0x41.
     r.skip(8)?;
     let name = r.string()?;
@@ -91,7 +100,12 @@ pub fn read(data: &[u8]) -> Result<Project> {
     for _ in 0..defs_n {
         defs.push(sound_def(&mut r)?);
     }
-    Ok(Project { name, banks, events, defs })
+    Ok(Project {
+        name,
+        banks,
+        events,
+        defs,
+    })
 }
 
 fn category(r: &mut Le) -> Result<()> {
@@ -264,13 +278,21 @@ impl<'a> Le<'a> {
             return Ok(String::new());
         }
         let b = self.take(n)?;
-        ensure!(b.last() == Some(&0), "string at {:#x} is not NUL-terminated", self.at - n);
+        ensure!(
+            b.last() == Some(&0),
+            "string at {:#x} is not NUL-terminated",
+            self.at - n
+        );
         Ok(String::from_utf8_lossy(&b[..n - 1]).into_owned())
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.at.checked_add(n).filter(|e| *e <= self.d.len());
         let Some(end) = end else {
-            bail!("read of {n} bytes at {:#x} runs past end of {:#x}", self.at, self.d.len());
+            bail!(
+                "read of {n} bytes at {:#x} runs past end of {:#x}",
+                self.at,
+                self.d.len()
+            );
         };
         let b = &self.d[self.at..end];
         self.at = end;
@@ -283,12 +305,18 @@ mod tests {
     use super::*;
 
     fn disc(name: &str) -> Option<Vec<u8>> {
-        Some(crate::vfs::test_disc()?.read(&format!("sound/{name}")).unwrap())
+        Some(
+            crate::vfs::test_disc()?
+                .read(&format!("sound/{name}"))
+                .unwrap(),
+        )
     }
 
     #[test]
     fn booster_events() {
-        let Some(data) = disc("acv2_se_booster.fev") else { return };
+        let Some(data) = disc("acv2_se_booster.fev") else {
+            return;
+        };
         let project = read(&data).unwrap();
         assert_eq!(project.name, "acv2_se_booster");
         assert_eq!(project.banks, ["se_booster"]);
@@ -307,7 +335,9 @@ mod tests {
 
     #[test]
     fn weapon_cues() {
-        let Some(data) = disc("acv2_se_weapon.fev") else { return };
+        let Some(data) = disc("acv2_se_weapon.fev") else {
+            return;
+        };
         let project = read(&data).unwrap();
         assert!(project.banks.iter().any(|b| b == "se_weapon"));
         for cue in ["w00000022", "w00000034", "w00009100"] {
@@ -317,7 +347,9 @@ mod tests {
 
     #[test]
     fn ac_jump_cue() {
-        let Some(data) = disc("acv2_se_ac.fev") else { return };
+        let Some(data) = disc("acv2_se_ac.fev") else {
+            return;
+        };
         let project = read(&data).unwrap();
         let waves = project.waves("c00000024");
         assert_eq!(waves.len(), 1);

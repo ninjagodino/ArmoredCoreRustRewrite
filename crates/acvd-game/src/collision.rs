@@ -79,7 +79,11 @@ impl Collision {
         if self.grid.cells.is_empty() {
             return Box::new(self.hits.iter());
         }
-        let ids = self.grid.cells.get(&(cell(x), cell(z))).map_or(&[][..], Vec::as_slice);
+        let ids = self
+            .grid
+            .cells
+            .get(&(cell(x), cell(z)))
+            .map_or(&[][..], Vec::as_slice);
         Box::new(ids.iter().map(|&i| &self.hits[i as usize]))
     }
 
@@ -154,7 +158,9 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
     let mut cache: HashMap<String, Option<(hmd::Hmd, Vec<hmd::Vec3>)>> = HashMap::new();
     let mut hits = Vec::new();
     for part in &parts {
-        let Some(binder) = crate::map::binder(map, part) else { continue };
+        let Some(binder) = crate::map::binder(map, part) else {
+            continue;
+        };
         let asset = format!("{binder}|{}_h.hmd", part.model);
         if !cache.contains_key(&asset) {
             let h = match vfs::open(disc, &asset) {
@@ -172,7 +178,9 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
             };
             cache.insert(asset.clone(), h);
         }
-        let Some((h, verts)) = cache[&asset].as_ref() else { continue };
+        let Some((h, verts)) = cache[&asset].as_ref() else {
+            continue;
+        };
         let xf = crate::map::xform(part);
         for tri in &h.triangles {
             let [a, b, c] = tri.verts.map(|i| mirror(xf.apply(verts[i as usize])));

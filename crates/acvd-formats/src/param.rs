@@ -34,10 +34,14 @@ pub fn looks_like_param(data: &[u8]) -> bool {
     let (Ok(rows), Ok(start), Ok(endian)) = (r.u16(0x0A), r.u16(0x04), r.u8(0x2C)) else {
         return false;
     };
-    let Ok(ty) = r.fixstr(0x0C, 0x20) else { return false };
+    let Ok(ty) = r.fixstr(0x0C, 0x20) else {
+        return false;
+    };
     endian == 0xFF
         && !ty.is_empty()
-        && ty.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+        && ty
+            .bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
         && start as usize == 0x30 + rows as usize * 12
 }
 
@@ -58,7 +62,11 @@ pub fn read(data: &[u8]) -> Result<Param> {
         rows.push(RowHeader {
             id: r.u32(o)?,
             data_offset: r.u32(o + 4)?,
-            name: if name_offset == 0 { String::new() } else { r.cstr_sjis(name_offset)? },
+            name: if name_offset == 0 {
+                String::new()
+            } else {
+                r.cstr_sjis(name_offset)?
+            },
         });
     }
 

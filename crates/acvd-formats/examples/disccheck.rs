@@ -9,12 +9,22 @@ use acvd_formats::{bnd3, dcx, vfs};
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = vfs::repo_root();
-    let path = args.first().map(std::path::PathBuf::from).unwrap_or_else(|| root.join(vfs::X360_ISO));
-    let prefix = args.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    let path = args
+        .first()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join(vfs::X360_ISO));
+    let prefix = args
+        .get(1)
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
     let disc = vfs::Disc::open(&path)?;
     let mut tally: BTreeMap<String, usize> = BTreeMap::new();
     let mut failed = 0;
-    let files: Vec<String> = disc.files().into_iter().filter(|f| f.to_ascii_lowercase().starts_with(&prefix)).collect();
+    let files: Vec<String> = disc
+        .files()
+        .into_iter()
+        .filter(|f| f.to_ascii_lowercase().starts_with(&prefix))
+        .collect();
     for file in &files {
         let mut check = || -> anyhow::Result<()> {
             let raw = disc.read(file)?;
@@ -29,7 +39,8 @@ fn main() -> anyhow::Result<()> {
                 let b = bnd3::read(&data)?;
                 *tally.entry("bnd3".into()).or_default() += 1;
                 for (i, e) in b.entries.iter().enumerate() {
-                    vfs::undcx(e.contents(&data)?.into_owned()).map_err(|err| anyhow::anyhow!("entry {i}: {err:#}"))?;
+                    vfs::undcx(e.contents(&data)?.into_owned())
+                        .map_err(|err| anyhow::anyhow!("entry {i}: {err:#}"))?;
                 }
             }
             Ok(())

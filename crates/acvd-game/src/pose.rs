@@ -25,7 +25,7 @@ use crate::assemble::Placement;
 pub const FRAME_RATE: f32 = 60.0;
 
 /// How fast the lean follows the heading, degrees per second (assumed; the 360 rate is unread).
-const WHEEL_RATE: f32 = 540.0;
+pub(crate) const WHEEL_RATE: f32 = 540.0;
 /// How fast a wheel clip may slide the `center` bone, metres per second. On `a01_055` that
 /// bone's translation (its rotation stays identity) carries the whole body and swings about
 /// 1.8 m around the wheel. Tracking the heading at `WHEEL_RATE` shoves the mech whenever the
@@ -67,8 +67,13 @@ pub struct Fade {
 }
 
 impl Fade {
-    /// The crossfade times of one `ACANIM_HOKANPARAM_ST` row (Booster_Frame drives the booster's
-    /// own clips, which are not played yet).
+    /// The crossfade times of one `ACANIM_HOKANPARAM_ST` row. `booster` is the nozzle clips
+    /// (`sheets/booster_anim.csv`); the other eight are the body groups.
+    pub fn booster(row: &AcanimHokanparamSt) -> f32 {
+        f32::from(row.booster_frame.max(0)) / HOKAN_FRAME_RATE
+    }
+
+    /// The body crossfade times of one `ACANIM_HOKANPARAM_ST` row.
     pub fn of(row: &AcanimHokanparamSt) -> [f32; 8] {
         [
             row.general_frame,
@@ -117,7 +122,7 @@ pub struct Motion {
     pub looping: bool,
     /// Playback rate relative to `FRAME_RATE`.
     pub speed: f32,
-    /// Direction-wheel clips (dash / air-move lean, 360 frames, a key every 45 = one of the eight
+    /// Direction-wheel clips (dash / air-move / glide lean, 360 frames, a key every 45 = one of the eight
     /// directions, frame = heading in degrees clockwise from forward): the heading to pose, which
     /// replaces time playback. Cleared by select.
     pub wheel: Option<f32>,
@@ -231,6 +236,38 @@ pub struct Built {
     /// Hokan bone group per clip bone.
     groups: Vec<usize>,
     pub motion: Option<Motion>,
+}
+
+impl Built {
+    /// Rest local of part bone `bone` and the joint index of its parent, if it has one.
+    /// The local is the same transform [`spawn`] writes, in Bevy axes.
+    pub fn mount_local(&self, part: usize, bone: usize) -> Option<(Option<usize>, Transform)> {
+        let (first, _) = *self.parts.get(part)?;
+        let spec = self.joints.get(first + bone)?;
+        let parent_bind = spec
+            .parent
+            .map_or(Affine3A::IDENTITY, |p| self.joints[p].bind);
+        let local = parent_bind.inverse() * spec.bind;
+        let (s, r, t) = local.to_scale_rotation_translation();
+        Some((spec.parent, to_transform(t, r, s)))
+    }
+
+    /// `child` bone's rest transform in `parent` bone's space, in Bevy axes.
+    pub fn local_against(
+        &self,
+        child_part: usize,
+        child_bone: usize,
+        parent_part: usize,
+        parent_bone: usize,
+    ) -> Option<Transform> {
+        let (child_first, _) = *self.parts.get(child_part)?;
+        let (parent_first, _) = *self.parts.get(parent_part)?;
+        let child = self.joints.get(child_first + child_bone)?;
+        let parent = self.joints.get(parent_first + parent_bone)?;
+        let local = parent.bind.inverse() * child.bind;
+        let (s, r, t) = local.to_scale_rotation_translation();
+        Some(to_transform(t, r, s))
+    }
 }
 
 pub fn affine(x: &flver::Xform) -> Affine3A {
@@ -446,14 +483,15 @@ fn carrier(
     Some(first[p] + b)
 }
 
-/// Spawns the joints under `ac` and returns, per loaded part, its skin: joint entities in bone
-/// order plus the unboned joint, and their inverse bind poses (Bevy axes).
+/// Spawns the joints under `ac`. The returned joint list is in [`Built`] order (one entity per
+/// joint, parents included). Per loaded part: its skin, joint entities in bone order plus the
+/// unboned joint, and their inverse bind poses (Bevy axes).
 pub fn spawn(
     commands: &mut Commands,
     ac: Entity,
     built: &Built,
     parts: &[Loaded],
-) -> Vec<(Vec<Entity>, Vec<Mat4>)> {
+) -> (Vec<Entity>, Vec<(Vec<Entity>, Vec<Mat4>)>) {
     let entities: Vec<Entity> = built
         .joints
         .iter()
@@ -484,7 +522,7 @@ pub fn spawn(
             });
         }
     }
-    parts
+    let skins = parts
         .iter()
         .zip(&built.parts)
         .map(|(p, &(f, unboned))| {
@@ -505,7 +543,8 @@ pub fn spawn(
                 .collect();
             (joints, binds)
         })
-        .collect()
+        .collect();
+    (entities, skins)
 }
 
 /// Advances the clip and poses every driven joint, crossfading from the pose shown when the clip
@@ -523,9 +562,11 @@ pub fn animate(
         m.frame = (m.frame + diff.clamp(-step, step)).rem_euclid(360.0);
         // The wheel's `center` translation is the body's shift into the heading. Follow it
         // slowly so a strafe change leans the limbs without shoving the whole mech.
-        let center = m.skeleton.bones.iter().position(|b| {
-            b.rest.as_ref().is_some_and(|r| r.name == "center")
-        });
+        let center = m
+            .skeleton
+            .bones
+            .iter()
+            .position(|b| b.rest.as_ref().is_some_and(|r| r.name == "center"));
         if let Some(goal) = center
             .and_then(|i| m.clip.bones.get(i))
             .and_then(|b| b.track.translation(m.frame))
@@ -650,6 +691,8 @@ mod tests {
         let walk = find_hokan(2);
         assert_eq!(Fade::of(&walk)[0], 0.06);
         assert_eq!(Fade::of(&walk)[3], 0.3);
+        assert_eq!(Fade::booster(&walk), 0.06);
+        assert_eq!(Fade::booster(&find_hokan(4)), 0.015);
     }
 
     fn find_hokan(id: u32) -> AcanimHokanparamSt {

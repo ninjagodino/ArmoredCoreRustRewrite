@@ -3,9 +3,10 @@
 //!
 //! Facing comes from `param/acattachinfo.bin`. The flag byte (record +3) is switched at 360
 //! `0x8288cea0`: flags 0/1 build a basis on the socket forward against world +Y (`0x8288c0b8`),
-//! flags 2/3 against world +Z (`0x8288bef8`). Flag 4 (hanger weapons on a rack) copies the
-//! rack's rotation; the VMX branch it shares with flag 5 (`0x8288a058`) is not reproduced, and
-//! flag 5 is not applied to shoulder weapons.
+//! flags 2/3 against world +Z (`0x8288bef8`). Flag 4 (a hanger weapon on its rack) builds the
+//! same kind of basis through `0x8288a058`: local -Z, the barrel, lies along the socket
+//! forward, and world +Y fills the remaining axis (`0x827ce358`). Flag 5 negates that forward
+//! and is not applied to shoulder weapons.
 
 use acvd_data::{ac_part, Joint, ModelRef, Slot, SocketRef};
 use acvd_render::{RootPlace, SocketFrame};
@@ -15,8 +16,10 @@ use acvd_render::{RootPlace, SocketFrame};
 const RACK_L: &str = "model/ac/parts/hanger/hgl0001/hgl0001_m.bnd.dcx|hgl0001.flv";
 const RACK_R: &str = "model/ac/parts/hanger/hgr0001/hgr0001_m.bnd.dcx|hgr0001.flv";
 
-/// Second booster sockets. Absent on cores that only carry dummies 8 and 9; the outer booster
-/// then copies the inner one's place so the pair stays rigid.
+/// Front booster sockets. Cores without them (31 of 72, e.g. cr0230) get no attach for
+/// `l2_boost` / `r2_boost`, and `0x8288db60` then switches that bone's meshes off (category 6
+/// only: model vtable `0x82044bec` slot 8 = `0x8258aed8` → `0x82c92688` clears the per-mesh
+/// draw bit, children included).
 const SOCKET_L2: u8 = 25;
 const SOCKET_R2: u8 = 26;
 /// Front socket of each rack, where the hanger weapon's root lands.
@@ -42,6 +45,8 @@ pub struct Placement {
     pub part: u16,
     pub model: &'static ModelRef,
     pub mounts: Vec<Mount>,
+    /// Root bones the parent has no socket for; they and their children are not drawn.
+    pub hidden: Vec<&'static str>,
 }
 
 /// A parent placement after its model has loaded: `places` are its root poses, `frames` its
@@ -96,6 +101,7 @@ pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
                 part: part.id,
                 model,
                 mounts: Vec::new(),
+                hidden: Vec::new(),
             });
             continue;
         };
@@ -137,6 +143,7 @@ pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
                     orient: s.orient,
                     follow: None,
                 }],
+                hidden: Vec::new(),
             });
             placed.push((if left { "rack_l" } else { "rack_r" }, rack_index));
             (
@@ -148,29 +155,32 @@ pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
             (parent_index, s.socket, s.orient)
         };
 
-        let mounts: Vec<Mount> = roots
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let (socket, follow) = match (i, r.name) {
-                    (0, _) => (socket, None),
-                    (_, "l2_boost") => (SocketRef::Dummy(SOCKET_L2), Some(roots[0].name)),
-                    (_, "r2_boost") => (SocketRef::Dummy(SOCKET_R2), Some(roots[0].name)),
-                    _ => (socket, Some(roots[0].name)),
-                };
-                Mount {
-                    root: r.name,
-                    origin: r.origin,
-                    parent: parent_index,
-                    socket,
-                    orient,
-                    follow,
-                }
-            })
-            .collect();
+        let mut mounts = Vec::new();
+        let mut hidden = Vec::new();
+        for (i, r) in roots.iter().enumerate() {
+            let (socket, follow) = match (i, r.name) {
+                (0, _) => (socket, None),
+                (_, "l2_boost") => (SocketRef::Dummy(SOCKET_L2), None),
+                (_, "r2_boost") => (SocketRef::Dummy(SOCKET_R2), None),
+                _ => (socket, Some(roots[0].name)),
+            };
+            if i > 0 && follow.is_none() && !socket_on(&out.placements[parent_index], socket) {
+                hidden.push(r.name);
+                continue;
+            }
+            mounts.push(Mount {
+                root: r.name,
+                origin: r.origin,
+                parent: parent_index,
+                socket,
+                orient,
+                follow,
+            });
+        }
         let index = match out.placements.iter().position(|p| p.column == s.column) {
             Some(i) => {
                 out.placements[i].mounts.extend(mounts);
+                out.placements[i].hidden.extend(hidden);
                 i
             }
             None => {
@@ -180,6 +190,7 @@ pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
                     part: part.id,
                     model,
                     mounts,
+                    hidden,
                 });
                 out.placements.len() - 1
             }
@@ -242,7 +253,6 @@ fn mount_place(
             Some(f) => (f.position, f.forward, placed(&parent.places, &f.root)),
             None => match parent_model.model.socket(id) {
                 Some(s) => (s.position, [0.0, 1.0, 0.0], placed(&parent.places, s.root)),
-                // l2_boost / r2_boost: the core has no dummy 25/26, so copy the inner booster.
                 None => return follow().unwrap_or(RootPlace::IDENTITY),
             },
         },
@@ -259,7 +269,6 @@ fn mount_place(
     let position = carrier.apply_point(at);
     let facing = carrier.apply_dir(forward);
     let columns = match mount.orient {
-        Some(4) => [carrier.x, carrier.y, carrier.z],
         Some(flag) => orient_basis(flag, facing),
         None => [
             RootPlace::IDENTITY.x,
@@ -300,9 +309,14 @@ fn placed(places: &[(&str, RootPlace)], name: &str) -> RootPlace {
 /// flag 1 keeps it and flag 0 flips it. Local Y is `normalize(-Fx Fy, 1-Fy², -Fy Fz)` of the
 /// original forward. Flags 2 and 3 (`0x8288bef8`): local Y is the forward for flag 2 and its
 /// opposite for flag 3, so a booster's nozzle (local -Y) lies along the socket forward.
+/// Flag 4 (`0x8288a058` → `0x827ce358`): local Z is the negated forward, so a weapon's barrel
+/// (local -Z, the muzzle dummy's forward) lies along the socket. World +Y is the hint; when
+/// the forward is parallel to it the hint is turned ±90° about X (`0x82d4ee50`, +90° at
+/// `0x820146d0`, −90° at `0x82016ec0`).
 pub fn orient_basis(flag: u8, forward: [f32; 3]) -> [[f32; 3]; 3] {
     let f = unit(forward);
     match flag {
+        4 => rack_basis(f),
         0 | 1 => {
             let x = if flag & 1 == 1 { f } else { neg(f) };
             let y = if f[1].abs() >= 1.0 - 1.0e-4 {
@@ -323,6 +337,37 @@ pub fn orient_basis(flag: u8, forward: [f32; 3]) -> [[f32; 3]; 3] {
         }
         _ => orient_basis(2, f),
     }
+}
+
+/// Flag 4 columns: local X, Y, Z. Local -Z points along `forward`.
+fn rack_basis(forward: [f32; 3]) -> [[f32; 3]; 3] {
+    let n = neg(forward);
+    let hint = [0.0, 1.0, 0.0];
+    let along = dot(n, hint);
+    let up = if along.abs() >= 1.0 - 1.0e-4 {
+        let angle = if along >= 1.0 {
+            90.0_f32.to_radians()
+        } else {
+            -90.0_f32.to_radians()
+        };
+        rot_x(hint, angle)
+    } else {
+        unit([
+            hint[0] - n[0] * along,
+            hint[1] - n[1] * along,
+            hint[2] - n[2] * along,
+        ])
+    };
+    [unit(cross(up, n)), up, n]
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn rot_x(v: [f32; 3], angle: f32) -> [f32; 3] {
+    let (s, c) = angle.sin_cos();
+    [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c]
 }
 
 fn unit(v: [f32; 3]) -> [f32; 3] {
@@ -357,6 +402,35 @@ mod tests {
     }
 
     #[test]
+    fn front_boosters_hide_on_cores_without_sockets_25_26() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+        let (mut hidden, mut mounted) = (0, 0);
+        for row in AC_ASSEMBLY_DESIGN_ST_FILES.iter().flat_map(|(_, r)| r.iter()) {
+            let built = assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &row.data);
+            let (Some(core), Some(booster)) = (
+                built.placements.iter().find(|p| p.column == "core"),
+                built.placements.iter().find(|p| p.column == "booster"),
+            ) else {
+                continue;
+            };
+            let fronts = core.model.socket(SOCKET_L2).is_some();
+            let has = |root| booster.mounts.iter().any(|m| m.root == root);
+            for root in ["l2_boost", "r2_boost"] {
+                assert_eq!(has(root), fronts, "design {} {root}", row.id);
+                assert_eq!(booster.hidden.contains(&root), !fronts, "design {} {root}", row.id);
+            }
+            if fronts {
+                mounted += 1;
+            } else {
+                hidden += 1;
+                println!("design {} core {} hides its front boosters", row.id, core.model.path);
+            }
+        }
+        assert!(hidden > 0 && mounted > 0, "hidden {hidden} mounted {mounted}");
+    }
+
+    #[test]
     fn arm_flags_leave_an_outward_socket_unrotated() {
         let left = orient_basis(1, [1.0, 0.0, 0.0]);
         let right = orient_basis(0, [-1.0, 0.0, 0.0]);
@@ -388,5 +462,18 @@ mod tests {
         let n = unit(f);
         close(nozzle, n);
         close(basis[0], [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn flag4_aims_the_barrel_along_the_socket() {
+        // Rack dummies 85/87 point along +Y. The barrel is the weapon's local -Z.
+        let up = orient_basis(4, [0.0, 1.0, 0.0]);
+        close(neg(up[2]), [0.0, 1.0, 0.0]);
+        close(up[0], [-1.0, 0.0, 0.0]);
+        close(up[1], [0.0, 0.0, -1.0]);
+
+        let ahead = orient_basis(4, [0.0, 0.0, 1.0]);
+        close(neg(ahead[2]), [0.0, 0.0, 1.0]);
+        close(ahead[1], [0.0, 1.0, 0.0]);
     }
 }
