@@ -30,6 +30,7 @@ mod assemble;
 mod blur;
 mod collision;
 mod control;
+mod env;
 mod hud;
 mod map;
 mod pose;
@@ -222,6 +223,7 @@ fn main() {
     .add_plugins(sound::SoundPlugin {
         disc: disc.clone(),
     })
+    .add_plugins(env::EnvPlugin { disc: disc.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(Garage {
         disc,

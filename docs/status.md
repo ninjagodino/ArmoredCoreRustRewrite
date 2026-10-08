@@ -30,6 +30,46 @@ in order:
   weapons' open units (see Weapons leftovers).
 - **Lock-on / FCS** (see FCS / lock-on HUD). Energy drain (the lock-sight EN gauge is drawn
   full; see UI leftovers). Boost gauge.
+- **Map look**: lighting / fog / sky are in (see below); still open: broken models (`_b.flv` /
+  `_b_h.hmd`), the `movie` texture (a runtime video surface), the area bounds (POINT kinds
+  100-102: operation / warning / caution area) and the water return point (kind 50).
+  - Done: `acvd-formats::env` reads `ch_env/*_env.msb` (MSB chain at version 0x00989A6C,
+    EVENT_PARAM_ST only); `sheets/map_env.csv` has every field, the shader constants built from
+    it (0x82c2bc48 lights, 0x82c2b4d8 fog, 0x82bd2268 gamma) and the Flver_ColDif pixel-shader
+    maths, checked against the uploads probed in `private/xenia/envlook_mission2.jsonl`.
+    `acvd-game` `env.rs` + `env_lit.wgsl` light map pieces with it; `env_sky.wgsl` draws the
+    `o9705` Map_Sky dome (texture from `model/obj/o9705/o9705.tpf.dcx`) on the far plane, which
+    is what makes the mountains past its ~825 m radius visible. The AC's two Bevy lights and
+    ambient take set 0; clear colour from the type-101 record; camera tonemapping off.
+  - Open, in order: (1) the **tone map**: lit colour is stored at x0.5 (c31) and goes through
+    the ToneMap filter (type-101 sub-block 2: mode 1, 0.5, 1.1, 0.6, 10; ToneMap_DivideToneMapPS
+    = c33.x * x/(1+x), x = col * adapted-luminance scale); the runtime shows col unscaled.
+    (2) the **sky look**: the 360 shot (`private/xenia/shots/ac_test_start.png`) has dark teal
+    storm clouds, the o9705 texture is a light-blue band, so the draw likely uses Flver_Sky.fpo
+    (second texture + fog) or another texture; probe the o9705 draw (pixel shader, texture
+    fetches, its light / fog set) with `.\tools\xenia\run.ps1 <probes> -Recipe
+    tools\xenia\recipes\ac_test.txt`. (3) which model / part field holds the per-draw light-set
+    id (`env.rs::model_slot` reproduces m4000's picks: m9000-m9049 -> 2, m91xx -> 3, rest 1; the
+    MSB part sub-struct word is 1 everywhere). (4) the Water.spx shader (water draws as ColDif
+    with set 3). (5) c0 / c16 / c19 / c136 values (taken as 1, no SSAO). (6) Map_Diffuse_Multi
+    textures (mountains read orange-brown; the 360 shows them grey-green).
+- **AC vs world collision** (blocks the demo): the AC walks through walls and objects; only a
+  downward ground ray exists (`collision.rs`). No paramdef carries an AC body size (`q name
+  Radius` finds only bullets, `ENEMY_GRAPHICS_ST.CollisionRadius` and camera `HitRadius`). Find
+  the 360 AC-vs-map query: the ground ray filter 0x100002 (`0x829e7b68`) and the eye-floor ray
+  0x200002 (`0x829e7be0`) are in the collision layer, so their neighbours / callers from the AC
+  update `0x828bef18` should include the horizontal sweep and its shape (capsule / spheres per
+  part?). Then a Xenia probe walking into a wall. Also wall kick (`ackickrhit` material) and
+  slopes too steep to stand on. `Collision` now has an XZ grid (16 m cells) for the queries.
+- **AC test targets**: `m4000_actest.msb` parts of kind 2 (22: ACs `a0000`-`a0003` at the vs
+  UNAC start (-797.168, 17, 616.934), enemies `e0010` / `e0110` / `e0210` / `e1020` / `e2030`)
+  on layers `actest2`-`actest8` (LAYER_PARAM_ST; the layer link in the part record is unread),
+  with `param/actestdata.bin` (+ `actestdata.def`, unread) choosing the test; AI in
+  `script/enemy/*_actest.lc`, `script/arena/actest_*.lc`. Draw them, take hits and damage.
+- **Damage model**: AP, bullet hit vs AC / enemy hit shapes, `damage_power`, impact, the
+  weapons' open units (see Weapons leftovers).
+- **Lock-on / FCS** (see FCS / lock-on HUD). Energy drain (the lock-sight EN gauge is drawn
+  full; see UI leftovers). Boost gauge.
 - **Map look**: map lighting / fog / sky (`ch_env/m4000_env.msb` is not an MSB: another format,
   77 of them), LOD (`_l1` / `_l2` FLVERs), broken models (`_b.flv` / `_b_h.hmd`), the `movie`
   texture (a runtime video surface), the area bounds (POINT kinds 100-102: operation / warning
@@ -243,6 +283,10 @@ in order:
 
 ## Done
 
+- Map lighting, fog and sky dome (`sheets/map_env.csv`, `acvd-formats::env`, `acvd-game::env`):
+  env light sets / fog / scene record read and matched to the 360's probed shader uploads; map
+  pieces lit with the Flver_ColDif maths; `o9705` sky dome behind everything. Open leftovers
+  under Map look.
 - AC test scene: `acvd-game` now starts in the garage AC TEST map, drawn from the disc.
   - **Which map**: the 360 exe has `AcTestScene` (`garagescene.lua` `Scr_CreateScene(2008,
     "AcTestScene")`) and `AcTestSortieScene` (0x825dbcd8, load step 0x825dcb68); the disc has

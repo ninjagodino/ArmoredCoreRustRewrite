@@ -21,6 +21,8 @@ use serde::Serialize;
 use crate::reader::Be;
 
 pub const MAGIC: u32 = 0x0098_9A6A;
+/// Section version of the `ch_env/*_env.msb` files (`crate::env`).
+pub const MAGIC_ENV: u32 = 0x0098_9A6C;
 
 /// `POINT_PARAM_ST` kind of a start position.
 pub const POINT_START: u32 = 200;
@@ -52,11 +54,11 @@ pub fn is_msb(data: &[u8]) -> bool {
 }
 
 /// Record offsets of the section called `name`, or empty when the file has none.
-fn section(data: &[u8], name: &str) -> Result<Vec<usize>> {
+pub(crate) fn section(data: &[u8], name: &str) -> Result<Vec<usize>> {
     let r = Be(data);
     let mut at = 0usize;
     for _ in 0..64 {
-        ensure!(r.u32(at)? == MAGIC, "MSB section at {at:#x} has no header");
+        ensure!(matches!(r.u32(at)?, MAGIC | MAGIC_ENV), "MSB section at {at:#x} has no header");
         let count = r.u32(at + 8)? as usize;
         ensure!(count >= 1 && at + 12 + 4 * count <= data.len(), "MSB section at {at:#x} count {count}");
         let offs: Vec<usize> = (0..count).map(|i| r.u32(at + 12 + 4 * i).map(|v| v as usize)).collect::<Result<_>>()?;
