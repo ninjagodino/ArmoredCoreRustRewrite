@@ -1,0 +1,3 @@
+# Boot -> AC TEST -> walkabout.
+run ac_test.txt
+run walkabout.txt

@@ -1,7 +1,7 @@
 From 8ab7777edfe540f053a68f87699f40222fdf2036 Mon Sep 17 00:00:00 2001
 From: acvd <acvd@local>
 Date: Mon, 5 Oct 2026 12:44:41 -0700
-Subject: [PATCH 1/2] ACVD guest-address probes (--acvd_probes): log registers
+Subject: [PATCH 1/3] ACVD guest-address probes (--acvd_probes): log registers
  and memory before chosen instructions
 
 ---
@@ -511,7 +511,7 @@ index 42d996cba..cc58ef2e2 100644
 From b4c90185ef71a61bbdebb9ed553f82c4b10b57c9 Mon Sep 17 00:00:00 2001
 From: acvd <acvd@local>
 Date: Mon, 5 Oct 2026 16:19:12 -0700
-Subject: [PATCH 2/2] ACVD probes: write non-finite floats as null
+Subject: [PATCH 2/3] ACVD probes: write non-finite floats as null
 
 ---
  src/xenia/cpu/ppc/acvd_probe.cc | 12 +++++++++---
@@ -564,6 +564,484 @@ index 7f2c5693b..f3a65832a 100644
      }
    }
    return "null";
+-- 
+2.53.0.windows.2
+
+
+From 3368169b5b38c814035545179bf80de433b9288f Mon Sep 17 00:00:00 2001
+From: acvd <acvd@local>
+Date: Wed, 7 Oct 2026 21:33:22 -0700
+Subject: [PATCH 3/3] ACVD probes: every= and after= gating; scripted
+ controller (--acvd_input) with guest-frame shots
+
+---
+ src/xenia/app/emulator_window.cc    |  12 ++
+ src/xenia/app/xenia_main.cc         |   6 +
+ src/xenia/cpu/ppc/acvd_probe.cc     |  46 ++++-
+ src/xenia/hid/acvd_script_driver.cc | 271 ++++++++++++++++++++++++++++
+ src/xenia/hid/acvd_script_driver.h  |  29 +++
+ 5 files changed, 362 insertions(+), 2 deletions(-)
+ create mode 100644 src/xenia/hid/acvd_script_driver.cc
+ create mode 100644 src/xenia/hid/acvd_script_driver.h
+
+diff --git a/src/xenia/app/emulator_window.cc b/src/xenia/app/emulator_window.cc
+index fbd2f9864..238b865ce 100644
+--- a/src/xenia/app/emulator_window.cc
++++ b/src/xenia/app/emulator_window.cc
+@@ -35,6 +35,7 @@
+ #include "xenia/emulator.h"
+ #include "xenia/gpu/command_processor.h"
+ #include "xenia/gpu/graphics_system.h"
++#include "xenia/hid/acvd_script_driver.h"
+ #include "xenia/hid/input_system.h"
+ #include "xenia/kernel/xam/profile_manager.h"
+ #include "xenia/kernel/xam/xam_module.h"
+@@ -749,6 +750,17 @@ bool EmulatorWindow::Initialize() {
+   window_->AddListener(&window_listener_);
+   window_->AddInputListener(&window_listener_, kZOrderEmulatorWindowInput);
+ 
++  hid::acvd_screenshot = [this](const std::filesystem::path& path) {
++    auto presenter = GetGraphicsSystemPresenter();
++    xe::ui::RawImage image;
++    if (!presenter || !presenter->CaptureGuestOutput(image)) return false;
++    if (path.has_parent_path()) {
++      std::filesystem::create_directories(path.parent_path());
++    }
++    SaveImage(path, image);
++    return true;
++  };
++
+   // Main menu.
+   // FIXME: This code is really messy.
+   auto main_menu = MenuItem::Create(MenuItem::Type::kNormal);
+diff --git a/src/xenia/app/xenia_main.cc b/src/xenia/app/xenia_main.cc
+index 9777dc6e1..e197eab04 100644
+--- a/src/xenia/app/xenia_main.cc
++++ b/src/xenia/app/xenia_main.cc
+@@ -59,6 +59,7 @@
+ #if XE_PLATFORM_LINUX
+ #include "xenia/hid/keyboard/keyboard_hid.h"
+ #endif  // XE_PLATFORM_LINUX
++#include "xenia/hid/acvd_script_driver.h"
+ #include "xenia/hid/nop/nop_hid.h"
+ #if !XE_PLATFORM_ANDROID
+ #include "xenia/hid/sdl/sdl_hid.h"
+@@ -446,6 +447,11 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
+ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
+     ui::Window* window) {
+   std::vector<std::unique_ptr<hid::InputDriver>> drivers;
++  if (auto script = xe::hid::CreateAcvdScriptDriver(
++          window, EmulatorWindow::kZOrderHidInput);
++      script && XSUCCEEDED(script->Setup())) {
++    drivers.emplace_back(std::move(script));
++  }
+   if (cvars::hid.compare("nop") == 0) {
+     drivers.emplace_back(
+         xe::hid::nop::Create(window, EmulatorWindow::kZOrderHidInput));
+diff --git a/src/xenia/cpu/ppc/acvd_probe.cc b/src/xenia/cpu/ppc/acvd_probe.cc
+index f3a65832a..de6a0fc5e 100644
+--- a/src/xenia/cpu/ppc/acvd_probe.cc
++++ b/src/xenia/cpu/ppc/acvd_probe.cc
+@@ -5,7 +5,10 @@
+  *
+  * --acvd_probes names a text file, one probe per line:
+  *
+- *   ADDRESS LABEL [max=N] READ...
++ *   ADDRESS LABEL [max=N] [every=N] [after=LABEL[:N]] READ...
++ *
++ * every=N logs one execution in N. after=LABEL[:N] stays silent until the
++ * probe LABEL has executed N times (default 1), counted past its max.
+  *
+  *   0x82826058 over_max r3 f1 [r3+0x88]:f32 [[r3+0x4]+0x1bc]:u32
+  *
+@@ -45,7 +48,8 @@
+ #include "xenia/memory.h"
+ 
+ DEFINE_path(acvd_probes, "",
+-            "Probe list: one 'ADDRESS LABEL [max=N] READ...' per line "
++            "Probe list: one 'ADDRESS LABEL [max=N] [every=N] [after=LABEL[:N]] "
++            "READ...' per line "
+             "(see src/xenia/cpu/ppc/acvd_probe.cc).",
+             "ACVD");
+ DEFINE_path(acvd_probe_log, "acvd_probes.jsonl",
+@@ -81,6 +85,12 @@ struct Probe {
+   std::string label;
+   uint32_t max_hits = 0;
+   uint32_t hits = 0;
++  // Every execution, logged or not (what after= counts).
++  uint64_t seen = 0;
++  uint32_t every = 1;
++  std::string after_label;
++  uint64_t after_count = 1;
++  Probe* after = nullptr;
+   std::vector<Read> reads;
+ };
+ 
+@@ -310,6 +320,9 @@ void OnProbeHit(PPCContext* ctx, void* arg0, void* arg1) {
+   auto probe = static_cast<Probe*>(arg0);
+   std::lock_guard<std::mutex> lock(state_->mutex);
+   if (!state_->log) return;
++  if (probe->after && probe->after->seen < probe->after_count) return;
++  uint64_t seen = probe->seen++;
++  if (seen % probe->every) return;
+   if (probe->max_hits && probe->hits >= probe->max_hits) return;
+   ++probe->hits;
+   ++state_->total_hits;
+@@ -371,6 +384,25 @@ void InitializeAcvdProbes(Processor* processor) {
+         probe->max_hits = static_cast<uint32_t>(max);
+         continue;
+       }
++      if (word.rfind("every=", 0) == 0) {
++        int64_t every;
++        if (!ParseNumber(word.substr(6), &every) || every < 1) ok = false;
++        probe->every = static_cast<uint32_t>(every);
++        continue;
++      }
++      if (word.rfind("after=", 0) == 0) {
++        std::string spec = word.substr(6);
++        if (auto colon = spec.find(':'); colon != std::string::npos) {
++          int64_t count;
++          if (!ParseNumber(spec.substr(colon + 1), &count) || count < 1) {
++            ok = false;
++          }
++          probe->after_count = static_cast<uint64_t>(count);
++          spec.resize(colon);
++        }
++        probe->after_label = spec;
++        continue;
++      }
+       Read read;
+       if (!ParseRead(word, &read)) {
+         XELOGE("ACVD probes line {}: cannot parse '{}'", line_number, word);
+@@ -393,6 +425,16 @@ void InitializeAcvdProbes(Processor* processor) {
+            probe->label, probe->reads.size(), probe->max_hits);
+     state_->probes.push_back(std::move(probe));
+   }
++  for (auto& probe : state_->probes) {
++    if (probe->after_label.empty()) continue;
++    for (auto& other : state_->probes) {
++      if (other->label == probe->after_label) probe->after = other.get();
++    }
++    if (!probe->after) {
++      XELOGE("ACVD probe {}: after={} names no probe", probe->label,
++             probe->after_label);
++    }
++  }
+ 
+   state_->log = xe::filesystem::OpenFile(cvars::acvd_probe_log, "wb");
+   if (!state_->log) {
+diff --git a/src/xenia/hid/acvd_script_driver.cc b/src/xenia/hid/acvd_script_driver.cc
+new file mode 100644
+index 000000000..13c8d100e
+--- /dev/null
++++ b/src/xenia/hid/acvd_script_driver.cc
+@@ -0,0 +1,271 @@
++/**
++ ******************************************************************************
++ * ACVD rewrite: a scripted controller, driven by a command file.             *
++ ******************************************************************************
++ *
++ * --acvd_input names a text file that a script appends commands to; it is
++ * polled every few milliseconds, so the emulator window needs no focus:
++ *
++ *   down A B ...      hold buttons (A B X Y LB RB START BACK LS RS UP DOWN
++ *   up A B ...        LEFT RIGHT GUIDE), or release them
++ *   stick L|R X Y     thumbstick, -1..1 per axis
++ *   trigger L|R V     trigger, 0..1
++ *   release           everything back to neutral
++ *   shot PATH         save the current guest frame as a PNG at PATH
++ *
++ * The controller sits on --acvd_input_port and stays connected while the cvar
++ * is set; it is queried before every other input driver.
++ */
++
++#include "xenia/hid/acvd_script_driver.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <deque>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <thread>
++
++#include "xenia/base/cvar.h"
++#include "xenia/base/filesystem.h"
++#include "xenia/base/logging.h"
++#include "xenia/ui/virtual_key.h"
++
++DEFINE_path(acvd_input, "",
++            "Command file for the ACVD scripted controller on port 0 (see "
++            "src/xenia/hid/acvd_script_driver.cc).",
++            "ACVD");
++DEFINE_uint32(acvd_input_port, 0,
++              "Controller port [0, 3] of the ACVD scripted controller; the "
++              "game wants a signed-in profile in that slot.",
++              "ACVD");
++
++namespace xe {
++namespace hid {
++
++std::function<bool(const std::filesystem::path&)> acvd_screenshot;
++
++namespace {
++
++struct Button {
++  const char* name;
++  uint16_t bit;
++  ui::VirtualKey key;
++};
++
++constexpr Button kButtons[] = {
++    {"UP", X_INPUT_GAMEPAD_DPAD_UP, ui::VirtualKey::kXInputPadDpadUp},
++    {"DOWN", X_INPUT_GAMEPAD_DPAD_DOWN, ui::VirtualKey::kXInputPadDpadDown},
++    {"LEFT", X_INPUT_GAMEPAD_DPAD_LEFT, ui::VirtualKey::kXInputPadDpadLeft},
++    {"RIGHT", X_INPUT_GAMEPAD_DPAD_RIGHT, ui::VirtualKey::kXInputPadDpadRight},
++    {"START", X_INPUT_GAMEPAD_START, ui::VirtualKey::kXInputPadStart},
++    {"BACK", X_INPUT_GAMEPAD_BACK, ui::VirtualKey::kXInputPadBack},
++    {"LS", X_INPUT_GAMEPAD_LEFT_THUMB, ui::VirtualKey::kXInputPadLThumbPress},
++    {"RS", X_INPUT_GAMEPAD_RIGHT_THUMB, ui::VirtualKey::kXInputPadRThumbPress},
++    {"LB", X_INPUT_GAMEPAD_LEFT_SHOULDER, ui::VirtualKey::kXInputPadLShoulder},
++    {"RB", X_INPUT_GAMEPAD_RIGHT_SHOULDER,
++     ui::VirtualKey::kXInputPadRShoulder},
++    {"GUIDE", X_INPUT_GAMEPAD_GUIDE, ui::VirtualKey::kXInputPadGuide},
++    {"A", X_INPUT_GAMEPAD_A, ui::VirtualKey::kXInputPadA},
++    {"B", X_INPUT_GAMEPAD_B, ui::VirtualKey::kXInputPadB},
++    {"X", X_INPUT_GAMEPAD_X, ui::VirtualKey::kXInputPadX},
++    {"Y", X_INPUT_GAMEPAD_Y, ui::VirtualKey::kXInputPadY},
++};
++
++int16_t Axis(double v) {
++  return static_cast<int16_t>(std::lround(std::clamp(v, -1.0, 1.0) * 32767));
++}
++
++class AcvdScriptDriver final : public InputDriver {
++ public:
++  AcvdScriptDriver(xe::ui::Window* window, size_t window_z_order,
++                   std::filesystem::path path)
++      : InputDriver(window, window_z_order), path_(std::move(path)) {}
++
++  ~AcvdScriptDriver() override {
++    stop_ = true;
++    if (thread_.joinable()) thread_.join();
++  }
++
++  X_STATUS Setup() override {
++    // Start from an empty file so stale commands never replay.
++    std::ofstream(path_, std::ios::trunc);
++    thread_ = std::thread([this] { Poll(); });
++    XELOGI("ACVD scripted controller reading {}", xe::path_to_utf8(path_));
++    return X_STATUS_SUCCESS;
++  }
++
++  X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
++                           X_INPUT_CAPABILITIES* out_caps) override {
++    if (user_index != port_) return X_ERROR_DEVICE_NOT_CONNECTED;
++    if (out_caps) {
++      std::memset(out_caps, 0, sizeof(*out_caps));
++      out_caps->type = 0x01;      // gamepad
++      out_caps->sub_type = 0x01;  // standard controller
++      out_caps->gamepad.buttons = 0xF7FF;
++      out_caps->gamepad.left_trigger = 0xFF;
++      out_caps->gamepad.right_trigger = 0xFF;
++      out_caps->gamepad.thumb_lx = INT16_MAX;
++      out_caps->gamepad.thumb_ly = INT16_MAX;
++      out_caps->gamepad.thumb_rx = INT16_MAX;
++      out_caps->gamepad.thumb_ry = INT16_MAX;
++    }
++    return X_ERROR_SUCCESS;
++  }
++
++  X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override {
++    if (user_index != port_) return X_ERROR_DEVICE_NOT_CONNECTED;
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (out_state) {
++      out_state->packet_number = packet_;
++      out_state->gamepad.buttons = buttons_;
++      out_state->gamepad.left_trigger = left_trigger_;
++      out_state->gamepad.right_trigger = right_trigger_;
++      out_state->gamepad.thumb_lx = lx_;
++      out_state->gamepad.thumb_ly = ly_;
++      out_state->gamepad.thumb_rx = rx_;
++      out_state->gamepad.thumb_ry = ry_;
++    }
++    return X_ERROR_SUCCESS;
++  }
++
++  X_RESULT SetState(uint32_t user_index,
++                    X_INPUT_VIBRATION* vibration) override {
++    return user_index == port_ ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
++  }
++
++  X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
++                        X_INPUT_KEYSTROKE* out_keystroke) override {
++    if (user_index != port_ && user_index != XUserIndexAny) {
++      return X_ERROR_DEVICE_NOT_CONNECTED;
++    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (keystrokes_.empty()) return X_ERROR_EMPTY;
++    if (out_keystroke) *out_keystroke = keystrokes_.front();
++    keystrokes_.pop_front();
++    return X_ERROR_SUCCESS;
++  }
++
++  InputType GetInputType() const override { return InputType::Controller; }
++
++ private:
++  void SetButtons(uint16_t buttons) {
++    for (auto& b : kButtons) {
++      bool was = buttons_ & b.bit, now = buttons & b.bit;
++      if (was == now) continue;
++      X_INPUT_KEYSTROKE k = {};
++      k.virtual_key = static_cast<uint16_t>(b.key);
++      k.flags = now ? X_INPUT_KEYSTROKE_KEYDOWN : X_INPUT_KEYSTROKE_KEYUP;
++      k.user_index = static_cast<uint8_t>(port_);
++      keystrokes_.push_back(k);
++    }
++    buttons_ = buttons;
++  }
++
++  void Execute(const std::string& line) {
++    std::istringstream words(line);
++    std::string verb;
++    if (!(words >> verb) || verb[0] == '#') return;
++    if (verb == "shot") {
++      std::string rest;
++      std::getline(words, rest);
++      rest.erase(0, rest.find_first_not_of(" \t"));
++      bool ok = acvd_screenshot && acvd_screenshot(rest);
++      if (!ok) XELOGE("ACVD scripted controller: shot {} failed", rest);
++      return;
++    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (verb == "down" || verb == "up") {
++      uint16_t buttons = buttons_;
++      std::string name;
++      while (words >> name) {
++        std::transform(name.begin(), name.end(), name.begin(), ::toupper);
++        auto it = std::find_if(std::begin(kButtons), std::end(kButtons),
++                               [&](auto& b) { return name == b.name; });
++        if (it == std::end(kButtons)) {
++          XELOGE("ACVD scripted controller: unknown button {}", name);
++          continue;
++        }
++        buttons = verb == "down" ? (buttons | it->bit) : (buttons & ~it->bit);
++      }
++      SetButtons(buttons);
++    } else if (verb == "stick") {
++      std::string side;
++      double x = 0, y = 0;
++      words >> side >> x >> y;
++      bool left = side == "L" || side == "l";
++      (left ? lx_ : rx_) = Axis(x);
++      (left ? ly_ : ry_) = Axis(y);
++    } else if (verb == "trigger") {
++      std::string side;
++      double v = 0;
++      words >> side >> v;
++      auto value = static_cast<uint8_t>(std::lround(std::clamp(v, 0.0, 1.0) * 255));
++      (side == "L" || side == "l" ? left_trigger_ : right_trigger_) = value;
++    } else if (verb == "release") {
++      SetButtons(0);
++      left_trigger_ = right_trigger_ = 0;
++      lx_ = ly_ = rx_ = ry_ = 0;
++    } else {
++      XELOGE("ACVD scripted controller: unknown command '{}'", line);
++      return;
++    }
++    ++packet_;
++  }
++
++  void Poll() {
++    std::streamoff offset = 0;
++    std::string pending;
++    while (!stop_) {
++      std::ifstream file(path_, std::ios::binary);
++      if (file) {
++        file.seekg(0, std::ios::end);
++        std::streamoff size = file.tellg();
++        if (size < offset) offset = 0;
++        if (size > offset) {
++          file.seekg(offset);
++          std::string chunk(static_cast<size_t>(size - offset), '\0');
++          file.read(chunk.data(), chunk.size());
++          offset = size;
++          pending += chunk;
++          size_t newline;
++          while ((newline = pending.find('\n')) != std::string::npos) {
++            std::string line = pending.substr(0, newline);
++            pending.erase(0, newline + 1);
++            if (!line.empty() && line.back() == '\r') line.pop_back();
++            Execute(line);
++          }
++        }
++      }
++      std::this_thread::sleep_for(std::chrono::milliseconds(4));
++    }
++  }
++
++  std::filesystem::path path_;
++  uint32_t port_ = std::min<uint32_t>(cvars::acvd_input_port, 3);
++  std::thread thread_;
++  std::atomic<bool> stop_{false};
++  std::mutex mutex_;
++  uint32_t packet_ = 1;
++  uint16_t buttons_ = 0;
++  uint8_t left_trigger_ = 0, right_trigger_ = 0;
++  int16_t lx_ = 0, ly_ = 0, rx_ = 0, ry_ = 0;
++  std::deque<X_INPUT_KEYSTROKE> keystrokes_;
++};
++
++}  // namespace
++
++std::unique_ptr<InputDriver> CreateAcvdScriptDriver(xe::ui::Window* window,
++                                                    size_t window_z_order) {
++  if (cvars::acvd_input.empty()) return nullptr;
++  return std::make_unique<AcvdScriptDriver>(window, window_z_order,
++                                            cvars::acvd_input);
++}
++
++}  // namespace hid
++}  // namespace xe
+diff --git a/src/xenia/hid/acvd_script_driver.h b/src/xenia/hid/acvd_script_driver.h
+new file mode 100644
+index 000000000..d68bc3908
+--- /dev/null
++++ b/src/xenia/hid/acvd_script_driver.h
+@@ -0,0 +1,29 @@
++/**
++ ******************************************************************************
++ * ACVD rewrite: a scripted controller, driven by a command file.             *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_HID_ACVD_SCRIPT_DRIVER_H_
++#define XENIA_HID_ACVD_SCRIPT_DRIVER_H_
++
++#include <filesystem>
++#include <functional>
++#include <memory>
++
++#include "xenia/hid/input_driver.h"
++
++namespace xe {
++namespace hid {
++
++// Saves the current guest frame as a PNG; set by the emulator window.
++extern std::function<bool(const std::filesystem::path&)> acvd_screenshot;
++
++// Null unless --acvd_input names a command file.
++std::unique_ptr<InputDriver> CreateAcvdScriptDriver(xe::ui::Window* window,
++                                                    size_t window_z_order);
++
++}  // namespace hid
++}  // namespace xe
++
++#endif  // XENIA_HID_ACVD_SCRIPT_DRIVER_H_
 -- 
 2.53.0.windows.2
 

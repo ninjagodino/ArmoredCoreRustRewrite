@@ -1,0 +1,28 @@
+# Boot -> AC TEST (m4000), standing at the start point. Needs the run.ps1 defaults: the signed-in
+# profile in slot 1 and the scripted controller on port 1. Waits leave margin for shader
+# compilation on a cold cache; shots land in private/xenia/shots/.
+wait 25
+press START          # title "PRESS START"
+wait 6
+press A              # "not connected to Xbox LIVE"
+wait 5
+press A              # "starting the game offline"
+wait 22
+press A              # "select a screenshot data storage device"
+wait 25
+press A              # Basic Guide -> Start Game
+wait 15
+press A              # World Menu: Workshop
+wait 10
+press DOWN
+press DOWN
+press DOWN
+press DOWN
+press DOWN           # Workshop: AC Test (6th entry)
+press A
+wait 4
+press A              # AC Test: Start Test
+wait 3
+press A              # "Commence AC test sortie?" OK
+wait 25
+shot private/xenia/shots/ac_test_start.png

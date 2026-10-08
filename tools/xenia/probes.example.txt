@@ -1,7 +1,12 @@
-# One probe per line: ADDRESS LABEL [max=N] READ...
+# One probe per line: ADDRESS LABEL [max=N] [every=N] [after=LABEL[:N]] READ...
 # The probe runs before the instruction at ADDRESS (a 360 address from ACV2.pe) executes.
 # READ: rN (hex) | fN (double) | lr | ctr | [BASE+OFF]:TYPE, TYPE u8 u16 u32 s8 s16 s32 f32 f64,
 # BASE a register or another [..] (pointer chase). max=N caps the logged hits (default 200).
+# every=N logs one execution in N. after=LABEL[:N] keeps the probe silent until probe LABEL has
+# executed N times (default 1), e.g. per-draw probes that should skip the menus:
+#   0x82800128 env_bgm max=1 r4                      # type-400 env record: mission envs only
+#   0x82c0a160 draw_setup every=11 after=env_bgm r3
+# Unattended runs: run.ps1 -Recipe tools\xenia\recipes\ac_test_walk.txt (drive.py steps).
 
 # Boot check: the XEX entry point, and DRB text lookups (r4 bank, r5 message id).
 0x82d1ef30 entry_point r1 r13

@@ -1,0 +1,13 @@
+# After ac_test.txt: stand, walk forward, turn, jump, turn back, with a shot at each stage.
+wait 5
+shot private/xenia/shots/walk_stand.png
+stick L 0 1 6        # walk forward
+shot private/xenia/shots/walk_forward.png
+stick R 1 0 1.5      # camera right
+shot private/xenia/shots/walk_right.png
+stick L 0 1 5
+hold A 2             # jump / rise
+shot private/xenia/shots/walk_air.png
+stick R -1 0 3       # camera left
+shot private/xenia/shots/walk_left.png
+release
