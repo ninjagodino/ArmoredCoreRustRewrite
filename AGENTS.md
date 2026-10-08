@@ -18,7 +18,8 @@ the owned 360 disc image. `README.md` covers the legal boundary and the sheet pi
   without a sheet row or a comment citing the 360 address.
 - Static RE uses the Xbox 360 build (see `.cursor/rules/decompile-view.mdc`). Runtime questions
  ("does this path fire?") go to the project's Xenia probes on that same 360 build
- (`tools/xenia/run.ps1`), not long static hunts. The PS3 executable is never read or cited.
+ (`tools/xenia/run.ps1`), not long static hunts. **`docs/xenia-probes.md` is the full probe
+ how-to for any model** (probe syntax, unattended recipes, reading logs, pitfalls). The PS3 executable is never read or cited.
 - Before any `cargo` command, set `CARGO_TARGET_DIR` (see `.cursor/rules/cargo-target.mdc`).
 
 ## Layout

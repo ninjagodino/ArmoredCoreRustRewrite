@@ -63,6 +63,8 @@ Start-Process $g start -WindowStyle Hidden -RedirectStandardOutput private\tmp\b
 
 ## Runtime: Xenia probes on the same addresses
 
+Full how-to (syntax, recipes, log reading, worked example, pitfalls): `docs/xenia-probes.md`.
+
 Questions that need the game running (who triggers something, which path fires, a value's unit
 or tick rate) go to the project's Xenia build, which runs this same executable, so the addresses
 are the Ghidra ones with no translation. List the probes (syntax in
