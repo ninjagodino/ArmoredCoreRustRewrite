@@ -51,6 +51,12 @@ pub fn orbit(
     }
 }
 
+/// Set on the frame [`take_shot`] requests a screenshot, so a probe can log that exact frame.
+#[derive(Resource, Default)]
+pub struct ShotMark {
+    pub path: Option<PathBuf>,
+}
+
 /// `--shot <png>`: once `ready`, saves one frame and exits. With `burst > 1` it saves that many
 /// frames `interval` seconds apart as `<stem>_<i>.png`.
 #[derive(Resource)]
@@ -80,7 +86,12 @@ impl Shot {
 /// Pipelines compile asynchronously, so the shot waits for wall-clock time rather than frames.
 const SHOT_DELAY: f32 = 4.0;
 
-pub fn take_shot(mut commands: Commands, mut shot: ResMut<Shot>, time: Res<Time>) {
+pub fn take_shot(
+    mut commands: Commands,
+    mut shot: ResMut<Shot>,
+    mut mark: Option<ResMut<ShotMark>>,
+    time: Res<Time>,
+) {
     if !shot.ready {
         return;
     }
@@ -89,6 +100,10 @@ pub fn take_shot(mut commands: Commands, mut shot: ResMut<Shot>, time: Res<Time>
     if shot.requested < n && shot.waited >= SHOT_DELAY + shot.requested as f32 * shot.interval {
         let file = shot.file(shot.requested);
         let _ = std::fs::remove_file(&file);
+        if let Some(mark) = mark.as_mut() {
+            mark.path = Some(file.clone());
+        }
+        eprintln!("SHOT request {}", file.display());
         shot.requested += 1;
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(file));
     }

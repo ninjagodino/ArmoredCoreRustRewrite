@@ -72,6 +72,9 @@ pub struct Pilot {
     pub boost: bool,
     pub glide: bool,
     pub airborne: bool,
+    /// Move stick this frame, x right and y forward in the facing the integrator uses.
+    /// The booster effect dispatcher (`0x828932a0`) reads this vector.
+    pub command: Vec2,
     /// High boosts so far, and the world direction of the last one.
     pub quick_boosts: u32,
     pub quick_dir: Vec3,
@@ -754,6 +757,7 @@ impl Pilot {
             boost: false,
             glide: false,
             airborne: false,
+            command: Vec2::ZERO,
             quick_boosts: 0,
             quick_dir: FORWARD,
             quick_pending: None,
@@ -1169,6 +1173,7 @@ pub fn pilot(
         p.boost = !p.boost;
     }
     p.boost |= held.0.contains(&KeyCode::ShiftLeft);
+    p.command = input.stick;
     p.glide |= input.glide && p.boost && !p.airborne;
     p.jump_queued |= input.jump && !p.airborne;
     // The re-fire interval is not traced: a new high boost waits for the last one's clip.

@@ -7,7 +7,7 @@
 //! An effect plays at its [`Sfx`] entity, effect +Z along the entity's +Z. Effect-space
 //! offsets and angles are in FLVER axes and mirror on X like the models. The AC's FLVER effect
 //! points become [`EffectPoint`] entities; [`boosters`] lights the `param/mapsfxparam.bin`
-//! booster effects on them.
+//! booster effects on them the way the 360 dispatcher `0x828932a0` does.
 
 use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
@@ -26,6 +26,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::transform::TransformSystems;
 
+use acvd_render::app::ShotMark;
+
 use crate::control::{self, Pilot};
 
 const EFFECTS: &str = "sfx/acv_commoneffects.ffxbnd";
@@ -36,16 +38,26 @@ const LIGHT_LUMENS: f32 = 400_000.0;
 const POINT_SPRITE_METRES: f32 = 0.12;
 /// Action 82 sparks stretch along their velocity over this many seconds; not game data.
 const POINT_SPRITE_STREAK: f32 = 0.02;
-/// Horizontal speed, metres per tick, above which a boosting AC fires its boosters; not game data.
+/// Horizontal speed, metres per tick, above which a grounded boost still counts as moving
+/// when the stick is neutral. The 360 ground-boost slot (`0x828225e8`) simply is not called
+/// while standing; this threshold is the stand-in.
 const BOOST_MOVING: f32 = 0.05;
-/// Booster effect points on the AC parts' FLVER dummies (colour byte 1): bs0010 nozzles 31-34,
-/// lg0010 foot boosters 21/23 and the `l_bb`/`r_bb` back boosters 25-28. bs0010 41/42 sit on
-/// the `l_boost`/`l2_boost` bones without a flame of their own; the booster light goes there
-/// (inferred, not traced).
+/// Stick component past which a side booster group fires (`0x82013518`, 0.1).
+const SIDE_STICK: f32 = 0.1;
+/// Full-stick glide effect scale. Slots `+0x34` / `+0x38` clamp the stick length to global
+/// param 0 `+0x498` and pass that as both intensities (mode 1). A full stick measured 0.6
+/// (`private/xenia/boost_vfx.txt`).
+const GLIDE_SFX_SCALE: f32 = 0.6;
+/// Glide main and foot effects: slots `+0x744` / `+0x748` of the sfx id table at object
+/// `+0x740`. `0x82891e18` sets them to 131 / 120 and the `MAP_SFXPARAM_ST` copy `0x82891e68`
+/// skips them. The 360 starts 131 four times and 120 twice when a glide begins, and never 1379
+/// or 303 (`private/xenia/glide_ids.jsonl`).
+const GLIDE_MAIN: i32 = 131;
+const GLIDE_FOOT: i32 = 120;
+/// Main nozzles, the booster light on them, leg back nozzles, and the side-booster pairs.
+/// Built in `0x82893ec0` and selected by `0x82892f08`.
 const MAIN_NOZZLES: std::ops::RangeInclusive<u8> = 31..=34;
-const LIGHT_POINTS: [u8; 2] = [41, 42];
-const FOOT_NOZZLES: [u8; 2] = [21, 23];
-const BACK_NOZZLES: std::ops::RangeInclusive<u8> = 25..=28;
+const LEG_NOZZLES: std::ops::RangeInclusive<u8> = 21..=24;
 
 pub struct SfxPlugin {
     pub disc: Disc,
@@ -58,7 +70,7 @@ impl Plugin for SfxPlugin {
             .add_systems(Update, (boosters.after(control::pilot), preview))
             .add_systems(
                 PostUpdate,
-                (simulate, sweep)
+                (simulate, probe_shot, sweep)
                     .chain()
                     .after(TransformSystems::Propagate)
                     .before(VisibilitySystems::CheckVisibility),
@@ -74,6 +86,9 @@ struct Dir(Disc);
 #[derive(Component)]
 pub struct Sfx {
     pub id: i32,
+    /// Ground-dust clusters (action 71) keep emitting for the whole effect. f0000300's smoke
+    /// node is that dust; a 0.5 s emit window would stop it while the 360 keeps it on.
+    dust: bool,
     stopping: bool,
     run: Option<Run>,
 }
@@ -82,6 +97,7 @@ impl Sfx {
     pub fn new(id: i32) -> Self {
         Self {
             id,
+            dust: false,
             stopping: false,
             run: None,
         }
@@ -90,6 +106,10 @@ impl Sfx {
     pub fn stop(&mut self) {
         self.stopping = true;
     }
+
+    pub fn dust(&mut self, dust: bool) {
+        self.dust = dust;
+    }
 }
 
 /// An FFX effect point of a part: dummy colour byte 1, local +Z along the dummy's forward.
@@ -97,7 +117,8 @@ impl Sfx {
 pub struct EffectPoint {
     pub id: u8,
     pub column: &'static str,
-    playing: Option<(i32, Entity)>,
+    /// Effects currently parented here, with the uniform scale last applied.
+    playing: Vec<(i32, Entity, f32)>,
 }
 
 /// Plays effect `.0` in front of the AC, again each time it ends (`--sfx <id>`).
@@ -123,7 +144,7 @@ pub fn effect_points(
             EffectPoint {
                 id: e.id,
                 column,
-                playing: None,
+                playing: Vec::new(),
             },
             transform,
             Visibility::default(),
@@ -147,6 +168,8 @@ struct Library {
     models: HashMap<i32, Option<Arc<Vec<Part>>>>,
     packs: acvd_render::Packs,
     quad: Handle<Mesh>,
+    /// Billboard quad with tangents, so a normal map can refract (action 43).
+    haze: Handle<Mesh>,
     dot: Handle<Image>,
     seed: u32,
 }
@@ -186,6 +209,12 @@ fn setup(
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
     );
+    let mut haze = Mesh::from(Rectangle::new(1.0, 1.0));
+    // A camera-facing quad with a flat normal does not bend a head-on view. The normal map
+    // only applies when the mesh has tangents.
+    if let Err(err) = haze.generate_tangents() {
+        warn!("heat-haze tangents: {err}");
+    }
     commands.insert_resource(Library {
         disc: dir.0.clone(),
         effects: HashMap::new(),
@@ -193,6 +222,7 @@ fn setup(
         models: HashMap::new(),
         packs: acvd_render::Packs::default(),
         quad: meshes.add(Rectangle::new(1.0, 1.0)),
+        haze: meshes.add(haze),
         dot: images.add(dot),
         seed: 0x2545_f491,
     });
@@ -228,9 +258,12 @@ impl Library {
     }
 
     fn texture(&mut self, id: i32, images: &mut Assets<Image>) -> Option<Handle<Image>> {
-        (id > 0)
-            .then(|| self.texture_named(&format!("s{id:04}"), images))
-            .flatten()
+        if id <= 0 {
+            return None;
+        }
+        // Distortion textures are stored as `s1206_n` (the normal map), not `s1206`.
+        self.texture_named(&format!("s{id:04}"), images)
+            .or_else(|| self.texture_named(&format!("s{id:04}_n"), images))
     }
 
     fn texture_named(&mut self, name: &str, images: &mut Assets<Image>) -> Option<Handle<Image>> {
@@ -616,12 +649,22 @@ enum Look {
         model: i32,
         blend: Blend,
         scale: [Curve; 3],
+        /// Slot 7 = 1: Y and Z take the X curve (def `+0xcc` in the mode-2 draw `0x82c711d8`).
+        uniform: bool,
         color: ColorCurve,
         frames: Frames,
     },
     Light {
         color: ColorCurve,
         radius: Curve,
+    },
+    /// Action 43 heat haze: a camera-facing quad that refracts the scene through `texture`
+    /// (the normal map). Width and height are metres.
+    Haze {
+        texture: i32,
+        width: Curve,
+        height: Curve,
+        spin: Curve,
     },
 }
 
@@ -652,12 +695,21 @@ fn look(id: i32, l: &ParamList) -> Option<Look> {
             model: int(l, 0),
             blend: blend(int(l, 8)),
             scale: [float_curve(p(1)), float_curve(p(2)), float_curve(p(3))],
+            uniform: int(l, 7) == 1,
             color: color_curve(p(9)),
             frames: Frames::new(int(l, 16), int(l, 17), p(15)),
         },
         24 => Look::Light {
             color: color_curve(p(0)),
             radius: float_curve(p(2)),
+        },
+        // f0000300 node 1: 1.2 m, normal map 1206, 1.35 m out the nozzle. Refraction strength
+        // is not a traced slot.
+        43 => Look::Haze {
+            texture: int(l, 14),
+            width: float_curve(p(3)),
+            height: float_curve(p(4)),
+            spin: float_curve(p(13)),
         },
         _ => return None,
     })
@@ -724,7 +776,9 @@ fn particle_look(id: i32, l: &ParamList) -> Option<ParticleLook> {
             frames: Frames::new(int(l, 17), int(l, 18), p(19)),
             start_frame: pair(l, 20),
             streak: (0.0, 0.0),
-            follow: true,
+            // Slot 21 is 1 on the main-booster flames (f0000300) and 0 on ground-dust models
+            // (f0001406). 1 keeps the particle on the emitter.
+            follow: int(l, 21) != 0,
         },
         82 => ParticleLook {
             shape: Shape::Quad {
@@ -844,10 +898,11 @@ impl Motion {
 #[derive(Clone, Debug)]
 enum Kind {
     Static,
-    /// Spawns `count` copies of `child` every `interval` (once when zero), each turned into a
-    /// random direction of the cone `angle`.
+    /// Spawns `count` copies of `child` every `interval` (once when zero), `emissions` times
+    /// (negative never stops), each turned into a random direction of the cone `angle`.
     Spawner {
         count: u32,
+        emissions: i32,
         interval: f32,
         angle: f32,
         child: Vec<Arc<NodeDef>>,
@@ -914,8 +969,11 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
         2020 | 2024 => {
             (n.life, n.delay) = (tick(l, 0), tick(l, 4));
             let angle = Emitter::read(action(l, 9)).angle;
+            // f0000120's 2020 ([5] 3, [6] 1/6 s, [7] 1) keeps exactly three s1020 copies per
+            // nozzle, born about 0.18 s apart, and spawns no more (`private/xenia/glide_scale.jsonl`).
             n.kind = Kind::Spawner {
-                count: int(l, 5).max(1) as u32,
+                count: int(l, 7).max(1) as u32,
+                emissions: int(l, 5),
                 interval: tick(l, 6),
                 angle,
                 child: children(l, 8),
@@ -933,7 +991,7 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
                 count: float_curve(p(6)),
                 interval: tick(l, 8),
                 emit_for: tick(l, 1),
-                max: int(l, 10).max(1) as usize,
+                max: cluster_max(int(l, 10)),
                 emitter: Emitter::read(action(l, 12)),
                 look,
                 gravity: gravity(action(l, 13)),
@@ -950,7 +1008,7 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
                 count: float_curve(p(10)),
                 interval: pair(l, 9).0,
                 emit_for: pair(l, 11).0,
-                max: int(l, 14).max(1) as usize,
+                max: cluster_max(int(l, 14)),
                 emitter: Emitter::read(action(l, 1)),
                 look,
                 gravity: gravity(action(l, 2)),
@@ -963,6 +1021,11 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
         _ => return None,
     }
     Some(n)
+}
+
+/// Live-particle cap; -1 has none (f0000131's glide jet, one s1011 every 1/12 s for 1 s).
+fn cluster_max(v: i32) -> usize {
+    if v < 0 { usize::MAX } else { v.max(1) as usize }
 }
 
 /// Cluster motion action 55: [0] gravity keys, [1] drag keys, [2] gravity range.
@@ -1094,10 +1157,15 @@ struct Particle {
     frame: f32,
     streak: f32,
     gravity: f32,
+    /// Position and `dir` are in world space. Following particles store both in the emitter frame.
+    world: bool,
 }
 
 struct NodeRt {
     def: Arc<NodeDef>,
+    /// Seconds; negative never ends. Spawned copies with an infinite template live for one
+    /// pass of their colour and scale keys, otherwise they pile up on the last key.
+    life: f32,
     age: f32,
     base: Affine3A,
     speed: f32,
@@ -1105,10 +1173,15 @@ struct NodeRt {
     spin: Vec3,
     /// Billboard roll at birth, radians.
     roll: f32,
+    /// World matrix of the spawner at birth. A 2020/2024 copy keeps that frame, so a
+    /// glide flame stays where the nozzle was instead of riding it onto the last colour key.
+    anchor: Option<Affine3A>,
     visual: Option<Visual>,
     children: Vec<NodeRt>,
     /// Seconds to the next emission or spawn.
     emit: f32,
+    /// Spawner emissions so far.
+    emissions: i32,
     particles: Vec<Particle>,
     batch: Option<Visual>,
 }
@@ -1173,8 +1246,68 @@ fn scale_of(world: Affine3A) -> f32 {
     world.matrix3.x_axis.length()
 }
 
+/// True when every UV already lies inside one flipbook cell, so the frame index must
+/// translate the cell instead of scaling a 0–1 quad into it.
+fn uvs_in_cell(uvs: &[[f32; 2]], cell: Vec2) -> bool {
+    !uvs.is_empty()
+        && uvs
+            .iter()
+            .all(|[u, v]| *u <= cell.x + 0.02 && *v <= cell.y + 0.02)
+}
+
 fn srgba(c: Vec4) -> Color {
     Color::srgba(c.x, c.y, c.z, c.w)
+}
+
+/// `AlphaMode::Add` shares Bevy's premultiplied pipeline, and the PBR shader then does the
+/// additive case itself: `src.rgb * src.a` with output alpha 0, so the blend is `src + dst`.
+/// Scaling RGB by alpha before that squares it and knocks the blue nozzle (alpha about 0.8)
+/// down while an alpha-1 orange is left at full strength.
+fn vertex_color(c: [f32; 4]) -> [f32; 4] {
+    linear(c)
+}
+
+fn curve_end(c: &Curve) -> f32 {
+    c.keys.last().map(|k| k.0).unwrap_or(0.0)
+}
+
+fn color_end(c: &ColorCurve) -> f32 {
+    c.keys.last().map(|k| k.0).unwrap_or(0.0)
+}
+
+/// How long a spawned node's authored keys run. An infinite template would otherwise
+/// sit on its last key forever.
+fn look_span(def: &NodeDef) -> f32 {
+    let Some(look) = &def.look else {
+        return 0.0;
+    };
+    match look {
+        Look::Model {
+            scale, color, frames, ..
+        } => curve_end(&scale[0])
+            .max(curve_end(&scale[1]))
+            .max(curve_end(&scale[2]))
+            .max(color_end(color))
+            .max(curve_end(&frames.key)),
+        Look::Billboard {
+            width,
+            height,
+            color,
+            frames,
+            spin,
+            ..
+        } => curve_end(width)
+            .max(curve_end(height))
+            .max(color_end(color))
+            .max(curve_end(&frames.key))
+            .max(curve_end(spin)),
+        Look::Light { color, radius } => color_end(color).max(curve_end(radius)),
+        Look::Haze {
+            width, height, spin, ..
+        } => curve_end(width)
+            .max(curve_end(height))
+            .max(curve_end(spin)),
+    }
 }
 
 impl NodeRt {
@@ -1197,17 +1330,21 @@ impl NodeRt {
                 .map(|c| NodeRt::new(c.clone(), rng, Quat::IDENTITY))
                 .collect(),
         };
+        let life = def.life;
         Self {
             def,
+            life,
             age: 0.0,
             base,
             speed,
             travel: 0.0,
             spin,
             roll,
+            anchor: None,
             visual: None,
             children,
             emit: 0.0,
+            emissions: 0,
             particles: Vec::new(),
             batch: None,
         }
@@ -1215,14 +1352,31 @@ impl NodeRt {
 
     /// Advances the node by `dt` under its parent's world transform; false once it and all its
     /// children and particles are done.
-    fn step(&mut self, parent: Affine3A, dt: f32, stop: bool, rng: &mut Rng, cx: &mut Cx) -> bool {
+    fn step(
+        &mut self,
+        parent: Affine3A,
+        dt: f32,
+        stop: bool,
+        dust: bool,
+        rng: &mut Rng,
+        cx: &mut Cx,
+    ) -> bool {
         let def = self.def.clone();
+        // A spawned copy is posed in the spawner's world at birth and then left there.
+        let parent = self.anchor.unwrap_or(parent);
         self.age += dt;
         let t = self.age - def.delay;
         if t < 0.0 {
             return !stop;
         }
-        let own = if def.life < 0.0 { !stop } else { t < def.life };
+        // A negative life runs until stop. Boost dust (action 71) keeps going for the whole
+        // boost; the glide-start flash is the finite ignition and is allowed to end.
+        let smoke = matches!(&def.kind, Kind::Cluster(c) if smoke_cluster(c));
+        let own = if self.life < 0.0 || (dust && smoke) {
+            !stop
+        } else {
+            t < self.life
+        };
         self.speed += def.motion.accel.at(t) * dt;
         self.travel += self.speed * dt;
         let s = self.spin * t;
@@ -1245,17 +1399,28 @@ impl NodeRt {
             Kind::Static => {}
             Kind::Spawner {
                 count,
+                emissions,
                 interval,
                 angle,
                 child,
             } => {
-                if own {
+                if own && (*emissions < 0 || self.emissions < (*emissions).max(1)) {
                     self.emit -= dt;
                     if self.emit <= 0.0 {
+                        self.emissions += 1;
                         for _ in 0..*count {
                             for c in child {
                                 let turn = Quat::from_rotation_arc(Vec3::Z, rng.cone(*angle));
-                                self.children.push(NodeRt::new(c.clone(), rng, turn));
+                                let mut born = NodeRt::new(c.clone(), rng, turn);
+                                if born.life < 0.0 {
+                                    born.life = look_span(&born.def).max(1.0 / 60.0);
+                                }
+                                // f0000301's 2020 child is an infinite model 61 whose colour
+                                // runs blue to orange over 2.5 s. Following the nozzle piles
+                                // every copy on the last key; the chase camera then only sees
+                                // the young blue end of a trail left behind the AC.
+                                born.anchor = Some(world);
+                                self.children.push(born);
                             }
                         }
                         self.emit = if *interval > 0.0 {
@@ -1266,10 +1431,10 @@ impl NodeRt {
                     }
                 }
             }
-            Kind::Cluster(c) => alive |= self.cluster(c, t, own, world, dt, rng, cx),
+            Kind::Cluster(c) => alive |= self.cluster(c, t, own, dust, world, dt, rng, cx),
         }
         self.children.retain_mut(|c| {
-            let live = c.step(world, dt, stop, rng, cx);
+            let live = c.step(world, dt, stop, dust, rng, cx);
             if !live {
                 c.clear(cx);
             }
@@ -1339,6 +1504,7 @@ impl NodeRt {
                 model,
                 blend,
                 scale,
+                uniform,
                 color,
                 frames,
             } => {
@@ -1364,15 +1530,31 @@ impl NodeRt {
                     });
                 }
                 let v = self.visual.as_ref().unwrap();
+                let s = if *uniform {
+                    Vec3::splat(scale[0].at(t))
+                } else {
+                    Vec3::new(scale[0].at(t), scale[1].at(t), scale[2].at(t))
+                };
                 let tf = Transform {
                     translation: pos,
                     rotation: rot,
-                    scale: Vec3::new(scale[0].at(t), scale[1].at(t), scale[2].at(t)) * k,
+                    scale: s * k,
                 };
-                if let Some(mut m) = cx.materials.get_mut(&v.material) {
+                // s1020 / s1011 UVs already sit in one atlas cell. Scaling them by the
+                // cell (right for a 0–1 billboard quad) samples an empty corner and the
+                // flame mesh disappears. Slide the cell instead.
+                let (o, s) = frames.rect(t, 0.0);
+                let slide = cx.lib.model(*model, cx.meshes, cx.images).is_some_and(|parts| {
+                    parts.iter().all(|p| uvs_in_cell(&p.uvs, s))
+                });
+                let material = v.material.clone();
+                if let Some(mut m) = cx.materials.get_mut(&material) {
                     m.base_color = srgba(color.at(t));
-                    let (o, s) = frames.rect(t, 0.0);
-                    m.uv_transform = Affine2::from_scale_angle_translation(s, 0.0, o);
+                    m.uv_transform = if slide {
+                        Affine2::from_translation(o)
+                    } else {
+                        Affine2::from_scale_angle_translation(s, 0.0, o)
+                    };
                 }
                 for &e in &v.entities {
                     cx.moves.push((e, tf, None));
@@ -1400,6 +1582,13 @@ impl NodeRt {
                     }
                 }
             }
+            Look::Haze { .. } => {
+                // The DXN normal map loads, but a transmissive quad draws as a solid card
+                // (white or black) instead of warping the scene, so it is not shown.
+                if let Some(v) = self.visual.take() {
+                    cx.despawn(v);
+                }
+            }
         }
     }
 
@@ -1409,19 +1598,25 @@ impl NodeRt {
         c: &ClusterDef,
         t: f32,
         own: bool,
+        dust: bool,
         world: Affine3A,
         dt: f32,
         rng: &mut Rng,
         cx: &mut Cx,
     ) -> bool {
-        let emitting = own && (c.emit_for <= 0.0 || t < c.emit_for);
+        let smoke = dust && smoke_cluster(c);
+        let emitting = own && (smoke || c.emit_for <= 0.0 || t < c.emit_for);
         if emitting {
             self.emit -= dt;
             while self.emit <= 0.0 {
                 let n = c.count.at(t).round().max(0.0) as usize;
-                for _ in 0..n.min(c.max.saturating_sub(self.particles.len())) {
-                    let p = self.particle(c, t, world, rng);
-                    self.particles.push(p);
+                let local_have = if c.look.follow {
+                    self.particles.iter().filter(|p| !p.world).count()
+                } else {
+                    self.particles.iter().filter(|p| p.world).count()
+                };
+                for _ in 0..n.min(c.max.saturating_sub(local_have)) {
+                    self.particles.push(self.particle(c, t, world, false, rng));
                 }
                 self.emit = if c.interval > 0.0 {
                     self.emit + c.interval
@@ -1430,14 +1625,12 @@ impl NodeRt {
                 };
             }
         }
-        let down = scale_of(world)
-            * if c.look.follow {
-                world.inverse().transform_vector3(Vec3::NEG_Y)
-            } else {
-                Vec3::NEG_Y
-            };
+        let scale = scale_of(world);
+        let down_world = Vec3::NEG_Y * scale;
+        let down_local = scale * world.inverse().transform_vector3(Vec3::NEG_Y);
         for p in &mut self.particles {
             p.age += dt;
+            let down = if p.world { down_world } else { down_local };
             p.vel += down * c.gravity.0.at(p.age) * p.gravity * dt;
             let drag = c.drag.at(p.age);
             let s = p.vel.length();
@@ -1452,7 +1645,14 @@ impl NodeRt {
         emitting || !self.particles.is_empty()
     }
 
-    fn particle(&self, c: &ClusterDef, t: f32, world: Affine3A, rng: &mut Rng) -> Particle {
+    fn particle(
+        &self,
+        c: &ClusterDef,
+        t: f32,
+        world: Affine3A,
+        force_world: bool,
+        rng: &mut Rng,
+    ) -> Particle {
         let dir = rng.cone(c.emitter.angle);
         let speed = c.emitter.speed.sample(t, rng);
         let size = Vec3::new(
@@ -1461,18 +1661,27 @@ impl NodeRt {
             c.emitter.size[2].sample(t, rng),
         );
         let tint = c.look.tint.0.lerp(c.look.tint.1, rng.next()) * c.emitter.color.at(t);
-        let (pos, vel) = if c.look.follow {
-            (Vec3::ZERO, dir * speed)
+        // Slot 21 = 1 (the main-booster flame) stores the particle in the emitter frame, so the
+        // jet stays on the nozzle. Slot 21 = 0 leaves it where it was born.
+        let in_world = force_world || !c.look.follow;
+        let (_, rot, origin) = world.to_scale_rotation_translation();
+        let (pos, vel, orient) = if in_world {
+            (
+                origin,
+                world.transform_vector3(dir) * speed,
+                rot * Quat::from_rotation_arc(Vec3::Z, dir),
+            )
         } else {
             (
-                Vec3::from(world.translation),
-                world.transform_vector3(dir) * speed,
+                Vec3::ZERO,
+                dir * speed,
+                Quat::from_rotation_arc(Vec3::Z, dir),
             )
         };
         Particle {
             pos,
             vel,
-            dir: Quat::from_rotation_arc(Vec3::Z, dir),
+            dir: orient,
             age: 0.0,
             life: rng.range(c.look.life).max(0.001),
             size,
@@ -1482,6 +1691,7 @@ impl NodeRt {
             frame: rng.range(c.look.start_frame).floor(),
             streak: rng.range(c.look.streak),
             gravity: rng.range(c.gravity.1),
+            world: in_world,
         }
     }
 
@@ -1508,19 +1718,22 @@ impl NodeRt {
                 * k;
             let color = (l.color.at(p.age) * p.tint).to_array();
             let rect = l.frames.rect(p.age, p.frame);
-            let (center, vel) = if l.follow {
+            let (center, vel) = if p.world {
+                (p.pos, p.vel)
+            } else {
                 (
                     world.transform_point3(p.pos),
                     world.transform_vector3(p.vel),
                 )
-            } else {
-                (p.pos, p.vel)
             };
             if let Some(parts) = &model {
+                // Mesh +Z follows the dummy forward, as in the action 61 draw. s1011 is wide at
+                // the nozzle and thins out along +Z: f0000131's glide jet.
                 let (_, rot, _) = world.to_scale_rotation_translation();
+                let orient = if p.world { p.dir } else { rot * p.dir };
                 let m = Affine3A::from_scale_rotation_translation(
                     size,
-                    rot * p.dir * Quat::from_rotation_z(-p.angle),
+                    orient * Quat::from_rotation_z(-p.angle),
                     center - origin,
                 );
                 for part in parts.iter() {
@@ -1543,7 +1756,11 @@ impl NodeRt {
                 )
             };
             let q = center - origin;
-            b.quad([q - r - u, q + r - u, q + r + u, q - r + u], rect, color);
+            b.quad(
+                [q - r - u, q + r - u, q + r + u, q - r + u],
+                rect,
+                color,
+            );
         }
         if self.batch.is_none() {
             let (texture, blend) = match (&c.look.shape, &model) {
@@ -1588,6 +1805,18 @@ impl NodeRt {
     }
 }
 
+/// Action 71: a world-space textured quad. On the main booster that is the ground dust.
+fn smoke_cluster(c: &ClusterDef) -> bool {
+    !c.look.follow
+        && matches!(
+            c.look.shape,
+            Shape::Quad {
+                texture: Some(_),
+                ..
+            }
+        )
+}
+
 /// Vertices of a particle batch, relative to the emitter.
 #[derive(Default)]
 struct Batch {
@@ -1605,21 +1834,32 @@ impl Batch {
             [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]
                 .map(|[u, v]| [o.x + u * s.x, o.y + v * s.y]),
         );
-        self.color.extend([linear(color); 4]);
+        self.color.extend([vertex_color(color); 4]);
         self.index.extend([i, i + 1, i + 2, i, i + 2, i + 3]);
     }
 
-    fn model(&mut self, part: &Part, m: Affine3A, (o, s): (Vec2, Vec2), color: [f32; 4]) {
+    fn model(
+        &mut self,
+        part: &Part,
+        m: Affine3A,
+        (o, _): (Vec2, Vec2),
+        color: [f32; 4],
+    ) {
         let i = self.pos.len() as u32;
         self.pos.extend(
             part.positions
                 .iter()
                 .map(|&p| m.transform_point3(p).to_array()),
         );
+        // The mesh UVs already sit inside one atlas cell (s1020 is about 0.05–0.08 of a
+        // 512-wide strip). Scaling them by the cell size samples a few texels and the card
+        // goes flat white. Slide the cell by whole frames instead.
         self.uv
-            .extend(part.uvs.iter().map(|[u, v]| [o.x + u * s.x, o.y + v * s.y]));
-        self.color
-            .extend(std::iter::repeat_n(linear(color), part.positions.len()));
+            .extend(part.uvs.iter().map(|[u, v]| [u + o.x, v + o.y]));
+        self.color.extend(std::iter::repeat_n(
+            vertex_color(color),
+            part.positions.len(),
+        ));
         self.index.extend(part.indices.iter().map(|&k| i + k));
     }
 
@@ -1680,6 +1920,7 @@ fn simulate(
     let dt = time.delta_secs().min(0.1);
     for (entity, mut sfx, at) in &mut effects {
         let stop = sfx.stopping;
+        let dust = sfx.dust;
         if sfx.run.is_none() {
             let Some(roots) = lib.effect(sfx.id) else {
                 commands.entity(entity).try_despawn();
@@ -1711,7 +1952,7 @@ fn simulate(
         let world = at.affine();
         let Run { nodes, rng } = run;
         nodes.retain_mut(|n| {
-            let live = n.step(world, dt, stop, rng, &mut cx);
+            let live = n.step(world, dt, stop, dust, rng, &mut cx);
             if !live {
                 n.clear(&mut cx);
             }
@@ -1745,77 +1986,280 @@ fn sweep(
     }
 }
 
-/// Lights the `param/mapsfxparam.bin` row 0 booster effects on the AC's effect points while
-/// boost mode moves it: main booster on the booster nozzles moving forward, back booster on
-/// the legs' back nozzles moving backward, foot booster on the feet while rising, and the
-/// booster light with either. Each high boost fires the one-shot QB burst once on the nozzles
-/// facing away from its direction. Which motion fires which booster is not traced.
+/// One effect the dispatcher wants on a dummy: id, uniform scale, and whether its smoke keeps
+/// emitting.
+struct Play {
+    id: i32,
+    scale: f32,
+    dust: bool,
+}
+
+/// `0x82825918`: eight 45° sectors of the move stick. 0 is no stick. Values 6, 7 and 8 are the
+/// rear three sectors (more than 112.5° off forward). The table at `0x8208fe2c` is
+/// `[1, 3, 5, 8, 6, 7, 4, 2]`.
+fn rear_stick(stick: Vec2) -> bool {
+    if stick.length_squared() < 1e-8 {
+        return false;
+    }
+    let deg = stick.x.atan2(stick.y).to_degrees();
+    let index = ((deg + 22.5) / 45.0 + 8.0) as i32 & 7;
+    const TABLE: [u8; 8] = [1, 3, 5, 8, 6, 7, 4, 2];
+    matches!(TABLE[index as usize], 6 | 7 | 8)
+}
+
+/// Effects for one dummy colour. `0x828932a0` / `0x82892f08`, fed by the lists built in
+/// `0x82893ec0`:
+/// - ground boost (slot `+0x10`) and air boost (slot `+0x2c`): main 300 on nozzles 31-34 and
+///   light 299 on 41, scale 1; back 302 on leg points 21-24, scale 1. Air boost passes f2 = 1,
+///   so the main flame stays on with the stick neutral.
+/// - glide (slots `+0x34` and `+0x38`, mode 1): glide main 131 on 31-34 at the clamped stick
+///   length, and glide foot 120 in place of foot 301. A rear stick also keeps main 300.
+/// - strafe: back 302 on dummies 11/12 (stick x > 0.1) or 13/14 (stick x < -0.1), scale |x|,
+///   with the light on 42 or 43.
+fn booster_plays(
+    id: u8,
+    stick: Vec2,
+    glide: bool,
+    active: bool,
+    glide_scale: f32,
+    row: &acvd_data::generated::sfx::MapSfxparamSt,
+) -> Vec<Play> {
+    if !active {
+        return Vec::new();
+    }
+    let main = i32::from(row.ac_main_booster);
+    let back = i32::from(row.ac_back_booster);
+    let light = i32::from(row.ac_booster_light);
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<Play>, id: i32, scale: f32, dust: bool| {
+        if id > 0 {
+            out.push(Play { id, scale, dust });
+        }
+    };
+    if MAIN_NOZZLES.contains(&id) {
+        if glide {
+            if rear_stick(stick) {
+                push(&mut out, main, 1.0, true);
+            }
+            // Each glide frame `0x830e8ef8` leaves five effects at 0.6 and two at 1.0
+            // (`private/xenia/glide_fxscale.jsonl`), the five 131 and two 120 starts.
+            push(&mut out, GLIDE_MAIN, glide_scale, false);
+            push(&mut out, GLIDE_FOOT, 1.0, false);
+        } else {
+            push(&mut out, main, 1.0, true);
+        }
+    }
+    if id == 41 {
+        push(&mut out, light, 1.0, false);
+    }
+    if LEG_NOZZLES.contains(&id) && !glide {
+        push(&mut out, back, 1.0, true);
+    }
+    if stick.x > SIDE_STICK && matches!(id, 11 | 12) {
+        push(&mut out, back, stick.x, true);
+    }
+    if stick.x > SIDE_STICK && id == 42 {
+        push(&mut out, light, stick.x, false);
+    }
+    if stick.x < -SIDE_STICK && matches!(id, 13 | 14) {
+        push(&mut out, back, -stick.x, true);
+    }
+    if stick.x < -SIDE_STICK && id == 43 {
+        push(&mut out, light, -stick.x, false);
+    }
+    out
+}
+
+#[derive(Default)]
+struct Tally {
+    nodes: u32,
+    spawners: u32,
+    spawned: u32,
+    particles: u32,
+    drawn: u32,
+}
+
+fn tally(n: &NodeRt, t: &mut Tally) {
+    t.nodes += 1;
+    t.particles += n.particles.len() as u32;
+    if n.visual.is_some() || n.batch.is_some() {
+        t.drawn += 1;
+    }
+    if matches!(n.def.kind, Kind::Spawner { .. }) {
+        t.spawners += 1;
+        t.spawned += n.children.len() as u32;
+    }
+    for c in &n.children {
+        tally(c, t);
+    }
+}
+
+fn sfx_probe(sfx: &Sfx) -> String {
+    let Some(run) = &sfx.run else {
+        return format!("run=none stop={}", u8::from(sfx.stopping));
+    };
+    let mut t = Tally::default();
+    for n in &run.nodes {
+        tally(n, &mut t);
+    }
+    format!(
+        "nodes={} spawners={} spawned={} particles={} drawn={} stop={}",
+        t.nodes, t.spawners, t.spawned, t.particles, t.drawn, u8::from(sfx.stopping)
+    )
+}
+
+/// Logs booster effects on the frame [`ShotMark`] names. `take_shot` sets that path in Update;
+/// this runs after [`simulate`] in PostUpdate, which is the state the screenshot renders.
+fn probe_shot(
+    mark: Option<ResMut<ShotMark>>,
+    pilots: Query<&Pilot>,
+    points: Query<(&EffectPoint, &GlobalTransform)>,
+    effects: Query<(&Sfx, &GlobalTransform)>,
+    visuals: Query<(&SfxVisual, &Transform)>,
+    cameras: Query<&GlobalTransform, With<Camera3d>>,
+) {
+    let Some(mut mark) = mark else { return };
+    let Some(path) = mark.path.take() else { return };
+    let Ok(pilot) = pilots.single() else {
+        eprintln!("SHOT {} no pilot", path.display());
+        return;
+    };
+    let cam = cameras
+        .iter()
+        .next()
+        .map(|c| c.rotation() * Vec3::NEG_Z)
+        .unwrap_or(Vec3::Z);
+    eprintln!(
+        "SHOT {} glide={} boost={} air={} stick=({:.3},{:.3}) speed={:.3} vel=({:.2},{:.2},{:.2}) cam=({:.2},{:.2},{:.2})",
+        path.display(),
+        u8::from(pilot.glide),
+        u8::from(pilot.boost),
+        u8::from(pilot.airborne),
+        pilot.command.x,
+        pilot.command.y,
+        pilot.velocity.with_y(0.0).length(),
+        pilot.velocity.x,
+        pilot.velocity.y,
+        pilot.velocity.z,
+        cam.x,
+        cam.y,
+        cam.z
+    );
+    let mut rows: Vec<_> = points.iter().collect();
+    rows.sort_by_key(|(p, _)| (p.column, p.id));
+    let mut shown = 0u32;
+    for (p, xf) in rows {
+        if p.playing.is_empty() {
+            continue;
+        }
+        let at = xf.translation();
+        for (id, fx, scale) in &p.playing {
+            shown += 1;
+            let body = effects
+                .get(*fx)
+                .map(|(s, _)| sfx_probe(s))
+                .unwrap_or_else(|_| "missing".to_string());
+            let axis = effects
+                .get(*fx)
+                .map(|(_, g)| g.rotation() * Vec3::Z)
+                .unwrap_or(Vec3::ZERO);
+            let mut n = 0u32;
+            let mut lo = Vec3::splat(f32::MAX);
+            let mut hi = Vec3::splat(f32::MIN);
+            let mut max_z = 0.0f32;
+            for (v, tf) in &visuals {
+                if v.0 != *fx {
+                    continue;
+                }
+                n += 1;
+                lo = lo.min(tf.translation);
+                hi = hi.max(tf.translation);
+                max_z = max_z.max(tf.scale.z.abs());
+            }
+            let span = if n == 0 { Vec3::ZERO } else { hi - lo };
+            eprintln!(
+                "SHOT {} dummy {} ({}) f{id} scale={scale:.3} at=({:.1},{:.1},{:.1}) {body} vis={n} span=({:.1},{:.1},{:.1}) maxz={max_z:.2} axis=({:.2},{:.2},{:.2})",
+                path.display(),
+                p.id,
+                p.column,
+                at.x,
+                at.y,
+                at.z,
+                span.x,
+                span.y,
+                span.z,
+                axis.x,
+                axis.y,
+                axis.z
+            );
+        }
+    }
+    if shown == 0 {
+        eprintln!("SHOT {} no booster effects playing", path.display());
+    }
+}
+
+/// Lights the booster effects. The groups and which state plays them are `0x828932a0`.
 pub fn boosters(
     mut commands: Commands,
     pilots: Query<&Pilot>,
     mut points: Query<(Entity, &mut EffectPoint)>,
     mut effects: Query<&mut Sfx>,
-    mut quick_seen: Local<u32>,
+    mut xforms: Query<&mut Transform>,
 ) {
     let Ok(pilot) = pilots.single() else { return };
     let Some(row) = find(PARAM_MAPSFXPARAM_BIN, 0).map(|r| &r.data) else {
         return;
     };
-    let flat = Vec2::new(pilot.velocity.x, pilot.velocity.z);
-    let facing = (Quat::from_rotation_y(pilot.yaw) * Vec3::NEG_Z).xz();
-    let moving = pilot.boost && flat.length() > BOOST_MOVING;
-    let ahead = flat.dot(facing) >= 0.0;
-    let quick = pilot.quick_boosts != *quick_seen;
-    *quick_seen = pilot.quick_boosts;
-    let quick_ahead = pilot.quick_dir.xz().dot(facing) >= 0.0;
+    let stick = pilot.command;
+    let glide = pilot.glide && pilot.boost;
+    let glide_scale = stick.length().clamp(0.0, GLIDE_SFX_SCALE);
+    let moving = stick.length() > SIDE_STICK || pilot.velocity.with_y(0.0).length() > BOOST_MOVING;
+    // Ground boost only while the boost-move slot runs. Air boost passes f2 = 1, so the main
+    // flame stays lit with the stick neutral. Glide passes the clamped stick as both.
+    let active =
+        pilot.boost && (glide && glide_scale > 0.0 || !glide && (pilot.airborne || moving));
     for (e, mut p) in &mut points {
-        let burst = match (p.column, p.id) {
-            ("booster", id) => MAIN_NOZZLES.contains(&id) && quick_ahead,
-            ("legs", id) => BACK_NOZZLES.contains(&id) && !quick_ahead,
-            _ => false,
-        };
-        if quick && burst && row.ac_qb_normal > 0 {
-            commands.spawn((
-                Sfx::new(row.ac_qb_normal.into()),
-                Transform::default(),
-                Visibility::default(),
-                ChildOf(e),
-            ));
-        }
-        let want = match (p.column, p.id) {
-            ("booster", id) if LIGHT_POINTS.contains(&id) && moving => row.ac_booster_light,
-            ("booster", id) if MAIN_NOZZLES.contains(&id) && moving && ahead => row.ac_main_booster,
-            ("legs", id) if BACK_NOZZLES.contains(&id) && moving && !ahead => row.ac_back_booster,
-            ("legs", id)
-                if FOOT_NOZZLES.contains(&id) && pilot.airborne && pilot.velocity.y > 0.0 =>
-            {
-                row.ac_foot_booster
-            }
-            _ => 0,
-        } as i32;
-        let current = p.playing.filter(|&(_, fx)| effects.contains(fx));
-        if current.map(|c| c.0) == Some(want) || (current.is_none() && want <= 0) {
-            p.playing = current;
-            continue;
-        }
-        if let Some((_, fx)) = current {
-            if let Ok(mut s) = effects.get_mut(fx) {
-                s.stop();
+        let want = booster_plays(p.id, stick, glide, active, glide_scale, row);
+        p.playing.retain(|(_, fx, _)| effects.contains(*fx));
+        for (id, fx, applied) in p.playing.clone() {
+            if !want.iter().any(|w| w.id == id) {
+                if let Ok(mut s) = effects.get_mut(fx) {
+                    s.stop();
+                }
+            } else if let Some(w) = want.iter().find(|w| w.id == id) {
+                if let Ok(mut s) = effects.get_mut(fx) {
+                    s.dust(w.dust);
+                }
+                if (applied - w.scale).abs() > 0.001 {
+                    if let Ok(mut t) = xforms.get_mut(fx) {
+                        t.scale = Vec3::splat(w.scale.max(0.001));
+                    }
+                }
             }
         }
-        p.playing = (want > 0).then(|| {
-            (
-                want,
-                commands
-                    .spawn((
-                        Sfx::new(want),
-                        Transform::default(),
-                        Visibility::default(),
-                        ChildOf(e),
-                    ))
-                    .id(),
-            )
+        p.playing.retain(|(_, fx, _)| {
+            effects.contains(*fx) && !effects.get(*fx).is_ok_and(|s| s.stopping)
         });
+        for w in &want {
+            if p.playing.iter().any(|(id, _, _)| *id == w.id) {
+                if let Some(slot) = p.playing.iter_mut().find(|(id, _, _)| *id == w.id) {
+                    slot.2 = w.scale;
+                }
+                continue;
+            }
+            let mut sfx = Sfx::new(w.id);
+            sfx.dust(w.dust);
+            let fx = commands
+                .spawn((
+                    sfx,
+                    Transform::from_scale(Vec3::splat(w.scale.max(0.001))),
+                    Visibility::default(),
+                    ChildOf(e),
+                ))
+                .id();
+            p.playing.push((w.id, fx, w.scale));
+        }
     }
 }
 
@@ -1842,4 +2286,21 @@ fn preview(
             ))
             .id(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rear_stick;
+    use bevy::prelude::Vec2;
+
+    #[test]
+    fn stick_sectors_match_the_360_table() {
+        assert!(!rear_stick(Vec2::ZERO));
+        assert!(!rear_stick(Vec2::new(0.0, 1.0)), "forward");
+        assert!(!rear_stick(Vec2::new(1.0, 0.0)), "right");
+        assert!(!rear_stick(Vec2::new(-1.0, 0.0)), "left");
+        assert!(rear_stick(Vec2::new(0.0, -1.0)), "back");
+        assert!(rear_stick(Vec2::new(0.5, -1.0)), "back-right");
+        assert!(!rear_stick(Vec2::new(1.0, 0.4)), "forward-right");
+    }
 }

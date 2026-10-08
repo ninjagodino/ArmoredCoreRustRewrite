@@ -1,0 +1,23 @@
+# The boost_vfx.txt sequence up to the glide (the start point faces a wall, so the camera
+# turns right first), then a forward glide with shots at 1.6 s and 2.6 s.
+# L1 is LB (boost), glide is LS (L3). Shots are the guest framebuffer.
+run ac_test.txt
+wait 2
+press LB
+wait 0.4
+stick L 0 1 3
+shot private/xenia/shots/glide_fwd.png
+stick R 1 0 1.2
+stick L 0 1 2
+stick L 0 -1 2.5
+stick L 1 0 2
+stick L 0 1
+press LS
+wait 1.6
+shot private/xenia/shots/glide_1s6.png
+wait 1
+shot private/xenia/shots/glide_2s6.png
+wait 1
+shot private/xenia/shots/glide_3s6.png
+release
+wait 1
