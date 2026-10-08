@@ -15,6 +15,7 @@ use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
+use bevy::transform::TransformSystems;
 
 use crate::map::{self, MapPart};
 
@@ -167,7 +168,28 @@ impl Plugin for EnvPlugin {
         ))
             .insert_resource(EnvDisc(self.disc.clone()))
             .add_systems(PostStartup, load)
-            .add_systems(Update, relight);
+            .add_systems(Update, relight)
+            .add_systems(PostUpdate, follow_sky.before(TransformSystems::Propagate));
+    }
+}
+
+/// A `Map_Sky` part: the 360 draws it at the camera's X / Z, its own height, scaled by the scene
+/// record's sky scale (probe `private/xenia/sky_obj.txt`: object matrix diag(100) at
+/// (cam x, 0, cam z) in m4000's sky pass).
+#[derive(Component)]
+struct SkyDome {
+    y: f32,
+    scale: f32,
+}
+
+fn follow_sky(
+    camera: Query<&Transform, With<Camera3d>>,
+    mut domes: Query<(&SkyDome, &mut Transform), Without<Camera3d>>,
+) {
+    let Ok(camera) = camera.single() else { return };
+    for (dome, mut xf) in &mut domes {
+        xf.translation = Vec3::new(camera.translation.x, dome.y, camera.translation.z);
+        xf.scale = Vec3::splat(dome.scale);
     }
 }
 
@@ -257,7 +279,7 @@ fn relight(
     env: Option<ResMut<MapEnv>>,
     added: Query<(Entity, &MeshMaterial3d<StandardMaterial>), Added<MeshMaterial3d<StandardMaterial>>>,
     parents: Query<&ChildOf>,
-    parts: Query<&Name, With<MapPart>>,
+    parts: Query<(&Name, &Transform), With<MapPart>>,
     standard: Res<Assets<StandardMaterial>>,
     mut materials: ResMut<Assets<EnvMaterial>>,
     mut sky_materials: ResMut<Assets<SkyMaterial>>,
@@ -266,7 +288,9 @@ fn relight(
     let Some(mut env) = env else { return };
     let env = &mut *env;
     for (entity, material) in &added {
-        let Some(name) = parents.iter_ancestors(entity).find_map(|a| parts.get(a).ok()) else {
+        let Some((part, (name, part_xf))) =
+            parents.iter_ancestors(entity).find_map(|a| parts.get(a).ok().map(|p| (a, p)))
+        else {
             continue;
         };
         let model = env.models.get(name.as_str()).cloned().unwrap_or_default();
@@ -293,6 +317,8 @@ fn relight(
                     .entity(entity)
                     .remove::<MeshMaterial3d<StandardMaterial>>()
                     .insert(MeshMaterial3d(sky));
+                let scale = env.env.scene.map_or(1.0, |s| s.sky_scale);
+                commands.entity(part).insert(SkyDome { y: part_xf.translation.y, scale });
                 continue;
             }
         }

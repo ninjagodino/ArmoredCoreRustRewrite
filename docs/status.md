@@ -41,14 +41,22 @@ in order:
     `o9705` Map_Sky dome (texture from `model/obj/o9705/o9705.tpf.dcx`) on the far plane, which
     is what makes the mountains past its ~825 m radius visible. The AC's two Bevy lights and
     ambient take set 0; clear colour from the type-101 record; camera tonemapping off.
+  - Done (sky look): there is no skybox cubemap; every map's sky is one of six hemisphere
+    domes `o9700`-`o9705` (radius ~822 m, horizon to zenith, MSB part at the origin, scale 1).
+    The 360 sky pass (`0x827f3d38`) draws it at (camera x, part y, camera z) scaled by the
+    type-101 scene sub-block `+0x1c` (debug name 天球スケール, `0x827ffa80` -> runtime +0x28;
+    100 everywhere but m3710 = 5), with the projection's depth row zeroed and viewport MinZ = 1
+    (`0x827d1d90`) so it sits on the far plane. Probes: `private/xenia/sky_obj.txt` (object
+    matrix diag(100) at the camera X/Z), `sky_view.txt` (the zero-depth projection),
+    `sky_wvp.txt` / `sky_world.txt` (camera / view block). `env.rs::follow_sky` does the same;
+    the m4000 start view now matches `ac_test_start.png`. The "light-blue band" was the dome
+    seen from 720 m off-centre; the texture itself is right.
   - Open, in order: (1) the **tone map**: lit colour is stored at x0.5 (c31) and goes through
     the ToneMap filter (type-101 sub-block 2: mode 1, 0.5, 1.1, 0.6, 10; ToneMap_DivideToneMapPS
     = c33.x * x/(1+x), x = col * adapted-luminance scale); the runtime shows col unscaled.
-    (2) the **sky look**: the 360 shot (`private/xenia/shots/ac_test_start.png`) has dark teal
-    storm clouds, the o9705 texture is a light-blue band, so the draw likely uses Flver_Sky.fpo
-    (second texture + fog) or another texture; probe the o9705 draw (pixel shader, texture
-    fetches, its light / fog set) with `.\tools\xenia\run.ps1 <probes> -Recipe
-    tools\xenia\recipes\ac_test.txt`. (3) which model / part field holds the per-draw light-set
+    (2) sky leftovers: which pixel shader the sky pass binds (NoLightNoFog vs Flver_Sky.fpo
+    with fog; the colour already matches the 360 shot) and the code that writes the camera X/Z
+    into the dome's object matrix (seen only at runtime). (3) which model / part field holds the per-draw light-set
     id (`env.rs::model_slot` reproduces m4000's picks: m9000-m9049 -> 2, m91xx -> 3, rest 1; the
     MSB part sub-struct word is 1 everywhere). (4) the Water.spx shader (water draws as ColDif
     with set 3). (5) c0 / c16 / c19 / c136 values (taken as 1, no SSAO). (6) Map_Diffuse_Multi
@@ -285,8 +293,8 @@ in order:
 
 - Map lighting, fog and sky dome (`sheets/map_env.csv`, `acvd-formats::env`, `acvd-game::env`):
   env light sets / fog / scene record read and matched to the 360's probed shader uploads; map
-  pieces lit with the Flver_ColDif maths; `o9705` sky dome behind everything. Open leftovers
-  under Map look.
+  pieces lit with the Flver_ColDif maths; `o9705` sky dome behind everything, centred under
+  the camera at the env sky scale like the 360 sky pass. Open leftovers under Map look.
 - AC test scene: `acvd-game` now starts in the garage AC TEST map, drawn from the disc.
   - **Which map**: the 360 exe has `AcTestScene` (`garagescene.lua` `Scr_CreateScene(2008,
     "AcTestScene")`) and `AcTestSortieScene` (0x825dbcd8, load step 0x825dcb68); the disc has

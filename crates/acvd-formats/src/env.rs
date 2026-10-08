@@ -87,6 +87,9 @@ pub struct Scene {
     pub clear: [u8; 3],
     /// The first sub-block's `+4`, the view far distance.
     pub far: f32,
+    /// `+0x1c`, the sky dome scale (debug label 天球スケール); 0x827ffa80 keeps the default 1
+    /// unless it is positive.
+    pub sky_scale: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +159,7 @@ pub fn read(data: &[u8]) -> Result<Env> {
                 env.scene = Some(Scene {
                     clear: [r.u8(sub)?, r.u8(sub + 1)?, r.u8(sub + 2)?],
                     far: r.f32(sub + 4)?,
+                    sky_scale: Some(r.f32(sub + 0x1c)?).filter(|&s| s > 0.0).unwrap_or(1.0),
                 });
             }
             _ => {}
@@ -201,5 +205,6 @@ mod tests {
         let scene = env.scene.unwrap();
         assert_eq!(scene.clear, [0x25, 0x32, 0x31]);
         assert_eq!(scene.far, 15000.0);
+        assert_eq!(scene.sky_scale, 100.0);
     }
 }

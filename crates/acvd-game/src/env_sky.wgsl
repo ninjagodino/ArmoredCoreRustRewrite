@@ -1,5 +1,6 @@
 // Map_Sky (NoLightNoFog.spx): the squared texel, unlit and unfogged (sheets/map_env.csv sky
-// row). The dome is smaller than the map, so it sits on the far plane behind every other draw.
+// row). The 360's sky pass (0x827f3d38) zeroes the projection's depth row and sets the viewport
+// MinZ to the far end, so the dome sits on the far plane behind every other draw.
 
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
