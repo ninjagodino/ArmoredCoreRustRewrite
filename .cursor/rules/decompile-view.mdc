@@ -71,11 +71,15 @@ are the Ghidra ones with no translation. List the probes (syntax in
 `tools/xenia/probes.example.txt`) and run them:
 
 ```powershell
-.\tools\xenia\run.ps1 private\xenia\mytask.txt -Seconds 90 # hits -> private\xenia\mytask.jsonl
+# gameplay: boots, drives the menus into AC TEST with the scripted pad, plays the recipe, closes
+.\tools\xenia\run.ps1 private\xenia\mytask.txt -Recipe tools\xenia\recipes\ac_test.txt # -> mytask.jsonl
+.\tools\xenia\run.ps1 private\xenia\mytask.txt -Seconds 90 # boot-only, no input
 ```
 
-With `-Seconds` the run is scripted end to end. Anything that needs gameplay (a mission, firing,
-boosting) needs the user at the controls: hand them the command and read the `.jsonl` after.
+Gameplay probes (walking, boosting, gliding, quick boost, jumping, camera) are agent-driven:
+write a recipe that starts with `run ac_test.txt` and run it yourself (`walkabout`, `boost_vfx`,
+`boost_glide` in `tools/xenia/recipes/`; the m4000 start faces a wall). Give the shell
+`block_until_ms` >= 400000. Ask the user to play only for states no recipe reaches.
 `tools\xenia\setup.ps1` rebuilds the emulator if `external/xenia-canary` is missing.
 
 When Xenia cannot reach a state, say so in the sheet row ("Xenia re-check pending") and record

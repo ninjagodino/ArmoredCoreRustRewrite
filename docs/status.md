@@ -5,6 +5,15 @@ Done with a one-line summary, record findings (360 addresses, file layouts, dead
 task, and add any new tasks it uncovered. Per-system data/runtime status also lives in
 `sheets/systems.csv`; keep both in step.
 
+Runtime probes are agent-driven: `run.ps1 PROBES -Recipe tools\xenia\recipes\ac_test.txt` boots
+the disc, drives the menus into AC TEST with the scripted controller and plays the recipe's
+walk / look / boost / glide / quick-boost / jump steps (`docs/xenia-probes.md`; recipes
+`walkabout`, `boost_vfx`, `boost_glide`). Firing is `trigger R 1 SEC` / `RB`; no committed recipe
+fires yet, so the first firing run should confirm the binding with a weapon probe. The m4000
+start point faces a wall. Recipes below
+replace the older "user at the controls" runs; ask the user only for states no recipe reaches
+(a specific story mission).
+
 ## Open
 
 Rough priority order; reorder freely.
@@ -76,8 +85,9 @@ in order:
   need triggers free play doesn't produce: earlier emulator breakpoints on the camera message
   0x68 / 0x69 handlers never fired; ready position waits on weapons). Xenia re-check: probe the
   handlers `0x8285cf48` / `0x8285cf68` / `0x8285cf88` / `0x8285cfb0` (registered for messages
-  0x66-0x69 by `0x836cad88` into the table at `0x83713b70`) during a mission with landings and
-  hits; the same run re-checks `dash_inv` (0x66) and `side_moving` (0x67) in
+  0x66-0x69 by `0x836cad88` into the table at `0x83713b70`) in AC TEST with a recipe that lands
+  from a boost jump (`walkabout` / `boost_vfx` jump steps) and boosts sideways / back; hits on
+  the AC need the AC TEST targets (layers `actest2`-`8`) or a story mission. The same run re-checks `dash_inv` (0x66) and `side_moving` (0x67) in
   `sheets/camera_follow.csv`. Speed blur: the per-call ease runs once per 1/30 s
   game frame (Xenia probe, `frame_time` / `speed_blur` in `sheets/camera_follow.csv`); the
   runtime (`blur.rs`) still steps it per 60 Hz tick and needs to step per 1/30 s. A camera action
@@ -109,8 +119,8 @@ in order:
     the excess per tick, not game data), the re-fire interval (runtime waits for the clip), EN,
     and the player caller of slot +0x68 (only `0x82842dd8` found, f1 = f2 = 1, fixed
     direction). Per-state max `0x82822af0` case 4 = lerp(+0x120, +0x11c, +0x220 = f1), +0x11c =
-    +0x118 x param 138 (booster float 11). Probe recipe (user at the controls, high-boosting
-    in a mission): hits on `0x82822980` logging f1, f2, r7, r8, and reads of movement +0x260 /
+    +0x118 x param 138 (booster float 11). Probe recipe (`boost_vfx.txt`, whose `press X` step is
+    the high boost): hits on `0x82822980` logging f1, f2, r7, r8, and reads of movement +0x260 /
     +0x268 (horizontal speed) and +0x1bc for the following 30 frames. Booster int16 fields
     0/3-6 (18/15/10, 10/7/4, small frame counts) are unassigned candidates for the burst and
     reload frames. The earlier note calling `0x828844f0` (row 218) a quick-boost builder is
@@ -149,7 +159,7 @@ in order:
     重力加速度, no unit; read as m/s added per 60 Hz tick, so 1.0 drops rifle 10002 rounds
     steeply), `reload_time` (read as ticks). Needs the 360 bullet update reading these
     (`acvd-index q field` on the `BulletRigidSt` offsets), then a Xenia probe on a fired round's
-    velocity (user at the controls, firing).
+    velocity (recipe: `run ac_test.txt` then `trigger R 1 2`).
   - `magazine` (+0x138) name unconfirmed: may be total ammo.
   - Bay shift is in (`acvd-game::bay`, `sheets/ac_states.csv`): hold R (△) and press that
     arm's fire button. Ready-position weapons purge instead of moving onto the rack. The
@@ -200,7 +210,7 @@ in order:
     current angle over that many frames. On the 360 the ReactTime switch only fires when
     `clock - delay == 0` exactly, so with delay 5 and 2-frame steps it may never fire.
     `0x82beefdc` also scales anim-player value +0x2c by 0.3 (`0x82016f20`) while the weight
-    is 0; meaning unknown. Xenia probe recipe (user firing a rifle):
+    is 0; meaning unknown. Xenia probe list (recipe: `run ac_test.txt`, then fire the rifle with `trigger R 1 2`):
     `0x82bee808 kick_start r3 f1 f2 lr`, `0x82beeb38 kick_weight max=400 r31 f30 [r31+0x8]:f32 [r31+0x10]:f32`,
     `0x82c42048 blend_time max=200 r3 f1 lr`, `0x8287f348 gun_ctrl r30`,
     `0x8287f33c sniper_ctrl r30`.
@@ -213,7 +223,7 @@ in order:
   shoulder / hanger panels (no weapons there yet), generator EN capacity (Lua `gene_owen_out` =
   `Scr_GetACVParam(5, Float32(3))` = generator f32 +0x20, values 25300–99100; the HUD digits are
   percent so a full bar is 100.00 either way). Xenia re-check pending: `private/xenia/hud_apen.txt`
-  (`0x829d0b30` status AP/EN, `0x8286a668` AP sum) in the AC test while boosting. **Param enums**:
+  (`0x829d0b30` status AP/EN, `0x8286a668` AP sum) with `boost_vfx.txt`. **Param enums**:
   TDF reader.
 - **Effects leftovers** (FFX player done, see Done): every slot meaning in
   `sheets/ffx_actions.csv` is inferred from the effect files. The 360 action-id to class map
@@ -265,7 +275,8 @@ in order:
   update; its 360 address is still to find from the AC update `0x828bef18`), `follow_ease`,
   `dash_inv`, `side_moving`, `shake`, `eye_lift`. Pending 360 addresses: the per-id part
   getters behind `0x8246fbb0` (`ac_part_fields.csv`), the AC+0x1104 update gate, the
-  camera-effects view builder, the offset-row lerp.
+  camera-effects view builder, the offset-row lerp. All of these are reachable unattended in
+  AC TEST (`ac_test_walk.txt` / `boost_vfx.txt`).
 - **Movies**: the 360 ships ASF `movie/jp/*.wmv` (WMV3 video, WMA2 / WMA Pro audio, see
   `formats.csv` `.wmv`); nothing demuxes or decodes them. A pure-Rust VC-1 decoder is a large job;
   the WMA Pro audio could reuse `acvd-formats::xma`'s WMA Pro core.
