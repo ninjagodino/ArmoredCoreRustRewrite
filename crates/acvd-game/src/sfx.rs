@@ -2112,7 +2112,7 @@ fn sfx_probe(sfx: &Sfx) -> String {
 /// this runs after [`simulate`] in PostUpdate, which is the state the screenshot renders.
 fn probe_shot(
     mark: Option<ResMut<ShotMark>>,
-    pilots: Query<&Pilot>,
+    pilots: Query<(&Pilot, &Transform)>,
     points: Query<(&EffectPoint, &GlobalTransform)>,
     effects: Query<(&Sfx, &GlobalTransform)>,
     visuals: Query<(&SfxVisual, &Transform)>,
@@ -2120,7 +2120,7 @@ fn probe_shot(
 ) {
     let Some(mut mark) = mark else { return };
     let Some(path) = mark.path.take() else { return };
-    let Ok(pilot) = pilots.single() else {
+    let Ok((pilot, at)) = pilots.single() else {
         eprintln!("SHOT {} no pilot", path.display());
         return;
     };
@@ -2130,8 +2130,11 @@ fn probe_shot(
         .map(|c| c.rotation() * Vec3::NEG_Z)
         .unwrap_or(Vec3::Z);
     eprintln!(
-        "SHOT {} glide={} boost={} air={} stick=({:.3},{:.3}) speed={:.3} vel=({:.2},{:.2},{:.2}) cam=({:.2},{:.2},{:.2})",
+        "SHOT {} pos=({:.2},{:.2},{:.2}) glide={} boost={} air={} stick=({:.3},{:.3}) speed={:.3} vel=({:.2},{:.2},{:.2}) cam=({:.2},{:.2},{:.2})",
         path.display(),
+        at.translation.x,
+        at.translation.y,
+        at.translation.z,
         u8::from(pilot.glide),
         u8::from(pilot.boost),
         u8::from(pilot.airborne),

@@ -53,14 +53,23 @@ in order:
     MSB part sub-struct word is 1 everywhere). (4) the Water.spx shader (water draws as ColDif
     with set 3). (5) c0 / c16 / c19 / c136 values (taken as 1, no SSAO). (6) Map_Diffuse_Multi
     textures (mountains read orange-brown; the 360 shows them grey-green).
-- **AC vs world collision** (blocks the demo): the AC walks through walls and objects; only a
-  downward ground ray exists (`collision.rs`). No paramdef carries an AC body size (`q name
-  Radius` finds only bullets, `ENEMY_GRAPHICS_ST.CollisionRadius` and camera `HitRadius`). Find
-  the 360 AC-vs-map query: the ground ray filter 0x100002 (`0x829e7b68`) and the eye-floor ray
-  0x200002 (`0x829e7be0`) are in the collision layer, so their neighbours / callers from the AC
-  update `0x828bef18` should include the horizontal sweep and its shape (capsule / spheres per
-  part?). Then a Xenia probe walking into a wall. Also wall kick (`ackickrhit` material) and
-  slopes too steep to stand on. `Collision` now has an XZ grid (16 m cells) for the queries.
+- **AC vs world collision leftovers** (walls are in, see Done "AC wall collision"):
+  - The upper sphere is built with radius = height = tuning `+0x230` (`0x82863b60`) but runs at
+    radius 5.5 / height 6.0; what shrinks the radius is not found. A third sphere (`+0x10`,
+    same `+0x230`, skipped when `0x8287fd60(+0x4c)`) and a static radius-6 sphere at 3 m
+    (`0x82b8da24` via AC-class slot `0x828aa320`) are not modelled; neither moved the AC in
+    the parapet run.
+  - The lower sphere's XZ offset follows the mean of up to four leg contacts (virtual `+0x174`
+    on `+0x48`) x `+0x3c` (tuning `+0x380` when `0x82479820` is true, else 1.0); runtime keeps
+    it at the feet. Which legs take `+0x380` is open.
+  - The 360's real resolve (sweep + slide inside `0x82ceec98` / `HitCheckerSphereGeometry`
+    `0x82cf4428`) is not decoded; the runtime pushes the deepest contact out horizontally, 3
+    passes a tick, skipping triangles with |normal.y| >= 0.7 (not game data).
+  - Walk speed: the 360 AC TEST AC walks at 0.12 m per tick at entity `+0x130`
+    (`private/xenia/wall_walk3.jsonl`), the runtime's default design 5001 at 0.249; check
+    whether that is the design (AC TEST may use another AC) or a 2x step.
+  - Wall kick (`ackickrhit` material), slopes too steep to stand on, AC vs objects that move,
+    AC vs AC.
 - **AC test targets**: `m4000_actest.msb` parts of kind 2 (22: ACs `a0000`-`a0003` at the vs
   UNAC start (-797.168, 17, 616.934), enemies `e0010` / `e0110` / `e0210` / `e1020` / `e2030`)
   on layers `actest2`-`actest8` (LAYER_PARAM_ST; the layer link in the part record is unread),
@@ -287,6 +296,28 @@ in order:
 
 ## Done
 
+- **AC wall collision** (`collision.rs` `push_out`, `control.rs` step; leftovers under Open).
+  Found with four unattended Xenia runs (AC TEST, walk forward into the start parapet; probe
+  lists `private/xenia/wall_walk{,2,3,4}.txt`, recipe `private/xenia/wall_walk_recipe.txt`):
+  - `0x829e7b68` / `0x829e7be0` (and wrappers `0x829e7d58` / `0x829e7d68`) never run in AC
+    TEST. The AC's down rays come from the WorldRayCastManager (vtable `0x820c5538`, source
+    `World\WorldRayCastManager.cpp`) batch `0x829e84f8` -> `0x829ea0d8`, five rays through the
+    ray builder `0x82b9df28`: `…a194` 23 m up (filter 0x80100006), `…a27c` 1000 m down from
+    +6.7 m (0x100002), `…a30c` 100 m down from +54.6 m (0x200002), `…a378` short down rays
+    2.2-2.5 m out from the centre (0x100002), `…a3e8` long down (filter 0).
+  - Body: FromSoftware's own hit library (`Source\Hit\`: `HitCheckerSphereWorld` `0x82ce6a48`,
+    `HitCheckerSphereGeometry` `0x82cf4428`, `HitShape_Sphere` `0x82ceec98`), no Havok. The
+    AC hit object (vtable `0x82095f54`: dtor `0x82866b20`, update `0x828651d0`, shape test
+    `0x82866048`) is created by `0x82863ad0` from `0x82858460`, which reads tuning record 0
+    (`0x82330c38(0x82332018(), 0)`) `+0x22c` / `+0x230` / `+0x234` (+ `+0x380`) and builds three
+    spheres in `0x82863b60` via `0x82862df0` -> `0x82c44028`. Each frame `0x828651d0` sweeps
+    the lower (`+0x8`, r 3.0, 3.0 m up) and upper (`+0xc`, r 5.5, 6.0 m up) spheres from the
+    old to the new position through `0x82c441f8` (sphere +0x8 radius, +0x10 offset; r4 +0x0
+    new, +0x30 old), up to three sweeps a frame.
+  - Probe result: at the parapet the velocity turns from (-0.120, 0) to (-0.116, +0.031) at
+    the same speed and the AC slides along it to (-393.15, 22.81, 668.63). The runtime walks
+    from the start to (393.72, 22.81, 668.92) (x mirrored) along the same parapet; without the
+    push it walked off the platform.
 - Booster VFX groups (`acvd-game::sfx::boosters`, probe `private/xenia/boost_vfx.txt`,
   recipe `tools/xenia/recipes/boost_vfx.txt`). The sfx controller (`vtable 0x82098d10`)
   builds the lists in `0x82893ec0` from `MAP_SFXPARAM_ST` copied to object `+0x740`, and

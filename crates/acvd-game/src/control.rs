@@ -1060,6 +1060,15 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     p.velocity = Vec3::new(horizontal.x, p.velocity.y, horizontal.y);
     let before_y = position.y;
     *position += p.velocity;
+    // Walls: the body spheres push the AC out sideways and lose the velocity into the wall,
+    // so it slides along it (AC TEST parapet, `private/xenia/wall_walk3.jsonl`).
+    for n in collision.push_out(position) {
+        let into = p.velocity.x * n.x + p.velocity.z * n.y;
+        if into < 0.0 {
+            p.velocity.x -= into * n.x;
+            p.velocity.z -= into * n.y;
+        }
+    }
     // Snap puts y on the triangle, so a grounded ray has to start above it. The lift is this
     // tick's travel (slopes) or 5 cm when still — a hit farther down than that is a drop.
     // Airborne, the ray starts at last tick's height so a fast fall cannot step past a floor.
