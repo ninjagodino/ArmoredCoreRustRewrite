@@ -75,8 +75,9 @@ in order:
   on layers `actest2`-`actest8` (LAYER_PARAM_ST; the layer link in the part record is unread),
   with `param/actestdata.bin` (+ `actestdata.def`, unread) choosing the test; AI in
   `script/enemy/*_actest.lc`, `script/arena/actest_*.lc`. Draw them, take hits and damage.
-- **Damage model**: AP, bullet hit vs AC / enemy hit shapes, `damage_power`, impact, the
-  weapons' open units (see Weapons leftovers).
+- **Damage model**: AP, bullet hit vs AC / enemy hit shapes, defense mitigation (KE/CE/TE vs
+  defense thresholds), impact (range-decay curve `0x827ca448` and bullet units are done; see
+  Weapons leftovers and Done).
 - **Lock-on / FCS** (see FCS / lock-on HUD). Energy drain (the lock-sight EN gauge is drawn
   full; see UI leftovers). Boost gauge.
 
@@ -163,21 +164,15 @@ in order:
   0x200002. HNAV/HTR navigation readers.
 - **FCS / lock-on HUD**: AcFcs lock-sight cone (20° × 20°, datum 20 m back); not a camera mode
   (see `lock_on` row in `sheets/camera_follow.csv`).
-- **Weapons leftovers** (hand-weapon tracers done, see Done):
-  - Units unconfirmed: `init_speed` (read as km/h), `BulletRigidSt.gravity` (paramdef label
-    重力加速度, no unit; read as m/s added per 60 Hz tick, so 1.0 drops rifle 10002 rounds
-    steeply), `reload_time` (read as ticks). Needs the 360 bullet update reading these
-    (`acvd-index q field` on the `BulletRigidSt` offsets), then a Xenia probe on a fired round's
-    velocity (recipe: `run ac_test.txt` then `trigger R 1 2`).
-  - `magazine` (+0x138) name unconfirmed: may be total ammo.
+- **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics and range-decay done; see Done):
   - Bay shift is in (`acvd-game::bay`, `sheets/ac_states.csv`): hold R (△) and press that
     arm's fire button. Ready-position weapons purge instead of moving onto the rack. The
     rack holds the stow until the hand weapon is seated (frame 40), then `a00_011` turns the prong (`sheets/hanger_anim.csv`).
-  - Not done: bullet max/min speed and brake, hit/damage (`hit_id`, `damage_power`), energy
-    drain, missiles (`bulletmissile`), blades, shoulder weapons (category 12 bullet ids at
-    +356/+360), weapon modes, core aim (shots follow the camera pitch, not a posed
-    upper body). The lock-sight HUD shows AP, energy, the `AlphaAnimSprite` gauges and the
-    hand-weapon ammo counts (`acvd-game::hud`).
+  - Not done: target hit shapes and defense mitigation, arm firing-stability reload factor
+    (`0x8286bd00` / `0x8286adf8`), energy drain, missiles (`bulletmissile`), blades, shoulder
+    weapons (category 12 bullet ids at +356/+360), weapon modes, core aim (shots follow the
+    camera pitch, not a posed upper body). The lock-sight HUD shows AP, energy, the
+    `AlphaAnimSprite` gauges and the hand-weapon ammo counts (`acvd-game::hud`).
   - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
     360 call that starts `a00_001` on a held trigger was not found (joint-control bit 31 at
     `0x82456f68` selects `sniper_$(LR)` vs `gun_$(LR)` and was not tied back to +0x153).
@@ -689,14 +684,36 @@ in order:
   - **Testing**: `--sfx <id>` previews one effect; `--burst <n>` saves `n` shots 0.05 s apart.
     The user confirmed boosters, muzzle flash and hits on screen.
 
-- Hand-weapon fire (`acvd-game::weapons`): `acvparts.bin` category 10 fields `magazine`,
-  `missile_lock_time`, `bullet_id`, `hit_id`, `init_speed`, `en_drain`, `reload_time`,
-  `no_decay_range`, `damage_power`, `damage_recoil` (`sheets/ac_part_fields.csv`, matched
-  against `growpartsarmunitparam.bin`). F / left mouse / R2 fire the right arm, C / right
+- Hand-weapon fire (`acvd-game::weapons`): `acvparts.bin` category 10 fields `magazine` (+0x176,
+  total ammo `総弾数`, switch `0x8247f208` case 5 → `0x82478af0`), `damp_range` (+0x138, case 4 →
+  `0x82478910`, previously mislabelled `magazine`), `missile_lock_time` (+0x13a, case 11 →
+  `0x8247cf48`, 60 Hz ticks), `bullet_id` (+0x13c, `0x82475bd8`), `hit_id` (+0x140, `0x82475c18`),
+  `init_speed` (+0x148, case 6 → `0x8247cbf8`, m/s), `en_drain` (+0x14c, case 8 → `0x8247cec0`),
+  `reload_time` (+0x158, case 7 → `0x8247cb80`, 60 Hz ticks), `no_decay_range` (+0x17c, case 3 →
+  `0x8247d350`, metres), `guarantee_rate` (+0x17e, `0x82478ca8`, % at `damp_range`),
+  `min_power_rate` (+0x17f, `0x82478cf8`, % at 2000 m), `damage_power` (+0x18c, case 0 →
+  `0x8247d4d8`) and `damage_recoil` (+0x190, case 1 → `0x8247d4d8`) (`sheets/ac_part_fields.csv`).
+  Bullet units & ballistics: `init_speed` is in m/s (`0x8247dfc8`, `0x828a3294`, `0x829c0764`
+  multiply by `DAT_82004408` = 1/60 for m/tick), while `BulletRigidSt` / `BulletEnergySt`
+  `max_speed_km_h` (+0x1a) and `min_speed_km_h` (+0x1c) are in km/h (`0x828dd460` / `0x828dd49c`
+  multiply by `DAT_8200d118` = 1/216 for m/tick). `BulletRigidSt.gravity` (+0x2c) is in m/s per
+  60 Hz tick (`0x8247dfc8` and `0x828dd580` multiply by 1/60 for m/tick²). Both bullet ticks
+  (`0x828dd528` rigid, `0x828dd708` energy) check `0x8298bdf8` (`distance > damp_range` at
+  `bullet + 0x294`, copied from `fire_spec + 0x3e` at `0x829c0748`) and step velocity via
+  `0x828dd2e0` → `0x82830120` → `0x82830020` → `0x828dd218`: subtracting `(speed * cp + brake)`
+  along velocity, subtracting `gravity` from `vel.y`, and clamping speed to `[min, max]`. Past
+  `damp_range`, rigid bullets switch `air_cp` → `stalled_air_cp_h`, apply `brake`, and integrate
+  extra vertical drop velocity with `stalled_air_cp_v`; energy bullets switch `air_cp` →
+  `stalled_air_cp`, apply `brake`, and vanish once `stall_frames > stall_to_vanish_frame`.
+  Range decay (`0x8298be98` → `0x827ca448` with `max_dist` = 2000.0 m at `0x820466cc`, applied
+  by `0x827cf1c0` → `0x827cee08` / `0x827cee18`) interpolates power/recoil multiplier from 1.0
+  at `no_decay_range` to `guarantee_rate * 0.01` at `damp_range` and `min_power_rate * 0.01` at
+  2000 m (`RangeDecay::multiplier`, `Gun::damage_at`, `Projectile::effective_damage`).
+  F / left mouse / R2 fire the right arm, C / right
   mouse / L2 the left (button defaults from `manual.fmg`). Tracers leave the weapon-root joint
   along the follow camera's pitched forward, fly with the `bulletrigid` / `bulletenergy` row
-  of `bullet_id`, and despawn on the ground or after 5 s. `weapon_kind` (+0x0f) and
-  `ready_position` (+0x153) are on the same sheet. A hand `_a` binder's `a00_000`/`001`/`002`/`003`
+  of `bullet_id`, and despawn on the ground, on energy stall vanish, or after 5 s. `weapon_kind` (+0x0f) and
+  `ready_position` (+0x153, `0x82475ac0`) are on the same sheet. A hand `_a` binder's `a00_000`/`001`/`002`/`003`
   are stowed, deploy, fire and stow. Weapons with `ready_position` and `a00_001` (cannon 2010,
   autocannon 1210, H.E.A.T. cannon 2230) stay on `a00_000` until fire is held, then play `a00_001`
   and do not shoot until it ends; release plays `a00_003`. `a00_002` restarts on each shot

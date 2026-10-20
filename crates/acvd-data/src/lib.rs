@@ -300,7 +300,11 @@ mod tests {
         use crate::generated::bullet::{BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN};
         let mg = crate::ac_part(10, 1010).expect("part 1010");
         let g = crate::find(PARAM_GROWPARTSARMUNITPARAM_BIN, 1010).expect("grow 1010");
-        assert_eq!(mg.field("magazine"), Some(520.0));
+        assert_eq!(mg.field("magazine"), Some(35.0));
+        assert_eq!(mg.field("damp_range"), Some(520.0));
+        assert_eq!(mg.field("no_decay_range"), Some(g.data.no_decay_range_org as f64));
+        assert_eq!(mg.field("guarantee_rate"), Some(3.0));
+        assert_eq!(mg.field("min_power_rate"), Some(3.0));
         assert_eq!(mg.field("reload_time"), Some(g.data.reload_time_org as f64));
         assert_eq!(mg.field("init_speed"), Some(g.data.init_speed_org as f64));
         assert_eq!(mg.field("damage_power"), Some(g.data.damage_power_org as f64));

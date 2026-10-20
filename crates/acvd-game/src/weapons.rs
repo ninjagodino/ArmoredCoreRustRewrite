@@ -52,11 +52,19 @@ const MUZZLE_POINT: u8 = 101;
 /// source is not traced.
 const MUZZLE_SCALE: f32 = 0.25;
 
-/// Game ticks per second. `reload_time` is read as ticks and `BulletRigidSt.gravity` as metres
-/// per second added each tick; both units are unconfirmed (see `docs/status.md`, Weapons).
+/// Game ticks per second (`DAT_82004408` = 1/60):
+/// - `reload_time` (`+344`, `0x8247cb80`) is in 60 Hz ticks (`0x8286bd00` multiplies by `1/60`).
+/// - `init_speed` (`+328`, `0x8247cbf8`) is in m/s (`0x8247dfc8`, `0x828a3294`, `0x829c0764`
+///   multiply by `1/60` for m/tick).
+/// - `BulletRigidSt.gravity` (`+0x2c`, `0x8247ce08`) is in m/s per 60 Hz tick (`0x8247dfc8` and
+///   `0x828dd580` multiply by `1/60` for m/tick²).
 const TICK_RATE: f32 = 60.0;
-/// `init_speed` is read as km/h, the unit of the bullet rows' max/min speeds; unconfirmed.
+/// `BulletRigidSt` / `BulletEnergySt` `max_speed_km_h` (`+0x1a`) and `min_speed_km_h` (`+0x1c`)
+/// are in km/h (`0x828dd460` / `0x828dd49c` multiply by `DAT_8200d118` = `1 / 216` = `1 / (3.6 * 60)`).
 const KMH_PER_MS: f32 = 3.6;
+/// Range beyond `damp_range` where damage decay reaches `min_power_rate`
+/// (`0x820466cc` = 2000.0 m, passed by `0x8298be98` to `0x827ca448`).
+const MAX_DECAY_RANGE: f32 = 2000.0;
 /// Tracer lifetime in seconds; not game data.
 const MAX_LIFE: f32 = 5.0;
 /// Shoot id `FUN_82891e18` writes when the weapon has no `acweaponsoundparam` row.
@@ -94,6 +102,61 @@ pub(crate) struct Shift {
     pub racked: Option<Entity>,
 }
 
+/// Range-decay curve packed by `0x8247d350` and evaluated by `0x8298be98` -> `0x827ca448`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RangeDecay {
+    pub no_decay_range: f32,
+    pub damp_range: f32,
+    pub guarantee_rate: f32,
+    pub min_power_rate: f32,
+}
+
+impl RangeDecay {
+    /// Power/recoil multiplier at flight distance `dist` in metres (`0x8298be98` -> `0x827ca448`).
+    pub fn multiplier(self, dist: f32) -> f32 {
+        let g = self.guarantee_rate * 0.01;
+        let m = self.min_power_rate * 0.01;
+        if dist <= self.no_decay_range {
+            1.0
+        } else if dist < self.damp_range {
+            let span = self.damp_range - self.no_decay_range;
+            let t = if span <= 0.0 {
+                0.0
+            } else {
+                ((dist - self.no_decay_range) / span).clamp(0.0, 1.0)
+            };
+            1.0 + (g - 1.0) * t
+        } else if dist < MAX_DECAY_RANGE {
+            let span = MAX_DECAY_RANGE - self.damp_range;
+            let t = if span <= 0.0 {
+                0.0
+            } else {
+                ((dist - self.damp_range) / span).clamp(0.0, 1.0)
+            };
+            g + (m - g) * t
+        } else {
+            m
+        }
+    }
+}
+
+/// Ballistic parameters from `bullet/bulletrigid.bin` (`0x828dd528`) or
+/// `bullet/bulletenergy.bin` (`0x828dd708`), stepped by `0x828dd2e0` -> `0x828dd218`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Flight {
+    pub min_speed: f32,
+    pub max_speed: f32,
+    pub air_cp: f32,
+    pub stalled_air_cp_h: f32,
+    pub stalled_air_cp_v: f32,
+    /// `BulletRigidSt.gravity`: m/s per 60 Hz tick (`0x8247dfc8`, `0x828dd580`).
+    pub gravity: f32,
+    /// `brake`: m/s per 60 Hz tick after `damp_range` (`0x828dd5bc`, `0x828dd758`).
+    pub brake: f32,
+    /// `BulletEnergySt.stall_to_vanish_frame` (`None` for rigid bullets).
+    pub stall_to_vanish_frame: Option<f32>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Gun {
     pub remaining: u16,
@@ -102,7 +165,10 @@ pub struct Gun {
     pub cooldown: f32,
     pub init_speed: f32,
     pub kind: Kind,
-    pub gravity: f32,
+    pub flight: Flight,
+    pub damage_power: f32,
+    pub damage_recoil: f32,
+    pub decay: RangeDecay,
     pub fx: Fx,
     /// `acweaponsoundparam.shoot`. `≤ 0` plays nothing.
     pub shoot: i16,
@@ -111,6 +177,15 @@ pub struct Gun {
     pub stance: bool,
     /// Sniper rifle (`weapon_kind` 5): shots kick with `sniper_$(LR)` instead of `gun_$(LR)`.
     pub sniper: bool,
+}
+
+impl Gun {
+    /// Effective `(damage_power, damage_recoil)` at flight distance `dist` in metres
+    /// (`0x827cf1c0` -> `0x827cee08` / `0x827cee18`).
+    pub fn damage_at(&self, dist: f32) -> (f32, f32) {
+        let mult = self.decay.multiplier(dist);
+        (self.damage_power * mult, self.damage_recoil * mult)
+    }
 }
 
 /// FFX effect ids of a weapon; 0 plays nothing.
@@ -240,12 +315,95 @@ impl Default for SniperStance {
     }
 }
 
-#[derive(Component)]
+#[derive(Component, Clone, Copy, Debug)]
 pub struct Projectile {
     velocity: Vec3,
-    gravity: f32,
+    flight: Flight,
+    decay: RangeDecay,
+    damage_power: f32,
+    damage_recoil: f32,
+    distance: f32,
+    stall_drop: f32,
+    stall_frames: f32,
     life: f32,
     hit: i32,
+}
+
+impl Projectile {
+    /// Creates a projectile fired from `gun` along `aim` (`0x828a3138` -> `0x829c0160`).
+    pub fn from_gun(gun: &Gun, aim: Vec3) -> Self {
+        Self {
+            velocity: aim * gun.init_speed.max(1.0),
+            flight: gun.flight,
+            decay: gun.decay,
+            damage_power: gun.damage_power,
+            damage_recoil: gun.damage_recoil,
+            distance: 0.0,
+            stall_drop: 0.0,
+            stall_frames: 0.0,
+            life: MAX_LIFE,
+            hit: gun.fx.hit,
+        }
+    }
+
+    /// Steps bullet velocity and returns the world displacement `delta` for `dt` seconds,
+    /// or `None` when the round vanishes (`0x828dd528`, `0x828dd708`, `0x828dd2e0` -> `0x828dd218`).
+    pub fn step(&mut self, dt: f32) -> Option<Vec3> {
+        self.life -= dt;
+        if self.life <= 0.0 {
+            return None;
+        }
+        let frames = dt * TICK_RATE;
+        // `0x8298bdf8`: compares distance traveled (`bullet + 0x2a0`) against `damp_range` (`bullet + 0x294`).
+        let stalled = self.distance > self.decay.damp_range;
+        let (cp, brake) = if stalled {
+            (self.flight.stalled_air_cp_h, self.flight.brake)
+        } else {
+            (self.flight.air_cp, 0.0)
+        };
+        // `0x828dd218`: drag `(speed * cp + brake)` along velocity, gravity along -Y, speed clamp.
+        let speed = self.velocity.length();
+        if speed > 0.0 {
+            let dir = self.velocity / speed;
+            let drag = (speed * cp + brake) * frames;
+            self.velocity -= dir * drag.min(speed);
+        }
+        self.velocity.y -= self.flight.gravity * frames;
+        let new_speed = self.velocity.length();
+        if new_speed > 0.0 && self.flight.max_speed > 0.0 {
+            let clamped = new_speed.clamp(self.flight.min_speed, self.flight.max_speed);
+            self.velocity *= clamped / new_speed;
+        }
+        if stalled {
+            if self.flight.gravity > 0.0 || self.flight.stalled_air_cp_v > 0.0 {
+                // `0x828dd528`: extra vertical drop velocity (`controller + 0x0c`) after `damp_range`.
+                self.stall_drop = (self.stall_drop + self.flight.gravity * frames)
+                    - self.stall_drop * self.flight.stalled_air_cp_v * frames;
+            }
+            if let Some(vanish) = self.flight.stall_to_vanish_frame {
+                // `0x828dd708`: energy bullet stall timer (`controller + 0x08`).
+                self.stall_frames += frames;
+                if self.stall_frames > vanish {
+                    return None;
+                }
+            }
+        }
+        let step_vel = Vec3::new(
+            self.velocity.x,
+            self.velocity.y - self.stall_drop,
+            self.velocity.z,
+        );
+        let delta = step_vel * dt;
+        self.distance += delta.length();
+        Some(delta)
+    }
+
+    /// Effective `(damage_power, damage_recoil)` at the bullet's current flight distance
+    /// (`0x827cf1c0` -> `0x827cee08` / `0x827cee18`).
+    pub fn effective_damage(&self) -> (f32, f32) {
+        let mult = self.decay.multiplier(self.distance);
+        (self.damage_power * mult, self.damage_recoil * mult)
+    }
 }
 
 #[derive(Resource)]
@@ -453,7 +611,6 @@ pub fn fire(
             .iter()
             .find(|(h, _)| h.hand == hand)
             .map_or(ac_tf.translation, |(_, t)| t.translation());
-        let velocity = aim * gun.init_speed.max(1.0) / KMH_PER_MS;
         gun.remaining = gun.remaining.saturating_sub(1);
         gun.cooldown = gun.reload_time.max(1.0);
         sound::shot(
@@ -488,12 +645,7 @@ pub fn fire(
         }
         let shot = (
             Transform::from_translation(origin).looking_to(aim, Vec3::Y),
-            Projectile {
-                velocity,
-                gravity: gun.gravity,
-                life: MAX_LIFE,
-                hit: gun.fx.hit,
-            },
+            Projectile::from_gun(gun, aim),
         );
         if gun.fx.bullet > 0 {
             commands
@@ -530,14 +682,16 @@ pub fn fire(
         }
     }
     for (e, mut shot, mut transform) in &mut shots {
-        shot.life -= dt;
-        let next = transform.translation + shot.velocity * dt;
-        shot.velocity.y -= shot.gravity * TICK_RATE * dt;
+        let Some(delta) = shot.step(dt) else {
+            commands.entity(e).despawn();
+            continue;
+        };
+        let next = transform.translation + delta;
         let ground = collision
             .ground_below(transform.translation)
-            .filter(|&g| shot.velocity.y < 0.0 && next.y <= g);
-        if shot.life <= 0.0 || ground.is_some() {
-            if let Some(y) = ground.filter(|_| shot.hit > 0) {
+            .filter(|&g| delta.y < 0.0 && next.y <= g);
+        if let Some(y) = ground {
+            if shot.hit > 0 {
                 let at = Vec3::new(next.x, y, next.z);
                 commands.spawn((
                     Sfx::new(shot.hit),
@@ -549,8 +703,8 @@ pub fn fire(
             continue;
         }
         transform.translation = next;
-        if shot.velocity.length_squared() > 0.0 {
-            transform.look_to(shot.velocity.normalize(), Vec3::Y);
+        if delta.length_squared() > 0.0 {
+            transform.look_to(delta.normalize(), Vec3::Y);
         }
     }
 }
@@ -563,7 +717,10 @@ pub(crate) fn silent() -> Gun {
         cooldown: 0.0,
         init_speed: 0.0,
         kind: Kind::Skip,
-        gravity: 0.0,
+        flight: Flight::default(),
+        damage_power: 0.0,
+        damage_recoil: 0.0,
+        decay: RangeDecay::default(),
         fx: Fx::default(),
         shoot: 0,
         stance: false,
@@ -577,7 +734,7 @@ fn gun(id: i64) -> Gun {
     }
     let magazine = part_field(id, 10, "magazine").max(0.0) as u16;
     let init_speed = part_field(id, 10, "init_speed");
-    let (kind, gravity, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
+    let (kind, flight, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
     Gun {
         remaining: magazine,
         magazine,
@@ -585,7 +742,15 @@ fn gun(id: i64) -> Gun {
         cooldown: 0.0,
         init_speed: speed,
         kind,
-        gravity,
+        flight,
+        damage_power: part_field(id, 10, "damage_power"),
+        damage_recoil: part_field(id, 10, "damage_recoil"),
+        decay: RangeDecay {
+            no_decay_range: part_field(id, 10, "no_decay_range"),
+            damp_range: part_field(id, 10, "damp_range"),
+            guarantee_rate: part_field(id, 10, "guarantee_rate"),
+            min_power_rate: part_field(id, 10, "min_power_rate"),
+        },
         fx: fx(id),
         shoot: shoot_of(id),
         stance: part_field(id, 10, "ready_position") != 0.0,
@@ -619,29 +784,49 @@ fn fx(id: i64) -> Fx {
     }
 }
 
-fn flight(id: u32, init_speed: f32) -> (Kind, f32, f32) {
+fn flight(id: u32, init_speed: f32) -> (Kind, Flight, f32) {
     if let Some(row) = find(BULLET_BULLETRIGID_BIN, id) {
+        let d = &row.data;
         return (
             Kind::Rigid,
-            row.data.gravity,
-            speed(init_speed, row.data.max_speed_km_h),
+            Flight {
+                min_speed: d.min_speed_km_h as f32 / KMH_PER_MS,
+                max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
+                air_cp: d.air_cp,
+                stalled_air_cp_h: d.stalled_air_cp_h,
+                stalled_air_cp_v: d.stalled_air_cp_v,
+                gravity: d.gravity,
+                brake: d.brake,
+                stall_to_vanish_frame: None,
+            },
+            speed(init_speed, d.max_speed_km_h),
         );
     }
     if let Some(row) = find(BULLET_BULLETENERGY_BIN, id) {
+        let d = &row.data;
         return (
             Kind::Energy,
-            0.0,
-            speed(init_speed, row.data.max_speed_km_h),
+            Flight {
+                min_speed: d.min_speed_km_h as f32 / KMH_PER_MS,
+                max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
+                air_cp: d.air_cp,
+                stalled_air_cp_h: d.stalled_air_cp,
+                stalled_air_cp_v: 0.0,
+                gravity: 0.0,
+                brake: d.brake,
+                stall_to_vanish_frame: Some(d.stall_to_vanish_frame as f32),
+            },
+            speed(init_speed, d.max_speed_km_h),
         );
     }
-    (Kind::Skip, 0.0, init_speed)
+    (Kind::Skip, Flight::default(), init_speed)
 }
 
 fn speed(init: f32, max_km_h: u16) -> f32 {
     if init > 0.0 {
         init
     } else {
-        max_km_h as f32
+        max_km_h as f32 / KMH_PER_MS
     }
 }
 
@@ -1328,14 +1513,75 @@ mod tests {
             Kind::Rigid,
             "part 1720 bullet_id should be rigid 10002"
         );
-        assert!(
-            g.remaining > 0 && g.init_speed > 0.0 && g.reload_time > 0.0,
-            "{g:?}"
+        assert_eq!(g.magazine, 350);
+        assert_eq!(g.remaining, 350);
+        assert_eq!(g.init_speed, 391.0);
+        assert_eq!(g.reload_time, 30.0);
+        assert_eq!(g.damage_power, 1158.0);
+        assert_eq!(g.damage_recoil, 628.0);
+        assert_eq!(
+            g.decay,
+            RangeDecay {
+                no_decay_range: 153.0,
+                damp_range: 525.0,
+                guarantee_rate: 50.0,
+                min_power_rate: 50.0,
+            }
         );
         assert!(
             !g.sniper && !g.stance,
             "the starter rifle uses the gun kick, not the ready stance"
         );
+    }
+
+    #[test]
+    fn range_decay_matches_two_segment_curve() {
+        // Starter rifle 1720: 100% up to 153 m, linear to 50% at 525 m, 50% to 2000 m.
+        let rifle = gun(1720);
+        assert_eq!(rifle.decay.multiplier(0.0), 1.0);
+        assert_eq!(rifle.decay.multiplier(153.0), 1.0);
+        assert!((rifle.decay.multiplier(339.0) - 0.75).abs() < 1e-6);
+        assert!((rifle.decay.multiplier(525.0) - 0.50).abs() < 1e-6);
+        assert!((rifle.decay.multiplier(2000.0) - 0.50).abs() < 1e-6);
+        assert_eq!(rifle.damage_at(153.0), (1158.0, 628.0));
+        assert_eq!(rifle.damage_at(525.0), (579.0, 314.0));
+
+        // Pulse machine gun 920: 100% up to 81 m, 70% at 225 m, linear to 10% at 2000 m.
+        let pmg = gun(920);
+        assert_eq!(pmg.decay.multiplier(81.0), 1.0);
+        assert!((pmg.decay.multiplier(153.0) - 0.85).abs() < 1e-6);
+        assert!((pmg.decay.multiplier(225.0) - 0.70).abs() < 1e-6);
+        assert!((pmg.decay.multiplier(1112.5) - 0.40).abs() < 1e-6);
+        assert!((pmg.decay.multiplier(2000.0) - 0.10).abs() < 1e-6);
+        assert!((pmg.decay.multiplier(2500.0) - 0.10).abs() < 1e-6);
+    }
+
+    #[test]
+    fn projectile_units_and_stall() {
+        let dt = 1.0 / TICK_RATE;
+        // Rigid bullet (1720 -> row 10002): init_speed = 391 m/s, gravity = 1.0 m/s per tick.
+        let rifle = gun(1720);
+        let mut shot = Projectile::from_gun(&rifle, Vec3::NEG_Z);
+        assert_eq!(shot.velocity, Vec3::new(0.0, 0.0, -391.0));
+        assert_eq!(shot.effective_damage(), (1158.0, 628.0));
+        let first = shot.step(dt).expect("in flight");
+        // After 1 tick: v_y = -1.0 m/s, v_z = -391.0 m/s (air_cp = 0 before damp_range).
+        assert!((shot.velocity.y - (-1.0)).abs() < 1e-5);
+        assert!((shot.velocity.z - (-391.0)).abs() < 1e-5);
+        assert!((first.z - (-391.0 / 60.0)).abs() < 1e-5);
+
+        // Energy bullet (920 -> row 10006): init_speed = 422 m/s, damp_range = 225 m,
+        // stall_to_vanish_frame = 5.
+        let pmg = gun(920);
+        let mut en = Projectile::from_gun(&pmg, Vec3::NEG_Z);
+        assert_eq!(en.velocity, Vec3::new(0.0, 0.0, -422.0));
+        let mut ticks = 0usize;
+        while en.step(dt).is_some() {
+            ticks += 1;
+        }
+        // 225 m at 422 m/s (7.033 m/tick) crosses damp_range on tick 32 (225.07 m), then
+        // ticks 33..=37 accumulate stall_frames 1..=5 and tick 38 (stall_frames = 6 > 5) vanishes.
+        assert_eq!(ticks, 37, "energy round vanishes 5 ticks after damp_range");
     }
 
     #[test]
