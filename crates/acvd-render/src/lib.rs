@@ -24,6 +24,8 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 pub struct LoadedMesh {
     pub mesh: Mesh,
     pub diffuse: Option<String>,
+    /// Root bone above the first boned vertex of this mesh (`None` when unboned).
+    pub root: Option<String>,
     /// Bounds of the vertices the main face set uses, already mirrored.
     pub min: [f32; 3],
     pub max: [f32; 3],
@@ -181,7 +183,8 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
     let data = vfs::open(disc, asset)?;
     let f = flver::read(&data)?;
     let world = f.bone_transforms()?;
-    let by_bone: Vec<RootPlace> = f.bone_roots().into_iter().map(|r| place(Some(&f.bones[r].name))).collect();
+    let bone_roots = f.bone_roots();
+    let by_bone: Vec<RootPlace> = bone_roots.iter().map(|&r| place(Some(&f.bones[r].name))).collect();
     let unboned = place(None);
     let mut out = Vec::new();
     for (i, m) in f.meshes.iter().enumerate() {
@@ -237,7 +240,14 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
                 .find(|t| DIFFUSE_TYPES.contains(&t.kind.as_str()) && !t.path.is_empty())
                 .map(|t| texture_stem(&t.path))
         });
-        out.push(LoadedMesh { mesh, diffuse, min, max });
+        let root = bones
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|&b| bone_roots.get(b))
+            .and_then(|&r| f.bones.get(r))
+            .map(|b| b.name.clone());
+        out.push(LoadedMesh { mesh, diffuse, root, min, max });
     }
     Ok((out, f))
 }

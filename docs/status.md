@@ -148,13 +148,9 @@ in order:
     hold time scales jump height smoothly (only a tap 0.159 and a full 0.714 seen); the fall
     cap (not reached); over-max decay and air drag per frame vs per tick; the boost/fall
     switch is decided per 1/30 s frame in the game, per tick here.
-- **Paint**: map `_c` mask regions to accolor channels. Shader side decoded from the 360 build
-  (see Done); open: which accolor channel feeds each `FC_AC_OverlayCol` slot (c180..c188,
-  slots 0-6 reachable). Leads: accolor loader `0x82331478` (reads `$(Data)\Param\AcColor\color%04d.bin`
-  into an 0x358-byte struct; cache wrapper `0x82331680`, called from `0x82331bb0` and
-  `0x8249ca7c`); the code that writes PS constants 180-188 is not found (a Xenia dump of c180-188
-  during an AC draw is the quicker route). Then apply it in `acvd-game` (overlay blend, a
-  `StandardMaterial` extension or custom material over the diffuse map).
+- **Paint leftovers** (per-slot `AcColor` overlay blend is in, see Done "AC paint"):
+  - Camouflage pattern texture (`g_AC_CamouflageMap` s15, selected by `camo_id - 1` at `AcColor + 0x330 + group`, mixed where `R >= 0.4375` by mask `B`) and decals (`g_AC_DecalMap` s3) are not sampled yet.
+  - Glow / emissive channel (`_g` texture + `c180` eye / `c181` kojima in `Flver_ACColorColDifEmi.fpo`) is not wired as an emissive layer yet.
 - **Assembly gaps**: shoulder attach flag 5 (VMX `0x8288a058`; the parallel-to-+Y case
   rotates the up hint by ±90° and that axis is still unread), recon mounts, character LOD
   (`_l2` / `_l3`; map pieces are done, see Done);
@@ -290,6 +286,18 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **AC paint** (`acvd-formats::accolor`, `acvd-game::paint`, `ac_paint.wgsl`, `sheets/tuning_fields.csv` fields 147–148):
+  - **`param/accolor/color%04d.bin` (`0x358` = 856 bytes)**: loaded by `0x82331478` / `0x82331680` and copied into `assembly_data + 0xa0` by `0x82331b18` for `AcAssemblyDesignSt.coloring_id` (`+0x4e`). Initialized by `0x82332420`, compared by `0x8235ddc8`, unpacked by `0x82463630`:
+    - `+0x000..0x330` (`816` bytes = `34 × 24`): 34 part-colour groups, each a 24-byte `ColoringSetSt` (`base`, `aid`, `aid2`, `optional`, `joint`, `kojima` as `[u8; 4]` RGBA, indexed at `base + group * 24` by `0x82463700`; channel names at `0x820223ac..0x820223d4`).
+    - `+0x330..0x352` (`34` bytes): 34 `u8` camouflage pattern IDs (`camo_id - 1` passed to the composer; `0` = none).
+    - `+0x352..0x354` (`2` bytes): zero padding.
+    - `+0x354..0x358` (`4` bytes): `[u8; 4]` RGBA `eye` colour (channel `6` in `0x82463698` and `0x8257ff28`).
+  - **Part slot → `AcColor` group (`0x83694720` → `0x838a2b58`, `0x82463750`, `0x82463798`, `0x82b4d618`)**:
+    `0` head, `1` core + booster (`part_slot == 6` returns group `1`), `2` right arm + `rack_r` (`part_slot == 17`), `3` left arm + `rack_l` (`part_slot == 18`), `4` legs, `5` `armwep_r`, `6` `armwep_l`, `7` `back_r`, `8` `back_l`, `9` `shoulder`, `10` `hanger_r`, `11` `hanger_l`. Because `am*.flv` holds both arms in one FLVER, `0x82b4d618` splits arm meshes by root bone (`r_kata` → group 2, `l_kata` → group 3; `LoadedMesh::root` tracks this in `acvd-render`).
+  - **Byte-to-float remapping (`0x82460ef8`) and reversed `FC_AC_OverlayCol` upload (`0x82ca9c70` / `0x82bd6588`, `0x82461ce0`)**:
+    `0x82460ef8` reads `param/staticdrawparam.bin` (table `0x37`) field 147 `color_min` (`+0x228` = `0.2`) and field 148 `color_max` (`+0x22c` = `0.8`) and maps each RGB byte linearly into `[color_min, color_max] = 0.2 + 0.6 * (b / 255.0)`. Both `0x82ca9c70` (dynamic AC shader setter calling `0x82bd6588`) and `0x82461ce0` (baked `_c` composer, `0x824620f0..0x82462168`) upload pixel-shader constants `c180..c186` (`0xb4..0xba`, device offsets `0x22c0..0x232c`) in **reverse** order: `c180 = eye`, `c181 = kojima`, `c182 = joint`, `c183 = optional`, `c184 = aid2`, `c185 = aid`, `c186 = base`.
+  - **Runtime (`acvd-game::paint` + `ac_paint.wgsl`)**: `ExtendedMaterial<StandardMaterial, AcPaint>` binds `<diffuse>_c` as linear `Bc1RgbaUnorm` / `Bc3RgbaUnorm` (preventing sRGB decode on the 5-bit `R` index) and `FC_AC_OverlayCol[0..7]`, computes `idx = clamp(i32(floor(mask.r * 8.0 + 0.3)), 0, 6)`, and applies the 360 overlay blend (`2*d*c` below `0.5`, `1 - 2*(1-d)*(1-c)` above, weighted by `mask.g`) in raw sRGB texel space before PBR lighting.
 
 - **AC wall collision** (`collision.rs` `push_out`, `control.rs` step; leftovers under Open).
   Found with four unattended Xenia runs (AC TEST, walk forward into the start parapet; probe

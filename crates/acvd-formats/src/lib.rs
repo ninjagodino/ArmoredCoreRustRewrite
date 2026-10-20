@@ -1,6 +1,7 @@
 //! Readers for Armored Core: Verdict Day (Xbox 360) data formats.
 //! Disc data is big-endian.
 
+pub mod accolor;
 pub mod acv_parts;
 pub mod ani;
 pub mod bhd5;

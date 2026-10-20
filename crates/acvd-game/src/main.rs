@@ -41,6 +41,7 @@ mod env;
 mod hanger;
 mod hud;
 mod map;
+mod paint;
 mod pose;
 mod sfx;
 mod sound;
@@ -230,7 +231,7 @@ fn main() {
         }),
         ..default()
     }))
-    .add_plugins((blur::BlurPlugin, acvd_render::menu::MenuPlugin))
+    .add_plugins((blur::BlurPlugin, paint::PaintPlugin, acvd_render::menu::MenuPlugin))
     .add_plugins(sfx::SfxPlugin { disc: disc.clone() })
     .add_plugins(sound::SoundPlugin { disc: disc.clone() })
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
@@ -528,6 +529,7 @@ fn show(
     shots: Query<Entity, With<weapons::Projectile>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut paint_materials: ResMut<Assets<paint::AcPaintMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut orbit: Query<&mut Orbit>,
@@ -554,6 +556,9 @@ fn show(
     commands.remove_resource::<boost::BoostPose>();
 
     let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design.data);
+    let accolor = (!garage.flat)
+        .then(|| paint::load_accolor(&garage.disc, design.data.coloring_id))
+        .flatten();
     let spawn_y = collision.ground_below(start.position + Vec3::Y * RAY_HALF);
     let ac = commands
         .spawn((
@@ -689,17 +694,27 @@ fn show(
         for mesh in part.meshes {
             min = min.min(Vec3::from(mesh.min));
             max = max.max(Vec3::from(mesh.max));
-            let material = materials.add(acvd_render::material(
+            let base = acvd_render::material(
                 &garage.disc,
                 &mesh,
                 &mut packs,
                 &mut images,
                 garage.flat,
                 &mut missing,
-            ));
+            );
+            let painted = accolor.as_ref().and_then(|col| {
+                paint::material(
+                    &garage.disc,
+                    &base,
+                    &mesh,
+                    part.placement.column,
+                    col,
+                    &mut packs,
+                    &mut images,
+                )
+            });
             let mut mesh_entity = commands.spawn((
                 Mesh3d(meshes.add(mesh.mesh)),
-                MeshMaterial3d(material),
                 SkinnedMesh {
                     inverse_bindposes: inverse_bindposes.clone(),
                     joints: joints.clone(),
@@ -708,6 +723,14 @@ fn show(
                 Transform::default(),
                 ChildOf(ac),
             ));
+            match painted {
+                Some(mat) => {
+                    mesh_entity.insert(MeshMaterial3d(paint_materials.add(mat)));
+                }
+                None => {
+                    mesh_entity.insert(MeshMaterial3d(materials.add(base)));
+                }
+            }
             if let Some(root) = root {
                 if matches!(
                     part.placement.column,
