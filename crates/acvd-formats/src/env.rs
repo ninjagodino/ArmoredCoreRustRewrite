@@ -80,7 +80,35 @@ impl LightSet {
     }
 }
 
-/// The type-101 scene record's first sub-block.
+/// Tone-map parameters from type-101 sub-block 2 (`data + u32_be(data + 8)`, `0x827fc428` ->
+/// `0x82800450`, executed by `m_ToneMapFilter` at `0x82c18628`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ToneMap {
+    /// `+0`: `0` Exp, `1` Divide (`ToneMap_DivideToneMapPS`), `2` Reinhard, `3` Filmic, `4` RGBM.
+    pub mode: u32,
+    /// `+4` (`ToneMapFilter +0x10`).
+    pub lum: f32,
+    /// `+8` (`ToneMapFilter +0x14`, `c33.x`).
+    pub mul: f32,
+    /// `+0xc` (`ToneMapFilter +0x18`; `c32.x = 1 / (lum * key)`).
+    pub key: f32,
+    /// `+0x10` (`ToneMapFilter +0x1c`, `c34.x`).
+    pub white: f32,
+}
+
+impl Default for ToneMap {
+    fn default() -> Self {
+        Self {
+            mode: 1,
+            lum: 0.5,
+            mul: 1.1,
+            key: 0.6,
+            white: 10.0,
+        }
+    }
+}
+
+/// The type-101 scene record's sub-blocks (`0x827ffa80`).
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Scene {
     /// Bytes 0..3 of the first sub-block, RGB 0-255.
@@ -90,6 +118,8 @@ pub struct Scene {
     /// `+0x1c`, the sky dome scale (debug label 天球スケール); 0x827ffa80 keeps the default 1
     /// unless it is positive.
     pub sky_scale: f32,
+    /// Second sub-block (`data + 8`), tone-map parameters.
+    pub tonemap: ToneMap,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,10 +192,24 @@ pub fn read(data: &[u8]) -> Result<Env> {
             EVENT_LIGHT => env.lights.push(light(&r, e.name.clone(), e.data)?),
             EVENT_SCENE if env.scene.is_none() => {
                 let sub = e.data + r.u32(e.data)? as usize;
+                let sub2_rel = r.u32(e.data + 8)? as usize;
+                let tonemap = if sub2_rel > 0 && e.data + sub2_rel + 0x14 <= data.len() {
+                    let s2 = e.data + sub2_rel;
+                    ToneMap {
+                        mode: r.u32(s2)?,
+                        lum: r.f32(s2 + 4)?,
+                        mul: r.f32(s2 + 8)?,
+                        key: r.f32(s2 + 0x0c)?,
+                        white: r.f32(s2 + 0x10)?,
+                    }
+                } else {
+                    ToneMap::default()
+                };
                 env.scene = Some(Scene {
                     clear: [r.u8(sub)?, r.u8(sub + 1)?, r.u8(sub + 2)?],
                     far: r.f32(sub + 4)?,
                     sky_scale: Some(r.f32(sub + 0x1c)?).filter(|&s| s > 0.0).unwrap_or(1.0),
+                    tonemap,
                 });
             }
             _ => {}
@@ -224,5 +268,10 @@ mod tests {
         assert_eq!(scene.clear, [0x25, 0x32, 0x31]);
         assert_eq!(scene.far, 15000.0);
         assert_eq!(scene.sky_scale, 100.0);
+        assert_eq!(scene.tonemap.mode, 1);
+        assert!(near(scene.tonemap.lum, 0.5));
+        assert!(near(scene.tonemap.mul, 1.1));
+        assert!(near(scene.tonemap.key, 0.6));
+        assert!(near(scene.tonemap.white, 10.0));
     }
 }

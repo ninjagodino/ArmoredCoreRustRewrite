@@ -46,6 +46,8 @@ struct EnvParams {
     /// c9 / c10.
     fog_col0: Vec4,
     fog_col1: Vec4,
+    /// `m_ToneMapFilter` (`0x82c18628`): `(c32 = 1 / (lum * key), c33 = mul, c34 = white, mode)`.
+    tonemap: Vec4,
 }
 
 impl MaterialExtension for EnvLit {
@@ -58,7 +60,10 @@ pub type SkyMaterial = ExtendedMaterial<StandardMaterial, SkyLit>;
 
 /// `Map_Sky` objects (`env_sky.wgsl`), drawn behind everything.
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct SkyLit {}
+pub struct SkyLit {
+    #[uniform(100)]
+    tonemap: Vec4,
+}
 
 impl MaterialExtension for SkyLit {
     fn fragment_shader() -> ShaderRef {
@@ -102,22 +107,9 @@ fn sky_texture(disc: &Disc, packs: &mut Packs, o: &str) -> Option<Image> {
         .ok()
 }
 
-/// Light-set slots the 360 picked per draw in the AC test (`sheets/map_env.csv` draw.sets).
+/// Default light-set slots (`sheets/map_env.csv` draw.sets).
 const SET_AC: u32 = 0;
 const SET_MAP: u32 = 1;
-const SET_MOUNTAIN: u32 = 2;
-const SET_WATER: u32 = 3;
-
-/// The light set a map model draws with. The 360 reads the id from a field not yet found; this
-/// reproduces the ids it chose on m4000: the `Map_Diffuse_Multi` mountains m9000-m9049 use 2,
-/// the `Water` models m91xx use 3, everything else 1.
-fn model_slot(model: &str) -> u32 {
-    match model.strip_prefix('m').and_then(|n| n.parse::<u32>().ok()) {
-        Some(9000..=9049) => SET_MOUNTAIN,
-        Some(9100..=9199) => SET_WATER,
-        _ => SET_MAP,
-    }
-}
 
 /// `rgb^2 * w`, the 360 colour conversion with the gamma flag set (0x82c2bc48, 0x82bd2268).
 fn conv(c: [f32; 4]) -> Vec3 {
@@ -133,7 +125,13 @@ fn bevy_dir(d: [f32; 3]) -> Vec3 {
     Vec3::new(-d[0], d[1], d[2])
 }
 
-fn params(set: &LightSet) -> EnvParams {
+/// `m_ToneMapFilter` pixel-shader constants (`0x82c18628`): `(c32, c33, c34, mode)`.
+fn tonemap_vec(tm: env::ToneMap) -> Vec4 {
+    let denom = (tm.lum * tm.key).max(1e-6);
+    Vec4::new(1.0 / denom, tm.mul, tm.white, tm.mode as f32)
+}
+
+fn params(set: &LightSet, tonemap: Vec4) -> EnvParams {
     let sky = conv(set.sky);
     let ground = conv(set.ground);
     let f = &set.fog;
@@ -160,6 +158,7 @@ fn params(set: &LightSet) -> EnvParams {
         ),
         fog_col0: squared(f.color).extend(f.luma_tint),
         fog_col1: squared(f.height_color).extend(f.luma_tint),
+        tonemap,
     }
 }
 
@@ -182,9 +181,9 @@ impl Plugin for EnvPlugin {
     }
 }
 
-/// A `Map_Sky` part: the 360 draws it at the camera's X / Z, its own height, scaled by the scene
-/// record's sky scale (probe `private/xenia/sky_obj.txt`: object matrix diag(100) at
-/// (cam x, 0, cam z) in m4000's sky pass).
+/// A `Map_Sky` part whose `MODEL_PARAM_ST` `+0x14` sub-record `+1` bit 7 is set: the 360
+/// overwrites world-matrix X/Z with camera X/Z (`0x829911f0` / `0x8299f5e4`; probe
+/// `private/xenia/sky_obj.txt`: object matrix diag(100) at (cam x, 0, cam z) on m4000).
 #[derive(Component)]
 struct SkyDome {
     y: f32,
@@ -205,12 +204,12 @@ fn follow_sky(
 #[derive(Resource)]
 struct EnvDisc(Disc);
 
-/// The loaded env, the terrain parts' models by part name, the env materials made so far, and
+/// The loaded env, the terrain parts by part name, the env materials made so far, and
 /// each object model's sky material (`None`: not `Map_Sky`).
 #[derive(Resource)]
 struct MapEnv {
     env: Env,
-    models: HashMap<String, String>,
+    parts_by_name: HashMap<String, msb::Part>,
     made: HashMap<(AssetId<StandardMaterial>, u32), Handle<EnvMaterial>>,
     skies: HashMap<String, Option<Handle<SkyMaterial>>>,
     packs: Packs,
@@ -245,9 +244,9 @@ fn load(
             return;
         }
     };
-    let models = vfs::open(disc, &map::terrain_msb(disc, map))
+    let parts_by_name = vfs::open(disc, &map::terrain_msb(disc, map))
         .and_then(|d| msb::parts(&d))
-        .map(|parts| parts.into_iter().map(|p| (p.name, p.model)).collect())
+        .map(|parts| parts.into_iter().map(|p| (p.name.clone(), p)).collect())
         .unwrap_or_default();
     if let Some(s) = env.scene {
         commands.insert_resource(ClearColor(Color::srgb_u8(
@@ -280,7 +279,7 @@ fn load(
     );
     commands.insert_resource(MapEnv {
         env,
-        models,
+        parts_by_name,
         made: HashMap::new(),
         skies: HashMap::new(),
         packs: Packs::default(),
@@ -314,7 +313,12 @@ fn relight(
         else {
             continue;
         };
-        let model = env.models.get(name.as_str()).cloned().unwrap_or_default();
+        let msb_part = env.parts_by_name.get(name.as_str()).cloned();
+        let model = msb_part
+            .as_ref()
+            .map(|p| p.model.clone())
+            .unwrap_or_default();
+        let tm = tonemap_vec(env.env.scene.map(|s| s.tonemap).unwrap_or_default());
         if model.starts_with('o') {
             let sky = env
                 .skies
@@ -329,7 +333,7 @@ fn relight(
                             cull_mode: None,
                             ..default()
                         },
-                        extension: SkyLit {},
+                        extension: SkyLit { tonemap: tm },
                     }))
                 })
                 .clone();
@@ -338,15 +342,17 @@ fn relight(
                     .entity(entity)
                     .remove::<MeshMaterial3d<StandardMaterial>>()
                     .insert(MeshMaterial3d(sky));
-                let scale = env.env.scene.map_or(1.0, |s| s.sky_scale);
-                commands.entity(part).insert(SkyDome {
-                    y: part_xf.translation.y,
-                    scale,
-                });
+                if msb_part.as_ref().is_some_and(|p| p.follow_camera_xz) {
+                    let scale = env.env.scene.map_or(1.0, |s| s.sky_scale);
+                    commands.entity(part).insert(SkyDome {
+                        y: part_xf.translation.y,
+                        scale,
+                    });
+                }
                 continue;
             }
         }
-        let slot = model_slot(&model);
+        let slot = msb_part.as_ref().map_or(SET_MAP, |p| p.light_set as u32);
         let Some(set) = env.env.light(slot).or_else(|| env.env.light(SET_MAP)) else {
             continue;
         };
@@ -360,7 +366,7 @@ fn relight(
                 materials.add(EnvMaterial {
                     base: base.clone(),
                     extension: EnvLit {
-                        params: params(set),
+                        params: params(set, tm),
                     },
                 })
             })
@@ -377,10 +383,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mountains_and_water_take_their_sets() {
-        assert_eq!(model_slot("m9002"), SET_MOUNTAIN);
-        assert_eq!(model_slot("m9101"), SET_WATER);
-        assert_eq!(model_slot("m0012"), SET_MAP);
-        assert_eq!(model_slot("o2146"), SET_MAP);
+    fn tonemap_constants_match_m4000() {
+        let v = tonemap_vec(env::ToneMap::default());
+        assert!((v.x - 1.0 / 0.3).abs() < 1e-5);
+        assert!((v.y - 1.1).abs() < 1e-5);
+        assert!((v.z - 10.0).abs() < 1e-5);
+        assert_eq!(v.w, 1.0);
     }
 }

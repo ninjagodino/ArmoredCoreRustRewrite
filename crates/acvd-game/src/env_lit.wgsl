@@ -1,7 +1,7 @@
-// Map pieces lit like the 360 Flver_ColDif pixel shader (sheets/map_env.csv, ps.* rows): squared
-// albedo, two directional lights plus a hemisphere ambient, then distance and height fog whose
-// colours follow the lit colour's luminance. The output is the colour before the c31 halving;
-// the tone map after it is not reproduced yet.
+// Map pieces lit like the 360 Flver_ColDif pixel shader (sheets/map_env.csv, ps.* and tonemap
+// rows): squared albedo, two directional lights plus a hemisphere ambient, then distance and
+// height fog whose colours follow the lit colour's luminance, followed by the c31 = 0.5 halving
+// and m_ToneMapFilter (0x82c18628).
 
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
@@ -21,6 +21,7 @@ struct EnvLit {
     fog_height: vec4<f32>,
     fog_col0: vec4<f32>,
     fog_col1: vec4<f32>,
+    tonemap: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> env: EnvLit;
@@ -30,6 +31,22 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
     let lo = c * 12.92;
     let hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
     return select(hi, lo, c <= vec3(0.0031308));
+}
+
+fn apply_tonemap(hdr: vec3<f32>, tm: vec4<f32>) -> vec3<f32> {
+    let src = max(hdr, vec3(0.0)) * 0.5;
+    let x = src * tm.x;
+    let mode = u32(tm.w + 0.5);
+    if mode == 0u {
+        return sqrt(max(vec3(1.0) - exp2(-x), vec3(0.0))) * tm.y;
+    } else if mode == 1u {
+        return (x / (x + vec3(1.0))) * tm.y;
+    } else if mode == 2u {
+        let w = max(tm.z * tm.x, 1e-4);
+        let w2 = w * w;
+        return (x * (vec3(1.0) + x / w2) / (x + vec3(1.0))) * tm.y;
+    }
+    return src;
 }
 
 const LUMA: vec3<f32> = vec3(0.29891, 0.58661, 0.11448);
@@ -58,6 +75,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     col = mix(col, env.fog_col1.rgb * (1.0 + env.fog_col1.w * (luma - 1.0)), hfog);
 
     var out: FragmentOutput;
-    out.color = vec4(col, base.a);
+    out.color = vec4(apply_tonemap(col, env.tonemap), base.a);
     return out;
 }

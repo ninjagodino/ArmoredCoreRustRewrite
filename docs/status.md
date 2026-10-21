@@ -22,9 +22,10 @@ Rough priority order; reorder freely.
 "AC test scene"). Gameplay should match the 360 build; menus may stay partial. Tasks toward it,
 in order:
 
-- **Map look**: lighting / fog / sky are in (see below); still open: broken models (`_b.flv` /
-  `_b_h.hmd`), the `movie` texture (a runtime video surface), the area bounds (POINT kinds
-  100-102: operation / warning / caution area) and the water return point (kind 50).
+- **Map look**: lighting / fog / sky / tone map / per-draw light-set ids are in (see below);
+  still open: broken models (`_b.flv` / `_b_h.hmd`), the `movie` texture (a runtime video
+  surface), the area bounds (POINT kinds 100-102: operation / warning / caution area) and the
+  water return point (kind 50).
   - Done: `acvd-formats::env` reads `ch_env/*_env.msb` (MSB chain at version 0x00989A6C,
     EVENT_PARAM_ST only); `sheets/map_env.csv` has every field, the shader constants built from
     it (0x82c2bc48 lights, 0x82c2b4d8 fog, 0x82bd2268 gamma) and the Flver_ColDif pixel-shader
@@ -42,17 +43,28 @@ in order:
     matrix diag(100) at the camera X/Z), `sky_view.txt` (the zero-depth projection),
     `sky_wvp.txt` / `sky_world.txt` (camera / view block). `env.rs::follow_sky` does the same;
     the m4000 start view now matches `ac_test_start.png`. The "light-blue band" was the dome
-    seen from 720 m off-centre; the texture itself is right.
-  - Open, in order: (1) the **tone map**: lit colour is stored at x0.5 (c31) and goes through
-    the ToneMap filter (type-101 sub-block 2: mode 1, 0.5, 1.1, 0.6, 10; ToneMap_DivideToneMapPS
-    = c33.x * x/(1+x), x = col * adapted-luminance scale); the runtime shows col unscaled.
-    (2) sky leftovers: which pixel shader the sky pass binds (NoLightNoFog vs Flver_Sky.fpo
-    with fog; the colour already matches the 360 shot) and the code that writes the camera X/Z
-    into the dome's object matrix (seen only at runtime). (3) which model / part field holds the per-draw light-set
-    id (`env.rs::model_slot` reproduces m4000's picks: m9000-m9049 -> 2, m91xx -> 3, rest 1; the
-    MSB part sub-struct word is 1 everywhere). (4) the Water.spx shader (water draws as ColDif
-    with set 3). (5) c0 / c16 / c19 / c136 values (taken as 1, no SSAO). (6) Map_Diffuse_Multi
-    textures (mountains read orange-brown; the 360 shows them grey-green).
+    seen from 720 m off-centre; the texture itself is right. The camera X/Z overwrite is
+    `MODEL_PARAM_ST` `+0x14` sub-record `+1` bit 7 (`0x80`, set on `o9705`) copied into
+    draw_info `+6` bit `0x8000` by `0x829a5e60` and applied by `0x829911f0` / `0x8299f5e4`
+    (world-matrix X/Z = camera X/Z at draw_ctx `+0x510` / `+0x518`, part Y kept). Sub-record
+    `+2` is the sky-pass flag (set on water `m9100`/`m9101`, bit `0x2000` of the same word).
+  - Done (tone map + light-set id): type-101 sub-block 2 (`0x827ffa80` -> `0x827fc428` ->
+    `0x82800450`) feeds `m_ToneMapFilter` (`0x83a8b1e0+0x54b0`, execute `0x82c18628`):
+    `+0` mode (0 Exp / 1 Divide / 2 Reinhard / 3 Filmic / 4 RGBM), `+4` lum, `+8` mul,
+    `+0xc` key, `+0x10` white. FLVER output is `col * c31` with `c31.rgb = 0.5`; Divide
+    (`ToneMap_DivideToneMapPS`) is `mul * x / (1 + x)` with `x = src * (1 / (lum * key))`.
+    m4000: mode 1, 0.5, 1.1, 0.6, 10 (`c32 = 3.333`, `c33 = 1.1`). `env_lit.wgsl` /
+    `env_sky.wgsl` apply that; bloom (`+0x1a`) is not drawn. Per-draw light-set id is
+    `MODEL_PARAM_ST` `+0x14` sub-record `+0` `i8` (`0x829a5e8c`), overridden by
+    `PARTS_PARAM_ST` `+0x4c` sub-record `+0` `i8` when `>= 0` (`0x829a60a8`, `-1` inherits);
+    `0x829a5d00` writes it into draw_info `+0x10..+0x1c`. m4000_map.msb: `m0000..m1010` and
+    `m9050..m9051` = 1, `m9000..m9018` = 2, `m9100..m9101` = 3, `o9705` = 0. Replaces the
+    `env.rs::model_slot` name-range heuristic.
+  - Open, in order: (1) sky leftovers: which pixel shader the sky pass binds (NoLightNoFog vs
+    Flver_Sky.fpo with fog; the colour already matches the 360 shot). Bloom from type-101
+    sub-block 2 is not applied. (2) the Water.spx shader (water draws as ColDif with set 3).
+    (3) c0 / c16 / c19 / c136 values (taken as 1, no SSAO). (4) Map_Diffuse_Multi textures
+    (mountains read orange-brown; the 360 shows them grey-green).
 - **AC vs world collision leftovers** (walls are in, see Done "AC wall collision"):
   - The upper sphere is built with radius = height = tuning `+0x230` (`0x82863b60`) but runs at
     radius 5.5 / height 6.0; what shrinks the radius is not found. A third sphere (`+0x10`,
@@ -353,10 +365,13 @@ in order:
   nozzle plus f0000300 ground dust (`private/xenia/shots/boost_fwd.png`); it was not re-shot
   after the trail change. The glide shot still does not match.
 
-- Map lighting, fog and sky dome (`sheets/map_env.csv`, `acvd-formats::env`, `acvd-game::env`):
-  env light sets / fog / scene record read and matched to the 360's probed shader uploads; map
-  pieces lit with the Flver_ColDif maths; `o9705` sky dome behind everything, centred under
-  the camera at the env sky scale like the 360 sky pass. Open leftovers under Map look.
+- Map lighting, fog, sky dome, tone map and per-draw light-set ids (`sheets/map_env.csv`,
+  `acvd-formats::env` / `msb`, `acvd-game::env`): env light sets / fog / scene record read and
+  matched to the 360's probed shader uploads; map pieces lit with the Flver_ColDif maths then
+  `c31 = 0.5` and `m_ToneMapFilter` (m4000 Divide: `1.1 * x / (1 + x)`, `x = col * 0.5 / 0.3`);
+  `o9705` sky dome behind everything, centred under the camera at the env sky scale when
+  `MODEL_PARAM_ST +0x14 +1` bit 7 is set (`0x829911f0`); light-set id from that same
+  sub-record `+0` (part `+0x4c +0` override). Open leftovers under Map look.
 - Map piece LOD (`sheets/map_lod.csv`, `acvd-game::map`). m4000's piece binder has 57 full
   FLVERs and 39 `{model}_l1.flv` (54 of 72 kind-0 parts; no `_l2`; face flags 0). The model
   LOD metric is `max(distance - radius, 0.1) / (2 * radius)` (`0x82d13e70`, radius at model

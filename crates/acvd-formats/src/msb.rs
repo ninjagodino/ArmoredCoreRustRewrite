@@ -27,6 +27,19 @@ pub const MAGIC_ENV: u32 = 0x0098_9A6C;
 /// `POINT_PARAM_ST` kind of a start position.
 pub const POINT_START: u32 = 200;
 
+/// `MODEL_PARAM_ST` record (`0x8280d4c8`) and its `+0x14` draw sub-record (`0x829a5e60`).
+#[derive(Debug, Clone, Serialize)]
+pub struct Model {
+    pub name: String,
+    pub kind: u32,
+    /// Default light-set slot (`+0x14` sub-record `+0` `i8`, `0x829a5e8c`).
+    pub light_set: i8,
+    /// Camera-follow X/Z flag (`+0x14` sub-record `+1` bit 7, `0x829a5ec4`, applied at `0x829911f0`).
+    pub follow_camera_xz: bool,
+    /// Sky pass flag (`+0x14` sub-record `+2` `u8`, `0x829a5ef4`).
+    pub is_sky: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Part {
     pub name: String,
@@ -36,6 +49,13 @@ pub struct Part {
     pub translation: [f32; 3],
     pub rotation_deg: [f32; 3],
     pub scale: [f32; 3],
+    /// Resolved light-set slot (`0x829a5e60` / `0x829a5d00`): `PARTS_PARAM_ST` `+0x4c` sub-record
+    /// `+0` `i8` override when `>= 0`, else the matching `MODEL_PARAM_ST`'s `light_set`.
+    pub light_set: u8,
+    /// Whether the renderer overwrites the part's world matrix X/Z with camera X/Z (`0x829911f0`).
+    pub follow_camera_xz: bool,
+    /// Whether the model is flagged as a sky piece (`MODEL_PARAM_ST` `+0x14` sub-record `+2`).
+    pub is_sky: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,10 +111,50 @@ fn vec3(r: &Be, at: usize) -> Result<[f32; 3]> {
     Ok([r.f32(at)?, r.f32(at + 4)?, r.f32(at + 8)?])
 }
 
+/// Every `MODEL_PARAM_ST` record (`0x8280d4c8`).
+pub fn models(data: &[u8]) -> Result<Vec<Model>> {
+    let r = Be(data);
+    ensure!(r.u32(0)? == MAGIC, "not an MSB");
+    section(data, "MODEL_PARAM_ST")?
+        .into_iter()
+        .map(|off| {
+            let name_rel = r.u32(off)? as usize;
+            ensure!(
+                name_rel < 0x400,
+                "MSB model at {off:#x} name offset {name_rel:#x}"
+            );
+            let sub_rel = if off + 0x18 <= data.len() {
+                r.u32(off + 0x14)? as usize
+            } else {
+                0
+            };
+            let (light_set, follow_camera_xz, is_sky) =
+                if sub_rel > 0 && off + sub_rel + 3 <= data.len() {
+                    let sub = off + sub_rel;
+                    (
+                        r.u8(sub)? as i8,
+                        (r.u8(sub + 1)? & 0x80) != 0,
+                        r.u8(sub + 2)? != 0,
+                    )
+                } else {
+                    (1, false, false)
+                };
+            Ok(Model {
+                name: r.cstr_sjis(off + name_rel)?,
+                kind: r.u32(off + 4)?,
+                light_set,
+                follow_camera_xz,
+                is_sky,
+            })
+        })
+        .collect()
+}
+
 /// Every `PARTS_PARAM_ST` record.
 pub fn parts(data: &[u8]) -> Result<Vec<Part>> {
     let r = Be(data);
     ensure!(r.u32(0)? == MAGIC, "not an MSB");
+    let model_defs = models(data)?;
     section(data, "PARTS_PARAM_ST")?
         .into_iter()
         .map(|off| {
@@ -104,13 +164,34 @@ pub fn parts(data: &[u8]) -> Result<Vec<Part>> {
                 name_rel < 0x400 && model_rel < 0x400,
                 "MSB part at {off:#x} name offsets {name_rel:#x}/{model_rel:#x}"
             );
+            let name = r.cstr_sjis(off + name_rel)?;
+            let model = r.cstr_sjis(off + model_rel)?;
+            let kind = r.u32(off + 4)?;
+            let mdef = model_defs
+                .iter()
+                .find(|m| m.kind == kind && m.name == model);
+            let mut light_set = mdef.map_or(1i8, |m| m.light_set);
+            let follow_camera_xz = mdef.is_some_and(|m| m.follow_camera_xz);
+            let is_sky = mdef.is_some_and(|m| m.is_sky);
+            if off + 0x50 <= data.len() {
+                let sub_rel = r.u32(off + 0x4C)? as usize;
+                if sub_rel > 0 && off + sub_rel < data.len() {
+                    let over = r.u8(off + sub_rel)? as i8;
+                    if over >= 0 {
+                        light_set = over;
+                    }
+                }
+            }
             Ok(Part {
-                name: r.cstr_sjis(off + name_rel)?,
-                model: r.cstr_sjis(off + model_rel)?,
-                kind: r.u32(off + 4)?,
+                name,
+                model,
+                kind,
                 translation: vec3(&r, off + 0x14)?,
                 rotation_deg: vec3(&r, off + 0x20)?,
                 scale: vec3(&r, off + 0x2C)?,
+                light_set: light_set.max(0) as u8,
+                follow_camera_xz,
+                is_sky,
             })
         })
         .collect()
@@ -222,6 +303,15 @@ mod tests {
             22
         );
         let map = crate::vfs::open(&disc, "model/map/m4000/m4000_map.msb").unwrap();
-        assert_eq!(parts(&map).unwrap().len(), 550);
+        let map_parts = parts(&map).unwrap();
+        assert_eq!(map_parts.len(), 550);
+        let by_model = |m: &str| map_parts.iter().find(|p| p.model == m).unwrap();
+        assert_eq!(by_model("m0012").light_set, 1);
+        assert_eq!(by_model("m9002").light_set, 2);
+        assert_eq!(by_model("m9050").light_set, 1);
+        assert_eq!(by_model("m9101").light_set, 3);
+        assert!(by_model("m9101").is_sky);
+        assert_eq!(by_model("o9705").light_set, 0);
+        assert!(by_model("o9705").follow_camera_xz);
     }
 }

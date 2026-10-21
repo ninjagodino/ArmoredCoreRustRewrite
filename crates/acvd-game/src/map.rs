@@ -424,6 +424,9 @@ mod tests {
             translation: [10.0, 2.0, -3.0],
             rotation_deg: [15.0, 70.0, -20.0],
             scale: [1.0, 2.0, 0.5],
+            light_set: 1,
+            follow_camera_xz: false,
+            is_sky: false,
         };
         let xf = xform(&part);
         let t = bevy_transform(&xf);
