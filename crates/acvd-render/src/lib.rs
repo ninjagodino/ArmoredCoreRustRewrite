@@ -24,6 +24,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 pub struct LoadedMesh {
     pub mesh: Mesh,
     pub diffuse: Option<String>,
+    pub emission: Option<String>,
     /// Root bone above the first boned vertex of this mesh (`None` when unboned).
     pub root: Option<String>,
     /// Bounds of the vertices the main face set uses, already mirrored.
@@ -32,6 +33,7 @@ pub struct LoadedMesh {
 }
 
 const DIFFUSE_TYPES: &[&str] = &["g_DiffuseTexture", "g_Diffuse"];
+const EMISSION_TYPES: &[&str] = &["g_EmissionTexture", "g_Emission"];
 
 fn mirror(v: [f32; 3]) -> [f32; 3] {
     [-v[0], v[1], v[2]]
@@ -231,15 +233,20 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
             mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_INDEX, VertexAttributeValues::Uint16x4(index));
             mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, weight);
         }
-        let diffuse = f.materials.get(m.material.max(0) as usize).and_then(|mat| {
-            let start = mat.texture_index.max(0) as usize;
-            f.textures
-                .iter()
-                .skip(start)
-                .take(mat.texture_count.max(0) as usize)
-                .find(|t| DIFFUSE_TYPES.contains(&t.kind.as_str()) && !t.path.is_empty())
-                .map(|t| texture_stem(&t.path))
-        });
+        let mat = f.materials.get(m.material.max(0) as usize);
+        let mat_tex = |kinds: &[&str]| {
+            mat.and_then(|mat| {
+                let start = mat.texture_index.max(0) as usize;
+                f.textures
+                    .iter()
+                    .skip(start)
+                    .take(mat.texture_count.max(0) as usize)
+                    .find(|t| kinds.contains(&t.kind.as_str()) && !t.path.is_empty())
+                    .map(|t| texture_stem(&t.path))
+            })
+        };
+        let diffuse = mat_tex(DIFFUSE_TYPES);
+        let emission = mat_tex(EMISSION_TYPES);
         let root = bones
             .iter()
             .flatten()
@@ -247,7 +254,7 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
             .and_then(|&b| bone_roots.get(b))
             .and_then(|&r| f.bones.get(r))
             .map(|b| b.name.clone());
-        out.push(LoadedMesh { mesh, diffuse, root, min, max });
+        out.push(LoadedMesh { mesh, diffuse, emission, root, min, max });
     }
     Ok((out, f))
 }

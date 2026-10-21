@@ -27,6 +27,11 @@ pub const CH_OPTIONAL: usize = 3;
 pub const CH_JOINT: usize = 4;
 pub const CH_KOJIMA: usize = 5;
 
+/// Default emissive multiplier on `ACParts_Glow` / `ACParts_Wep_Glow` submeshes
+/// (`0x82bd8958` loads `20.0` from `0x8200b3c8` into `self + 0x4c`, uploaded to `c138` by
+/// `0x82bd7bd8` -> `0x82c89c78`).
+pub const GLOW_INTENSITY: f32 = 20.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcColor {
     /// 34 groups of 6 RGBA colors (`[base, aid, aid2, optional, joint, kojima]`).
@@ -85,6 +90,28 @@ impl AcColor {
             rgba_to_float(g[CH_AID2], color_min, color_max),
             rgba_to_float(g[CH_AID], color_min, color_max),
             rgba_to_float(g[CH_BASE], color_min, color_max),
+        ]
+    }
+
+    /// Camouflage pattern ID (`0` = none, `1..=11` = `ca0001..ca0011` in
+    /// `model/image/camouflage/camouflage_t.bnd|camouflage.tpf`, indexed by `camo_id - 1` in
+    /// 360 `0x82460e58`).
+    pub fn camo_id(&self, group: usize) -> u8 {
+        self.camo[group.min(GROUP_COUNT - 1)]
+    }
+
+    /// Emissive constant `c138` (`DL_FREG_138`) for `_Glow` submeshes on `group`
+    /// (360 `0x82bd7ea8` / `0x82bd7cc8` / `0x82bd7bd8` -> `0x82bd7ae8` converts `kojima` RGB by
+    /// `1.0 / 255.0` at `0x8201a21c` without `[color_min, color_max]` clamping, then multiplies by
+    /// `intensity` = [`GLOW_INTENSITY`]).
+    pub fn emission_col(&self, group: usize, intensity: f32) -> [f32; 4] {
+        let k = self.groups[group.min(GROUP_COUNT - 1)][CH_KOJIMA];
+        let scale = intensity / 255.0;
+        [
+            f32::from(k[0]) * scale,
+            f32::from(k[1]) * scale,
+            f32::from(k[2]) * scale,
+            1.0,
         ]
     }
 }
