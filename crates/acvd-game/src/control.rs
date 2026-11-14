@@ -52,6 +52,45 @@ const NO_ACTION_SIDE_FRAMES: f32 = 120.0;
 const ACTION_DIST_MIN: f32 = 0.001;
 /// The zoom-blur filter draws only above this alpha (360 0x82c98368: `if (9 < alpha)`).
 const BLUR_MIN_ALPHA: u8 = 9;
+/// Normalized Boost Charge hold threshold that auto-fires `HighBoostState` (360 `0x8237c1b8`,
+/// float `0x8200d3f0`).
+const QB_AUTO_FIRE: f32 = 0.9999;
+
+/// Active `HighBoostState` (360 vtable `0x8200d378`: ctor `0x8237bec8`, update `0x8237c5a0`).
+#[derive(Clone, Copy, Debug)]
+enum QbPhase {
+    /// Phase 0 (`0x8237c1b8`): Boost Charge wind-up while the button stays held, up to
+    /// `qb_charge_max_frames` ticks (`+0x24`).
+    Charge { held_ticks: f32 },
+    /// Phase 1 (`0x8237ba68`): initial burst (`+0x10` = `qb_phase1_frames * w1`), adding the
+    /// grounded vertical hop (`r7 = 1` in `0x82822980`) and triggering the directional clip at
+    /// the Phase 1 -> Phase 2 boundary (`0x8284c3a0`).
+    Phase1 {
+        timer: f32,
+        p1_ticks: f32,
+        p2_ticks: f32,
+        weight: f32,
+        dir: Vec3,
+        eighth: u8,
+    },
+    /// Phase 2 (`0x8237bf28`): main burst (`+0x14` = `qb_phase2_frames * w2`), ending when the
+    /// timer expires or the AC touches down (`0x8283fc10`).
+    Phase2 {
+        timer: f32,
+        p2_ticks: f32,
+        weight: f32,
+        dir: Vec3,
+    },
+}
+
+/// One tick's High Boost thrust command (`0x82822980`, movement slot `+0x68` + `+0xd4` mode 4).
+#[derive(Clone, Copy, Debug)]
+struct QbThrust {
+    weight: f32,
+    scale: f32,
+    dir: Vec3,
+    hop: bool,
+}
 /// Whether input drives the AC (`P` toggles) instead of browsing clips.
 #[derive(Resource)]
 pub struct Piloting(pub bool);
@@ -89,9 +128,15 @@ pub struct Pilot {
     /// Move stick this frame, x right and y forward in the facing the integrator uses.
     /// The booster effect dispatcher (`0x828932a0`) reads this vector.
     pub command: Vec2,
-    /// High boosts so far, and the world direction of the last one.
+    /// High boosts so far, whether the last one hit the Second-Stage sweet spot, and its world
+    /// direction.
     pub quick_boosts: u32,
+    pub second_stage_qb: bool,
     pub quick_dir: Vec3,
+    /// Active High Boost / Boost Charge state (`0x8200d378`), and re-fire cooldown ticks
+    /// (`action_ctrl +0x110`, `0x8283ed98`).
+    qb: Option<QbPhase>,
+    qb_cooldown: f32,
     /// The body-relative eighth of a high boost whose clip starts on the next state pick.
     quick_pending: Option<u8>,
     /// Ticks of take-off acceleration left.
@@ -773,6 +818,11 @@ impl Pilot {
         (self.state, self.hokan_base)
     }
 
+    /// Whether a High Boost / Boost Charge (`HighBoostState`, `0x8200d378`) is active.
+    pub fn in_quick_boost(&self) -> bool {
+        self.qb.is_some()
+    }
+
     /// A standing AC moving by `ctrl`, with the default follow camera for its legs' motion set.
     pub fn new(ctrl: AcCtrlParam, legs_motion_id: u8) -> Self {
         Self {
@@ -784,7 +834,10 @@ impl Pilot {
             airborne: false,
             command: Vec2::ZERO,
             quick_boosts: 0,
+            second_stage_qb: false,
             quick_dir: FORWARD,
+            qb: None,
+            qb_cooldown: 0.0,
             quick_pending: None,
             takeoff: 0.0,
             jump_queued: false,
@@ -840,6 +893,7 @@ struct Input {
     boost_toggle: bool,
     glide: bool,
     quick_boost: bool,
+    qb_held: bool,
 }
 
 fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamepad>) -> Input {
@@ -858,6 +912,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
         keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight);
     let mut glide = keys.just_pressed(KeyCode::ControlLeft) || held.contains(&KeyCode::ControlLeft);
     let mut quick_boost = keys.just_pressed(KeyCode::KeyV) || held.contains(&KeyCode::KeyV);
+    let mut qb_held = down(KeyCode::KeyV);
     for pad in pads {
         let left = pad.left_stick();
         if left.length() > 0.2 {
@@ -874,6 +929,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
         boost_toggle |= pad.just_pressed(GamepadButton::LeftTrigger);
         glide |= pad.just_pressed(GamepadButton::LeftThumb);
         quick_boost |= pad.just_pressed(GamepadButton::West);
+        qb_held |= pad.pressed(GamepadButton::West);
     }
     Input {
         stick: stick.clamp_length_max(1.0),
@@ -883,6 +939,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
         boost_toggle,
         glide,
         quick_boost,
+        qb_held,
     }
 }
 
@@ -892,23 +949,201 @@ fn body_stick(stick: Vec2, yaw_off: f32) -> Vec2 {
     Vec2::new(stick.x * cos - stick.y * sin, stick.x * sin + stick.y * cos)
 }
 
-/// High Boost (movement vtable 0x8208fea0 slot +0x68, 0x82822980, through 0x82820f38): the
-/// horizontal velocity becomes the stick direction (forward without one) times
-/// `quick_boost_max_tick`; the vertical speed is kept. Boost mode turns on and a glide ends. The
-/// move integrator then brings the speed back down to the boost or walk max.
-fn quick_boost(p: &mut Pilot, stick: Vec2) {
+/// Piecewise-linear Boost Charge weight curve (`360 0x8237bbf8`, `0x8202081c` = 0.5):
+/// holds `base` before `start`, ramps to `1.0` at `center - width * 0.5`, holds `1.0` across the
+/// Second-Stage sweet spot `[center - width * 0.5, center + width * 0.5]`, and ramps to `over` at
+/// `1.0` (`qb_charge_max_frames`).
+fn charge_curve(x: f32, start: f32, base: f32, center: f32, width: f32, over: f32) -> f32 {
+    if x < start {
+        return base;
+    }
+    let half = width * 0.5;
+    let lo = center - half;
+    if x < lo {
+        return if lo - start > 1e-6 {
+            base + (x - start) / (lo - start) * (1.0 - base)
+        } else {
+            1.0
+        };
+    }
+    let hi = center + half;
+    if x <= hi {
+        return 1.0;
+    }
+    if 1.0 - hi > 1e-6 {
+        1.0 + (x - hi) / (1.0 - hi) * (over - 1.0)
+    } else {
+        over
+    }
+}
+
+/// Enters `HighBoostState` Phase 0 (`360 0x8283ed98` -> `0x82844ea8` -> `0x8237bec8`).
+fn start_quick_boost(p: &mut Pilot) -> bool {
+    if p.qb.is_some() || p.qb_cooldown >= 1.0 {
+        return false;
+    }
+    p.qb_cooldown = p.ctrl.qb_reload_ticks;
+    p.glide = false;
+    p.qb = Some(QbPhase::Charge { held_ticks: 0.0 });
+    true
+}
+
+/// Evaluates the Boost Charge curve at `hold_ratio` (`0..=1`) and enters `HighBoostState` Phase 1
+/// (`360 0x8237c1b8`, `0x8237c2dc..0x8237c364`). Does not force boost mode on (`private/xenia/quick_boost.jsonl` Hit 1).
+fn fire_quick_boost(p: &mut Pilot, stick: Vec2, hold_ratio: f32) {
+    let c = p.ctrl;
+    let x = hold_ratio.clamp(0.0, 1.0);
+    let (w1, w2) = if c.qb_charge_max_frames > 0.0 {
+        let inv = 1.0 / c.qb_charge_max_frames;
+        let start = c.qb_charge_start_frames * inv;
+        let center = c.qb_sweet_frames * inv;
+        let width = c.qb_sweet_width_frames * inv;
+        let over = c.qb_over_rate * 0.01;
+        (
+            charge_curve(x, start, c.qb_base_rate1 * 0.01, center, width, over),
+            charge_curve(x, start, c.qb_base_rate2 * 0.01, center, width, over),
+        )
+    } else {
+        (c.qb_base_rate1 * 0.01, c.qb_base_rate2 * 0.01)
+    };
     let stick = stick.try_normalize().unwrap_or(Vec2::Y);
     let forward = Quat::from_rotation_y(p.yaw + p.cam.yaw_off) * FORWARD;
     let world = forward.cross(Vec3::Y) * stick.x + forward * stick.y;
-    p.velocity = (world * p.ctrl.quick_boost_max_tick).with_y(p.velocity.y);
-    (p.boost, p.glide, p.quick_dir) = (true, false, world);
+    let eighth = direction(body_stick(stick, p.cam.yaw_off));
+    p.glide = false;
+    p.quick_dir = world;
     p.quick_boosts += 1;
-    p.quick_pending = Some(direction(body_stick(stick, p.cam.yaw_off)));
-    let c = p.ctrl;
+    p.second_stage_qb = w2 >= 1.0;
+    let p1_ticks = c.qb_phase1_frames * w1;
+    let p2_ticks = c.qb_phase2_frames * w2;
+    p.qb = Some(QbPhase::Phase1 {
+        timer: 0.0,
+        p1_ticks,
+        p2_ticks,
+        weight: w1,
+        dir: world,
+        eighth,
+    });
+    let qb_max = c.quick_boost_min_tick + (c.quick_boost_max_tick - c.quick_boost_min_tick) * w1;
     debug!(
-        "high boost: {:.3} m/tick (boost max {:.3}, walk max {:.3}, hi brake {:.4}, over-max decel {:.4})",
-        c.quick_boost_max_tick, c.boost_max_tick, c.walk_max_tick, c.hispeed_brake_tick, c.over_max_decel_tick
+        "high boost (hold {:.2}, w1 {:.3}, w2 {:.3}, 2nd={}): target {:.3} m/tick ({:.1} km/h), p1 {:.2}f, p2 {:.2}f",
+        x,
+        w1,
+        w2,
+        p.second_stage_qb,
+        qb_max,
+        qb_max * TICK_TO_KMH,
+        p1_ticks,
+        p2_ticks
     );
+}
+
+/// Steps `HighBoostState` (`360 0x8237c5a0`: Phase 0 `0x8237c1b8`, Phase 1 `0x8237ba68`,
+/// Phase 2 `0x8237bf28`) by one 60 Hz tick.
+fn step_qb(p: &mut Pilot, input: &Input, moving: bool) -> Option<QbThrust> {
+    let phase = p.qb?;
+    match phase {
+        QbPhase::Charge { mut held_ticks } => {
+            held_ticks += 1.0;
+            let max_f = p.ctrl.qb_charge_max_frames;
+            let x = if max_f > 0.0 { held_ticks / max_f } else { 1.0 };
+            if input.qb_held && x < QB_AUTO_FIRE {
+                p.qb = Some(QbPhase::Charge { held_ticks });
+            } else {
+                fire_quick_boost(p, input.stick, x);
+            }
+            Some(QbThrust {
+                weight: 0.0,
+                scale: 0.0,
+                dir: p.quick_dir,
+                hop: false,
+            })
+        }
+        QbPhase::Phase1 {
+            timer,
+            p1_ticks,
+            p2_ticks,
+            weight,
+            dir,
+            eighth,
+        } => {
+            let next_t = timer + 1.0;
+            let hop = !p.airborne;
+            if next_t <= p1_ticks {
+                p.qb = Some(QbPhase::Phase1 {
+                    timer: next_t,
+                    p1_ticks,
+                    p2_ticks,
+                    weight,
+                    dir,
+                    eighth,
+                });
+                Some(QbThrust {
+                    weight,
+                    scale: 1.0,
+                    dir,
+                    hop,
+                })
+            } else {
+                let scale = (p1_ticks - timer).max(0.0);
+                p.quick_pending = Some(eighth);
+                p.qb = Some(QbPhase::Phase2 {
+                    timer: 0.0,
+                    p2_ticks,
+                    weight,
+                    dir,
+                });
+                Some(QbThrust {
+                    weight,
+                    scale,
+                    dir,
+                    hop,
+                })
+            }
+        }
+        QbPhase::Phase2 {
+            timer,
+            p2_ticks,
+            weight,
+            dir,
+        } => {
+            // `0x8237bcb0` + `0x8283fdb0`: Glide Boost cancels an active Phase 2 burst.
+            if input.glide && p.boost && moving && !p.airborne {
+                p.qb = None;
+                p.glide = true;
+                return None;
+            }
+            let next_t = timer + 1.0;
+            if next_t <= p2_ticks {
+                // `0x8237c054..0x8237c074`: touching the ground ends Phase 2 after this step's thrust.
+                if !p.airborne {
+                    p.qb = None;
+                } else {
+                    p.qb = Some(QbPhase::Phase2 {
+                        timer: next_t,
+                        p2_ticks,
+                        weight,
+                        dir,
+                    });
+                }
+                Some(QbThrust {
+                    weight,
+                    scale: 1.0,
+                    dir,
+                    hop: false,
+                })
+            } else {
+                let scale = (p2_ticks - timer).max(0.0);
+                p.qb = None;
+                Some(QbThrust {
+                    weight,
+                    scale,
+                    dir,
+                    hop: false,
+                })
+            }
+        }
+    }
 }
 
 /// Eighth of the circle `stick` points at, 0 forward, clockwise.
@@ -977,6 +1212,9 @@ fn integrate(v: Vec2, accel: Vec2, max: f32, decel: f32) -> Vec2 {
 /// One 60 Hz tick of movement over the highest ground under the AC.
 fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision) {
     let c = p.ctrl;
+    if p.qb_cooldown >= 1.0 {
+        p.qb_cooldown = (p.qb_cooldown - 1.0).max(0.0);
+    }
     p.yaw += input.turn * c.turn_rate / TICK_RATE;
     // Mouselook: move relative to where the camera looks, not where the body faces.
     let facing = Quat::from_rotation_y(p.yaw + p.cam.yaw_off);
@@ -988,16 +1226,49 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     let speed = horizontal.length();
     let moving = wish != Vec2::ZERO;
     // A glide starts on the ground (`pilot`) but carries on over a drop.
-    p.glide &= p.boost && moving;
+    p.glide &= p.boost && moving && p.qb.is_none();
     let brake = if speed >= c.brake_switch_tick {
         c.hispeed_brake_tick
     } else {
         c.lospeed_brake_tick
     };
+    let drag = if p.boost {
+        c.air_drag_boost_tick
+    } else {
+        c.air_drag_tick
+    };
+    let qb_thrust = step_qb(p, input, moving);
+    let mut qb_hopped = false;
 
-    // After a high boost the speed sits above the boost max; `integrate` keeps steering with the
-    // stick while it falls back by `over_max_decel_tick` per tick.
-    if !p.airborne || p.glide {
+    if let Some(qb) = qb_thrust {
+        // `0x82824078` with `+0x1c0 == 1` (no normal move action): ground brake or air drag runs
+        // before `0x82822ea0` adds the High Boost acceleration (`+0x118 * scale`) and clamps to
+        // `0x82822af0` case 4 (`lerp(quick_boost_min_tick, quick_boost_max_tick, weight)`).
+        if p.airborne {
+            horizontal *= (1.0 - drag).clamp(0.0, 1.0);
+        } else {
+            horizontal = approach(horizontal, Vec2::ZERO, brake);
+        }
+        if qb.scale > 0.0 {
+            let qb_max = c.quick_boost_min_tick
+                + (c.quick_boost_max_tick - c.quick_boost_min_tick) * qb.weight;
+            let accel = Vec2::new(qb.dir.x, qb.dir.z) * (c.quick_boost_acc_tick * qb.scale);
+            let cur = horizontal.length();
+            let next = horizontal + accel;
+            horizontal = if cur <= qb_max {
+                next.clamp_length_max(qb_max)
+            } else {
+                next.normalize_or(horizontal / cur) * cur
+            };
+        }
+        if qb.hop && qb.scale > 0.0 {
+            p.airborne = true;
+            p.velocity.y = (p.velocity.y + c.quick_boost_v_acc_tick * qb.scale).min(c.qb_hop_max_tick);
+            qb_hopped = true;
+        }
+    } else if !p.airborne || p.glide {
+        // After a high boost ends, speed sits above the boost/walk max; `integrate` keeps steering
+        // with the stick while speed decays by `over_max_decel_tick` per tick.
         let (max, accel) = if p.glide {
             (c.glide_max_tick, c.glide_acc_tick)
         } else if p.boost {
@@ -1026,19 +1297,14 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
             c.over_max_decel_tick,
         );
     } else {
-        let drag = if p.boost {
-            c.air_drag_boost_tick
-        } else {
-            c.air_drag_tick
-        };
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     }
-    if p.jump_queued && !p.airborne {
+    if p.jump_queued && !p.airborne && p.qb.is_none() {
         (p.airborne, p.takeoff, p.boost, p.glide) = (true, c.jump_frames, true, false);
     }
     p.jump_queued = false;
 
-    if p.airborne {
+    if p.airborne && !qb_hopped {
         if p.takeoff > 0.0 {
             p.velocity.y += c.jump_accel_tick * p.takeoff.min(1.0);
             p.takeoff = (p.takeoff - 1.0).max(0.0);
@@ -1095,11 +1361,25 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
     let moving = input.stick != Vec2::ZERO;
     let dir = moving.then(|| direction(input.stick));
     let current = p.state.unwrap_or(("idle", None));
-    // A high boost plays its directional clip out, on the ground or in the air.
+    // Boost Charge wind-up plays row 284; the Phase 1 -> Phase 2 transition triggers the
+    // directional High Boost clip (rows 285-292), which plays out unless a new QB, glide, or jump
+    // interrupts after `HighBoostState` ends.
     if let Some(d) = p.quick_pending {
         return ("quick_boost", Some(d));
     }
-    if current.0 == "quick_boost" && p.clip_ok && !motion.finished() {
+    if matches!(p.qb, Some(QbPhase::Charge { .. } | QbPhase::Phase1 { .. })) {
+        return if current.0 == "quick_boost" && p.clip_ok && !motion.finished() {
+            current
+        } else {
+            ("quick_boost_charge", None)
+        };
+    }
+    if current.0 == "quick_boost"
+        && p.clip_ok
+        && !motion.finished()
+        && !p.glide
+        && p.takeoff <= 0.0
+    {
         return current;
     }
     // On the ground a glide is the start, then the ground wheel. Off the ground it is the
@@ -1244,14 +1524,14 @@ pub fn pilot(
     }
     p.boost |= held.0.contains(&KeyCode::ShiftLeft);
     p.command = input.stick;
-    p.glide |= input.glide && p.boost && !p.airborne;
-    p.jump_queued |= input.jump && !p.airborne;
-    // The re-fire interval is not traced: a new high boost waits for the last one's clip.
-    let quick_playing =
-        matches!(p.state, Some(("quick_boost", _))) && p.clip_ok && !motion.finished();
-    if input.quick_boost && !quick_playing {
-        quick_boost(&mut p, input.stick);
-        p.state = None;
+    if p.qb.is_none() {
+        p.glide |= input.glide && p.boost && !p.airborne;
+        p.jump_queued |= input.jump && !p.airborne;
+    }
+    // Re-fire is gated by `HighBoostState` ending (`0x8200d378` slot `+0x50` = `0x8241a6b8`) and
+    // `action_ctrl +0x110` (`qb_reload_ticks`, `0x8283ed98`), not the animation clip length.
+    if input.quick_boost {
+        start_quick_boost(&mut p);
     }
     let yaw = p.yaw;
     p.accumulator = (p.accumulator + time.delta_secs()).min(10.0 / TICK_RATE);
@@ -1279,9 +1559,10 @@ pub fn pilot(
         stick: body_stick(input.stick, p.cam.yaw_off),
         ..input
     };
+    let had_quick_pending = p.quick_pending.is_some();
     let next = state(&p, &body, &motion);
     (p.landed, p.quick_pending) = (false, None);
-    let changed = p.state != Some(next);
+    let changed = p.state != Some(next) || had_quick_pending;
     if changed {
         if !p.suppress_locomotion {
             p.clip_ok = match acvd_data::ac_state(next.0, next.1)
@@ -1325,10 +1606,12 @@ pub fn pilot(
         p.state = Some(next);
     }
 
-    // Dash / air-move / glide lean: one 360-frame clip whose frame is the heading in degrees (a
-    // key per 45 degrees = the eight directions), so it blends smoothly between them.
-    if matches!(next.0, "dash" | "air_move" | "glide" | "glide_air")
-        && motion.clip.frames == 360
+    // Dash / air-move / glide / boost-charge lean: one 360-frame clip whose frame is the heading
+    // in degrees (a key per 45 degrees = the eight directions), so it blends smoothly between them.
+    if matches!(
+        next.0,
+        "dash" | "air_move" | "glide" | "glide_air" | "quick_boost_charge"
+    ) && motion.clip.frames == 360
         && p.clip_ok
     {
         // Mirrored: the clip's 90 degree key leans the way the stick's left does (checked by eye).
@@ -1340,9 +1623,13 @@ pub fn pilot(
             motion.frame = target;
         }
         motion.wheel = Some(target);
-        // The lean builds with speed: 0 at a standstill, full at the boost top speed.
-        motion.lean =
-            (p.velocity.with_y(0.0).length() / p.ctrl.boost_max_tick.max(1e-4)).clamp(0.0, 1.0);
+        // The lean builds with speed: 0 at a standstill, full at the boost top speed (or full
+        // during Boost Charge wind-up when stick is held).
+        motion.lean = if next.0 == "quick_boost_charge" {
+            body.stick.length().clamp(0.0, 1.0)
+        } else {
+            (p.velocity.with_y(0.0).length() / p.ctrl.boost_max_tick.max(1e-4)).clamp(0.0, 1.0)
+        };
     }
 
     if let Ok((mut o, mut cam, mut proj, mut blur)) = cams.single_mut() {
@@ -1438,21 +1725,39 @@ mod tests {
             .expect("a preset with boost acceleration");
         for airborne in [false, true] {
             let mut p = Pilot::new(ctrl, 0);
-            let collision = Collision::default();
-            let mut position = Vec3::new(0.0, 500.0, 0.0);
+            p.boost = true;
             p.airborne = airborne;
-            quick_boost(&mut p, Vec2::Y);
-            assert!(
-                p.velocity.length() > ctrl.boost_max_tick,
-                "impulse above boost max"
-            );
+            let collision = if airborne {
+                Collision::default()
+            } else {
+                Collision::with_hits(
+                    vec![crate::collision::Plane {
+                        y: 0.0,
+                        layer: Layer::Ground,
+                    }],
+                    Vec::new(),
+                )
+            };
+            let mut position = Vec3::new(0.0, if airborne { 500.0 } else { 0.0 }, 0.0);
+            fire_quick_boost(&mut p, Vec2::Y, 0.0);
             let right = Input {
                 stick: Vec2::X,
                 ..Input::default()
             };
+            let mut peak = 0.0f32;
             for _ in 0..30 {
                 step(&mut p, &right, &mut position, &collision);
+                peak = peak.max(Vec2::new(p.velocity.x, p.velocity.z).length());
             }
+            assert!(
+                peak > ctrl.boost_max_tick,
+                "air={airborne}: burst peak {peak} should exceed boost max {}",
+                ctrl.boost_max_tick
+            );
+            assert!(
+                !p.in_quick_boost(),
+                "air={airborne}: HighBoostState should finish well before 30 ticks"
+            );
             let horizontal = Vec2::new(p.velocity.x, p.velocity.z);
             let sideways = horizontal.dot(Vec2::new(p.yaw.cos(), -p.yaw.sin())).abs();
             assert!(sideways > 0.2 * horizontal.length(), "air={airborne}: stuck on the QB heading {horizontal:?}, boost acc {} max {} decel {} qb {}", ctrl.boost_acc_tick, ctrl.boost_max_tick, ctrl.over_max_decel_tick, ctrl.quick_boost_max_tick);
@@ -1466,6 +1771,102 @@ mod tests {
                 ctrl.boost_max_tick
             );
         }
+    }
+
+    #[test]
+    fn high_boost_charge_sweet_spot_and_refire() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .filter(|r| AcCtrlParam::buildable(&r.data))
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .find(|c| {
+                c.tank == 0.0
+                    && c.qb_charge_max_frames > 0.0
+                    && c.qb_min_speed_rate > 0.0
+                    && c.qb_min_speed_rate < 1.0
+            })
+            .expect("a non-tank preset with Boost Charge window");
+
+        // 1. Uncharged tap on ground with boost mode OFF stays boost=false, hops, and settles to walk_max_tick.
+        let ground = Collision::with_hits(
+            vec![crate::collision::Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            Vec::new(),
+        );
+        let mut p = Pilot::new(ctrl, 0);
+        let mut pos = Vec3::ZERO;
+        assert!(start_quick_boost(&mut p));
+        assert!(!start_quick_boost(&mut p), "blocked while active");
+        let tap_release = Input {
+            stick: Vec2::Y,
+            qb_held: false,
+            ..Input::default()
+        };
+        step(&mut p, &tap_release, &mut pos, &ground);
+        assert!(!p.second_stage_qb);
+        let expected_tap_max = ctrl.quick_boost_min_tick
+            + (ctrl.quick_boost_max_tick - ctrl.quick_boost_min_tick) * (ctrl.qb_base_rate1 * 0.01);
+        let mut tap_peak = 0.0f32;
+        let mut hopped = false;
+        let mut burst_ticks = 0u32;
+        while p.in_quick_boost() {
+            step(&mut p, &tap_release, &mut pos, &ground);
+            tap_peak = tap_peak.max(Vec2::new(p.velocity.x, p.velocity.z).length());
+            hopped |= p.velocity.y > 0.0;
+            burst_ticks += 1;
+            assert!(burst_ticks < 30);
+        }
+        assert!(hopped, "grounded High Boost should add a small vertical hop");
+        assert!(
+            (tap_peak - expected_tap_max).abs() < 1e-3,
+            "tap peak {tap_peak} vs expected {expected_tap_max}"
+        );
+        assert!(!p.boost, "High Boost must not force boost mode on");
+        // Immediately re-fireable once HighBoostState ends (well under 20 ticks).
+        assert!(burst_ticks <= 16, "burst took {burst_ticks} ticks");
+        assert!(start_quick_boost(&mut p), "re-fire unlocked right after burst");
+        p.qb = None;
+        for _ in 0..300 {
+            step(&mut p, &tap_release, &mut pos, &ground);
+        }
+        let walk_settled = Vec2::new(p.velocity.x, p.velocity.z).length();
+        assert!(
+            (walk_settled - ctrl.walk_max_tick).abs() < 1e-4,
+            "boost-off QB settled at {walk_settled}, expected walk max {}",
+            ctrl.walk_max_tick
+        );
+
+        // 2. Sweet-spot hold reaches Second-Stage High Boost (`w1 = w2 = 1.0`, full `quick_boost_max_tick`).
+        let mut p2 = Pilot::new(ctrl, 0);
+        p2.boost = true;
+        p2.airborne = true;
+        let mut pos2 = Vec3::new(0.0, 500.0, 0.0);
+        assert!(start_quick_boost(&mut p2));
+        let sweet_ticks = ctrl.qb_sweet_frames.round() as u32;
+        let hold = Input {
+            stick: Vec2::Y,
+            qb_held: true,
+            ..Input::default()
+        };
+        for _ in 0..sweet_ticks.saturating_sub(1) {
+            step(&mut p2, &hold, &mut pos2, &Collision::default());
+        }
+        step(&mut p2, &tap_release, &mut pos2, &Collision::default());
+        assert!(p2.second_stage_qb, "sweet-spot release must trigger Second-Stage QB");
+        let mut sweet_peak = 0.0f32;
+        while p2.in_quick_boost() {
+            step(&mut p2, &tap_release, &mut pos2, &Collision::default());
+            sweet_peak = sweet_peak.max(Vec2::new(p2.velocity.x, p2.velocity.z).length());
+        }
+        assert!(
+            (sweet_peak - ctrl.quick_boost_max_tick).abs() < 1e-4,
+            "sweet-spot peak {sweet_peak} vs {}",
+            ctrl.quick_boost_max_tick
+        );
     }
 
     #[test]

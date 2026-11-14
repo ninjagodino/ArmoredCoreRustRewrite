@@ -133,21 +133,11 @@ in order:
     `glide_air` (row 222 空中浮遊, anim 62, 360-frame wheel, booster clip 3, builder
     `0x82883d30`). Camera action 26, cue b00000006 (taken as the start). What ends a glide
     in the air (EN) is open. The damage rows 239-242 / 246-247 are not played.
-  - High Boost (quick boost, manual id 20301, □; V / pad West): impulse = movement slot +0x68
-    `0x82822980` (velocity = direction x +0x118 x f2, +0x118 = `quick_boost_max_tick`, Lua
-    param 133 = glide max x 1.25); clips rows 285-292 by direction, camera action 50, cues
-    b00000007 + b00000008, FFX 303 on the nozzles opposite the direction. Open (Xenia re-check
-    pending): the burst length and deceleration (runtime stand-in `QUICK_BOOST_DECAY` 0.85 of
-    the excess per tick, not game data), the re-fire interval (runtime waits for the clip), EN,
-    and the player caller of slot +0x68 (only `0x82842dd8` found, f1 = f2 = 1, fixed
-    direction). Per-state max `0x82822af0` case 4 = lerp(+0x120, +0x11c, +0x220 = f1), +0x11c =
-    +0x118 x param 138 (booster float 11). Probe recipe (`boost_vfx.txt`, whose `press X` step is
-    the high boost): hits on `0x82822980` logging f1, f2, r7, r8, and reads of movement +0x260 /
-    +0x268 (horizontal speed) and +0x1bc for the following 30 frames. Booster int16 fields
-    0/3-6 (18/15/10, 10/7/4, small frame counts) are unassigned candidates for the burst and
-    reload frames. The earlier note calling `0x828844f0` (row 218) a quick-boost builder is
-    wrong: row 218 is the glide (急加速) clip; quick-boost directions are `0x82884d28`
-    (picker `0x82884788`), the charge wind-up (row 284) `0x82884cd8`.
+  - High Boost / Boost Charge leftovers (burst phases, charge curve, decay and re-fire done; see
+    Done "High Boost and Boost Charge"): EN drain (`BST__QUICK_EN_RATE`, Lua param 53) and the
+    boost-off ground walk-brake gate (`0x8283fc10` -> `0x82845590` -> `0x8283f3d0`, which holds
+    `+0x1c0 = 1` with `hispeed_brake_tick` until horizontal speed drops below the 80 km/h walk
+    threshold instead of decaying by `over_max_decel_tick`).
   - Per-state current max (`0x82822af0`): switch on +0x1bc, x terrain/slope scale +0x334, x +0x324.
   - Dash / air-boost acceleration multiplier (field 406, also the default divisor at `0x5c4`).
   - Tick rate (Xenia probes `private/xenia/move_tick.txt`, `vertical.txt`, flying design 5010;
@@ -254,9 +244,11 @@ in order:
     as a refractive quad; the 360 shot's blown-out white core is the additive stack plus the
     engine bloom, which Bevy's tonemap does not match. QB shortage 304 and QB large 305 are
     built into lists at the sfx object `+0xb0` and the four `0x82891c50` slots, and
-    `0x82892f08` never plays them (EN shortage and Boost Charge are not modelled). Also not
+    `0x82892f08` never plays them (EN shortage and the `0x8283c8d0` TAE events `0xC1D..0xC22`
+    from `HighBoostState` are not wired to SFX yet; Boost Charge movement and row 284 wind-up
+    are done in `control.rs`). Also not
     wired: ground dust from `groundsfxparam.bin` (walk/landing rows), water splashes,
-    cartridges (`cartridge_sfx_id`). Boost Charge (□ held, row 284 wind-up) is not implemented.
+    cartridges (`cartridge_sfx_id`).
   - Muzzle scale: f0001218 as stored is a 16 m flash and a 20 m sprite (user: far too
     large), so the game scales weapon effects at spawn. `weapons::MUZZLE_SCALE` 0.25 is a
     guess; find the spawn call that reads `muzzle_sfx_id` (+0x02 of the weaponsfx row) and its
@@ -297,6 +289,13 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **High Boost and Boost Charge** (`acvd-game::control`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`, `sheets/ac_states.csv`; Xenia probes `private/xenia/quick_boost{,2}.txt` -> `.jsonl`, recipe `tools/xenia/recipes/quick_boost.txt`):
+  - **Offset correction (`struct = movement + 4`)**: `0x82869e10` unpacks Lua params 131-142 and 147 (`AcCtrlParamCalc.lua` lines 288-314; `0x82455fe0` `Scr_GetACVParam` -> `0x8246edd0` -> `0x82475890` float `+0x14+4n`, `0x824758b8` i16 `+0xf4+2n`, `0x824758e0` u8 `+0x114+n`, from category 6 booster or category 3 tank legs), and `0x82821af0` writes into `movement + 4`: object `+0x114` = `quickBoostAccelVMS / 60` (param 132), `+0x118` = `quickBoostAccelHMS / 60` (param 131), `+0x11c` = `quickBoostMaxSpeedHKmH / 216` (param 133), and `+0x120` = `+0x11c * param 138` (`qb_min_speed_rate`, float 11 at `+0x40`). Movement slot `+0x68` (`0x82822980`) is **not** a velocity impulse: it stores `f1` at `+0x220`, adds `direction * (+0x118 * f2) * 60 * dt` to horizontal acceleration `+0x1d8..+0x1e0` (`0x82820f38` -> `0x82820020`), and when `r7 != 0` adds `+0x114 * f2` to vertical acceleration (`0x8281f4b0`) with rise cap `+0x21c` = `+0xe4` (`NewAcBehavior` field 344 `+0x510` = 15 km/h = 0.06944 m/tick).
+  - **Player state machine (`HighBoostState`, vtable `0x8200d378`)**: launched by `0x82841d50` -> `0x8283ef90` -> `0x8283ed98` -> `0x82844ea8` -> ctor `0x8237bec8` with the 10-word param block built by `0x828590f8` (`+0x3c..+0x60`, copied to `action_ctrl + 0xbc..0xe4` by `0x82845190`), stepped by `0x8237c5a0`:
+    - **Phase 0 (`0x8237c1b8`, Boost Charge wind-up)**: plays `acmotion` row 284 (`クイックブースト溜め（360）`, anim 185, booster clip 4; `0x8284c310` -> `0x82884cd8`) while held up to `qb_charge_max_frames` (param 147, i16 0: 18/15/10 frames; auto-fires at `0x8200d3f0` = 0.9999). On release, evaluates piecewise-linear curve `0x8237bbf8` (`x = hold / max_frames`, ramp start param 137 i16 1, sweet-spot centre param 135 i16 3, width param 139 i16 4 halved by `0x8202081c` = 0.5, overcharge end param 140 u8 2) twice: `w1` from base param 134 (u8 0: 5-9%, tank 80%) sets `+0x4c` (`f1`) and Phase 1 duration `+0x10 = param 141 (i16 5) * w1`; `w2` from base param 136 (u8 1: 45-93%, tank 70%) sets Phase 2 duration `+0x14 = param 142 (i16 6) * w2` (spec-sheet helper `0x825ef928` sums params 141 + 142). Emits TAE event `0x8283c8d0` `0xC1F`/`0xC20` (normal ground/air) or `0xC21`/`0xC22` (`w2 >= 1.0`, Second-Stage sweet spot).
+    - **Phase 1 (`0x8237ba68`) & Phase 2 (`0x8237bf28`)**: every frame calls `slot +0x68` (`f1 = w1`, `f2 = 1.0` or fractional tail, `r7 = is_grounded` in Phase 1) and `slot +0xd4(4)` (`0x834b7ed8`, setting `+0x1bc = 4` so `0x82822af0` clamps `0x82822ea0` to `lerp(+0x120, +0x11c, w1)`). Transition `1 -> 2` plays directional rows 285-292 (`0x8284c3a0` -> `0x82884d28`). Phase 2 exits via `0x8283fc10` on timer expiry, ground touchdown (`0x8318fa10`), or Glide Boost cancel (`0x8237bcb0` -> `0x8283fdb0`). High Boost does **not** force boost mode on (`quick_boost.jsonl` Hit 1 settles back to walk speed 26.0 km/h; `quick_boost2.jsonl` Hit 1 with boost on decays by `over_max_decel = 0.01`/tick to 57.9 km/h, tap peak `0.4711` = 101.8 km/h, sweet-spot peak `0.5787` = 125.0 km/h).
+    - **Re-fire interval**: `0x8283ed98` writes `NewAcBehavior` field 340 (`QBリロードフレーム` `+0x500` = `0.0`) x 1/60 to `action_ctrl +0x110` (`0x82844050` ticks it down), and `HighBoostState` slot `+0x50` = `0x8241a6b8` returns 0 while active, so a new High Boost is immediately available once Phase 2 ends (~200 ms chain spacing in `quick_boost2.jsonl` Hits 2-5) without waiting for the animation clip.
 
 - **AC paint** (`acvd-formats::accolor`, `acvd-game::paint`, `ac_paint.wgsl`, `sheets/tuning_fields.csv` fields 147–148):
   - **`param/accolor/color%04d.bin` (`0x358` = 856 bytes)**: loaded by `0x82331478` / `0x82331680` and copied into `assembly_data + 0xa0` by `0x82331b18` for `AcAssemblyDesignSt.coloring_id` (`+0x4e`). Initialized by `0x82332420`, compared by `0x8235ddc8`, unpacked by `0x82463630`:

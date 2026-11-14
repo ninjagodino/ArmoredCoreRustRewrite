@@ -1,0 +1,60 @@
+# AC TEST -> Boost-ON High Boost & Second-Stage Boost Charge along the dry bridge runway:
+# 1. Tap QB, 2. Chained QBs (~0.20s spacing), 3. Ground Second-Stage QB (0.16s hold), 4. Airborne Second-Stage QB + chain.
+run ac_test.txt
+wait 1.5
+stick R 1 0 2.0
+wait 0.4
+press LB
+wait 0.4
+
+# 1. Tap High Boost forward with boost mode ON
+stick L 0 1
+wait 0.4
+down X
+wait 0.04
+up X
+wait 2.0
+release
+wait 0.8
+
+# 2. Chained High Boosts backward along the runway
+stick L 0 -1
+down X
+wait 0.04
+up X
+wait 0.16
+down X
+wait 0.04
+up X
+wait 0.16
+down X
+wait 0.04
+up X
+wait 0.16
+down X
+wait 0.04
+up X
+wait 1.5
+release
+wait 0.8
+
+# 3. Sweet-spot Second-Stage Boost Charge on ground (hold X 0.16s, bs0111 window 0.133..0.200s)
+stick L 0 1
+hold X 0.16
+wait 0.15
+shot private/xenia/shots/qb_sweetspot.png
+wait 1.8
+release
+wait 0.8
+
+# 4. Airborne Sweet-spot Second-Stage Boost Charge + chained air QB
+hold A 0.6
+stick L 0 -1
+hold X 0.16
+wait 0.35
+down X
+wait 0.04
+up X
+wait 1.8
+release
+wait 0.5

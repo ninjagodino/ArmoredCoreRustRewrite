@@ -228,10 +228,12 @@ fn motion(
     }
     heard.moving = moving;
 
-    // Rising edge of airborne with upward speed: a jump. A ledge fall leaves `vy` ≤ 0.
+    // Rising edge of airborne with upward speed: a jump. A ledge fall leaves `vy` ≤ 0, and a
+    // grounded High Boost adds its own small hop while playing `QUICK_BOOST`.
     // `se_jump` is +0xA of `AC_SOUNDPARAM_ST` (`FUN_82899168`, category 1 `c%08d`). Row 0
     // stands in for the AC's own row; every row stores the same id.
-    let jump = pilot.airborne && !heard.airborne && pilot.velocity.y > 0.0;
+    let jump =
+        pilot.airborne && !heard.airborne && pilot.velocity.y > 0.0 && !pilot.in_quick_boost();
     heard.airborne = pilot.airborne;
     if jump {
         if let Some(row) = acvd_data::find(PARAM_ACSOUNDPARAM_BIN, 0).filter(|r| r.data.se_jump > 0)

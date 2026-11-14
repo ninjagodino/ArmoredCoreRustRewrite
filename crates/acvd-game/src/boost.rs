@@ -267,6 +267,7 @@ mod tests {
         assert_eq!(id("dash", Some(0)), 1);
         assert_eq!(id("air_move", Some(0)), 1);
         assert_eq!(id("jump", None), 2);
+        assert_eq!(id("quick_boost_charge", None), 4);
         assert_eq!(id("quick_boost", Some(0)), 4);
         assert_eq!(id("glide", None), 1);
         assert_eq!(id("glide_air_in", Some(0)), 1);
