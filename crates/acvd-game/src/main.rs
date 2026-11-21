@@ -23,7 +23,10 @@
 //! `--wait` delays `--shot` that long. The default scene is the garage AC test: map `m4000`
 //! (drawn and collided from the disc, see `map`) with the AC at the start point of
 //! `m4000_actest.msb`. `--map` picks another `model/map` folder, `--layout <name>` another
-//! `{map}_{name}.msb` start point (`none`: the terrain MSB's), `--hits` draws the hit meshes
+//! `{map}_{name}.msb` start point (`none`: the terrain MSB's), `--test <mode>` picks which
+//! `LAYER_PARAM_ST` target set to spawn from `{map}_{layout}.msb` (`0`/`none`/`actest1` empty,
+//! `1`/`light`/`actest2` tanks & helis [default], `2`/`mt`/`actest3` MTs, `3`..`5`/`7` test ACs
+//! `a0000`..`a0003`, `all`), `--hits` draws the hit meshes
 //! instead of the map models, `--plane` is the old infinite floor, `--water` adds a test water
 //! plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
 //! `--no-hud` leaves that HUD and the part-name overlay out, for looking at effects.
@@ -45,6 +48,7 @@ mod paint;
 mod pose;
 mod sfx;
 mod sound;
+mod targets;
 mod weapons;
 
 use std::path::PathBuf;
@@ -100,6 +104,8 @@ struct StartYaw(f32);
 #[derive(Resource)]
 struct Scene {
     map: Option<String>,
+    layout: Option<String>,
+    test: targets::TestMode,
 }
 
 fn main() {
@@ -108,6 +114,7 @@ fn main() {
     let (mut clip, mut frame, mut held, mut wait) = (None, None, Vec::new(), 0.0);
     let (mut map, mut plane, mut water) = (Some("m4000".to_string()), false, None);
     let (mut layout, mut hits) = (Some("actest".to_string()), false);
+    let mut test = targets::TestMode::default();
     let (mut preview, mut burst, mut no_hud) = (None, 1, false);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -138,6 +145,11 @@ fn main() {
             }
             "--map" => map = args.next().filter(|s| s != "none"),
             "--layout" => layout = args.next().filter(|s| s != "none"),
+            "--test" => {
+                if let Some(m) = args.next() {
+                    test = targets::TestMode::parse(&m);
+                }
+            }
             "--hits" => hits = true,
             "--plane" => plane = true,
             "--water" => water = args.next().and_then(|s| s.parse::<f32>().ok()),
@@ -251,6 +263,8 @@ fn main() {
     .insert_resource(start)
     .insert_resource(Scene {
         map: map.filter(|_| !plane && !hits),
+        layout: layout.filter(|_| !plane),
+        test,
     })
     .insert_resource(collision)
     .insert_resource(control::Piloting(piloting))
@@ -331,11 +345,14 @@ fn key(name: &str) -> Option<KeyCode> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut paint_materials: ResMut<Assets<paint::AcPaintMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     garage: Res<Garage>,
     yaw: Res<StartYaw>,
     collision: Res<Collision>,
@@ -386,6 +403,23 @@ fn setup(
             }
         }
     });
+    if let (Some(map_id), Some(layout)) = (scene.map.as_deref(), scene.layout.as_deref()) {
+        if let Err(e) = targets::spawn(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut paint_materials,
+            &mut images,
+            &mut bindposes,
+            &garage.disc,
+            map_id,
+            layout,
+            &scene.test,
+            garage.flat,
+        ) {
+            warn!("targets {map_id}_{layout}: {e:#}");
+        }
+    }
     if drawn == 0 && collision.hits.is_empty() {
         commands.spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))),

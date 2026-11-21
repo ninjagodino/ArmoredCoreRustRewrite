@@ -547,6 +547,87 @@ pub fn spawn(
     (entities, skins)
 }
 
+/// Spawns the joints under `ac` posed on frame 0 of `built.motion` without inserting [`Driven`],
+/// so non-player ACs (such as AC TEST targets) hold their standing pose independently of the
+/// player's [`Motion`] resource.
+pub fn spawn_static(
+    commands: &mut Commands,
+    ac: Entity,
+    built: &Built,
+    parts: &[Loaded],
+) -> (Vec<Entity>, Vec<(Vec<Entity>, Vec<Mat4>)>) {
+    let entities: Vec<Entity> = built
+        .joints
+        .iter()
+        .map(|_| {
+            commands
+                .spawn((Transform::default(), Visibility::default()))
+                .id()
+        })
+        .collect();
+    for (j, spec) in built.joints.iter().enumerate() {
+        let parent_bind = spec
+            .parent
+            .map_or(Affine3A::IDENTITY, |p| built.joints[p].bind);
+        let local = parent_bind.inverse() * spec.bind;
+        let (s, r, t) = local.to_scale_rotation_translation();
+        let mut transform = to_transform(t, r, s);
+        if let (Some(bone), Some(m)) = (spec.bone, built.motion.as_ref()) {
+            if let (Some(rest), Some(cbone)) = (
+                m.skeleton.bones.get(bone).and_then(|b| b.rest.as_ref()),
+                m.clip.bones.get(bone),
+            ) {
+                let cbone = if m.in_place && rest.parent.is_none() {
+                    &m.skeleton.bones[bone]
+                } else {
+                    cbone
+                };
+                let rotation = Quat::from_array(
+                    cbone
+                        .track
+                        .rotation(0.0)
+                        .unwrap_or_else(|| ani::euler_quat(rest.euler)),
+                );
+                let ct = Vec3::from(cbone.track.translation(0.0).unwrap_or(rest.translation));
+                let cs = Vec3::from(cbone.track.scale(0.0).unwrap_or(rest.scale));
+                let absolute = spec.parent.is_none_or(|p| built.joints[p].virtual_bone);
+                let translation = if absolute {
+                    ct * m.scale
+                } else {
+                    t + (ct - Vec3::from(rest.translation)) * m.scale
+                };
+                transform = to_transform(translation, rotation, cs);
+            }
+        }
+        commands
+            .entity(entities[j])
+            .insert((transform, ChildOf(spec.parent.map_or(ac, |p| entities[p]))));
+    }
+    let skins = parts
+        .iter()
+        .zip(&built.parts)
+        .map(|(p, &(f, unboned))| {
+            let n = p.rig.bones.len();
+            let extra = commands
+                .spawn((
+                    to_transform(unboned.translation.into(), Quat::IDENTITY, Vec3::ONE),
+                    Visibility::default(),
+                    ChildOf(ac),
+                ))
+                .id();
+            let joints = entities[f..f + n].iter().copied().chain([extra]).collect();
+            let binds = built.joints[f..f + n]
+                .iter()
+                .map(|s| s.bind)
+                .chain([unboned])
+                .map(|b| Mat4::from(mirror(b).inverse()))
+                .collect();
+            (joints, binds)
+        })
+        .collect();
+    (entities, skins)
+}
+
 /// Advances the clip and poses every driven joint, crossfading from the pose shown when the clip
 /// changed.
 pub fn animate(

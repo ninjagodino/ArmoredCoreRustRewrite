@@ -347,7 +347,7 @@ fn set_vis(vis: &mut Query<&mut Visibility>, entity: Entity, on: bool) {
 
 /// `xf` (FLVER axes) acting on meshes that `acvd-render` already mirrored on X: `S xf S` with
 /// `S = diag(-1, 1, 1)`.
-fn bevy_transform(xf: &flver::Xform) -> Transform {
+pub(crate) fn bevy_transform(xf: &flver::Xform) -> Transform {
     let s = [-1.0f32, 1.0, 1.0];
     let m = |r: usize, c: usize| s[r] * s[c] * xf.m[r][c];
     let mat = Mat4::from_cols(
@@ -427,6 +427,9 @@ mod tests {
             light_set: 1,
             follow_camera_xz: false,
             is_sky: false,
+            layer_index: None,
+            layer: None,
+            ac_design_id: None,
         };
         let xf = xform(&part);
         let t = bevy_transform(&xf);

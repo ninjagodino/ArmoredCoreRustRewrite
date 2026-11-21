@@ -82,11 +82,9 @@ in order:
     whether that is the design (AC TEST may use another AC) or a 2x step.
   - Slopes too steep to stand on, AC vs objects that move, AC vs AC (wall kick / `ackickrhit`
     filter is now in, see Done "Wall Kick / Wall Jump").
-- **AC test targets**: `m4000_actest.msb` parts of kind 2 (22: ACs `a0000`-`a0003` at the vs
-  UNAC start (-797.168, 17, 616.934), enemies `e0010` / `e0110` / `e0210` / `e1020` / `e2030`)
-  on layers `actest2`-`actest8` (LAYER_PARAM_ST; the layer link in the part record is unread),
-  with `param/actestdata.bin` (+ `actestdata.def`, unread) choosing the test; AI in
-  `script/enemy/*_actest.lc`, `script/arena/actest_*.lc`. Draw them, take hits and damage.
+- **AC test targets**: spawning and rendering from `m4000_actest.msb` are in (see Done "AC test
+  targets"); still open: target hit shapes / taking damage (see Damage model below) and enemy/AC
+  AI (`script/enemy/*_actest.lc`, `script/arena/actest_*.lc`).
 - **Damage model**: AP, bullet hit vs AC / enemy hit shapes, defense mitigation (KE/CE/TE vs
   defense thresholds), impact (range-decay curve `0x827ca448` and bullet units are done; see
   Weapons leftovers and Done).
@@ -288,6 +286,11 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **AC test targets** (`acvd-formats::msb`, `acvd-game::targets`, `pose::spawn_static`, `main`):
+  - **MSB layer & AC model links**: `acvd-formats::msb` now decodes `LAYER_PARAM_ST` (section stored at MSB reader `+0x18` by `0x82603878`, indexed by `0x8280cee8` / `0x82b91610` / `0x82b916b8`), `PARTS_PARAM_ST` `+0x64` sub-record `+0` `i16` layer index (`0x82b912b0`, resolved to `Part::layer`), and `MODEL_PARAM_ST` (`kind == 4`) `+0x18` sub-record `+0` `u16` `AcAssemblyDesignSt` ID (`0x82b91348` → `0x82b91470` at `0x82b91488`; `a0000`–`a0003` = designs `5011`–`5014`).
+  - **AC TEST mode selection**: `param/actestdata.bin` (`m720_NO TARGET`..`m725_NEXT AC`) is an unused AC4/FA leftover; ACVD AC TEST uses `mission/ch6000.xml` (`0x825dbb70` returns `6000`) and the garage AC TEST settings list (`0x82361b08` / `0x82361ce0`, `0x82a2a658` mapping `0..7` → `actest1..actest8`): `0`/`actest1` empty (360 menu default), `1`/`actest2` 7 `e1020` tanks + 5 `e2030` CHheli, `2`/`actest3` 2 `e0010` + 2 `e0110` + 2 `e0210` MTs, `3`/`actest4` `a0000` ATK-AC (5011, CBT), `4`/`actest5` `a0001` DEF-AC (5012), `5`/`actest6` `a0002` SNP-AC (5013), `6`/`actest7` vs-UNAC (0 MSB parts), `7`/`actest8` `a0003` Eirik AC (5014, retail).
+  - **Runtime**: `acvd-game::targets` spawns the active layer's kind-2 parts from `{map}_{layout}.msb` via `--test <mode>` (default `actest2` / `light`; accepts `0`..`7`, `none`/`light`/`mt`/`atk`/`def`/`snp`/`unac`/`eirik`/`all`, or a literal layer name). Enemy targets load `model/ene/{m}/{m}_m.bnd.dcx|{m}.flv`; AC targets assemble, paint (`AcColor`), and hold their idle stance via `pose::spawn_static` independently of the player's `Motion`. Verified by `msb::tests::actest_layout_from_disc`, `targets::tests::*`, and `--shot` (`private/shots/actest_light.png`, `actest_mt.png`, `actest_eirik.png`).
 
 - **Generator Energy (EN) drain & recharge** (`acvd-game::control`, `weapons`, `hud`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`; Xenia probes `private/xenia/en_drain{,2}.txt` -> `.jsonl`, recipe `tools/xenia/recipes/en_drain.txt`):
   - **EN Pool (`AC + 0x214`, `0x828308f0` init, `0x82830910` drain, `0x828307c8` recharge)** & **Generator (`AC + 0x248` `m_pGenerator`, `0x82855ad8` -> `0x8287edc8` ctor, `0x8287edd8`/`0x8287eec8`/`0x8287eef0`/`0x8287ef40`)**:

@@ -27,7 +27,8 @@ pub const MAGIC_ENV: u32 = 0x0098_9A6C;
 /// `POINT_PARAM_ST` kind of a start position.
 pub const POINT_START: u32 = 200;
 
-/// `MODEL_PARAM_ST` record (`0x8280d4c8`) and its `+0x14` draw sub-record (`0x829a5e60`).
+/// `MODEL_PARAM_ST` record (`0x8280d4c8`) and its `+0x14` draw sub-record (`0x829a5e60`) /
+/// `+0x18` AC sub-record (`0x82b91348` → `0x82b91470`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Model {
     pub name: String,
@@ -38,6 +39,18 @@ pub struct Model {
     pub follow_camera_xz: bool,
     /// Sky pass flag (`+0x14` sub-record `+2` `u8`, `0x829a5ef4`).
     pub is_sky: bool,
+    /// `AcAssemblyDesignSt` ID for AC models (`kind == 4`, `+0x18` sub-record `+0` `u16`,
+    /// `0x82b91348` → `0x82b91470` at `0x82b91488`).
+    pub ac_design_id: Option<u16>,
+}
+
+/// `LAYER_PARAM_ST` record (section at MSB reader `+0x18`, `0x82603878`; name lookup at
+/// `0x8280cee8` / `0x82b91610` / `0x82b916b8`).
+#[derive(Debug, Clone, Serialize)]
+pub struct Layer {
+    pub name: String,
+    pub id: u32,
+    pub index: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +69,12 @@ pub struct Part {
     pub follow_camera_xz: bool,
     /// Whether the model is flagged as a sky piece (`MODEL_PARAM_ST` `+0x14` sub-record `+2`).
     pub is_sky: bool,
+    /// Index into `LAYER_PARAM_ST` (`PARTS_PARAM_ST` `+0x64` sub-record `+0` `i16`, `0x82b912b0`).
+    pub layer_index: Option<i16>,
+    /// Resolved `LAYER_PARAM_ST` name for `layer_index` (`0x82b912b0` → `0x82b916b8` / `0x82b91610`).
+    pub layer: Option<String>,
+    /// `AcAssemblyDesignSt` ID from the matching `MODEL_PARAM_ST` (`kind == 4`) for AC parts.
+    pub ac_design_id: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +142,7 @@ pub fn models(data: &[u8]) -> Result<Vec<Model>> {
                 name_rel < 0x400,
                 "MSB model at {off:#x} name offset {name_rel:#x}"
             );
+            let kind = r.u32(off + 4)?;
             let sub_rel = if off + 0x18 <= data.len() {
                 r.u32(off + 0x14)? as usize
             } else {
@@ -139,12 +159,47 @@ pub fn models(data: &[u8]) -> Result<Vec<Model>> {
                 } else {
                     (1, false, false)
                 };
+            let ac_design_id = if kind == 4 && off + 0x1C <= data.len() {
+                let ac_rel = r.u32(off + 0x18)? as usize;
+                if ac_rel > 0 && off + ac_rel + 2 <= data.len() {
+                    let id = r.u16(off + ac_rel)?;
+                    (id > 0).then_some(id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(Model {
                 name: r.cstr_sjis(off + name_rel)?,
-                kind: r.u32(off + 4)?,
+                kind,
                 light_set,
                 follow_camera_xz,
                 is_sky,
+                ac_design_id,
+            })
+        })
+        .collect()
+}
+
+/// Every `LAYER_PARAM_ST` record (`0x82603878`, `0x8280cee8`, `0x82b91610`, `0x82b916b8`).
+pub fn layers(data: &[u8]) -> Result<Vec<Layer>> {
+    let r = Be(data);
+    ensure!(r.u32(0)? == MAGIC, "not an MSB");
+    section(data, "LAYER_PARAM_ST")?
+        .into_iter()
+        .map(|off| {
+            let name_rel = r.u32(off)? as usize;
+            ensure!(
+                name_rel < 0x400,
+                "MSB layer at {off:#x} name offset {name_rel:#x}"
+            );
+            Ok(Layer {
+                name: r
+                    .cstr_sjis(off + name_rel)
+                    .with_context(|| format!("MSB layer at {off:#x}"))?,
+                id: r.u32(off + 4)?,
+                index: r.u32(off + 0x0C)?,
             })
         })
         .collect()
@@ -155,6 +210,7 @@ pub fn parts(data: &[u8]) -> Result<Vec<Part>> {
     let r = Be(data);
     ensure!(r.u32(0)? == MAGIC, "not an MSB");
     let model_defs = models(data)?;
+    let layer_defs = layers(data)?;
     section(data, "PARTS_PARAM_ST")?
         .into_iter()
         .map(|off| {
@@ -169,10 +225,11 @@ pub fn parts(data: &[u8]) -> Result<Vec<Part>> {
             let kind = r.u32(off + 4)?;
             let mdef = model_defs
                 .iter()
-                .find(|m| m.kind == kind && m.name == model);
+                .find(|m| m.name == model && (m.kind == kind || (kind == 2 && m.kind == 4)));
             let mut light_set = mdef.map_or(1i8, |m| m.light_set);
             let follow_camera_xz = mdef.is_some_and(|m| m.follow_camera_xz);
             let is_sky = mdef.is_some_and(|m| m.is_sky);
+            let ac_design_id = mdef.and_then(|m| m.ac_design_id);
             if off + 0x50 <= data.len() {
                 let sub_rel = r.u32(off + 0x4C)? as usize;
                 if sub_rel > 0 && off + sub_rel < data.len() {
@@ -182,6 +239,21 @@ pub fn parts(data: &[u8]) -> Result<Vec<Part>> {
                     }
                 }
             }
+            let layer_index = if off + 0x68 <= data.len() {
+                let layer_rel = r.u32(off + 0x64)? as usize;
+                if layer_rel > 0 && off + layer_rel + 2 <= data.len() {
+                    let idx = r.u16(off + layer_rel)? as i16;
+                    (idx >= 0).then_some(idx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let layer = layer_index
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| layer_defs.get(i))
+                .map(|l| l.name.clone());
             Ok(Part {
                 name,
                 model,
@@ -192,6 +264,9 @@ pub fn parts(data: &[u8]) -> Result<Vec<Part>> {
                 light_set: light_set.max(0) as u8,
                 follow_camera_xz,
                 is_sky,
+                layer_index,
+                layer,
+                ac_design_id,
             })
         })
         .collect()
@@ -298,10 +373,42 @@ mod tests {
             .unwrap();
         assert_eq!(start.translation, [-324.65, 29.0, 649.5]);
         assert_eq!(start.rotation_deg[1], 90.0);
+        let layer_list = layers(&data).unwrap();
+        let layer_names: Vec<&str> = layer_list.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(
-            parts(&data).unwrap().iter().filter(|p| p.kind == 2).count(),
-            22
+            layer_names,
+            [
+                "actest1", "actest2", "actest3", "actest4", "actest5", "actest6", "actest7",
+                "actest8", "normal", "tmp"
+            ]
         );
+        let actest_parts = parts(&data).unwrap();
+        assert_eq!(actest_parts.iter().filter(|p| p.kind == 2).count(), 22);
+        let count_layer = |l: &str| {
+            actest_parts
+                .iter()
+                .filter(|p| p.layer.as_deref() == Some(l))
+                .count()
+        };
+        assert_eq!(count_layer("actest1"), 0);
+        assert_eq!(count_layer("actest2"), 12); // 7 e1020 + 5 e2030
+        assert_eq!(count_layer("actest3"), 6); // 2 e0010 + 2 e0110 + 2 e0210
+        assert_eq!(count_layer("actest4"), 1); // a0000
+        assert_eq!(count_layer("actest5"), 1); // a0001
+        assert_eq!(count_layer("actest6"), 1); // a0002
+        assert_eq!(count_layer("actest7"), 0); // vs UNAC
+        assert_eq!(count_layer("actest8"), 1); // a0003
+        let ac_design = |m: &str| {
+            actest_parts
+                .iter()
+                .find(|p| p.model == m)
+                .and_then(|p| p.ac_design_id)
+        };
+        assert_eq!(ac_design("a0000"), Some(5011));
+        assert_eq!(ac_design("a0001"), Some(5012));
+        assert_eq!(ac_design("a0002"), Some(5013));
+        assert_eq!(ac_design("a0003"), Some(5014));
+        assert_eq!(ac_design("e1020"), None);
         let map = crate::vfs::open(&disc, "model/map/m4000/m4000_map.msb").unwrap();
         let map_parts = parts(&map).unwrap();
         assert_eq!(map_parts.len(), 550);
