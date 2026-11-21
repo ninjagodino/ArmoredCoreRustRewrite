@@ -83,7 +83,7 @@ in order:
   - Slopes too steep to stand on, AC vs objects that move, AC vs AC (wall kick / `ackickrhit`
     filter is now in, see Done "Wall Kick / Wall Jump").
 - **AC test targets**: spawning, rendering, hit shapes, AP/defense damage, and destruction from `m4000_actest.msb` are in (see Done "AC test targets" and "Damage model & target hits"); still open: enemy/AC AI (`script/enemy/*_actest.lc`, `script/arena/actest_*.lc`).
-- **Lock-on / FCS** (see FCS / lock-on HUD). Boost gauge. (Generator EN drain & recharge and Damage model are now in, see Done.)
+- **Boost gauge** (Lock-on / FCS, Generator EN drain & recharge, and Damage model are now in, see Done).
 
 - **Animation**: TAE event reader; core control (upper body faces the aim while legs strafe);
   upper/lower body layering; part `*_a` clips beyond the hand weapons, arms and boosters.
@@ -151,8 +151,7 @@ in order:
 - **Maps leftovers**: rest of MSB (MODEL/EVENT/POINT/ROUTE/LAYER/TREE), `.smd`, map FLVER
   visuals, water-layer materials (none named water on m3100), collision filters 0x100002 /
   0x200002. HNAV/HTR navigation readers.
-- **FCS / lock-on HUD**: AcFcs lock-sight cone (20° × 20°, datum 20 m back); not a camera mode
-  (see `lock_on` row in `sheets/camera_follow.csv`).
+- **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`), multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), and scan-mode lock sight (`ACV_ScanModeLockSight`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, and target lock-on HUD cursor are now in (see Done).
 - **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics and range-decay done; see Done):
   - Bay shift is in (`acvd-game::bay`, `sheets/ac_states.csv`): hold R (△) and press that
     arm's fire button. Ready-position weapons purge instead of moving onto the rack. The
@@ -281,6 +280,11 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **Lock-on / FCS** (`acvd-game::fcs`, `weapons`, `hud`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`):
+  - **Head & FCS `acvparts.bin` fields**: traced `Scr_GetPartsParam` per-category getter tables (`0x820236ac` head, `0x820237a0` FCS): head `camera_ability` (`+0x140` `u16`, id 1010, `0x82479188`), FCS `missile_lock_max` (`+0x135` `u8`, id 1500, `0x8247a1a0`), `lock_range` (`+0x13c` `u16`, id 1503, `0x8247a078`), `lock_sight_x` (`+0x13e` `i16`, id 1509, `0x8247a0a0`), `lock_sight_y` (`+0x140` `i16`, `0x8247a0d0`), `lock_calc_speed` (`+0x144` `i16`, id 1501, `0x8247a140`), and `missile_lock_calc_speed` (`+0x146` `i16`, id 1502, `0x8247a170`). `AcCtrlParamCalc.lua` (`NewAcBehavior` fields 532–535, 564–566) computes `first_lock_range_rate`, `first_lock_range` (param 74, `AcCtrlParam +0x12c`), `lock_effective_rate` (param 80, `+0x148`), and `missile_lock_effective_rate` (param 81, `+0x144`); `Assemble.bin` fields 200–202 (`+0x320..+0x328`) provide HUD sight base angles (`20° × 20°`, `0x829d4e40`) and the backward datum offset (`20.0 m`, `0x828577b0`).
+  - **Elliptical lock-sight cone, secondary lock timer & lead prediction**: `0x82858178` (vtable `0x820541f0` `+0x54`) → `0x828577b0` packs `(sight_x_rad, sight_y_rad, first_lock_range, datum_back)`. `0x829d8d58` → `0x829d8850` → `0x829d8340` / `0x829dd5b8` tests `dist <= first_lock_range` and the elliptical cone `(x / (z * tan(sight_x)))^2 + (y / (z * tan(sight_y)))^2 <= 1.0` from `datum = ac_pos - aim * 20 m`, with a `+2.0°` outer keep-lock hysteresis margin (`0x829d8758`, `DAT_820b005c`). Per-hand secondary lock time is `weapon.missile_lock_time * lock_effective_rate / 60.0` (`0x82857688`), ticked by `0x829debe8` / `0x829de560`. When secondary-locked, `0x8287b070` → `0x829c2ee8` → `0x829c2808` aims at the linear lead point `target_pos + target_vel * t_flight`; primary-locked aims at current `target_pos` (`0x8287b158`).
+  - **Runtime & HUD**: `fcs::update` acquires living targets, tracks velocity, advances per-hand secondary lock, and feeds `Fcs::aim_for_hand` into `weapons::fire` (projectiles + `ArmAim`). `hud::lock_cursor` projects the locked target onto the viewport, draws a hollow lock-on bracket tinted with `StaticDrawParam` 1st/2nd lock overlay colors (`indices 9..12 / 17..20`) that shrinks as secondary lock completes, and populates `sortie.drb` `ACV_OutLine_LockCursor_E` (`EnemyName`, `EnemyAP`, `EnemyInfo`, `0x829d1b40`). Verified by unit tests (`fcs::tests::*`, 66/66 `acvd-game` tests) and `--shot` (`private/shots/fcs_lock_v2_0.png`..`_1.png`: auto-locks and destroys `e1020_0002`, then secondary-locks off-center `e1020_0001`/`e1020_0000` with red reticle + `e1020` / `65` AP readout).
 
 - **Damage model & target hits** (`acvd-game::damage`, `targets`, `weapons`, `sound`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`, `sheets/sound_cues.csv`):
   - **Weapon attribute & AC frame defense stats**: category 10 byte `+0x188` (`+392`, copied at `+0x54` by `0x8247d4d8` ahead of `damage_power` `+0x18c` and `damage_recoil` `+0x190`) is `damage_type`, switched in `0x82874190` (`0` = KE on 104 weapons, `1` = TE on 79, `6` = CE on 39 across all 222 records; `4`/`7` = unmitigated via `0x827d0928`). AC frame parts (categories 0–3) sum `ke_def` (`+0x134` `u16`, `0x8286a670`, Lua `Scr_GetPartsParam(cat, 201)`), `te_def` (`+0x136` `u16`, `0x8286a6d8`, Lua `202`), and `ce_def` (`+0x20` `f32`, `0x82475890`, Lua `float 3`), converted to `(low_def, hi_def, threshold)` via `AcCtrlParamCalc.lua` lines 199–232 / 410–416 (`NewAcBehavior` fields 509–517) and packed by `0x82873e70` (`0x82868ae8`/`0x82868b50`/`0x82868bb8` + `0x82874548..0x82874818`). Stagger threshold (`clashThreshold * 0.8` = `stagger_penalty_threshold`, Lua lines 326–339, `NewAcBehavior` fields 536–540) lowers defense thresholds by `0.8×` for 2 s.

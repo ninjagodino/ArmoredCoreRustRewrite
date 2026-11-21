@@ -31,8 +31,10 @@ use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
 use acvd_formats::vfs::Disc;
 use acvd_render::menu::{self, Layout, MenuGauge, MenuObject, MenuRoot, MenuSprite, MenuText};
 use bevy::prelude::*;
+use bevy::ui::{px, UiRect};
 use bevy::window::PrimaryWindow;
 
+use crate::fcs::Fcs;
 use crate::weapons::{Armament, Gun, Kind};
 
 const LAYOUT: &str = "lang/en/menu/sortie.drb.dcx";
@@ -52,6 +54,8 @@ pub struct Sortie {
     layout: Layout,
     /// Window size the HUD was last laid out for.
     size: Vec2,
+    /// Current layout scale factor (`min(size / SCREEN)`).
+    scale: f32,
     /// Gauge show scale (`0x829d0b30` this+0x3f0), 0 when the lock sight appears.
     show: f32,
     /// Per-readout blend toward the low colour (gauge controller +0x14).
@@ -62,6 +66,7 @@ pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
     Ok(Sortie {
         layout: menu::load(disc, LAYOUT, images)?,
         size: Vec2::ZERO,
+        scale: 1.0,
         show: 0.0,
         low: [0.0; 5],
     })
@@ -116,8 +121,27 @@ impl Status {
 #[derive(Component)]
 pub struct Panel(usize);
 
+/// Screen-space target lock-on reticle (`ACV_OutLine_LockCursor_Target`, 32x32, `0x829d4b88`).
+#[derive(Component)]
+pub struct LockCursorTarget;
+
+/// Screen-space locked target info readout (`ACV_OutLine_LockCursor_E`, 128x64, `0x829d1b40`).
+#[derive(Component)]
+pub struct LockCursorInfo;
+
 fn tuning(index: usize) -> f32 {
     acvd_data::tuning(STATIC_DRAW, index).unwrap_or_default() as f32
+}
+
+/// Primary (1st) or secondary (2nd) lock overlay color (`StaticDrawParam` indices 9..12 / 17..20).
+fn lock_color(secondary: bool) -> Color {
+    let base = if secondary { 17 } else { 9 };
+    Color::srgba(
+        tuning(base).clamp(0.0, 1.0),
+        tuning(base + 1).clamp(0.0, 1.0),
+        tuning(base + 2).clamp(0.0, 1.0),
+        tuning(base + 3).clamp(0.5, 1.0),
+    )
 }
 
 /// `gauge_low_r..a` (StaticDrawParam +0x444).
@@ -145,6 +169,7 @@ pub fn layout(
         commands.entity(e).despawn();
     }
     let scale = (size / SCREEN).min_element();
+    hud.scale = scale;
     let corner = (size - SCREEN * scale) / 2.0;
     let dialog = |name: &str| hud.layout.drb.dialogs.iter().position(|d| d.name == name);
     for (name, centered) in DIALOGS {
@@ -176,6 +201,30 @@ pub fn layout(
             corner + Vec2::new(rect[0].min(rect[2]) as f32, rect[1].min(rect[3]) as f32) * scale;
         let root = menu::spawn(&mut commands, &hud.layout, weapon, origin, scale);
         commands.entity(root).insert(Panel(hand));
+    }
+    // `ACV_OutLine_LockCursor_Target` in sortie.drb holds the 1st/2nd lock color swatches
+    // (`0x829d4b88`), not a hollow reticle; draw a hollow bracket frame tinted by StaticDrawParam
+    // 1st/2nd lock colors and shrink it as secondary lock progresses.
+    commands.spawn((
+        MenuRoot,
+        LockCursorTarget,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0.0),
+            top: px(0.0),
+            width: px(32.0 * scale),
+            height: px(32.0 * scale),
+            border: UiRect::all(px((2.0 * scale).max(1.5))),
+            ..default()
+        },
+        BorderColor::all(lock_color(false)),
+        Visibility::Hidden,
+    ));
+    if let Some(info_dlg) = dialog("ACV_OutLine_LockCursor_E") {
+        let root = menu::spawn(&mut commands, &hud.layout, info_dlg, Vec2::ZERO, scale);
+        commands
+            .entity(root)
+            .insert((LockCursorInfo, Visibility::Hidden));
     }
 }
 
@@ -511,6 +560,108 @@ pub fn panels(
                 _ => true,
             };
             visibility.set_if_neq(if shown {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            });
+        }
+    }
+}
+
+/// Projects the FCS-locked target onto the viewport and updates the hollow lock-on bracket
+/// (tinted by `StaticDrawParam` 1st/2nd lock colors, shrinking as secondary lock completes)
+/// and `ACV_OutLine_LockCursor_E` (`EnemyName`, `EnemyAP`, `EnemyInfo`, `0x829d1b40`).
+#[allow(clippy::too_many_arguments)]
+pub fn lock_cursor(
+    hud: Option<Res<Sortie>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    fcs_q: Query<&Fcs>,
+    mut cursor_target: Query<
+        (&mut Node, &mut BorderColor, &mut Visibility),
+        (With<LockCursorTarget>, Without<LockCursorInfo>, Without<MenuObject>),
+    >,
+    mut cursor_info: Query<
+        (Entity, &mut Node, &mut Visibility),
+        (With<LockCursorInfo>, Without<LockCursorTarget>, Without<MenuObject>),
+    >,
+    children: Query<&Children>,
+    mut objects: Query<(&MenuObject, &mut Visibility, Option<&mut MenuText>)>,
+) {
+    let Some(hud) = hud else { return };
+    let scale = hud.scale;
+    let locked = fcs_q.single().ok().and_then(|f| f.locked.as_ref());
+    let projected = locked.and_then(|lock| {
+        let (cam, cam_gt) = cameras.single().ok()?;
+        let vp = cam.world_to_viewport(cam_gt, lock.world_pos).ok()?;
+        Some((lock, vp))
+    });
+
+    for (mut node, mut border, mut vis) in &mut cursor_target {
+        let Some((lock, vp)) = projected else {
+            vis.set_if_neq(Visibility::Hidden);
+            continue;
+        };
+        vis.set_if_neq(Visibility::Inherited);
+        let secondary = lock.any_secondary();
+        let prog = lock.progress(0).max(lock.progress(1));
+        // Shrink reticle from 52 px (0% primary lock) to 28 px (100% secondary lock).
+        let side = (52.0 - 24.0 * prog) * scale;
+        node.width = px(side);
+        node.height = px(side);
+        node.left = px(vp.x - side * 0.5);
+        node.top = px(vp.y - side * 0.5);
+        *border = BorderColor::all(lock_color(secondary));
+    }
+
+    for (root, mut node, mut vis) in &mut cursor_info {
+        let Some((lock, vp)) = projected else {
+            vis.set_if_neq(Visibility::Hidden);
+            continue;
+        };
+        vis.set_if_neq(Visibility::Inherited);
+        node.left = px(vp.x + 18.0 * scale);
+        node.top = px(vp.y - 16.0 * scale);
+        let secondary = lock.any_secondary();
+        let pct = (lock.progress(0).max(lock.progress(1)) * 100.0).round() as u32;
+        for child in children.iter_descendants(root) {
+            let Ok((obj, mut cvis, text)) = objects.get_mut(child) else {
+                continue;
+            };
+            let show = match obj.0.as_str() {
+                "EnemyName" => {
+                    if let Some(mut t) = text {
+                        if t.text != lock.model {
+                            t.text = lock.model.clone();
+                        }
+                    }
+                    true
+                }
+                "EnemyAP" => {
+                    if let Some(mut t) = text {
+                        let s = format!("{:.0}", lock.ap);
+                        if t.text != s {
+                            t.text = s;
+                        }
+                    }
+                    true
+                }
+                "EnemyInfo" => {
+                    if let Some(mut t) = text {
+                        let s = if secondary {
+                            format!("{:.0}m", lock.distance)
+                        } else {
+                            format!("{:.0}m {pct}%", lock.distance)
+                        };
+                        if t.text != s {
+                            t.text = s;
+                        }
+                    }
+                    true
+                }
+                "EnemySquadNumber" => false,
+                _ => true,
+            };
+            cvis.set_if_neq(if show {
                 Visibility::Inherited
             } else {
                 Visibility::Hidden

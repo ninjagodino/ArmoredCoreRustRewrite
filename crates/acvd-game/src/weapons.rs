@@ -166,6 +166,9 @@ pub struct Gun {
     pub remaining: u16,
     pub magazine: u16,
     pub reload_time: f32,
+    /// Base lock-on time in 60 Hz ticks (`category 10 +0x13a`, `0x8247cf48`, scaled by
+    /// `AcCtrlParam::lock_effective_rate / 60.0` in `0x82857688`).
+    pub lock_time_ticks: f32,
     pub cooldown: f32,
     pub init_speed: f32,
     pub kind: Kind,
@@ -540,7 +543,10 @@ pub fn fire(
     pads: Query<&Gamepad>,
     mut speaker: Speaker,
     mut commands: Commands,
-    mut acs: Query<(&mut Pilot, &mut Armament, &Transform, Option<&mut Status>), Without<ClipJoint>>,
+    mut acs: Query<
+        (&mut Pilot, &mut Armament, &Transform, Option<&mut Status>, Option<&crate::fcs::Fcs>),
+        Without<ClipJoint>,
+    >,
     rigging: Rigging,
     points: Query<(Entity, &EffectPoint)>,
     mut body: Body,
@@ -550,7 +556,7 @@ pub fn fire(
         return;
     }
     let dt = time.delta_secs();
-    let Ok((mut pilot, mut arms, ac_tf, mut status)) = acs.single_mut() else {
+    let Ok((mut pilot, mut arms, ac_tf, mut status, fcs)) = acs.single_mut() else {
         return;
     };
     let down = |k: KeyCode| keys.pressed(k) || held.0.contains(&k);
@@ -642,6 +648,7 @@ pub fn fire(
             .iter()
             .find(|(h, _)| h.hand == hand)
             .map_or(ac_tf.translation, |(_, t)| t.translation());
+        let hand_aim = fcs.map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
         gun.remaining = gun.remaining.saturating_sub(1);
         gun.cooldown = gun.reload_time.max(1.0);
         sound::shot(
@@ -669,14 +676,14 @@ pub fn fire(
                 None => commands.spawn((
                     Sfx::new(gun.fx.muzzle),
                     Transform::from_translation(origin)
-                        .looking_to(-aim, Vec3::Y)
+                        .looking_to(-hand_aim, Vec3::Y)
                         .with_scale(Vec3::splat(MUZZLE_SCALE)),
                 )),
             };
         }
         let shot = (
-            Transform::from_translation(origin).looking_to(aim, Vec3::Y),
-            Projectile::from_gun(gun, aim),
+            Transform::from_translation(origin).looking_to(hand_aim, Vec3::Y),
+            Projectile::from_gun(gun, hand_aim),
         );
         if gun.fx.bullet > 0 {
             commands
@@ -702,12 +709,18 @@ pub fn fire(
                     .iter()
                     .find(|(_, p)| p.column == column && p.id == MUZZLE_POINT)
                     .map(|(e, _)| e);
+                let origin = rigging
+                    .hardpoints
+                    .iter()
+                    .find(|(h, _)| h.hand == hand)
+                    .map_or(ac_tf.translation, |(_, t)| t.translation());
+                let hand_aim = fcs.map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
                 let arm = &mut anims.aim[i];
                 arm.sniper = gun.sniper;
                 arm.step(want[i] && gun.kind != Kind::Skip && !gun.stance, frames);
                 arm.frame = arm
                     .shoulder
-                    .and_then(|s| rigging.aim_frame(s, hand, muzzle, aim));
+                    .and_then(|s| rigging.aim_frame(s, hand, muzzle, hand_aim));
             }
             anims.apply_recoil(frames, &mut posed);
         }
@@ -834,6 +847,7 @@ pub(crate) fn silent() -> Gun {
         remaining: 0,
         magazine: 0,
         reload_time: 0.0,
+        lock_time_ticks: 0.0,
         cooldown: 0.0,
         init_speed: 0.0,
         kind: Kind::Skip,
@@ -863,6 +877,7 @@ fn gun(id: i64) -> Gun {
         remaining: magazine,
         magazine,
         reload_time: part_field(id, 10, "reload_time"),
+        lock_time_ticks: part_field(id, 10, "missile_lock_time"),
         cooldown: 0.0,
         init_speed: speed,
         kind,

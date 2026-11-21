@@ -42,6 +42,7 @@ mod collision;
 mod control;
 mod damage;
 mod env;
+mod fcs;
 mod hanger;
 mod hud;
 mod map;
@@ -279,6 +280,7 @@ fn main() {
             show,
             clips,
             control::pilot,
+            fcs::update,
             map::lod,
             pose::animate,
             boost::pose,
@@ -295,7 +297,7 @@ fn main() {
     )
     .add_systems(
         Update,
-        (hud::layout, hud::tick, hud::readouts, hud::panels)
+        (hud::layout, hud::tick, hud::readouts, hud::panels, hud::lock_cursor)
             .chain()
             .after(weapons::fire),
     );
@@ -844,6 +846,7 @@ fn show(
         warn!("design {}: {p}", design.id);
     }
     let ctrl = AcCtrlParam::calculate(&design.data);
+    let fcs = fcs::Fcs::from_ctrl(&ctrl);
     let legs_motion_id = acvd_data::part_field(design.data.legs as i64, 3, "legs_motion_id") as u8;
     let mut pilot = control::Pilot::new(ctrl, legs_motion_id);
     pilot.yaw = start.yaw;
@@ -852,6 +855,7 @@ fn show(
     }
     commands.entity(ac).insert((
         pilot,
+        fcs,
         weapons::Armament::from_design(&design.data),
         hud::Status::from_design(&design.data),
     ));
