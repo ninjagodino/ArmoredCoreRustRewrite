@@ -24,6 +24,7 @@ use bevy::prelude::*;
 
 use crate::blur::ZoomBlur;
 use crate::collision::{Collision, Layer, RAY_HALF};
+use crate::hud::Status;
 use crate::pose::{Driven, Fade, Motion};
 
 /// Movement ticks per second; `AcCtrlParam`'s `_tick` values are per tick.
@@ -157,6 +158,10 @@ pub(crate) fn lean_heading(yaw: f32, velocity: Vec3, stick: Vec2) -> f32 {
 #[derive(Component)]
 pub struct Pilot {
     pub ctrl: AcCtrlParam,
+    /// Current generator energy (`AC + 0x214` `+0x04`, `0x82830910` / `0x828307c8`).
+    pub en: f32,
+    /// Generator energy capacity (`AC + 0x214` `+0x08`, `0x8247a390` -> `0x82858408`).
+    pub en_max: f32,
     pub velocity: Vec3,
     pub yaw: f32,
     pub boost: bool,
@@ -877,8 +882,11 @@ impl Pilot {
 
     /// A standing AC moving by `ctrl`, with the default follow camera for its legs' motion set.
     pub fn new(ctrl: AcCtrlParam, legs_motion_id: u8) -> Self {
+        let en_max = ctrl.en_capacity.max(0.0);
         Self {
             ctrl,
+            en: en_max,
+            en_max,
             velocity: Vec3::ZERO,
             yaw: 0.0,
             boost: false,
@@ -922,6 +930,20 @@ impl Pilot {
             self.state = None;
         }
         self.suppress_locomotion = hold;
+    }
+
+    /// Attempts to spend `amount` EN (`360 0x82830910(..., is_passive = 0)` via `0x828b2648` /
+    /// `0x828a1820`). Rejects without draining when `en < amount` (Xenia probe
+    /// `private/xenia/en_drain2.jsonl`).
+    pub fn try_drain_en(&mut self, amount: f32) -> bool {
+        if amount <= 0.0 {
+            return true;
+        }
+        if self.en < amount {
+            return false;
+        }
+        self.en = (self.en - amount).max(0.0);
+        true
     }
 
     /// Fire direction: the follow camera's pitched forward (`FollowCam::place`); core aim is not
@@ -1034,8 +1056,13 @@ fn charge_curve(x: f32, start: f32, base: f32, center: f32, width: f32, over: f3
 }
 
 /// Enters `HighBoostState` Phase 0 (`360 0x8283ed98` -> `0x82844ea8` -> `0x8237bec8`).
+/// Drains `qb_en_drain` (`BST__HI_EN * 0.7`, Lua param 57) via `0x828b2648` -> `0x82830910` and
+/// blocks launch when EN is insufficient (Xenia probe `private/xenia/en_drain2.jsonl`).
 fn start_quick_boost(p: &mut Pilot) -> bool {
     if p.qb.is_some() || p.qb_cooldown >= 1.0 {
+        return false;
+    }
+    if !p.try_drain_en(p.ctrl.qb_en_drain) {
         return false;
     }
     p.qb_cooldown = p.ctrl.qb_reload_ticks;
@@ -1164,7 +1191,7 @@ fn step_qb(p: &mut Pilot, input: &Input, moving: bool) -> Option<QbThrust> {
             dir,
         } => {
             // `0x8237bcb0` + `0x8283fdb0`: Glide Boost cancels an active Phase 2 burst.
-            if input.glide && p.boost && moving && !p.airborne {
+            if input.glide && p.boost && moving && !p.airborne && p.en >= p.ctrl.glide_en_tick {
                 p.qb = None;
                 p.glide = true;
                 return None;
@@ -1397,6 +1424,15 @@ fn step_wall_jump(p: &mut Pilot, input: &Input, facing: Quat) -> Option<WallJump
     }
 }
 
+/// One 60 Hz tick of generator output minus passive part EN drain (`360 0x828bef18` at
+/// `0x828bf6cc..0x828bf74c`: `0x8287edd8` -> `0x8287eef0` -> `0x82830910(passive=1)` ->
+/// `0x8287ef40` -> `0x828307c8`; Xenia probes `private/xenia/en_drain{,2}.jsonl`).
+/// Runs every tick with no recovery delay and the same rate on ground and in air.
+fn step_en(p: &mut Pilot) {
+    let net = p.ctrl.en_output_tick - p.ctrl.passive_en_drain_tick;
+    p.en = (p.en + net).clamp(0.0, p.en_max);
+}
+
 /// One 60 Hz tick of movement over the highest ground under the AC.
 fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision) {
     let c = p.ctrl;
@@ -1501,12 +1537,14 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         }
     } else if let Some(wj) = wj_thrust {
         // `AcMove_wallJump` (`0x82824560`, movement slot `+0x44`):
+        // - Drains `trijump_en_tick * wj.scale` (`+0x14c`/`+0x150` = `BST__HI_EN * 1.5`) via
+        //   `0x828b2648` -> `0x82830910`; skips thrust when EN is insufficient.
         // - Vertical (`0x8281f408`: `dir.y >= 1.0`): no horizontal accel, `vy += (v_acc + h_acc) * scale`
         //   capped at `trijump_v_speed_tick`.
         // - Directional (`dir.y < 1.0`): horizontal accel `h_acc * scale` along `dir` capped at
         //   `trijump_h_speed_tick` (`0x82822af0` case 2), `vy += v_acc * 0.5 * scale` capped at
         //   `trijump_v_speed_tick * 0.8` (Xenia probe `private/xenia/wall_kick.jsonl`).
-        if wj.scale > 0.0 {
+        if wj.scale > 0.0 && p.try_drain_en(c.trijump_en_tick * wj.scale) {
             if wj.dir.y >= 1.0 {
                 horizontal *= (1.0 - drag).clamp(0.0, 1.0);
                 p.velocity.y = (p.velocity.y
@@ -1530,6 +1568,14 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         // `WallJumpState` Phase 0 (Prep) or Phase 2 (After): coast with air drag.
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     } else if !p.airborne || p.glide {
+        // Glide Boost (`0x8281ea30` / `0x8281e9d4`) drains `glide_en_tick` (`BST__HI_EN / 60`)
+        // each tick and ends immediately when `en < glide_en_tick` (`private/xenia/en_drain2.jsonl`).
+        if p.glide && !p.try_drain_en(c.glide_en_tick) {
+            p.glide = false;
+        }
+        if !p.glide && p.boost && moving {
+            let _ = p.try_drain_en(c.boost_ep_tick);
+        }
         // After a high boost ends, speed sits above the boost/walk max; `integrate` keeps steering
         // with the stick while speed decays by `over_max_decel_tick` per tick.
         let (max, accel) = if p.glide {
@@ -1545,14 +1591,21 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
                 wish * max,
                 if speed <= max { accel } else { brake },
             )
-        } else if moving {
+        } else if moving && !p.airborne {
             integrate(horizontal, wish * accel, max, c.over_max_decel_tick)
-        } else {
+        } else if !p.airborne {
             approach(horizontal, Vec2::ZERO, brake)
+        } else if p.boost && moving {
+            integrate(horizontal, wish * c.boost_acc_tick, c.boost_max_tick, c.over_max_decel_tick)
+        } else {
+            horizontal *= (1.0 - drag).clamp(0.0, 1.0);
+            horizontal
         };
     } else if p.takeoff > 0.0 {
+        let _ = p.try_drain_en(c.boost_ep_tick);
         horizontal += wish * c.jump_h_acc_tick;
     } else if p.boost && moving {
+        let _ = p.try_drain_en(c.boost_ep_tick);
         horizontal = integrate(
             horizontal,
             wish * c.boost_acc_tick,
@@ -1620,6 +1673,7 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
             None => p.airborne = true,
         }
     }
+    step_en(p);
 }
 
 /// The state this frame's movement shows, given the one playing.
@@ -1725,7 +1779,7 @@ pub fn pilot(
     garage: Res<crate::Garage>,
     collision: Res<Collision>,
     motion: Option<ResMut<Motion>>,
-    mut acs: Query<(&mut Pilot, &mut Transform, &GlobalTransform)>,
+    mut acs: Query<(&mut Pilot, &mut Transform, &GlobalTransform, Option<&mut Status>)>,
     mut cams: Query<(&mut Orbit, &mut Transform, &mut Projection, &mut ZoomBlur), Without<Pilot>>,
     joints: Query<(&Driven, &GlobalTransform)>,
     mut window: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
@@ -1754,7 +1808,8 @@ pub fn pilot(
             c.visible = visible;
         }
     }
-    let (Some(mut motion), Ok((mut p, mut transform, ac_global))) = (motion, acs.single_mut())
+    let (Some(mut motion), Ok((mut p, mut transform, ac_global, mut status))) =
+        (motion, acs.single_mut())
     else {
         return;
     };
@@ -1801,7 +1856,7 @@ pub fn pilot(
     p.boost |= held.0.contains(&KeyCode::ShiftLeft);
     p.command = input.stick;
     if p.qb.is_none() && p.wj.is_none() {
-        p.glide |= input.glide && p.boost && !p.airborne;
+        p.glide |= input.glide && p.boost && !p.airborne && p.en >= p.ctrl.glide_en_tick;
         p.jump_queued |= input.jump && !p.airborne;
         p.wall_jump_queued |= input.jump && p.airborne;
     }
@@ -1828,6 +1883,10 @@ pub fn pilot(
         p.cam.accel = (p.velocity - before).with_y(0.0).length() * TICK_TO_KMH;
         let velocity = p.velocity;
         p.cam.blur_tick(velocity);
+    }
+    if let Some(status) = status.as_deref_mut() {
+        status.en = p.en;
+        status.en_max = p.en_max;
     }
     transform.rotation = Quat::from_rotation_y(p.yaw);
 
@@ -2360,5 +2419,114 @@ mod tests {
         p.velocity = Vec3::ZERO;
         assert_eq!(travel_eighth(&p, Vec2::Y), 0);
         assert_eq!(travel_eighth(&p, Vec2::new(1.0, 1.0)), 1);
+    }
+
+    #[test]
+    fn en_high_boost_drains_and_blocks_when_low() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        assert!(ctrl.en_capacity > 0.0 && ctrl.en_output > ctrl.passive_en_drain);
+        assert!((ctrl.qb_en_drain - ctrl.hi_en * 0.7).abs() < 1e-3);
+
+        let mut p = Pilot::new(ctrl, 0);
+        assert_eq!(p.en, p.en_max);
+        assert!(start_quick_boost(&mut p));
+        assert!((p.en - (p.en_max - ctrl.qb_en_drain)).abs() < 1e-2);
+
+        // Immediate recharge with no delay, same on ground and in air.
+        let before_rec = p.en;
+        let net_tick = ctrl.en_output_tick - ctrl.passive_en_drain_tick;
+        step_en(&mut p);
+        assert!((p.en - (before_rec + net_tick)).abs() < 1e-3);
+
+        // High Boost is blocked without draining when EN < qb_en_drain.
+        p.qb = None;
+        p.qb_cooldown = 0.0;
+        p.en = ctrl.qb_en_drain - 10.0;
+        let low_en = p.en;
+        assert!(!start_quick_boost(&mut p));
+        assert_eq!(p.en, low_en);
+    }
+
+    #[test]
+    fn en_glide_drains_and_ends_on_depletion() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        let collision = Collision::default();
+        let mut p = Pilot::new(ctrl, 0);
+        let mut pos = Vec3::ZERO;
+        p.boost = true;
+        p.glide = true;
+        // Start with just enough EN for 2 ticks of glide (net drain per tick = glide - net_rec).
+        let net_rec = ctrl.en_output_tick - ctrl.passive_en_drain_tick;
+        let net_drain = ctrl.glide_en_tick - net_rec;
+        assert!(net_drain > 0.0, "glide drains faster than generator surplus");
+        p.en = ctrl.glide_en_tick * 1.5;
+
+        let input = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
+        step(&mut p, &input, &mut pos, &collision);
+        assert!(p.glide, "still gliding while EN >= glide_en_tick");
+        // Keep stepping until EN drops below glide_en_tick -> glide must end.
+        for _ in 0..20 {
+            if !p.glide {
+                break;
+            }
+            step(&mut p, &input, &mut pos, &collision);
+        }
+        assert!(!p.glide, "glide ends once EN < glide_en_tick");
+        let after_stop = p.en;
+        step(&mut p, &input, &mut pos, &collision);
+        assert!(
+            p.en > after_stop,
+            "EN immediately recharges after glide ends"
+        );
+    }
+
+    #[test]
+    fn en_wall_kick_drains_and_skips_when_low() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        assert!((ctrl.trijump_en_drain - ctrl.hi_en * 1.5).abs() < 1e-2);
+        let collision = Collision::default();
+        let mut p = Pilot::new(ctrl, 0);
+        let mut pos = Vec3::new(0.0, 20.0, 0.0);
+        p.airborne = true;
+        p.wj = Some(WallJumpPhase::Accel {
+            timer: 0.0,
+            dir: Vec3::Y,
+            clip_dir: 0,
+        });
+        let input = Input::default();
+        let before = p.en;
+        step(&mut p, &input, &mut pos, &collision);
+        assert!(p.velocity.y > 0.0, "wall kick accelerates with EN");
+        assert!(p.en < before, "wall kick drains trijump_en_tick");
+
+        // Insufficient EN skips wall-kick acceleration (0x828245e8).
+        p.velocity = Vec3::ZERO;
+        p.en = ctrl.trijump_en_tick * 0.5;
+        step(&mut p, &input, &mut pos, &collision);
+        assert!(
+            p.velocity.y <= 0.0,
+            "wall kick skips accel when EN < trijump_en_tick"
+        );
     }
 }

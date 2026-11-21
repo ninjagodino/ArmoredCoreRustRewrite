@@ -1,0 +1,34 @@
+# AC TEST -> EN drain & recharge probe:
+# 1. Ground boost, 2. Jump + Air boost, 3. High Boost (tap & charged),
+# 4. Glide Boost all the way to EN = 0 (depletion / redline) + recovery.
+run ac_test.txt
+wait 1.5
+stick R 1 0 2.0
+wait 0.4
+
+# 1. Ground boost forward
+press LB
+wait 0.3
+stick L 0 1 1.5
+wait 1.0
+
+# 2. Jump + air boost
+hold A 0.5
+stick L 0 1 1.0
+wait 1.0
+
+# 3. High Boost (tap, then charged)
+stick L 0 -1
+down X
+wait 0.04
+up X
+wait 0.6
+hold X 0.16
+wait 0.4
+
+# 4. Glide Boost until EN hits 0, keep holding stick to observe redline/depletion, then wait to recharge
+stick L 0 1
+press LS
+wait 9.0
+release
+wait 3.0

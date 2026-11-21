@@ -79,3 +79,19 @@ category,offset,type,name,evidence
 1,312,u16,ap,"same sum as head ap (0x8286a600); core values 4329-18662"
 2,312,u16,ap,"same sum as head ap (0x8286a600); arms values 1499-7352"
 3,312,u16,ap,"same sum as head ap (0x8286a600); legs values 11436-32574"
+0,10,u16,en_consumption,"0x82475788 loads lhz +0xa; 0x8286a4c0 sums it over all equipped parts in 0x8286bd68 (subtracting generator +0xa = 0) and scales by Assemble.bin +0x14 (0x82868f40) for passive Combat-mode EN drain/s (Xenia probe private/xenia/en_drain.jsonl: 9121 EN/s on AC TEST build)"
+1,10,u16,en_consumption,same getter as head en_consumption (0x82475788)
+2,10,u16,en_consumption,same getter as head en_consumption (0x82475788)
+3,10,u16,en_consumption,same getter as head en_consumption (0x82475788)
+4,10,u16,en_consumption,same getter as head en_consumption (0x82475788)
+5,10,u16,en_consumption,"same getter as head en_consumption (0x82475788); 0 on all generators and subtracted by 0x8286bd68"
+6,10,u16,en_consumption,same getter as head en_consumption (0x82475788)
+10,10,u16,en_consumption,same getter as head en_consumption (0x82475788)
+11,10,u16,en_consumption,same getter as head en_consumption (0x82475788)
+12,10,u16,en_consumption,same getter as head en_consumption (0x82475788)
+5,308,u32,en_capacity,"0x8247a390 loads u32 at +0x134; 0x82858408 passes it to EN pool init 0x828308f0(cap, 0.0, 1.0, AC+0x214) as max EN capacity (Xenia probe private/xenia/en_drain.jsonl: 58630 on generator 111)"
+5,316,u32,en_output,"0x8247a3d0 loads u32 at +0x13c; 0x8286e700 stores it at +0x34c, 0x82868728 -> 0x82855ad8 -> 0x8287edc8 sets m_pGenerator +0x00 EN/s output (Xenia probe private/xenia/en_drain.jsonl: 15640 on generator 111)"
+6,312,u32,boost_ep,"Scr_GetPartsParam(6, 601) (AcCtrlParamCalc.lua BOOST_EP, Scr_SetParam 47/50); u32 at +0x138 (0 on all 360 boosters; Xenia probe private/xenia/en_drain2.jsonl: 0.00 in ground/air boost and jump)"
+6,40,f32,hi_en,"Scr_GetACVParam(6, float 5) (AcCtrlParamCalc.lua BST__HI_EN, Scr_SetParam 56; 0x82475890: f32 at record+0x14+4n): Glide Boost EN/s, High Boost 0.7x (param 57), Wall Kick 1.5x (params 22/23); Xenia probe private/xenia/en_drain2.jsonl: 13025/30 = 434.2 per 30 Hz frame on booster 111"
+3,360,u32,tank_boost_ep,"Scr_GetPartsParam(3, 1312) (AcCtrlParamCalc.lua BOOST_EP for tanks); u32 at +0x168 (0 on all 360 tank legs)"
+3,60,f32,tank_hi_en,"Scr_GetACVParam(3, float 10) (AcCtrlParamCalc.lua BST__HI_EN for tanks; 0x82475890: f32 at record+0x14+4n): 21054-29635 on tank legs"

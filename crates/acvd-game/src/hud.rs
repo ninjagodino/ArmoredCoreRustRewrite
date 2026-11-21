@@ -24,8 +24,8 @@
 //! at zero (`0x825970f0`).
 //!
 //! Not drawn: shoulder and hanger weapons (the rewrite has none), the damage blink of
-//! `Gauge_APEffect`, the conditional warnings of `ACV_FE_Normal`. AP and energy stay full until
-//! damage and energy drain exist.
+//! `Gauge_APEffect`, the conditional warnings of `ACV_FE_Normal`. AP stays full until damage
+//! exists; EN is driven live from `Pilot::en` / `Pilot::en_max`.
 
 use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
 use acvd_formats::vfs::Disc;
@@ -73,12 +73,15 @@ pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
 pub struct Status {
     pub ap: u32,
     pub ap_max: u32,
-    /// Energy over capacity; the HUD only shows the fraction.
-    pub energy: f32,
+    /// Current generator energy (`0x829d0b30` status `+0x10`, from `AC + 0x214` `+0x04`).
+    pub en: f32,
+    /// Generator energy capacity (`0x829d0b30` status `+0x14`, from `AC + 0x214` `+0x08`).
+    pub en_max: f32,
 }
 
 impl Status {
-    /// Full AP: the sum of the frame parts' `ap` (`sheets/ac_part_fields.csv`, `0x8286a600`).
+    /// Full AP (sum of frame parts' `ap`, `0x8286a600`) and full EN (`gene.en_capacity`,
+    /// `0x8247a390` -> `0x82858408`).
     pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
         let parts = [
             (0, design.head),
@@ -90,10 +93,21 @@ impl Status {
             .iter()
             .map(|&(category, id)| acvd_data::part_field(id as i64, category, "ap") as u32)
             .sum();
+        let en_max = acvd_data::part_field(design.gene as i64, 5, "en_capacity").max(0.0);
         Self {
             ap: ap_max,
             ap_max,
-            energy: 1.0,
+            en: en_max,
+            en_max,
+        }
+    }
+
+    /// Current EN fraction in `0..=1` (`0x82596b48` / `0x82593980`).
+    pub fn energy_fraction(&self) -> f32 {
+        if self.en_max > 0.0 {
+            (self.en / self.en_max).clamp(0.0, 1.0)
+        } else {
+            0.0
         }
     }
 }
@@ -264,10 +278,11 @@ fn reading(
             (s.ap.min(999_999), f, s.ap_max > 0 && f < tuning(322))
         }),
         Readout::Energy => status.map(|s| {
+            let f = s.energy_fraction();
             (
-                (s.energy * 10000.0) as u32,
-                s.energy,
-                s.energy < tuning(323),
+                (f * 10000.0) as u32,
+                f,
+                s.en_max > 0.0 && f < tuning(323),
             )
         }),
         Readout::LeftArm | Readout::RightArm => gun(arms, which).map(|g| {
@@ -547,6 +562,29 @@ mod tests {
             .flat_map(|(_, rows)| rows.iter())
             .find(|r| r.id == 5001)
             .unwrap();
-        assert_eq!(Status::from_design(&d.data).ap, 34695);
+        let s = Status::from_design(&d.data);
+        assert_eq!(s.ap, 34695);
+        assert!(s.en_max > 0.0 && s.en == s.en_max);
+        assert_eq!(s.energy_fraction(), 1.0);
+    }
+
+    #[test]
+    fn status_en_and_red_zone() {
+        let mut s = Status {
+            ap: 30000,
+            ap_max: 30000,
+            en: 58630.0,
+            en_max: 58630.0,
+        };
+        let (digits, fill, low) = reading(Readout::Energy, Some(&s), None).unwrap();
+        assert_eq!(digits, 10000);
+        assert_eq!(fill, 1.0);
+        assert!(!low);
+
+        s.en = s.en_max * 0.2;
+        let (digits, fill, low) = reading(Readout::Energy, Some(&s), None).unwrap();
+        assert_eq!(digits, 2000);
+        assert!((fill - 0.2).abs() < 1e-6);
+        assert!(low, "20% EN is below en_red_zone");
     }
 }

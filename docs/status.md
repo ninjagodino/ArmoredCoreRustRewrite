@@ -90,8 +90,7 @@ in order:
 - **Damage model**: AP, bullet hit vs AC / enemy hit shapes, defense mitigation (KE/CE/TE vs
   defense thresholds), impact (range-decay curve `0x827ca448` and bullet units are done; see
   Weapons leftovers and Done).
-- **Lock-on / FCS** (see FCS / lock-on HUD). Energy drain (the lock-sight EN gauge is drawn
-  full; see UI leftovers). Boost gauge.
+- **Lock-on / FCS** (see FCS / lock-on HUD). Boost gauge. (Generator EN drain & recharge are now in, see Done.)
 
 - **Animation**: TAE event reader; core control (upper body faces the aim while legs strafe);
   upper/lower body layering; part `*_a` clips beyond the hand weapons, arms and boosters.
@@ -131,10 +130,10 @@ in order:
     then `glide` (row 218, 360-frame wheel, booster clip 1). In the air: one directional entry
     (rows 223-230, anims 63-70, 30 frames, sector `0x82825918` / builder `0x82883c80`) then
     `glide_air` (row 222 空中浮遊, anim 62, 360-frame wheel, booster clip 3, builder
-    `0x82883d30`). Camera action 26, cue b00000006 (taken as the start). What ends a glide
-    in the air (EN) is open. The damage rows 239-242 / 246-247 are not played.
-  - High Boost / Boost Charge leftovers (burst phases, charge curve, decay and re-fire done; see
-    Done "High Boost and Boost Charge"): EN drain (`BST__QUICK_EN_RATE`, Lua param 53) and the
+    `0x82883d30`). Camera action 26, cue b00000006 (taken as the start). Glide EN drain and
+    depletion end are now in (see Done "Generator Energy (EN) drain & recharge"). The damage rows 239-242 / 246-247 are not played.
+  - High Boost / Boost Charge leftovers (burst phases, charge curve, decay, re-fire, and EN drain done; see
+    Done "High Boost and Boost Charge" and "Generator Energy (EN) drain & recharge"): the
     boost-off ground walk-brake gate (`0x8283fc10` -> `0x82845590` -> `0x8283f3d0`, which holds
     `+0x1c0 = 1` with `hispeed_brake_tick` until horizontal speed drops below the 80 km/h walk
     threshold instead of decaying by `over_max_decel_tick`).
@@ -166,9 +165,10 @@ in order:
     arm's fire button. Ready-position weapons purge instead of moving onto the rack. The
     rack holds the stow until the hand weapon is seated (frame 40), then `a00_011` turns the prong (`sheets/hanger_anim.csv`).
   - Not done: target hit shapes and defense mitigation, arm firing-stability reload factor
-    (`0x8286bd00` / `0x8286adf8`), energy drain, missiles (`bulletmissile`), blades, shoulder
+    (`0x8286bd00` / `0x8286adf8`), missiles (`bulletmissile`), blades, shoulder
     weapons (category 12 bullet ids at +356/+360), weapon modes, core aim (shots follow the
-    camera pitch, not a posed upper body). The lock-sight HUD shows AP, energy, the
+    camera pitch, not a posed upper body). Energy weapon per-shot EN drain (`en_drain`,
+    `0x828a1820`) is now wired. The lock-sight HUD shows AP, live energy, the
     `AlphaAnimSprite` gauges and the hand-weapon ammo counts (`acvd-game::hud`).
   - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
     360 call that starts `a00_001` on a held trigger was not found (joint-control bit 31 at
@@ -221,10 +221,9 @@ in order:
   byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0).
   HUD: `Gauge_APEffect` damage blink (StaticDrawParam +0x430 / +0x434), the lock-sight show scale
   (StaticDrawParam +0x448 = 0.53, not applied), the weapon-gauge fill formula inside `0x829d0580`,
-  shoulder / hanger panels (no weapons there yet), generator EN capacity (Lua `gene_owen_out` =
-  `Scr_GetACVParam(5, Float32(3))` = generator f32 +0x20, values 25300–99100; the HUD digits are
-  percent so a full bar is 100.00 either way). Xenia re-check pending: `private/xenia/hud_apen.txt`
-  (`0x829d0b30` status AP/EN, `0x8286a668` AP sum) with `boost_vfx.txt`. **Param enums**:
+  shoulder / hanger panels (no weapons there yet). Live EN capacity / drain / recharge and red-zone
+  HUD are now wired (Xenia probes `private/xenia/en_drain{,2}.jsonl` confirmed HUD status EN
+  `+0x10`/`+0x14` = `58630/58630`). **Param enums**:
   TDF reader.
 - **Effects leftovers** (FFX player done, see Done): every slot meaning in
   `sheets/ffx_actions.csv` is inferred from the effect files. The 360 action-id to class map
@@ -289,6 +288,19 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **Generator Energy (EN) drain & recharge** (`acvd-game::control`, `weapons`, `hud`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`; Xenia probes `private/xenia/en_drain{,2}.txt` -> `.jsonl`, recipe `tools/xenia/recipes/en_drain.txt`):
+  - **EN Pool (`AC + 0x214`, `0x828308f0` init, `0x82830910` drain, `0x828307c8` recharge)** & **Generator (`AC + 0x248` `m_pGenerator`, `0x82855ad8` -> `0x8287edc8` ctor, `0x8287edd8`/`0x8287eec8`/`0x8287eef0`/`0x8287ef40`)**:
+    - Capacity: generator `u32 +0x134` (`0x8247a390` -> `0x82858408` -> `0x828308f0(cap, 0.0, 1.0)`), `58630` on generator 111 (`en_drain.jsonl`). Critical threshold `+0x0c` is `0.0` (no redline lockout in ACVD; active drains with `is_passive == 0` simply return `0` without draining when `cur_en < amount`).
+    - Output: normal mode uses generator `u32 +0x13c` (`0x8247a3d0` -> `0x8286e700` `+0x34c` -> `0x8287edc8` `+0x00`), `15640` EN/s on generator 111; OW mode (`+0x10 != 0`) uses `core.en_conductivity * 0.01 * gene_owen_out` (`0x82868798`, `21505`).
+    - Passive drain: `0x8286a4c0` sums `u16 +0x0a` (`0x82475788`) over all equipped parts (minus generator `+0x0a` = `0` in `0x8286bd68`) × `Assemble.bin +0x14` (`1.0`, `0x82868f40`); `9121` EN/s on the AC TEST build. Each frame `0x828bef18` fills `m_pGenerator +0x08 = output * dt`, draws `passive_drain * dt` via `0x8287eef0` (overflowing to `0x82830910(passive=1)` if overloaded), and recharges `AC + 0x214` with the surplus via `0x8287ef40` -> `0x828307c8` (`+217.4` EN per 30 Hz frame = `6519` EN/s net, no recovery delay, identical on ground and in air; Scan Mode `AC + 0xdb0` uses `0x8286a558` with `NewAcBehavior` fields 319-331, not yet wired).
+  - **Action & weapon drains**:
+    - **High Boost** (`AcActCtrl_startHighBoost` `0x8283ed98` -> `0x828b2648` -> `0x82830910`): drains `qb_en_drain = BST__HI_EN * 0.7` (Lua param 57 `kickEnDrainAtOnce`, probed `9117.5 = 13025 * 0.7` on launch for both tap and charged High Boost) and blocks launch when `en < qb_en_drain`.
+    - **Glide Boost** (`0x8281ea30` / `0x8281e9d4`): drains `hi_en * dt` (`BST__HI_EN`, Lua param 56, probed `434.2` per 30 Hz frame = `13025` EN/s); returns `0` and ends glide immediately when `en < amount` (`en_drain2.jsonl` `t=41552ms`: `en = 425.1 < 434.18` ends glide and immediately recharges next frame).
+    - **Wall Kick** (`AcMove_wallJump` `0x82824560`): drains `trijump_en_drain * dt * scale` (`BST__HI_EN * 1.5`, Lua params 22/23 at movement `+0x14c`/`+0x150`) each Phase 1 Accel tick, skipping thrust when insufficient.
+    - **Ground / Air Boost & Jump** (`0x828225e8` / `0x828234f0` / `0x828227f0`): drain `BOOST_EP * dt` (Lua params 47/50; `0` on all 360 boosters and tank legs, probed `0.00`).
+    - **Energy weapons** (`0x828a1820`, `weapons.rs`): `Gun::en_drain` (`category 10 +0x14c`) blocks firing when `en < en_drain` and drains on each shot.
+  - **HUD (`hud.rs`)**: `Status` tracks live `en` / `en_max` synced from `Pilot` (and `weapons::fire`), driving `Gauge_EN`, `EN1..EN5` digits, and the `en_red_zone` (`0.3`) fade to red (`private/shots/en_glide_mid.png` `056.12`, `private/shots/en_glide_red.png` `021.00` red).
 
 - **Wall Kick / Wall Jump (三角跳び)** (`acvd-game::collision`, `control`, `sfx`, `sound`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`, `sheets/ac_states.csv`; Xenia probe `private/xenia/wall_kick.txt` -> `.jsonl`, recipe `tools/xenia/recipes/wall_kick.txt`):
   - **Surface & material filter (`0x8371d460`, `0x82b9dc38` -> `0x82c52498`, `0x828aa500`)**: the 27-entry HMD material table at `0x8371d460` stores per-material exclusion masks (`water`/`ashore` `0x02`, `camera` `0x08`, `enehit` `0x10`, `plyerhit` `0x20`, `ackickrhit` `0x60` = `0x20 | 0x40`; normal terrain `concrete`/`clay`/`iron`/etc. = `0x00`). `WallJumpHitChecker` (`0x828aa500`, built by `0x82858f10` from `NewAcBehavior +0x628/+0x62c` = radius `6.0 m` at height `3.0 m` for all leg types) sets filter `0x100042` (`0x82c43c20`), excluding `water` (`0x02`) and `ackickrhit` (`0x40`) as well as objects with `AcObjectParam.enable_wall_jump == 0`. `0x828ab428` rejects contacts with `|dot(normal, +Y)| > NewAcBehavior[+0x4f8] * deg2rad` (`45° * pi/180 = 0.7854`).

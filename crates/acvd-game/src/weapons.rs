@@ -41,6 +41,7 @@ use bevy::prelude::*;
 use crate::assemble::Placement;
 use crate::collision::Collision;
 use crate::control::{Held, Pilot, Piloting};
+use crate::hud::Status;
 use crate::pose::{self, Driven, Motion};
 use crate::sfx::{EffectPoint, Sfx};
 use crate::sound::{self, Cues};
@@ -168,6 +169,9 @@ pub struct Gun {
     pub flight: Flight,
     pub damage_power: f32,
     pub damage_recoil: f32,
+    /// Per-shot EN drain (`category 10 +0x14c`, `0x8247cec0`, drained via `0x828a1820` ->
+    /// `0x82830910`; 0 on kinetic weapons).
+    pub en_drain: f32,
     pub decay: RangeDecay,
     pub fx: Fx,
     /// `acweaponsoundparam.shoot`. `≤ 0` plays nothing.
@@ -512,7 +516,7 @@ pub fn fire(
     pads: Query<&Gamepad>,
     mut speaker: Speaker,
     mut commands: Commands,
-    mut acs: Query<(&mut Pilot, &mut Armament, &Transform), Without<ClipJoint>>,
+    mut acs: Query<(&mut Pilot, &mut Armament, &Transform, Option<&mut Status>), Without<ClipJoint>>,
     rigging: Rigging,
     points: Query<(Entity, &EffectPoint)>,
     mut body: Body,
@@ -526,7 +530,7 @@ pub fn fire(
         return;
     }
     let dt = time.delta_secs();
-    let Ok((mut pilot, mut arms, ac_tf)) = acs.single_mut() else {
+    let Ok((mut pilot, mut arms, ac_tf, mut status)) = acs.single_mut() else {
         return;
     };
     let down = |k: KeyCode| keys.pressed(k) || held.0.contains(&k);
@@ -568,7 +572,10 @@ pub fn fire(
     for (i, gun) in arms.hands.iter_mut().enumerate() {
         gun.cooldown = (gun.cooldown - dt * TICK_RATE).max(0.0);
         let hand = if i == 0 { Hand::Right } else { Hand::Left };
-        let can = gun.kind != Kind::Skip && gun.remaining > 0 && gun.cooldown <= 0.0;
+        let can = gun.kind != Kind::Skip
+            && gun.remaining > 0
+            && gun.cooldown <= 0.0
+            && pilot.en >= gun.en_drain;
         // Ready weapons wait out the body stance. A sniper rifle does not take one.
         let stance_ready = !gun.stance
             || body.motion.is_none()
@@ -603,8 +610,12 @@ pub fn fire(
                 anims.kick(hand, gun.sniper);
             }
         }
-        if !fired {
+        if !fired || !pilot.try_drain_en(gun.en_drain) {
             continue;
+        }
+        if let Some(status) = status.as_deref_mut() {
+            status.en = pilot.en;
+            status.en_max = pilot.en_max;
         }
         let origin = rigging
             .hardpoints
@@ -720,6 +731,7 @@ pub(crate) fn silent() -> Gun {
         flight: Flight::default(),
         damage_power: 0.0,
         damage_recoil: 0.0,
+        en_drain: 0.0,
         decay: RangeDecay::default(),
         fx: Fx::default(),
         shoot: 0,
@@ -745,6 +757,7 @@ fn gun(id: i64) -> Gun {
         flight,
         damage_power: part_field(id, 10, "damage_power"),
         damage_recoil: part_field(id, 10, "damage_recoil"),
+        en_drain: part_field(id, 10, "en_drain"),
         decay: RangeDecay {
             no_decay_range: part_field(id, 10, "no_decay_range"),
             damp_range: part_field(id, 10, "damp_range"),
@@ -1829,5 +1842,14 @@ mod tests {
             .expect("part 1720 hit_id has an acweaponsoundparam row");
         assert_eq!(g.shoot, row.data.shoot);
         assert!(g.shoot > 0, "rifle shoot cue");
+        assert_eq!(g.en_drain, 0.0, "kinetic rifle has zero EN drain");
+    }
+
+    #[test]
+    fn energy_weapon_reads_en_drain() {
+        let g = gun(810);
+        let expected = part_field(810, 10, "en_drain");
+        assert!(expected > 0.0, "laser weapon 810 has positive EN drain");
+        assert_eq!(g.en_drain, expected);
     }
 }
