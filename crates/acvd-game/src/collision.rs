@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use acvd_data::find;
+use acvd_data::generated::ac_unit::PARAM_ACOBJECTPARAM_BIN;
 use acvd_formats::vfs::{self, Disc};
 use acvd_formats::{hmd, msb};
 use anyhow::Result;
@@ -36,6 +38,11 @@ pub struct Hit {
     pub b: Vec3,
     pub c: Vec3,
     pub layer: Layer,
+    /// Whether `WallJumpHitChecker` (`0x828aa500`, filter `0x100042`) can kick off this triangle.
+    /// False for `water`/`ashore` (mask `0x02`), `camera` (`0x08`), `enehit` (`0x10`),
+    /// `ackickrhit` (`0x60`, bit `0x40`), and objects with `AcObjectParam.enable_wall_jump == 0`
+    /// (360 HMD material table `0x8371d460`, `0x82b9dc38` -> `0x82c52498`).
+    pub wall_kickable: bool,
 }
 
 #[derive(Resource, Default)]
@@ -172,6 +179,50 @@ impl Collision {
         }
         normals
     }
+
+    /// Wall-kick sphere query (`WallJumpHitChecker`, 360 `0x828aa500` filter `0x100042`, sphere
+    /// built by `0x82858f10` from `NewAcBehavior +0x628/+0x62c` = radius 6.0 m at height 3.0 m).
+    /// Returns the unit outward normal of the closest `wall_kickable` triangle within `radius`
+    /// whose normal satisfies `|n.y| <= max_normal_y` (`0x828ab428`, `NewAcBehavior +0x4f8` x
+    /// `deg2rad` = 0.7854).
+    pub fn wall_kick_contact(
+        &self,
+        feet: Vec3,
+        radius: f32,
+        height: f32,
+        max_normal_y: f32,
+    ) -> Option<Vec3> {
+        let centre = feet + Vec3::Y * height;
+        let r2 = radius * radius;
+        let mut best: Option<(f32, Vec3)> = None;
+        for h in self.near_disc(feet.x, feet.z, radius) {
+            if !h.wall_kickable {
+                continue;
+            }
+            let raw_n = (h.b - h.a).cross(h.c - h.a);
+            let len = raw_n.length();
+            if len < 1e-8 {
+                continue;
+            }
+            let q = closest_on_tri(centre, h.a, h.b, h.c);
+            let d = centre - q;
+            let dist2 = d.length_squared();
+            if dist2 >= r2 {
+                continue;
+            }
+            let mut n = raw_n / len;
+            if n.dot(d) < 0.0 {
+                n = -n;
+            }
+            if n.y.abs() > max_normal_y {
+                continue;
+            }
+            if best.is_none_or(|(b, _)| dist2 < b) {
+                best = Some((dist2, n));
+            }
+        }
+        best.map(|(_, n)| n)
+    }
 }
 
 /// One AC body sphere: radius, centre height above the feet.
@@ -265,12 +316,49 @@ fn tri_y(a: Vec3, b: Vec3, c: Vec3, x: f32, z: f32, from: f32, to: f32) -> Optio
     (t >= 0.0 && (to..=from).contains(&y)).then_some(y)
 }
 
-fn layer_of(name: &str) -> Layer {
-    if name.to_ascii_lowercase().contains("water") {
+/// HMD material filter mask from the 360 table at `0x8371d460` (`0x82b9db78` / `0x82b9dc38` ->
+/// `0x82c52498`): `water`/`ashore` = `0x02`, `camera` = `0x08`, `enehit` = `0x10`,
+/// `plyerhit` = `0x20`, `ackickrhit` = `0x60` (`0x20 | 0x40`), all other surfaces = `0x00`.
+pub fn material_mask(name: &str) -> u8 {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("ackickrhit") {
+        0x60
+    } else if lower.contains("plyerhit") {
+        0x20
+    } else if lower.contains("enehit") {
+        0x10
+    } else if lower.contains("camera") {
+        0x08
+    } else if lower.contains("bottomwater") {
+        0x00
+    } else if lower.contains("water") || lower.contains("ashore") {
+        0x02
+    } else {
+        0x00
+    }
+}
+
+fn layer_of(mask: u8) -> Layer {
+    if mask & 0x02 != 0 {
         Layer::Water
     } else {
         Layer::Ground
     }
+}
+
+/// Whether `oNNNN` allows wall kicks (`param/acobjectparam.bin` `enable_wall_jump`, default row 0
+/// = 1 for map pieces or objects without a dedicated row).
+fn object_wall_kickable(model: &str) -> bool {
+    let Some(id) = model
+        .strip_prefix('o')
+        .or_else(|| model.strip_prefix('O'))
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
+        return true;
+    };
+    find(PARAM_ACOBJECTPARAM_BIN, id)
+        .or_else(|| find(PARAM_ACOBJECTPARAM_BIN, 0))
+        .map_or(true, |r| r.data.enable_wall_jump != 0)
 }
 
 fn mirror(v: [f32; 3]) -> Vec3 {
@@ -308,6 +396,7 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
             continue;
         };
         let xf = crate::map::xform(part);
+        let obj_kickable = object_wall_kickable(&part.model);
         for tri in &h.triangles {
             let [a, b, c] = tri.verts.map(|i| mirror(xf.apply(verts[i as usize])));
             let mat = h
@@ -315,11 +404,13 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
                 .get(tri.material as usize)
                 .map(String::as_str)
                 .unwrap_or("");
+            let mask = material_mask(mat);
             hits.push(Hit {
                 a,
                 b,
                 c,
-                layer: layer_of(mat),
+                layer: layer_of(mask),
+                wall_kickable: obj_kickable && (mask & 0x5a) == 0,
             });
         }
     }
@@ -337,6 +428,7 @@ mod tests {
             b: Vec3::new(2.0, 1.0, 0.0),
             c: Vec3::new(0.0, 1.0, 2.0),
             layer: Layer::Ground,
+            wall_kickable: true,
         };
         let c = Collision::with_hits(
             vec![Plane {
@@ -361,6 +453,7 @@ mod tests {
             b: Vec3::from(b),
             c: Vec3::from(c),
             layer: Layer::Ground,
+            wall_kickable: true,
         };
         let c = Collision::with_hits(
             Vec::new(),
@@ -378,5 +471,50 @@ mod tests {
         let mut clear = Vec3::new(8.0, 0.0, 3.0);
         assert!(c.push_out(&mut clear).is_empty());
         assert_eq!(clear, Vec3::new(8.0, 0.0, 3.0));
+    }
+
+    #[test]
+    fn wall_kick_contact_filters_material_and_angle() {
+        let max_ny = 45.0_f32.to_radians();
+        let make = |a: [f32; 3], b: [f32; 3], c: [f32; 3], mat: &str| {
+            let mask = material_mask(mat);
+            Hit {
+                a: Vec3::from(a),
+                b: Vec3::from(b),
+                c: Vec3::from(c),
+                layer: layer_of(mask),
+                wall_kickable: (mask & 0x5a) == 0,
+            }
+        };
+        let concrete_wall = Collision::with_hits(
+            Vec::new(),
+            vec![
+                make([0.0, 0.0, -50.0], [0.0, 20.0, -50.0], [0.0, 0.0, 50.0], "uconcrete.tga"),
+                make([-50.0, 0.0, -50.0], [50.0, 0.0, -50.0], [-50.0, 0.0, 50.0], "uconcrete.tga"),
+            ],
+        );
+        // Within 6.0 m of x = 0 wall at height 3.0 m: returns outward normal (+1, 0, 0).
+        let n = concrete_wall
+            .wall_kick_contact(Vec3::new(5.5, 1.0, 0.0), 6.0, 3.0, max_ny)
+            .expect("should hit concrete wall");
+        assert!((n - Vec3::X).length() < 1e-4, "{n}");
+        // Beyond 6.0 m from the wall (only floor is within 6.0 m): floor rejected by |n.y| > 0.7854.
+        assert!(concrete_wall
+            .wall_kick_contact(Vec3::new(7.0, 1.0, 0.0), 6.0, 3.0, max_ny)
+            .is_none());
+
+        // `ackickrhit` (mask 0x60) is rejected by WallJumpHitChecker filter 0x100042.
+        let blocked_wall = Collision::with_hits(
+            Vec::new(),
+            vec![make(
+                [0.0, 0.0, -50.0],
+                [0.0, 20.0, -50.0],
+                [0.0, 0.0, 50.0],
+                "ackickrhit.tga",
+            )],
+        );
+        assert!(blocked_wall
+            .wall_kick_contact(Vec3::new(3.0, 1.0, 0.0), 6.0, 3.0, max_ny)
+            .is_none());
     }
 }

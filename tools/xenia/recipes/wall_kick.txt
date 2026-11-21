@@ -1,0 +1,78 @@
+# AC TEST -> drop off the start platform into the yard beside the tall bridge retaining wall,
+# strafe right into that tall concrete wall, then test:
+# 1. Vertical wall kick (stick pushed straight into the wall)
+# 2. Directional wall kick (stick pulled away from the wall)
+# 3. Oblique wall kick (stick forward-right into the wall)
+run ac_test.txt
+wait 1.5
+press LB
+wait 0.4
+
+# Walk forward off the start ramp into the lower yard (tall bridge wall is on the right)
+stick L 0 1
+wait 1.8
+release
+wait 0.8
+
+# Strafe right into the tall bridge retaining wall
+stick L 1 0
+wait 2.5
+shot private/xenia/shots/wall_kick_at_wall.png
+
+# 1. Vertical wall kick: short tap jump while pushing into wall, wait past 10-frame lockout, press A
+down A
+wait 0.08
+up A
+wait 0.45
+down A
+wait 0.12
+up A
+wait 0.25
+shot private/xenia/shots/wall_kick_vert.png
+wait 0.35
+down A
+wait 0.12
+up A
+wait 1.5
+release
+wait 1.0
+
+# Re-approach the tall wall on the right
+stick L 1 0
+wait 2.5
+
+# 2. Directional wall kick away from the wall: jump, pull stick left (away), press A
+down A
+wait 0.08
+up A
+wait 0.40
+stick L -1 0
+wait 0.08
+down A
+wait 0.12
+up A
+wait 0.25
+shot private/xenia/shots/wall_kick_dir.png
+wait 1.5
+release
+wait 1.0
+
+# Re-approach the tall wall on the right
+stick L 1 0
+wait 3.5
+
+# 3. Oblique wall kick (stick forward-right into wall)
+down A
+wait 0.08
+up A
+wait 0.40
+stick L 0.5 0.86
+wait 0.08
+down A
+wait 0.12
+up A
+wait 0.25
+shot private/xenia/shots/wall_kick_oblique.png
+wait 1.5
+release
+wait 0.5

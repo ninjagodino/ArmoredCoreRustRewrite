@@ -29,6 +29,12 @@ category,offset,type,name,evidence
 3,84,f32,max_load_downer,Scr_GetACVParam(3 float 16) (Lua max_load_downer_rate)
 3,88,f32,move_limit,Scr_GetACVParam(3 float 17) (Lua move_limit_rate)
 3,164,f32,boost_accel_divisor,Scr_GetACVParam(3 float 36) (Lua Scr_SetParam 48); 10 on every legs record
+3,96,f32,tri_turn_base,"Scr_GetACVParam(3, float 19) (AcCtrlParamCalc.lua Scr_SetParam 16 tir_turn_speed; 360 0x82455fe0 -> 0x82475890: f32 at record+0x14+4n): base wall-kick turn speed in deg/s (150-200)"
+3,124,f32,trijump_after_frames,"360 0x824764c0 -> 0x82475890(legs, 0x1a) x 0x82004408 (1/60) stored at AcCtrlParam +0x364 by 0x8286e700 (read by 0x82868758 -> 0x828590f8 +0x2c -> WallJumpState 0x828410a0 +0x94): Phase 2 wall-kick follow-through ticks (8-12)"
+3,128,f32,trijump_lockout_frames,"360 0x82476508 -> 0x82475890(legs, 0x1b) x 0x82004408 (1/60) stored at AcCtrlParam +0x368 by 0x8286e700 (read by 0x82868760 -> 0x828590f8 +0x30 -> action_ctrl +0x114 in 0x82841338): wall-kick re-trigger lockout ticks (12-18 biped, 25 RJ/quad, 60 tank)"
+3,132,f32,trijump_glance_angle,"360 0x8247b948 -> 0x82475890(legs, 0x1c) x 0x8371c0e8 (deg2rad) stored at AcCtrlParam +0x36c by 0x8286e700 (read by 0x82869bf8 -> 0x828590f8 +0x34 -> WallJumpState +0x9c -> 0x828abac0): wall-normal rotation angle in deg for oblique wall kicks (85 biped, 65 RJ/quad/tank)"
+3,144,f32,trijump_accel_frames,"360 0x82476418 -> 0x82475890(legs, 0x1f) stored at 0x828590f8 +0x24 -> action_ctrl +0xa4 -> WallJumpState 0x828410a0 +0x8c (x 1/60 in 0x82841338): Phase 1 wall-kick acceleration ticks (11-12 biped, 19-22 RJ, 15 quad, 1 tank; Xenia probe private/xenia/wall_kick.jsonl: 5 full 30 Hz frames + 0.5 tail = 11 ticks)"
+3,252,i16,trijump_prep_frames,"Scr_GetACVParam(3, int16 4) (AcCtrlParamCalc.lua Scr_SetParam 130; 360 0x824758b8: i16 at record+0xf4+2n -> 0x828590f8 +0x28 x 1/60 -> WallJumpState +0x90): Phase 0 wall-kick prep ticks (8/12/15/17; Xenia probe private/xenia/wall_kick.jsonl: 207 ms = 12 ticks)"
 6,308,u32,power,"Scr_GetPartsParam id 600 (Lua BOOST_POWER; 360 binding 0x82455fa8 -> per-category switch 0x8246fc0c in 0x8246fbb0; ids 600+ are the booster): u32 at +0x134; the per-id 360 getter is not traced"
 6,32,f32,std_burn_eff,Scr_GetACVParam(6 float 3) (Lua BST__STD_BURN_EFF): float at record+0x14+4n
 6,36,f32,hi_output,Scr_GetACVParam(6 float 4) (Lua BST__HI_OUTPUT)

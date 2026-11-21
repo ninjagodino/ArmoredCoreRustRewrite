@@ -186,6 +186,7 @@ struct Heard {
     airborne: bool,
     glide: bool,
     quick_boosts: u32,
+    wall_jumps: u32,
     sustain: Vec<Entity>,
 }
 
@@ -204,7 +205,8 @@ fn motion(
         stop(&mut commands, &mut heard.sustain);
         heard.moving = false;
         heard.airborne = pilot.airborne;
-        (heard.glide, heard.quick_boosts) = (pilot.glide, pilot.quick_boosts);
+        (heard.glide, heard.quick_boosts, heard.wall_jumps) =
+            (pilot.glide, pilot.quick_boosts, pilot.wall_jumps);
         return;
     }
     if pilot.quick_boosts != heard.quick_boosts {
@@ -212,10 +214,12 @@ fn motion(
             cues.play(&mut commands, &mut assets, cue, false);
         }
     }
+    let wall_jumped = pilot.wall_jumps != heard.wall_jumps;
     if pilot.glide && !heard.glide {
         cues.play(&mut commands, &mut assets, GLIDE_ON, false);
     }
-    (heard.glide, heard.quick_boosts) = (pilot.glide, pilot.quick_boosts);
+    (heard.glide, heard.quick_boosts, heard.wall_jumps) =
+        (pilot.glide, pilot.quick_boosts, pilot.wall_jumps);
     let flat = Vec2::new(pilot.velocity.x, pilot.velocity.z);
     let moving = pilot.boost && flat.length() > BOOST_MOVING;
     if moving && !heard.moving {
@@ -232,8 +236,8 @@ fn motion(
     // grounded High Boost adds its own small hop while playing `QUICK_BOOST`.
     // `se_jump` is +0xA of `AC_SOUNDPARAM_ST` (`FUN_82899168`, category 1 `c%08d`). Row 0
     // stands in for the AC's own row; every row stores the same id.
-    let jump =
-        pilot.airborne && !heard.airborne && pilot.velocity.y > 0.0 && !pilot.in_quick_boost();
+    let jump = wall_jumped
+        || (pilot.airborne && !heard.airborne && pilot.velocity.y > 0.0 && !pilot.in_quick_boost());
     heard.airborne = pilot.airborne;
     if jump {
         if let Some(row) = acvd_data::find(PARAM_ACSOUNDPARAM_BIN, 0).filter(|r| r.data.se_jump > 0)

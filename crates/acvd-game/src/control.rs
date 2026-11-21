@@ -55,6 +55,43 @@ const BLUR_MIN_ALPHA: u8 = 9;
 /// Normalized Boost Charge hold threshold that auto-fires `HighBoostState` (360 `0x8237c1b8`,
 /// float `0x8200d3f0`).
 const QB_AUTO_FIRE: f32 = 0.9999;
+/// Directional wall-kick vertical acceleration multiplier (`360 0x82824560` at `0x82824688`,
+/// float `0x8371398c` = 0.5).
+const WALL_JUMP_DIR_V_ACC_SCALE: f32 = 0.5;
+/// Directional wall-kick vertical rise cap multiplier (`360 0x82824560` at `0x828246e0`,
+/// float `0x83713988` = 0.8).
+const WALL_JUMP_DIR_V_CAP_SCALE: f32 = 0.8;
+
+/// Active `WallJumpState` (360 vtable `0x82092a20`: ctor `0x828410a0`, enter `0x828436e0`,
+/// update `0x82844648`).
+#[derive(Clone, Copy, Debug)]
+enum WallJumpPhase {
+    /// Phase 0 (`0x828438c0`): wind-up on the wall (`trijump_prep_frames`, playing
+    /// `wall_jump_prep` rows 231/233/235/237). At expiry computes the launch direction via
+    /// `0x828abac0`, zeroes `velocity.y` (`0x8281f100`), and enters `Accel`.
+    Prep {
+        timer: f32,
+        wall_normal: Vec3,
+        clip_dir: u8,
+    },
+    /// Phase 1 (`0x82841190`): launch acceleration (`trijump_accel_frames`), calling
+    /// `AcMove_wallJump` (`0x82824560`) and playing `wall_jump` rows 232/234/236/238.
+    Accel {
+        timer: f32,
+        dir: Vec3,
+        clip_dir: u8,
+    },
+    /// Phase 2 (`0x82843b88`): post-launch follow-through (`trijump_after_frames`), allowing
+    /// turns at `trijump_turn_rate` (`0x8281fcd0`) until timer expiry or touchdown.
+    After { timer: f32, clip_dir: u8 },
+}
+
+/// One tick's Wall Jump thrust command (`AcMove_wallJump` `0x82824560`, movement slot `+0x44`).
+#[derive(Clone, Copy, Debug)]
+struct WallJumpThrust {
+    dir: Vec3,
+    scale: f32,
+}
 
 /// Active `HighBoostState` (360 vtable `0x8200d378`: ctor `0x8237bec8`, update `0x8237c5a0`).
 #[derive(Clone, Copy, Debug)]
@@ -133,10 +170,18 @@ pub struct Pilot {
     pub quick_boosts: u32,
     pub second_stage_qb: bool,
     pub quick_dir: Vec3,
+    /// Wall kicks launched so far (`WallJumpState` Phase 0 -> Phase 1, `0x828438c0`).
+    pub wall_jumps: u32,
     /// Active High Boost / Boost Charge state (`0x8200d378`), and re-fire cooldown ticks
     /// (`action_ctrl +0x110`, `0x8283ed98`).
     qb: Option<QbPhase>,
     qb_cooldown: f32,
+    /// Active Wall Jump state (`0x82092a20`), and wall-kick lockout ticks (`action_ctrl +0x114`:
+    /// set to `wall_jump_post_jump_lockout` on normal jump `0x8283d4b8` and
+    /// `trijump_lockout_frames` on wall kick `0x82841338`).
+    wj: Option<WallJumpPhase>,
+    wj_lockout: f32,
+    wall_jump_queued: bool,
     /// The body-relative eighth of a high boost whose clip starts on the next state pick.
     quick_pending: Option<u8>,
     /// Ticks of take-off acceleration left.
@@ -349,6 +394,7 @@ fn camera_action(state: &str, boost: bool, airborne: bool) -> u32 {
         "turn_left" | "turn_right" => 3,
         "land" => 9,
         "glide_start" | "glide" | "glide_air_in" | "glide_air" => 0x1a,
+        "wall_jump_prep" | "wall_jump" => 0x2b,
         "quick_boost" => 0x32,
         _ => 8,
     };
@@ -823,6 +869,12 @@ impl Pilot {
         self.qb.is_some()
     }
 
+    /// Whether `WallJumpState` (`0x82092a20`) is in its Phase 1 acceleration burst
+    /// (`AcMove_wallJump` `0x82824560`, which lights booster SFX mode 4 at `wall_jump_sfx_scale`).
+    pub fn in_wall_jump_accel(&self) -> bool {
+        matches!(self.wj, Some(WallJumpPhase::Accel { .. }))
+    }
+
     /// A standing AC moving by `ctrl`, with the default follow camera for its legs' motion set.
     pub fn new(ctrl: AcCtrlParam, legs_motion_id: u8) -> Self {
         Self {
@@ -836,8 +888,12 @@ impl Pilot {
             quick_boosts: 0,
             second_stage_qb: false,
             quick_dir: FORWARD,
+            wall_jumps: 0,
             qb: None,
             qb_cooldown: 0.0,
+            wj: None,
+            wj_lockout: 0.0,
+            wall_jump_queued: false,
             quick_pending: None,
             takeoff: 0.0,
             jump_queued: false,
@@ -1209,13 +1265,155 @@ fn integrate(v: Vec2, accel: Vec2, max: f32, decel: f32) -> Vec2 {
     next.normalize_or(v / speed) * (speed * (1.0 - decel)).max(max)
 }
 
+/// Computes the wall-kick launch direction (`360 0x828abac0`):
+/// - Zero stick -> `(0, 1, 0)` (vertical wall kick).
+/// - Stick away from the wall (`dot(wish, wall_normal) > 0`) -> `wish`.
+/// - Stick straight into the wall (`dot < -cos(vertical_angle_rad)`) -> `(0, 1, 0)` (vertical).
+/// - Stick obliquely into the wall -> horizontal `wall_normal` rotated by `±glance_rad` toward `wish`.
+fn wall_jump_dir(
+    stick: Vec2,
+    facing: Quat,
+    wall_normal: Vec3,
+    vertical_angle_rad: f32,
+    glance_rad: f32,
+) -> Vec3 {
+    if stick.length_squared() < 1e-6 {
+        return Vec3::Y;
+    }
+    let forward = facing * FORWARD;
+    let right = forward.cross(Vec3::Y);
+    let wish = (right * stick.x + forward * stick.y).normalize_or_zero();
+    if wish.length_squared() < 1e-6 {
+        return Vec3::Y;
+    }
+    let n = wall_normal.normalize_or(Vec3::Z);
+    let dot = wish.dot(n);
+    if dot > 0.0 {
+        return wish;
+    }
+    if dot < -vertical_angle_rad.cos() {
+        return Vec3::Y;
+    }
+    let flat_n = Vec3::new(n.x, 0.0, n.z).normalize_or(Vec3::Z);
+    let sign = if flat_n.cross(wish).y >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    Quat::from_rotation_y(sign * glance_rad) * flat_n
+}
+
+/// Body-local cardinal direction (0 front, 2 right, 4 back, 6 left) of the outward wall normal,
+/// for `wall_jump_prep` (rows 237/235/231/233, `0x82884da8`) and `wall_jump` (rows 238/236/232/234,
+/// `0x82884688`) via `WallJumpState::enter` (`0x828436e0`).
+fn wall_jump_clip_dir(yaw: f32, wall_normal: Vec3) -> u8 {
+    let forward = Quat::from_rotation_y(yaw) * FORWARD;
+    let right = forward.cross(Vec3::Y);
+    let local = Vec2::new(wall_normal.dot(right), wall_normal.dot(forward));
+    if local.y.abs() >= local.x.abs() {
+        if local.y >= 0.0 {
+            0
+        } else {
+            4
+        }
+    } else if local.x >= 0.0 {
+        2
+    } else {
+        6
+    }
+}
+
+/// Steps `WallJumpState` (`360 0x82844648`: Phase 0 `0x828438c0`, Phase 1 `0x82841190`,
+/// Phase 2 `0x82843b88`) by one 60 Hz tick.
+fn step_wall_jump(p: &mut Pilot, input: &Input, facing: Quat) -> Option<WallJumpThrust> {
+    let phase = p.wj?;
+    let c = p.ctrl;
+    match phase {
+        WallJumpPhase::Prep {
+            timer,
+            wall_normal,
+            clip_dir,
+        } => {
+            let next_t = timer + 1.0;
+            if next_t >= c.trijump_prep_frames {
+                let dir = wall_jump_dir(
+                    input.stick,
+                    facing,
+                    wall_normal,
+                    c.wall_jump_vertical_angle_rad,
+                    c.trijump_glance_rad,
+                );
+                // `0x82843b24` -> `0x8281f100`: zero vertical velocity at launch.
+                p.velocity.y = 0.0;
+                p.wall_jumps += 1;
+                p.wj = Some(WallJumpPhase::Accel {
+                    timer: 0.0,
+                    dir,
+                    clip_dir,
+                });
+            } else {
+                p.wj = Some(WallJumpPhase::Prep {
+                    timer: next_t,
+                    wall_normal,
+                    clip_dir,
+                });
+            }
+            None
+        }
+        WallJumpPhase::Accel {
+            timer,
+            dir,
+            clip_dir,
+        } => {
+            let next_t = timer + 1.0;
+            if next_t <= c.trijump_accel_frames {
+                p.wj = Some(WallJumpPhase::Accel {
+                    timer: next_t,
+                    dir,
+                    clip_dir,
+                });
+                Some(WallJumpThrust { dir, scale: 1.0 })
+            } else {
+                let scale = (c.trijump_accel_frames - timer).max(0.0);
+                p.wj = Some(WallJumpPhase::After {
+                    timer: 0.0,
+                    clip_dir,
+                });
+                Some(WallJumpThrust { dir, scale })
+            }
+        }
+        WallJumpPhase::After { timer, clip_dir } => {
+            let next_t = timer + 1.0;
+            if next_t > c.trijump_after_frames {
+                p.wj = None;
+            } else {
+                p.wj = Some(WallJumpPhase::After {
+                    timer: next_t,
+                    clip_dir,
+                });
+            }
+            None
+        }
+    }
+}
+
 /// One 60 Hz tick of movement over the highest ground under the AC.
 fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision) {
     let c = p.ctrl;
     if p.qb_cooldown >= 1.0 {
         p.qb_cooldown = (p.qb_cooldown - 1.0).max(0.0);
     }
-    p.yaw += input.turn * c.turn_rate / TICK_RATE;
+    if p.wj_lockout > 0.0 {
+        p.wj_lockout = (p.wj_lockout - 1.0).max(0.0);
+    }
+    // `WallJumpState` Phases 0 and 2 turn via movement slot `+0xb4` (`0x8281fcd0`, `trijump_turn_rate`);
+    // Phase 1 (`0x82841190`) does not turn.
+    let turn_rate = match p.wj {
+        Some(WallJumpPhase::Prep { .. } | WallJumpPhase::After { .. }) => c.trijump_turn_rate,
+        Some(WallJumpPhase::Accel { .. }) => 0.0,
+        None => c.turn_rate,
+    };
+    p.yaw += input.turn * turn_rate / TICK_RATE;
     // Mouselook: move relative to where the camera looks, not where the body faces.
     let facing = Quat::from_rotation_y(p.yaw + p.cam.yaw_off);
     let forward = facing * FORWARD;
@@ -1226,7 +1424,7 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     let speed = horizontal.length();
     let moving = wish != Vec2::ZERO;
     // A glide starts on the ground (`pilot`) but carries on over a drop.
-    p.glide &= p.boost && moving && p.qb.is_none();
+    p.glide &= p.boost && moving && p.qb.is_none() && p.wj.is_none();
     let brake = if speed >= c.brake_switch_tick {
         c.hispeed_brake_tick
     } else {
@@ -1237,8 +1435,43 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     } else {
         c.air_drag_tick
     };
+
+    // Wall kick trigger (`0x82841520` -> `0x82841338`): airborne, not in jump take-off (state 3),
+    // lockout (`action_ctrl +0x114`) < 1 tick, and `WallJumpHitChecker` (`0x828aa500`) hits a wall.
+    if p.wall_jump_queued {
+        p.wall_jump_queued = false;
+        if p.airborne
+            && p.wj.is_none()
+            && p.qb.is_none()
+            && p.takeoff <= 0.0
+            && p.wj_lockout < 1.0
+        {
+            if let Some(wall_normal) = collision.wall_kick_contact(
+                *position,
+                c.wall_jump_sphere_radius,
+                c.wall_jump_sphere_height,
+                c.wall_jump_surface_angle_rad,
+            ) {
+                p.wj_lockout = c.trijump_lockout_frames;
+                p.glide = false;
+                let clip_dir = wall_jump_clip_dir(p.yaw, wall_normal);
+                p.wj = Some(WallJumpPhase::Prep {
+                    timer: 0.0,
+                    wall_normal,
+                    clip_dir,
+                });
+            }
+        }
+    }
+
     let qb_thrust = step_qb(p, input, moving);
+    let wj_thrust = if qb_thrust.is_none() {
+        step_wall_jump(p, input, facing)
+    } else {
+        None
+    };
     let mut qb_hopped = false;
+    let mut wj_accelerated = false;
 
     if let Some(qb) = qb_thrust {
         // `0x82824078` with `+0x1c0 == 1` (no normal move action): ground brake or air drag runs
@@ -1266,6 +1499,36 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
             p.velocity.y = (p.velocity.y + c.quick_boost_v_acc_tick * qb.scale).min(c.qb_hop_max_tick);
             qb_hopped = true;
         }
+    } else if let Some(wj) = wj_thrust {
+        // `AcMove_wallJump` (`0x82824560`, movement slot `+0x44`):
+        // - Vertical (`0x8281f408`: `dir.y >= 1.0`): no horizontal accel, `vy += (v_acc + h_acc) * scale`
+        //   capped at `trijump_v_speed_tick`.
+        // - Directional (`dir.y < 1.0`): horizontal accel `h_acc * scale` along `dir` capped at
+        //   `trijump_h_speed_tick` (`0x82822af0` case 2), `vy += v_acc * 0.5 * scale` capped at
+        //   `trijump_v_speed_tick * 0.8` (Xenia probe `private/xenia/wall_kick.jsonl`).
+        if wj.scale > 0.0 {
+            if wj.dir.y >= 1.0 {
+                horizontal *= (1.0 - drag).clamp(0.0, 1.0);
+                p.velocity.y = (p.velocity.y
+                    + (c.trijump_v_acc_tick + c.trijump_h_acc_tick) * wj.scale)
+                    .min(c.trijump_v_speed_tick);
+            } else {
+                let accel = Vec2::new(wj.dir.x, wj.dir.z) * (c.trijump_h_acc_tick * wj.scale);
+                horizontal = integrate(
+                    horizontal,
+                    accel,
+                    c.trijump_h_speed_tick,
+                    c.over_max_decel_tick,
+                );
+                p.velocity.y = (p.velocity.y
+                    + c.trijump_v_acc_tick * WALL_JUMP_DIR_V_ACC_SCALE * wj.scale)
+                    .min(c.trijump_v_speed_tick * WALL_JUMP_DIR_V_CAP_SCALE);
+            }
+            wj_accelerated = true;
+        }
+    } else if p.wj.is_some() {
+        // `WallJumpState` Phase 0 (Prep) or Phase 2 (After): coast with air drag.
+        horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     } else if !p.airborne || p.glide {
         // After a high boost ends, speed sits above the boost/walk max; `integrate` keeps steering
         // with the stick while speed decays by `over_max_decel_tick` per tick.
@@ -1299,12 +1562,15 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     } else {
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     }
-    if p.jump_queued && !p.airborne && p.qb.is_none() {
+    if p.jump_queued && !p.airborne && p.qb.is_none() && p.wj.is_none() {
         (p.airborne, p.takeoff, p.boost, p.glide) = (true, c.jump_frames, true, false);
+        // `0x8283d4b8`: entering Jump (state 3) sets `action_ctrl +0x114` to
+        // `NewAcBehavior +0x4ae` (10 ticks), preventing immediate wall kick off the ground.
+        p.wj_lockout = c.wall_jump_post_jump_lockout;
     }
     p.jump_queued = false;
 
-    if p.airborne && !qb_hopped {
+    if p.airborne && !qb_hopped && !wj_accelerated {
         if p.takeoff > 0.0 {
             p.velocity.y += c.jump_accel_tick * p.takeoff.min(1.0);
             p.takeoff = (p.takeoff - 1.0).max(0.0);
@@ -1346,7 +1612,7 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     let ground = collision.ground_below(Vec3::new(position.x, position.y + lift, position.z));
     if p.airborne {
         if let Some(g) = ground.filter(|&g| position.y <= g && p.velocity.y <= 0.0) {
-            (position.y, p.velocity.y, p.airborne, p.landed) = (g, 0.0, false, true);
+            (position.y, p.velocity.y, p.airborne, p.landed, p.wj) = (g, 0.0, false, true, None);
         }
     } else {
         match ground.filter(|&g| g >= position.y - lift) {
@@ -1361,6 +1627,16 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
     let moving = input.stick != Vec2::ZERO;
     let dir = moving.then(|| direction(input.stick));
     let current = p.state.unwrap_or(("idle", None));
+    // Wall Jump (`WallJumpState` 0x82092a20): Phase 0 plays `wall_jump_prep` (rows 231/233/235/237,
+    // `0x82884da8`), Phase 1/2 plays `wall_jump` (rows 232/234/236/238, `0x82884688`).
+    if let Some(wj) = p.wj {
+        return match wj {
+            WallJumpPhase::Prep { clip_dir, .. } => ("wall_jump_prep", Some(clip_dir)),
+            WallJumpPhase::Accel { clip_dir, .. } | WallJumpPhase::After { clip_dir, .. } => {
+                ("wall_jump", Some(clip_dir))
+            }
+        };
+    }
     // Boost Charge wind-up plays row 284; the Phase 1 -> Phase 2 transition triggers the
     // directional High Boost clip (rows 285-292), which plays out unless a new QB, glide, or jump
     // interrupts after `HighBoostState` ends.
@@ -1524,9 +1800,10 @@ pub fn pilot(
     }
     p.boost |= held.0.contains(&KeyCode::ShiftLeft);
     p.command = input.stick;
-    if p.qb.is_none() {
+    if p.qb.is_none() && p.wj.is_none() {
         p.glide |= input.glide && p.boost && !p.airborne;
         p.jump_queued |= input.jump && !p.airborne;
+        p.wall_jump_queued |= input.jump && p.airborne;
     }
     // Re-fire is gated by `HighBoostState` ending (`0x8200d378` slot `+0x50` = `0x8241a6b8`) and
     // `action_ctrl +0x110` (`qb_reload_ticks`, `0x8283ed98`), not the animation clip length.
@@ -1867,6 +2144,146 @@ mod tests {
             "sweet-spot peak {sweet_peak} vs {}",
             ctrl.quick_boost_max_tick
         );
+    }
+
+    #[test]
+    fn wall_jump_direction_vertical_away_and_oblique() {
+        let facing = Quat::IDENTITY; // forward = -Z, right = +X
+        let wall_n = Vec3::X; // wall on left, outward normal +X
+        let vert_rad = 45.0_f32.to_radians();
+        let glance_rad = 85.0_f32.to_radians();
+
+        // Neutral stick -> vertical (0, 1, 0).
+        assert_eq!(
+            wall_jump_dir(Vec2::ZERO, facing, wall_n, vert_rad, glance_rad),
+            Vec3::Y
+        );
+        // Straight into wall (-X, dot = -1 < -cos(45°)) -> vertical (0, 1, 0).
+        assert_eq!(
+            wall_jump_dir(Vec2::new(-1.0, 0.0), facing, wall_n, vert_rad, glance_rad),
+            Vec3::Y
+        );
+        // Away from wall (+X, dot = +1 > 0) -> wish (+X).
+        let away = wall_jump_dir(Vec2::new(1.0, 0.0), facing, wall_n, vert_rad, glance_rad);
+        assert!((away - Vec3::X).length() < 1e-5, "{away}");
+        // Oblique into wall (-0.3, +0.95): -cos(45°) <= dot <= 0 -> rotated wall normal.
+        let oblique = wall_jump_dir(Vec2::new(-0.3, 0.95), facing, wall_n, vert_rad, glance_rad);
+        assert!(oblique.y.abs() < 1e-5 && oblique.x > 0.0 && oblique.z < 0.0, "{oblique}");
+        assert!(
+            (oblique.dot(wall_n) - glance_rad.cos()).abs() < 1e-4,
+            "expected cos(85°) = {}, got {}",
+            glance_rad.cos(),
+            oblique.dot(wall_n)
+        );
+    }
+
+    #[test]
+    fn wall_jump_phases_lockout_and_velocity_caps() {
+        use crate::collision::{Hit, Layer, Plane};
+        let design = &acvd_data::find(
+            acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN,
+            5001,
+        )
+        .expect("design 5001")
+        .data;
+        let ctrl = AcCtrlParam::calculate(design);
+        // Wall at x = 0, floor at y = 0.
+        let world = Collision::with_hits(
+            vec![Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            vec![
+                Hit {
+                    a: Vec3::new(0.0, 0.0, -50.0),
+                    b: Vec3::new(0.0, 40.0, -50.0),
+                    c: Vec3::new(0.0, 0.0, 50.0),
+                    layer: Layer::Ground,
+                    wall_kickable: true,
+                },
+                Hit {
+                    a: Vec3::new(0.0, 40.0, -50.0),
+                    b: Vec3::new(0.0, 40.0, 50.0),
+                    c: Vec3::new(0.0, 0.0, 50.0),
+                    layer: Layer::Ground,
+                    wall_kickable: true,
+                },
+            ],
+        );
+
+        // 1. Post-jump 10-frame lockout blocks immediate wall kick, then directional kick fires.
+        let mut p = Pilot::new(ctrl, 0);
+        let mut pos = Vec3::new(5.5, 0.0, 0.0);
+        p.jump_queued = true;
+        step(&mut p, &Input::default(), &mut pos, &world);
+        assert!(p.airborne);
+        assert_eq!(p.wj_lockout, ctrl.wall_jump_post_jump_lockout);
+        p.wall_jump_queued = true;
+        step(&mut p, &Input::default(), &mut pos, &world);
+        assert!(p.wj.is_none(), "post-jump lockout must block wall kick");
+        for _ in 0..12 {
+            step(&mut p, &Input::default(), &mut pos, &world);
+        }
+        assert!(p.wj_lockout < 1.0);
+        // Trigger directional wall kick away from wall (+X stick).
+        p.velocity.y = -0.3;
+        p.wall_jump_queued = true;
+        let away = Input {
+            stick: Vec2::new(1.0, 0.0),
+            ..Input::default()
+        };
+        step(&mut p, &away, &mut pos, &world);
+        assert!(matches!(p.wj, Some(WallJumpPhase::Prep { .. })));
+        assert_eq!(camera_action("wall_jump_prep", true, true), 43);
+        assert_eq!(camera_action("wall_jump", true, true), 43);
+
+        let mut peak_h = 0.0f32;
+        let mut peak_v = 0.0f32;
+        for _ in 0..40 {
+            step(&mut p, &away, &mut pos, &world);
+            peak_h = peak_h.max(Vec2::new(p.velocity.x, p.velocity.z).length());
+            peak_v = peak_v.max(p.velocity.y);
+            if p.wj.is_none() {
+                break;
+            }
+        }
+        assert_eq!(p.wall_jumps, 1);
+        assert!(
+            (peak_h - ctrl.trijump_h_speed_tick).abs() < 1e-3,
+            "dir wall kick h peak {peak_h} vs {}",
+            ctrl.trijump_h_speed_tick
+        );
+        assert!(
+            (peak_v - ctrl.trijump_v_speed_tick * WALL_JUMP_DIR_V_CAP_SCALE).abs() < 1e-3,
+            "dir wall kick v peak {peak_v} vs {}",
+            ctrl.trijump_v_speed_tick * WALL_JUMP_DIR_V_CAP_SCALE
+        );
+
+        // 2. Vertical wall kick (neutral stick) reaches full `trijump_v_speed_tick` with no h accel.
+        let mut p2 = Pilot::new(ctrl, 0);
+        p2.airborne = true;
+        p2.boost = true;
+        let mut pos2 = Vec3::new(5.5, 5.0, 0.0);
+        p2.wall_jump_queued = true;
+        let neutral = Input::default();
+        step(&mut p2, &neutral, &mut pos2, &world);
+        let mut vert_v = 0.0f32;
+        let mut vert_h = 0.0f32;
+        for _ in 0..40 {
+            step(&mut p2, &neutral, &mut pos2, &world);
+            vert_v = vert_v.max(p2.velocity.y);
+            vert_h = vert_h.max(Vec2::new(p2.velocity.x, p2.velocity.z).length());
+            if p2.wj.is_none() {
+                break;
+            }
+        }
+        assert_eq!(p2.wall_jumps, 1);
+        assert!(
+            (vert_v - ctrl.trijump_v_speed_tick).abs() < 1e-3,
+            "vertical wall kick v peak {vert_v} vs {}",
+            ctrl.trijump_v_speed_tick
+        );
+        assert!(vert_h < 1e-4, "vertical wall kick should add no horizontal speed, got {vert_h}");
     }
 
     #[test]
