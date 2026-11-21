@@ -82,13 +82,8 @@ in order:
     whether that is the design (AC TEST may use another AC) or a 2x step.
   - Slopes too steep to stand on, AC vs objects that move, AC vs AC (wall kick / `ackickrhit`
     filter is now in, see Done "Wall Kick / Wall Jump").
-- **AC test targets**: spawning and rendering from `m4000_actest.msb` are in (see Done "AC test
-  targets"); still open: target hit shapes / taking damage (see Damage model below) and enemy/AC
-  AI (`script/enemy/*_actest.lc`, `script/arena/actest_*.lc`).
-- **Damage model**: AP, bullet hit vs AC / enemy hit shapes, defense mitigation (KE/CE/TE vs
-  defense thresholds), impact (range-decay curve `0x827ca448` and bullet units are done; see
-  Weapons leftovers and Done).
-- **Lock-on / FCS** (see FCS / lock-on HUD). Boost gauge. (Generator EN drain & recharge are now in, see Done.)
+- **AC test targets**: spawning, rendering, hit shapes, AP/defense damage, and destruction from `m4000_actest.msb` are in (see Done "AC test targets" and "Damage model & target hits"); still open: enemy/AC AI (`script/enemy/*_actest.lc`, `script/arena/actest_*.lc`).
+- **Lock-on / FCS** (see FCS / lock-on HUD). Boost gauge. (Generator EN drain & recharge and Damage model are now in, see Done.)
 
 - **Animation**: TAE event reader; core control (upper body faces the aim while legs strafe);
   upper/lower body layering; part `*_a` clips beyond the hand weapons, arms and boosters.
@@ -286,6 +281,11 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **Damage model & target hits** (`acvd-game::damage`, `targets`, `weapons`, `sound`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`, `sheets/sound_cues.csv`):
+  - **Weapon attribute & AC frame defense stats**: category 10 byte `+0x188` (`+392`, copied at `+0x54` by `0x8247d4d8` ahead of `damage_power` `+0x18c` and `damage_recoil` `+0x190`) is `damage_type`, switched in `0x82874190` (`0` = KE on 104 weapons, `1` = TE on 79, `6` = CE on 39 across all 222 records; `4`/`7` = unmitigated via `0x827d0928`). AC frame parts (categories 0–3) sum `ke_def` (`+0x134` `u16`, `0x8286a670`, Lua `Scr_GetPartsParam(cat, 201)`), `te_def` (`+0x136` `u16`, `0x8286a6d8`, Lua `202`), and `ce_def` (`+0x20` `f32`, `0x82475890`, Lua `float 3`), converted to `(low_def, hi_def, threshold)` via `AcCtrlParamCalc.lua` lines 199–232 / 410–416 (`NewAcBehavior` fields 509–517) and packed by `0x82873e70` (`0x82868ae8`/`0x82868b50`/`0x82868bb8` + `0x82874548..0x82874818`). Stagger threshold (`clashThreshold * 0.8` = `stagger_penalty_threshold`, Lua lines 326–339, `NewAcBehavior` fields 536–540) lowers defense thresholds by `0.8×` for 2 s.
+  - **360 three-zone damage formula (`0x82874190` → `0x827d0d08` → `0x827d0cc8` → `0x827d0b50`)**: reads `NewAcBehavior` `+0x605` (`mid_damage_width_pct` = `30%`) and `+0x606` (`mid_damage_min_rate_pct` = `50%`) via `0x827d08b8`. `low_dmg = power * low_def * 0.01` (floored to `0.0` if `< 1.0`, `0x827d0978`), `hi_dmg = power * hi_def * 0.01` (`0x827d09c0`), `upper = thr * 1.30`. `power <= thr`: ricochet (`low_dmg`, `effective = false`); `power >= upper`: full penetration (`hi_dmg`, `effective = true`); `thr < power < upper`: linear ramp from `lerp(low_dmg, hi_dmg, 0.50)` to `hi_dmg` (`effective = true`). Recoil scales by `param/damage.bin` `+0x00` (`recoil_scale` = `1.0`, `0x82984438` at `0x82984518`).
+  - **Target hit shapes, VFX/SFX & destruction**: enemies resolve `e####` → `EnemyCommonSt` → `EnemyBasicSt` (AP, KE/CE/TE `low_defense`/`hi_defense`/`defense_threshold`/`stagger_penalty_def_thr`, `small_stagger_threshold`/`stagger_penalty_time`) and `EnemyGraphicsSt` hit spheres (`collision_radius`, `hit_upper_hit_sphere_radius`/`height_offset`, `one_col_sphere_offset`); test ACs use frame AP sum (`0x8286a600`), `DefenseProfile::from_ac`, and body hit spheres (`r = 3.0 @ y = 3.0`, `r = 5.5 @ y = 6.0`, `0x82863b60`). `weapons::step_projectiles` sweeps each bullet segment against living target spheres, applies range decay + `calculate_damage`, spawns `bullethitsfxparam` `dry_ac_low_damage`/`ac_hi_damage` FFX, and plays `bullethitseparam` hit sounds (`acv2_se_bombs.fev`, e.g. `w00009027` ricochet / `w00009224` effective). On `AP <= 0`, `targets::tick` spawns `sfxsesetparam` row 501/502 explosion FFX (`4019`/`4041`), plays `w00009600`/`w00009601` (enemies) or `c00000089` (`acsoundparam.se_destroy`, ACs), and swaps enemy meshes to `{model}_b.flv` (or despawns ACs). Verified by unit tests (`damage::tests::*`, `targets::tests::*`, `weapons::tests::*`, `sound::tests::gameplay_cues_decode_x360`) and `--shot` (`private/shots/damage_boom_0.png`..`_3.png`: `e1020_0002` hit twice by rifle 1720 for `-1135 AP` each, staggered, exploded with FFX 4019, and swapped to `e1020_b.flv`).
 
 - **AC test targets** (`acvd-formats::msb`, `acvd-game::targets`, `pose::spawn_static`, `main`):
   - **MSB layer & AC model links**: `acvd-formats::msb` now decodes `LAYER_PARAM_ST` (section stored at MSB reader `+0x18` by `0x82603878`, indexed by `0x8280cee8` / `0x82b91610` / `0x82b916b8`), `PARTS_PARAM_ST` `+0x64` sub-record `+0` `i16` layer index (`0x82b912b0`, resolved to `Part::layer`), and `MODEL_PARAM_ST` (`kind == 4`) `+0x18` sub-record `+0` `u16` `AcAssemblyDesignSt` ID (`0x82b91348` → `0x82b91470` at `0x82b91488`; `a0000`–`a0003` = designs `5011`–`5014`).

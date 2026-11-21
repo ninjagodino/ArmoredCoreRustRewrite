@@ -26,7 +26,8 @@
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::bullet::{
-    BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN, PARAM_BULLETHITSFXPARAM_BIN,
+    BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN, PARAM_BULLETHITSEPARAM_BIN,
+    PARAM_BULLETHITSFXPARAM_BIN,
 };
 use acvd_data::generated::sfx::PARAM_ACWEAPONSFXPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACWEAPONSOUNDPARAM_BIN;
@@ -41,10 +42,12 @@ use bevy::prelude::*;
 use crate::assemble::Placement;
 use crate::collision::Collision;
 use crate::control::{Held, Pilot, Piloting};
+use crate::damage::{self, DamageType};
 use crate::hud::Status;
 use crate::pose::{self, Driven, Motion};
 use crate::sfx::{EffectPoint, Sfx};
 use crate::sound::{self, Cues};
+use crate::targets::{Target, TargetHealth};
 
 /// Hand-weapon muzzle effect point (FLVER dummy colour byte 1 on the arm weapons).
 const MUZZLE_POINT: u8 = 101;
@@ -167,6 +170,7 @@ pub struct Gun {
     pub init_speed: f32,
     pub kind: Kind,
     pub flight: Flight,
+    pub damage_type: DamageType,
     pub damage_power: f32,
     pub damage_recoil: f32,
     /// Per-shot EN drain (`category 10 +0x14c`, `0x8247cec0`, drained via `0x828a1820` ->
@@ -176,6 +180,8 @@ pub struct Gun {
     pub fx: Fx,
     /// `acweaponsoundparam.shoot`. `≤ 0` plays nothing.
     pub shoot: i16,
+    /// `bullethitseparam` ricochet / effective hit sound cue ids (`w%08d` in `acv2_se_bombs.fev`).
+    pub hit_se: HitSe,
     /// Ready weapon (`ready_position`). Holding fire plays the body stance before the shot.
     /// A sniper rifle (`weapon_kind` 5) is not one of these.
     pub stance: bool,
@@ -198,6 +204,17 @@ pub struct Fx {
     pub bullet: i32,
     pub muzzle: i32,
     pub hit: i32,
+    /// `bullethitsfxparam.dry_ac_low_damage` (ricochet hit VFX).
+    pub hit_low: i32,
+    /// `bullethitsfxparam.ac_hi_damage` (effective hit VFX).
+    pub hit_hi: i32,
+}
+
+/// Target hit sound cue ids (`param/bullethitseparam.bin`, `acv2_se_bombs.fev` `w%08d`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HitSe {
+    pub low: i16,
+    pub hi: i16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,6 +341,7 @@ pub struct Projectile {
     velocity: Vec3,
     flight: Flight,
     decay: RangeDecay,
+    damage_type: DamageType,
     damage_power: f32,
     damage_recoil: f32,
     distance: f32,
@@ -331,6 +349,9 @@ pub struct Projectile {
     stall_frames: f32,
     life: f32,
     hit: i32,
+    hit_low: i32,
+    hit_hi: i32,
+    hit_se: HitSe,
 }
 
 impl Projectile {
@@ -340,6 +361,7 @@ impl Projectile {
             velocity: aim * gun.init_speed.max(1.0),
             flight: gun.flight,
             decay: gun.decay,
+            damage_type: gun.damage_type,
             damage_power: gun.damage_power,
             damage_recoil: gun.damage_recoil,
             distance: 0.0,
@@ -347,6 +369,9 @@ impl Projectile {
             stall_frames: 0.0,
             life: MAX_LIFE,
             hit: gun.fx.hit,
+            hit_low: gun.fx.hit_low,
+            hit_hi: gun.fx.hit_hi,
+            hit_se: gun.hit_se,
         }
     }
 
@@ -512,7 +537,6 @@ pub fn fire(
     held: Res<Held>,
     piloting: Res<Piloting>,
     assets: Res<Tracers>,
-    collision: Res<Collision>,
     pads: Query<&Gamepad>,
     mut speaker: Speaker,
     mut commands: Commands,
@@ -521,10 +545,6 @@ pub fn fire(
     points: Query<(Entity, &EffectPoint)>,
     mut body: Body,
     mut posed: Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
-    mut shots: Query<
-        (Entity, &mut Projectile, &mut Transform),
-        (Without<Armament>, Without<ClipJoint>),
-    >,
 ) {
     if !piloting.0 {
         return;
@@ -692,18 +712,106 @@ pub fn fire(
             anims.apply_recoil(frames, &mut posed);
         }
     }
+}
+
+/// Steps in-flight projectiles against target hit spheres and map ground collision, applying
+/// the 360 damage formula (`0x827d0b50`) and spawning hit VFX/SFX.
+pub fn step_projectiles(
+    time: Res<Time>,
+    piloting: Res<Piloting>,
+    collision: Res<Collision>,
+    mut speaker: Speaker,
+    mut commands: Commands,
+    mut targets: Query<(Entity, &Target, &mut TargetHealth, &Transform), Without<Projectile>>,
+    mut shots: Query<(Entity, &mut Projectile, &mut Transform)>,
+) {
+    if !piloting.0 {
+        return;
+    }
+    let dt = time.delta_secs();
     for (e, mut shot, mut transform) in &mut shots {
         let Some(delta) = shot.step(dt) else {
             commands.entity(e).despawn();
             continue;
         };
-        let next = transform.translation + delta;
+        let prev = transform.translation;
+        let next = prev + delta;
+
+        // Test against all living target hit spheres, keeping the earliest intersection.
+        let mut best_target: Option<(f32, Vec3, Vec3, Entity)> = None;
+        for (t_entity, _, health, t_tf) in &targets {
+            if health.destroyed {
+                continue;
+            }
+            for sphere in &health.spheres {
+                let center = t_tf.translation + Vec3::Y * sphere.offset_y;
+                if let Some((t, pos, normal)) = damage::segment_hits_sphere(prev, next, center, sphere.radius) {
+                    if best_target.is_none_or(|(best_t, _, _, _)| t < best_t) {
+                        best_target = Some((t, pos, normal, t_entity));
+                    }
+                }
+            }
+        }
+
         let ground = collision
-            .ground_below(transform.translation)
-            .filter(|&g| delta.y < 0.0 && next.y <= g);
-        if let Some(y) = ground {
+            .ground_below(prev)
+            .filter(|&g| delta.y < 0.0 && next.y <= g)
+            .map(|g| {
+                let t = if delta.y.abs() > 1e-6 {
+                    ((g - prev.y) / delta.y).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                (t, Vec3::new(prev.x + delta.x * t, g, prev.z + delta.z * t))
+            });
+
+        if let Some((t_hit, pos, normal, t_entity)) = best_target {
+            if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
+                    let (power, recoil) = shot.effective_damage();
+                    let (res, lethal) = health.apply_hit(shot.damage_type, power, recoil);
+                    let ffx = if res.effective {
+                        if shot.hit_hi > 0 { shot.hit_hi } else { shot.hit }
+                    } else if shot.hit_low > 0 {
+                        shot.hit_low
+                    } else {
+                        shot.hit
+                    };
+                    if ffx > 0 {
+                        let rot = Quat::from_rotation_arc(Vec3::Z, normal);
+                        commands.spawn((
+                            Sfx::new(ffx),
+                            Transform::from_translation(pos).with_rotation(rot),
+                        ));
+                    }
+                    let se = if res.effective { shot.hit_se.hi } else { shot.hit_se.low };
+                    if se > 0 {
+                        sound::cue(
+                            &mut commands,
+                            &mut speaker.cues,
+                            &mut speaker.sources,
+                            &format!("w{se:08}"),
+                        );
+                    }
+                    info!(
+                        "hit {} ({}) [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
+                        target.name,
+                        target.model,
+                        if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                        res.damage,
+                        health.ap,
+                        health.ap_max,
+                        if health.is_staggered() { " STAGGER" } else { "" },
+                        if lethal { " DESTROYED" } else { "" },
+                    );
+                }
+                commands.entity(e).despawn();
+                continue;
+            }
+        }
+
+        if let Some((_, at)) = ground {
             if shot.hit > 0 {
-                let at = Vec3::new(next.x, y, next.z);
                 commands.spawn((
                     Sfx::new(shot.hit),
                     Transform::from_translation(at)
@@ -713,6 +821,7 @@ pub fn fire(
             commands.entity(e).despawn();
             continue;
         }
+
         transform.translation = next;
         if delta.length_squared() > 0.0 {
             transform.look_to(delta.normalize(), Vec3::Y);
@@ -729,12 +838,14 @@ pub(crate) fn silent() -> Gun {
         init_speed: 0.0,
         kind: Kind::Skip,
         flight: Flight::default(),
+        damage_type: DamageType::Ke,
         damage_power: 0.0,
         damage_recoil: 0.0,
         en_drain: 0.0,
         decay: RangeDecay::default(),
         fx: Fx::default(),
         shoot: 0,
+        hit_se: HitSe::default(),
         stance: false,
         sniper: false,
     }
@@ -747,6 +858,7 @@ fn gun(id: i64) -> Gun {
     let magazine = part_field(id, 10, "magazine").max(0.0) as u16;
     let init_speed = part_field(id, 10, "init_speed");
     let (kind, flight, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
+    let (fx, hit_se) = fx_and_hit_se(id);
     Gun {
         remaining: magazine,
         magazine,
@@ -755,6 +867,7 @@ fn gun(id: i64) -> Gun {
         init_speed: speed,
         kind,
         flight,
+        damage_type: DamageType::from_raw(part_field(id, 10, "damage_type") as u8),
         damage_power: part_field(id, 10, "damage_power"),
         damage_recoil: part_field(id, 10, "damage_recoil"),
         en_drain: part_field(id, 10, "en_drain"),
@@ -764,8 +877,9 @@ fn gun(id: i64) -> Gun {
             guarantee_rate: part_field(id, 10, "guarantee_rate"),
             min_power_rate: part_field(id, 10, "min_power_rate"),
         },
-        fx: fx(id),
+        fx,
         shoot: shoot_of(id),
+        hit_se,
         stance: part_field(id, 10, "ready_position") != 0.0,
         sniper: part_field(id, 10, "weapon_kind") == 5.0,
     }
@@ -778,23 +892,31 @@ fn shoot_of(id: i64) -> i16 {
         .unwrap_or(DEFAULT_SHOOT)
 }
 
-fn fx(id: i64) -> Fx {
+fn fx_and_hit_se(id: i64) -> (Fx, HitSe) {
     let hit_id = part_field(id, 10, "hit_id") as u32;
     let Some(row) = find(PARAM_ACWEAPONSFXPARAM_BIN, hit_id)
         .or_else(|| find(PARAM_ACWEAPONSFXPARAM_BIN, 1))
         .map(|r| &r.data)
     else {
-        return Fx::default();
+        return (Fx::default(), HitSe::default());
     };
-    let hit = u32::try_from(row.hit_sfx_type)
-        .ok()
-        .and_then(|t| find(PARAM_BULLETHITSFXPARAM_BIN, t))
-        .map_or(0, |r| r.data.default2);
-    Fx {
+    let hit_type = u32::try_from(row.hit_sfx_type).ok();
+    let hit_sfx = hit_type.and_then(|t| find(PARAM_BULLETHITSFXPARAM_BIN, t)).map(|r| &r.data);
+    let hit_se = hit_type
+        .and_then(|t| find(PARAM_BULLETHITSEPARAM_BIN, t))
+        .map(|r| HitSe {
+            low: r.data.dry_ac_low_damage,
+            hi: r.data.ac_hi_damage,
+        })
+        .unwrap_or_default();
+    let fx = Fx {
         bullet: row.bullet_sfx_id.into(),
         muzzle: row.muzzle_sfx_id.into(),
-        hit: hit.into(),
-    }
+        hit: hit_sfx.map_or(0, |d| d.default2.into()),
+        hit_low: hit_sfx.map_or(0, |d| d.dry_ac_low_damage.into()),
+        hit_hi: hit_sfx.map_or(0, |d| d.ac_hi_damage.into()),
+    };
+    (fx, hit_se)
 }
 
 fn flight(id: u32, init_speed: f32) -> (Kind, Flight, f32) {
@@ -1851,5 +1973,14 @@ mod tests {
         let expected = part_field(810, 10, "en_drain");
         assert!(expected > 0.0, "laser weapon 810 has positive EN drain");
         assert_eq!(g.en_drain, expected);
+        assert_eq!(g.damage_type, DamageType::Te);
+        assert_eq!(g.hit_se.low, 9028);
+        assert_eq!(g.hit_se.hi, 9225);
+        assert_eq!(gun(1720).damage_type, DamageType::Ke);
+        assert_eq!(gun(1720).hit_se.low, 9027);
+        assert_eq!(gun(1720).hit_se.hi, 9224);
+        assert_eq!(gun(1720).fx.hit_low, 199);
+        assert_eq!(gun(1720).fx.hit_hi, 411);
+        assert_eq!(gun(2230).damage_type, DamageType::Ce);
     }
 }

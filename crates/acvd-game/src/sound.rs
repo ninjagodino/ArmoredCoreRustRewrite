@@ -47,6 +47,7 @@ impl Cues {
         let mut projects = Vec::new();
         for name in [
             "acv2_se_weapon.fev",
+            "acv2_se_bombs.fev",
             "acv2_se_booster.fev",
             "acv2_se_ac.fev",
         ] {
@@ -166,6 +167,13 @@ impl Cues {
 pub fn shot(commands: &mut Commands, cues: &mut Cues, assets: &mut Assets<AudioSource>, id: i16) {
     if id > 0 {
         cues.play(commands, assets, &format!("w{id:08}"), false);
+    }
+}
+
+/// Plays a named one-shot cue (e.g. `w00009224` bullet hit, `w00009600` explosion, `c00000089` AC death).
+pub fn cue(commands: &mut Commands, cues: &mut Cues, assets: &mut Assets<AudioSource>, name: &str) {
+    if !name.is_empty() {
+        cues.play(commands, assets, name, false);
     }
 }
 
@@ -289,9 +297,13 @@ mod tests {
         let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
         let Ok(disc) = Disc::open(&iso) else { return };
         let mut cues = Cues::load(&disc);
-        assert_eq!(cues.projects.len(), 3);
+        assert_eq!(cues.projects.len(), 4);
         for cue in [
             "w00000034",
+            "w00009027",
+            "w00009224",
+            "w00009600",
+            "c00000089",
             BOOST_ON,
             BOOST_LOOP,
             "c00000024",

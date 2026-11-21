@@ -20,15 +20,23 @@ use std::collections::HashMap;
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, AC_ASSEMBLY_DESIGN_ST_FILES};
 use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+use acvd_data::generated::ctrl::AcCtrlParam;
+use acvd_data::generated::enemy::{
+    ENEMY_ENEMYBASICPARAM_BIN, ENEMY_ENEMYCOMMON_BIN, ENEMY_ENEMYGRAPHICSPARAM_BIN,
+};
+use acvd_data::generated::sfx::PARAM_SFXSESETPARAM_BIN;
+use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
+use acvd_data::{find, part_field};
 use acvd_formats::msb;
 use acvd_formats::vfs::{self, Disc};
 use acvd_render::Packs;
 use anyhow::Result;
+use bevy::audio::AudioSource;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
 
-use crate::{assemble, boost, map, paint, pose};
+use crate::{assemble, boost, damage, map, paint, pose, sfx, sound};
 
 /// `PARTS_PARAM_ST` kind for enemies and test ACs.
 const KIND_TARGET: u32 = 2;
@@ -79,6 +87,161 @@ pub struct Target {
     pub model: String,
     pub layer: String,
     pub ac_design_id: Option<u16>,
+}
+
+/// Live AP, KE/CE/TE defense profile, stagger state, hit spheres, and destruction config
+/// on a target entity.
+#[derive(Component, Debug, Clone)]
+pub struct TargetHealth {
+    pub ap: f32,
+    pub ap_max: f32,
+    pub defense: damage::DefenseProfile,
+    /// Impact recoil threshold that triggers stagger (`small_stagger_threshold` on enemies,
+    /// `stagger_penalty_threshold` = `clashThreshold * 0.8` on ACs per `AcCtrlParamCalc.lua` line 337).
+    pub stagger_threshold: f32,
+    /// Stagger duration in seconds (`EnemyBasicSt.stagger_penalty_time` or 2.0 s on ACs per
+    /// `AcCtrlParamCalc.lua` line 338).
+    pub stagger_penalty_time: f32,
+    /// Remaining stagger seconds (`> 0.0` lowers defense thresholds to `stagger_threshold`).
+    pub stagger_timer: f32,
+    /// Local-space vertical hit spheres (`EnemyGraphicsSt` or AC `0x82863b60`).
+    pub spheres: Vec<damage::HitSphere>,
+    /// True once AP has reached 0.
+    pub destroyed: bool,
+    /// Set on the lethal hit; consumed by `targets::tick` to play explosion + swap `_b.flv`.
+    pub just_destroyed: bool,
+    /// Broken FLVER asset path (`model/ene/{m}/{m}_m.bnd.dcx|{m}_b.flv`) for enemy targets.
+    pub broken_asset: Option<String>,
+    /// Destruction explosion FFX id (`param/sfxsesetparam.bin` rows 501/502: 4019 / 4041).
+    pub destroy_sfx: i32,
+    /// Destruction sound cue name (`w00009600` / `w00009601` / `c00000089`).
+    pub destroy_se: String,
+}
+
+impl TargetHealth {
+    pub fn is_staggered(&self) -> bool {
+        self.stagger_timer > 0.0
+    }
+
+    /// Applies one projectile hit (`0x827d0b50` + `0x82984438` + `0x82837f30`).
+    /// Returns the `HitResult` and whether this hit destroyed the target.
+    pub fn apply_hit(
+        &mut self,
+        attr: damage::DamageType,
+        power: f32,
+        recoil: f32,
+    ) -> (damage::HitResult, bool) {
+        let res = damage::calculate_damage(attr, power, recoil, &self.defense, self.is_staggered());
+        if self.destroyed {
+            return (res, false);
+        }
+        self.ap = (self.ap - res.damage).max(0.0);
+        if self.stagger_threshold > 0.0 && res.recoil >= self.stagger_threshold {
+            self.stagger_timer = self.stagger_penalty_time;
+        }
+        let lethal = self.ap <= 0.0;
+        if lethal {
+            self.destroyed = true;
+            self.just_destroyed = true;
+        }
+        (res, lethal)
+    }
+
+    /// Builds `TargetHealth` for an enemy model (`e0010`, `e1020`, `e2030`, ...) from
+    /// `enemy/enemycommon.bin` → `enemybasicparam.bin` + `enemygraphicsparam.bin`.
+    pub fn from_enemy(model: &str) -> Self {
+        let param_id = enemy_param_id(model).unwrap_or(0);
+        let common = find(ENEMY_ENEMYCOMMON_BIN, param_id).map(|r| &r.data);
+        let basic_id = common.map_or(param_id, |c| c.basic_param_id);
+        let gfx_id = common.map_or(param_id, |c| c.graphics_param_id);
+        let basic = find(ENEMY_ENEMYBASICPARAM_BIN, basic_id)
+            .or_else(|| find(ENEMY_ENEMYBASICPARAM_BIN, 0))
+            .map(|r| &r.data)
+            .expect("enemybasicparam row 0");
+        let gfx = find(ENEMY_ENEMYGRAPHICSPARAM_BIN, gfx_id)
+            .or_else(|| find(ENEMY_ENEMYGRAPHICSPARAM_BIN, 0))
+            .map(|r| &r.data)
+            .expect("enemygraphicsparam row 0");
+
+        // `param/sfxsesetparam.bin` row 501 (中爆発, FFX 4019, w00009600) for light enemies
+        // (tanks/helis, AP < 2500), row 502 (大爆発, FFX 4041, w00009601) for heavier MTs.
+        let sfx_set_id = if basic.ap >= 2500.0 { 502 } else { 501 };
+        let (destroy_sfx, destroy_se) = find(PARAM_SFXSESETPARAM_BIN, sfx_set_id)
+            .map(|r| (i32::from(r.data.sfx_id), format!("w{:08}", r.data.sound_id)))
+            .unwrap_or_else(|| (4019, "w00009600".to_string()));
+
+        Self {
+            ap: basic.ap.max(1.0),
+            ap_max: basic.ap.max(1.0),
+            defense: damage::DefenseProfile::from_enemy(basic),
+            stagger_threshold: f32::from(basic.small_stagger_threshold),
+            stagger_penalty_time: basic.stagger_penalty_time,
+            stagger_timer: 0.0,
+            spheres: damage::enemy_hit_spheres(gfx),
+            destroyed: false,
+            just_destroyed: false,
+            broken_asset: Some(enemy_broken_asset(model)),
+            destroy_sfx,
+            destroy_se,
+        }
+    }
+
+    /// Builds `TargetHealth` for a test AC (`a0000`–`a0003`, `AcAssemblyDesignSt` 5011–5014).
+    pub fn from_ac(design: &AcAssemblyDesignSt) -> Self {
+        // Frame AP sum (`0x8286a600`, `sheets/ac_part_fields.csv` +0x138).
+        let ap_max = [
+            (design.head, 0u8),
+            (design.core, 1),
+            (design.arms, 2),
+            (design.legs, 3),
+        ]
+        .into_iter()
+        .map(|(id, cat)| part_field(id as i64, cat, "ap").max(0.0))
+        .sum::<f32>()
+        .max(1.0);
+        let ctrl = AcCtrlParam::calculate(design);
+        let destroy_sfx = find(PARAM_SFXSESETPARAM_BIN, 502)
+            .map_or(4041, |r| i32::from(r.data.sfx_id));
+        let destroy_se = find(PARAM_ACSOUNDPARAM_BIN, 0)
+            .filter(|r| r.data.se_destroy > 0)
+            .map(|r| format!("c{:08}", r.data.se_destroy))
+            .unwrap_or_else(|| "c00000089".to_string());
+        Self {
+            ap: ap_max,
+            ap_max,
+            defense: damage::DefenseProfile::from_ac(design),
+            stagger_threshold: ctrl.stagger_penalty_threshold,
+            // `AcCtrlParamCalc.lua` line 338: `staggerPenaltyTime = 2`.
+            stagger_penalty_time: 2.0,
+            stagger_timer: 0.0,
+            spheres: damage::ac_hit_spheres(),
+            destroyed: false,
+            just_destroyed: false,
+            broken_asset: None,
+            destroy_sfx,
+            destroy_se,
+        }
+    }
+
+    /// World-space center of the target's primary hit sphere (for explosion VFX placement).
+    pub fn center_offset_y(&self) -> f32 {
+        self.spheres
+            .first()
+            .map_or(3.0, |s| s.offset_y)
+    }
+}
+
+/// Parses the `EnemyCommonSt` row ID from an enemy model name (`e0010` → `10`, `e1020` → `1020`).
+pub fn enemy_param_id(model: &str) -> Option<u32> {
+    model
+        .strip_prefix('e')
+        .or_else(|| model.strip_prefix('E'))
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Broken FLVER asset path of an enemy (`model/ene/{m}/{m}_m.bnd.dcx|{m}_b.flv`).
+pub fn enemy_broken_asset(model: &str) -> String {
+    format!("model/ene/{model}/{model}_m.bnd.dcx|{model}_b.flv")
 }
 
 /// Filters `parts` down to the kind-2 targets active under `mode`.
@@ -198,6 +361,7 @@ pub fn spawn(
         let Some(list) = entry.as_ref().filter(|l| !l.is_empty()) else {
             continue;
         };
+        let health = TargetHealth::from_enemy(&part.model);
         commands
             .spawn((
                 Target {
@@ -206,6 +370,7 @@ pub fn spawn(
                     layer,
                     ac_design_id: None,
                 },
+                health,
                 Name::new(part.name.clone()),
                 xf,
                 Visibility::default(),
@@ -278,6 +443,7 @@ fn spawn_ac_target(
             return false;
         }
     };
+    let health = TargetHealth::from_ac(design);
     let root = commands
         .spawn((
             Target {
@@ -286,6 +452,7 @@ fn spawn_ac_target(
                 layer: layer.to_string(),
                 ac_design_id: Some(design_id),
             },
+            health,
             Name::new(part.name.clone()),
             xf,
             Visibility::default(),
@@ -329,6 +496,79 @@ fn spawn_ac_target(
         }
     }
     true
+}
+
+/// Steps target stagger timers and handles destruction (explosion FFX/SFX + broken `_b.flv`
+/// model swap for enemies, or despawn for destroyed AC targets).
+#[allow(clippy::too_many_arguments)]
+pub fn tick(
+    time: Res<Time>,
+    garage: Res<crate::Garage>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut cues: ResMut<sound::Cues>,
+    mut audio_sources: ResMut<Assets<AudioSource>>,
+    mut targets: Query<(Entity, &Target, &mut TargetHealth, &Transform, Option<&Children>)>,
+) {
+    let dt = time.delta_secs();
+    let mut packs = Packs::default();
+    let mut missing = 0usize;
+    for (entity, target, mut health, xf, children) in &mut targets {
+        if health.stagger_timer > 0.0 {
+            health.stagger_timer = (health.stagger_timer - dt).max(0.0);
+        }
+        if !health.just_destroyed {
+            continue;
+        }
+        health.just_destroyed = false;
+        let center = xf.translation + Vec3::Y * health.center_offset_y();
+        if health.destroy_sfx > 0 {
+            commands.spawn((
+                sfx::Sfx::new(health.destroy_sfx),
+                Transform::from_translation(center),
+            ));
+        }
+        if !health.destroy_se.is_empty() {
+            sound::cue(&mut commands, &mut cues, &mut audio_sources, &health.destroy_se);
+        }
+        info!(
+            "target {} ({}) destroyed at ({:.1}, {:.1}, {:.1})",
+            target.name, target.model, center.x, center.y, center.z
+        );
+
+        let swapped = health.broken_asset.as_deref().is_some_and(|asset| {
+            let Ok(list) = acvd_render::model(&garage.disc, asset) else {
+                return false;
+            };
+            if list.is_empty() {
+                return false;
+            }
+            if let Some(kids) = children {
+                for child in kids.iter() {
+                    commands.entity(child).try_despawn();
+                }
+            }
+            commands.entity(entity).with_children(|c| {
+                for m in list {
+                    let mat = acvd_render::material(
+                        &garage.disc,
+                        &m,
+                        &mut packs,
+                        &mut images,
+                        garage.flat,
+                        &mut missing,
+                    );
+                    c.spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(materials.add(mat))));
+                }
+            });
+            true
+        });
+        if !swapped {
+            commands.entity(entity).try_despawn();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +618,9 @@ mod tests {
             if let Some(id) = part.ac_design_id {
                 let d = find_design(id).unwrap_or_else(|| panic!("missing design {id}"));
                 assert!(AcCtrlParam::buildable(d), "design {id} not buildable");
+                let hp = TargetHealth::from_ac(d);
+                assert!(hp.ap_max > 10000.0, "AC design {id} AP {}", hp.ap_max);
+                assert_eq!(hp.spheres.len(), 2);
             } else {
                 let asset = enemy_asset(&part.model);
                 assert!(
@@ -385,6 +628,16 @@ mod tests {
                         .is_ok_and(|list| !list.is_empty()),
                     "enemy FLVER failed to load: {asset}"
                 );
+                let broken = enemy_broken_asset(&part.model);
+                assert!(
+                    acvd_render::model(&disc, &broken)
+                        .is_ok_and(|list| !list.is_empty()),
+                    "broken enemy FLVER failed to load: {broken}"
+                );
+                let mut hp = TargetHealth::from_enemy(&part.model);
+                assert!(hp.ap_max >= 500.0, "{} AP {}", part.model, hp.ap_max);
+                let (res, lethal) = hp.apply_hit(damage::DamageType::Ke, 50000.0, 2000.0);
+                assert!(res.effective && lethal && hp.destroyed && hp.just_destroyed);
             }
         }
     }

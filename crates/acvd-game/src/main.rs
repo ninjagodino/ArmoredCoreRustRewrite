@@ -40,6 +40,7 @@ mod blur;
 mod boost;
 mod collision;
 mod control;
+mod damage;
 mod env;
 mod hanger;
 mod hud;
@@ -285,6 +286,8 @@ fn main() {
             hanger::pose,
             bay::shift,
             weapons::fire,
+            weapons::step_projectiles,
+            targets::tick,
             orbit,
             reframe,
         )
