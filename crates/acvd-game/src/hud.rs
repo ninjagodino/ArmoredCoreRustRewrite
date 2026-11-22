@@ -31,7 +31,7 @@ use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
 use acvd_formats::vfs::Disc;
 use acvd_render::menu::{self, Layout, MenuGauge, MenuObject, MenuRoot, MenuSprite, MenuText};
 use bevy::prelude::*;
-use bevy::ui::{px, UiRect};
+use bevy::ui::px;
 use bevy::window::PrimaryWindow;
 
 use crate::fcs::Fcs;
@@ -121,22 +121,22 @@ impl Status {
 #[derive(Component)]
 pub struct Panel(usize);
 
-/// Screen-space target lock-on reticle (`ACV_OutLine_LockCursor_Target`, 32x32, `0x829d4b88`).
-#[derive(Component)]
-pub struct LockCursorTarget;
+/// Screen-space target lock-on cursor wing from `sortie.drb` (`ACV_OutLine_LockCursor_E`,
+/// `_R`, `_L`; `0x829d1b40` / `0x829d1910`).
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub enum LockCursorWing {
+    /// `ACV_OutLine_LockCursor_E` (bottom-right: `CursorLine`, `EnemyName`, `EnemyAP`).
+    Enemy,
+    /// `ACV_OutLine_LockCursor_R` (top-left: Right-arm `CursorLine`, `LockOnText`, `ReloadBar`).
+    RightArm,
+    /// `ACV_OutLine_LockCursor_L` (top-right: Left-arm `CursorLine`, `LockOnText`, `ReloadBar`).
+    LeftArm,
+}
 
-/// Screen-space locked target info readout (`ACV_OutLine_LockCursor_E`, 128x64, `0x829d1b40`).
+/// Per-target multi-lock missile cursor dialog from `sortie.drb` (`ACV_OutLine_LockCursor_T`:
+/// `CursorLine`, `LockOnText`, `MissileLock1..6`, `0x829d1910` / `0x829d1a10`), indexed `0..6`.
 #[derive(Component)]
-pub struct LockCursorInfo;
-
-/// Per-target multi-lock missile cursor (`MissileLock1..6`, `0x829d1910` / `0x829d1a10`),
-/// indexed `0..6`.
-#[derive(Component)]
-pub struct MissileLockMarker(usize);
-
-/// Individual missile lock pip (`0..6`) inside `MissileLockMarker(slot)` (`0x829d1a10`).
-#[derive(Component)]
-pub struct MissileLockPip(usize, usize);
+pub struct MissileLockDialog(usize);
 
 fn tuning(index: usize) -> f32 {
     acvd_data::tuning(STATIC_DRAW, index).unwrap_or_default() as f32
@@ -211,69 +211,26 @@ pub fn layout(
         let root = menu::spawn(&mut commands, &hud.layout, weapon, origin, scale);
         commands.entity(root).insert(Panel(hand));
     }
-    // `ACV_OutLine_LockCursor_Target` in sortie.drb holds the 1st/2nd lock color swatches
-    // (`0x829d4b88`), not a hollow reticle; draw a hollow bracket frame tinted by StaticDrawParam
-    // 1st/2nd lock colors and shrink it as secondary lock progresses.
-    commands.spawn((
-        MenuRoot,
-        LockCursorTarget,
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(0.0),
-            top: px(0.0),
-            width: px(32.0 * scale),
-            height: px(32.0 * scale),
-            border: UiRect::all(px((2.0 * scale).max(1.5))),
-            ..default()
-        },
-        BorderColor::all(lock_color(false)),
-        Visibility::Hidden,
-    ));
-    if let Some(info_dlg) = dialog("ACV_OutLine_LockCursor_E") {
-        let root = menu::spawn(&mut commands, &hud.layout, info_dlg, Vec2::ZERO, scale);
-        commands
-            .entity(root)
-            .insert((LockCursorInfo, Visibility::Hidden));
+    // Spawn the actual in-game `sortie.drb` target lock-on cursor wings:
+    // `_E` (bottom-right: enemy name/AP), `_R` (top-left: right arm), `_L` (top-right: left arm),
+    // and 6x `_T` (bottom-left: per-target `MissileLock1..6`, `0x829d1910` / `0x829d1a10`).
+    for (name, wing) in [
+        ("ACV_OutLine_LockCursor_E", LockCursorWing::Enemy),
+        ("ACV_OutLine_LockCursor_R", LockCursorWing::RightArm),
+        ("ACV_OutLine_LockCursor_L", LockCursorWing::LeftArm),
+    ] {
+        if let Some(dlg) = dialog(name) {
+            let root = menu::spawn(&mut commands, &hud.layout, dlg, Vec2::ZERO, scale);
+            commands.entity(root).insert((wing, Visibility::Hidden));
+        }
     }
-    // Up to 6 simultaneous missile-locked target markers with 6 `MissileLock1..6` pips each
-    // (`0x829d1910` / `0x829d1a10`).
-    let msl_color = Color::srgba(1.0, 0.55, 0.1, 0.95);
-    for slot in 0..6 {
-        commands
-            .spawn((
-                MenuRoot,
-                MissileLockMarker(slot),
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: px(0.0),
-                    top: px(0.0),
-                    width: px(44.0 * scale),
-                    height: px(44.0 * scale),
-                    border: UiRect::all(px((1.5 * scale).max(1.0))),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::FlexEnd,
-                    justify_content: JustifyContent::Center,
-                    column_gap: px((2.0 * scale).max(1.0)),
-                    padding: UiRect::bottom(px((2.0 * scale).max(1.0))),
-                    ..default()
-                },
-                BorderColor::all(msl_color),
-                Visibility::Hidden,
-            ))
-            .with_children(|parent| {
-                for pip in 0..6 {
-                    parent.spawn((
-                        MissileLockPip(slot, pip),
-                        Node {
-                            width: px((5.0 * scale).max(3.0)),
-                            height: px((5.0 * scale).max(3.0)),
-                            ..default()
-                        },
-                        BackgroundColor(msl_color),
-                        Visibility::Hidden,
-                    ));
-                }
-            });
+    if let Some(msl_dlg) = dialog("ACV_OutLine_LockCursor_T") {
+        for slot in 0..6 {
+            let root = menu::spawn(&mut commands, &hud.layout, msl_dlg, Vec2::ZERO, scale);
+            commands
+                .entity(root)
+                .insert((MissileLockDialog(slot), Visibility::Hidden));
+        }
     }
 }
 
@@ -623,62 +580,34 @@ pub fn panels(
     }
 }
 
-/// Projects the FCS-locked target onto the viewport and updates the hollow lock-on bracket
-/// (tinted by `StaticDrawParam` 1st/2nd lock colors, shrinking as secondary lock completes),
-/// `ACV_OutLine_LockCursor_E` (`EnemyName`, `EnemyAP`, `EnemyInfo`, `0x829d1b40`), and
-/// per-target `MissileLock1..6` markers (`0x829d1910` / `0x829d1a10`).
+/// Projects the FCS-locked target(s) onto the viewport and updates the actual `sortie.drb`
+/// lock-on dialogs:
+/// - `ACV_OutLine_LockCursor_E` (`EnemyName`, `EnemyAP`, `CursorLine`, `0x829d1b40`)
+/// - `ACV_OutLine_LockCursor_R` / `_L` (per-arm `LockOnText`, `ReloadBar`, `CursorLine`)
+/// - `ACV_OutLine_LockCursor_T` (per-target `MissileLock1..6`, `LockOnText`, `CursorLine`,
+///   `0x829d1910` / `0x829d1a10`).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn lock_cursor(
     hud: Option<Res<Sortie>>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     fcs_q: Query<&Fcs>,
-    mut cursor_target: Query<
-        (&mut Node, &mut BorderColor, &mut Visibility),
-        (
-            With<LockCursorTarget>,
-            Without<LockCursorInfo>,
-            Without<MissileLockMarker>,
-            Without<MissileLockPip>,
-            Without<MenuObject>,
-        ),
+    mut wings: Query<
+        (Entity, &LockCursorWing, &mut Node, &mut Visibility),
+        (Without<MissileLockDialog>, Without<MenuObject>),
     >,
-    mut cursor_info: Query<
-        (Entity, &mut Node, &mut Visibility),
-        (
-            With<LockCursorInfo>,
-            Without<LockCursorTarget>,
-            Without<MissileLockMarker>,
-            Without<MissileLockPip>,
-            Without<MenuObject>,
-        ),
-    >,
-    mut msl_markers: Query<
-        (&MissileLockMarker, &mut Node, &mut Visibility),
-        (
-            Without<LockCursorTarget>,
-            Without<LockCursorInfo>,
-            Without<MissileLockPip>,
-            Without<MenuObject>,
-        ),
-    >,
-    mut msl_pips: Query<
-        (&MissileLockPip, &mut Visibility),
-        (
-            Without<LockCursorTarget>,
-            Without<LockCursorInfo>,
-            Without<MissileLockMarker>,
-            Without<MenuObject>,
-        ),
+    mut msl_dialogs: Query<
+        (Entity, &MissileLockDialog, &mut Node, &mut Visibility),
+        (Without<LockCursorWing>, Without<MenuObject>),
     >,
     children: Query<&Children>,
     mut objects: Query<
-        (&MenuObject, &mut Visibility, Option<&mut MenuText>),
         (
-            Without<LockCursorTarget>,
-            Without<LockCursorInfo>,
-            Without<MissileLockMarker>,
-            Without<MissileLockPip>,
+            &MenuObject,
+            &mut Visibility,
+            Option<&mut MenuText>,
+            Option<&mut MenuGauge>,
         ),
+        (Without<LockCursorWing>, Without<MissileLockDialog>),
     >,
 ) {
     let Some(hud) = hud else { return };
@@ -692,84 +621,111 @@ pub fn lock_cursor(
         Some((lock, vp))
     });
 
-    for (mut node, mut border, mut vis) in &mut cursor_target {
+    for (root, &wing, mut node, mut vis) in &mut wings {
         let Some((lock, vp)) = projected else {
             vis.set_if_neq(Visibility::Hidden);
             continue;
         };
         vis.set_if_neq(Visibility::Inherited);
-        let secondary = lock.any_secondary();
-        let prog = lock.progress(0).max(lock.progress(1));
-        // Shrink reticle from 52 px (0% primary lock) to 28 px (100% secondary lock).
-        let side = (52.0 - 24.0 * prog) * scale;
-        node.width = px(side);
-        node.height = px(side);
-        node.left = px(vp.x - side * 0.5);
-        node.top = px(vp.y - side * 0.5);
-        *border = BorderColor::all(lock_color(secondary));
-    }
-
-    for (root, mut node, mut vis) in &mut cursor_info {
-        let Some((lock, vp)) = projected else {
-            vis.set_if_neq(Visibility::Hidden);
-            continue;
-        };
-        vis.set_if_neq(Visibility::Inherited);
-        node.left = px(vp.x + 18.0 * scale);
-        node.top = px(vp.y - 16.0 * scale);
-        let secondary = lock.any_secondary();
-        let pct = (lock.progress(0).max(lock.progress(1)) * 100.0).round() as u32;
-        let msl_count = fcs.map_or(0, |f| f.missile_lock_count(lock.entity));
-        for child in children.iter_descendants(root) {
-            let Ok((obj, mut cvis, text)) = objects.get_mut(child) else {
-                continue;
-            };
-            let show = match obj.0.as_str() {
-                "EnemyName" => {
-                    if let Some(mut t) = text {
-                        if t.text != lock.model {
-                            t.text = lock.model.clone();
+        match wing {
+            LockCursorWing::Enemy => {
+                // `CursorLine` at (14,37)-(128,64) -> bottom-right wing below target center.
+                node.left = px(vp.x - 14.0 * scale);
+                node.top = px(vp.y - 24.0 * scale);
+                let col = lock_color(lock.any_secondary());
+                for child in children.iter_descendants(root) {
+                    let Ok((obj, mut cvis, text, gauge)) = objects.get_mut(child) else {
+                        continue;
+                    };
+                    let show = match obj.0.as_str() {
+                        "CursorLine" => {
+                            if let Some(mut g) = gauge {
+                                g.fill = 1.0;
+                                g.color = col;
+                            }
+                            true
                         }
-                    }
-                    true
+                        "EnemyName" => {
+                            if let Some(mut t) = text {
+                                if t.text != lock.model {
+                                    t.text = lock.model.clone();
+                                }
+                            }
+                            true
+                        }
+                        "EnemyAP" => {
+                            if let Some(mut t) = text {
+                                let s = format!("{:.0}", lock.ap);
+                                if t.text != s {
+                                    t.text = s;
+                                }
+                            }
+                            true
+                        }
+                        "EnemySquadNumber" => false,
+                        _ => true,
+                    };
+                    cvis.set_if_neq(if show {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    });
                 }
-                "EnemyAP" => {
-                    if let Some(mut t) = text {
-                        let s = format!("{:.0}", lock.ap);
-                        if t.text != s {
-                            t.text = s;
-                        }
-                    }
-                    true
+            }
+            LockCursorWing::RightArm | LockCursorWing::LeftArm => {
+                let hand = usize::from(wing == LockCursorWing::LeftArm);
+                if wing == LockCursorWing::RightArm {
+                    // `CursorLine` at (0,0)-(104,27) -> top-left wing above target center.
+                    node.left = px(vp.x - 104.0 * scale);
+                    node.top = px(vp.y - 42.0 * scale);
+                } else {
+                    // `CursorLine` at (24,0)-(128,27) -> top-right wing above target center.
+                    node.left = px(vp.x - 24.0 * scale);
+                    node.top = px(vp.y - 42.0 * scale);
                 }
-                "EnemyInfo" => {
-                    if let Some(mut t) = text {
-                        let mut s = if secondary {
-                            format!("{:.0}m", lock.distance)
-                        } else {
-                            format!("{:.0}m {pct}%", lock.distance)
-                        };
-                        if msl_count > 0 {
-                            s.push_str(&format!(" MSLx{msl_count}"));
+                let prog = lock.progress(hand);
+                let ready = lock.secondary[hand];
+                let col = lock_color(ready);
+                for child in children.iter_descendants(root) {
+                    let Ok((obj, mut cvis, text, gauge)) = objects.get_mut(child) else {
+                        continue;
+                    };
+                    let show = match obj.0.as_str() {
+                        "CursorLine" => {
+                            if let Some(mut g) = gauge {
+                                g.fill = prog.max(0.25);
+                                g.color = col;
+                            }
+                            true
                         }
-                        if t.text != s {
-                            t.text = s;
+                        "LockOnText" => {
+                            if let Some(mut t) = text {
+                                let s = if ready {
+                                    "LOCK ON".to_string()
+                                } else {
+                                    format!("{}%", (prog * 100.0).round() as u32)
+                                };
+                                if t.text != s {
+                                    t.text = s;
+                                }
+                            }
+                            true
                         }
-                    }
-                    true
+                        "ReloadBar" => !ready,
+                        name if name.starts_with("MissileLock") => false,
+                        _ => true,
+                    };
+                    cvis.set_if_neq(if show {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    });
                 }
-                "EnemySquadNumber" => false,
-                _ => true,
-            };
-            cvis.set_if_neq(if show {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            });
+            }
         }
     }
 
-    // Update multi-target missile lock markers (`MissileLock1..6`, `0x829d1910` / `0x829d1a10`).
+    // Update per-target `ACV_OutLine_LockCursor_T` dialogs (`MissileLock1..6`, `0x829d1910` / `0x829d1a10`).
     let msl_targets: Vec<(Vec2, u8)> = fcs
         .into_iter()
         .flat_map(Fcs::missile_targets)
@@ -780,27 +736,55 @@ pub fn lock_cursor(
         })
         .take(6)
         .collect();
-    let msl_side = 44.0 * scale;
-    for (marker, mut node, mut vis) in &mut msl_markers {
-        let Some(&(vp, _)) = msl_targets.get(marker.0) else {
+    let msl_col = lock_color(true);
+    for (root, dlg, mut node, mut vis) in &mut msl_dialogs {
+        let Some(&(vp, count)) = msl_targets.get(dlg.0) else {
             vis.set_if_neq(Visibility::Hidden);
             continue;
         };
         vis.set_if_neq(Visibility::Inherited);
-        node.width = px(msl_side);
-        node.height = px(msl_side);
-        node.left = px(vp.x - msl_side * 0.5);
-        node.top = px(vp.y - msl_side * 0.5);
-    }
-    for (pip, mut vis) in &mut msl_pips {
-        let active = msl_targets
-            .get(pip.0)
-            .is_some_and(|&(_, count)| pip.1 < count as usize);
-        vis.set_if_neq(if active {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        });
+        // `CursorLine` at (0,37)-(104,64) -> bottom-left wing below target center.
+        node.left = px(vp.x - 104.0 * scale);
+        node.top = px(vp.y - 24.0 * scale);
+        for child in children.iter_descendants(root) {
+            let Ok((obj, mut cvis, text, gauge)) = objects.get_mut(child) else {
+                continue;
+            };
+            let show = match obj.0.as_str() {
+                "CursorLine" => {
+                    if let Some(mut g) = gauge {
+                        g.fill = 1.0;
+                        g.color = msl_col;
+                    }
+                    true
+                }
+                "LockOnText" => {
+                    if let Some(mut t) = text {
+                        let s = format!("MSL x{count}");
+                        if t.text != s {
+                            t.text = s;
+                        }
+                    }
+                    true
+                }
+                "ReloadBar" => false,
+                name => {
+                    if let Some(n) = name
+                        .strip_prefix("MissileLock")
+                        .and_then(|s| s.parse::<u8>().ok())
+                    {
+                        n <= count
+                    } else {
+                        true
+                    }
+                }
+            };
+            cvis.set_if_neq(if show {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            });
+        }
     }
 }
 

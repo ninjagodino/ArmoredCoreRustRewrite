@@ -84,6 +84,7 @@ pub struct LockedTarget {
     /// Estimated target velocity in m/s.
     pub velocity: Vec3,
     /// World distance from the AC to `world_pos` in metres.
+    #[allow(dead_code)]
     pub distance: f32,
     pub ap: f32,
     #[allow(dead_code)]
@@ -141,6 +142,7 @@ impl Fcs {
     }
 
     /// Number of active missile locks on `entity` (`0..=6`, `0x829d1a10`).
+    #[allow(dead_code)]
     pub fn missile_lock_count(&self, entity: Entity) -> u8 {
         self.missile_locks
             .iter()

@@ -653,10 +653,6 @@ pub fn hardpoint(placement: &Placement) -> Option<Hardpoint> {
     })
 }
 
-pub fn is_shoulder_hardpoint(placement: &Placement) -> bool {
-    placement.column == "shoulder"
-}
-
 pub fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -951,11 +947,16 @@ pub fn fire(
                     status.en = pilot.en;
                     status.en_max = pilot.en_max;
                 }
-                let origin = rigging
+                let origins: Vec<Vec3> = rigging
                     .shoulder
                     .iter()
-                    .next()
-                    .map_or(ac_tf.translation + Vec3::Y * 5.0, GlobalTransform::translation);
+                    .map(GlobalTransform::translation)
+                    .collect();
+                let origin = if origins.is_empty() {
+                    ac_tf.translation + Vec3::Y * 5.0
+                } else {
+                    origins[(arms.salvo_index as usize) % origins.len()]
+                };
                 arms.shoulder.remaining = arms.shoulder.remaining.saturating_sub(1);
                 sound::shot(
                     &mut commands,

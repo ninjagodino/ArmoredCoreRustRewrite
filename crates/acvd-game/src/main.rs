@@ -674,9 +674,13 @@ fn show(
                 commands.entity(root).insert(h);
             }
         }
-        if weapons::is_shoulder_hardpoint(part.placement) {
-            if let Some(root) = root {
-                commands.entity(root).insert(weapons::ShoulderHardpoint);
+        if part.placement.column == "arms" {
+            for bone_name in ["r_kata", "l_kata"] {
+                if let Some(idx) = part.rig.bones.iter().position(|b| b.name == bone_name) {
+                    if let Some(&e) = joints.get(idx) {
+                        commands.entity(e).insert(weapons::ShoulderHardpoint);
+                    }
+                }
             }
         }
         if part.placement.column == "rack_r" || part.placement.column == "rack_l" {
