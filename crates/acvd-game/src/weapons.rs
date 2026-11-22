@@ -26,11 +26,13 @@
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::bullet::{
-    BULLET_BULLETBLADE_BIN, BULLET_BULLETENERGY_BIN, BULLET_BULLETEXPLOSION_BIN,
-    BULLET_BULLETMISSILE_BIN, BULLET_BULLETRIGID_BIN, PARAM_BULLETHITSEPARAM_BIN,
-    PARAM_BULLETHITSFXPARAM_BIN, PARAM_ENEMY_BULLET_ENEMYBULLETENERGY_BIN,
-    PARAM_ENEMY_BULLET_ENEMYBULLETMISSILE_BIN, PARAM_ENEMY_BULLET_ENEMYBULLETRIGID_BIN,
+    BULLET_BULLETARISE_BIN, BULLET_BULLETBLADE_BIN, BULLET_BULLETENERGY_BIN,
+    BULLET_BULLETEXPLOSION_BIN, BULLET_BULLETMISSILE_BIN, BULLET_BULLETRIGID_BIN,
+    PARAM_BULLETHITSEPARAM_BIN, PARAM_BULLETHITSFXPARAM_BIN,
+    PARAM_ENEMY_BULLET_ENEMYBULLETENERGY_BIN, PARAM_ENEMY_BULLET_ENEMYBULLETMISSILE_BIN,
+    PARAM_ENEMY_BULLET_ENEMYBULLETRIGID_BIN,
 };
+use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::generated::sfx::{PARAM_ACWEAPONSFXPARAM_BIN, PARAM_ENEMYWEAPONSFXPARAM_BIN};
 use acvd_data::generated::sound::{
     PARAM_ACSOUNDPARAM_BIN, PARAM_ACWEAPONSOUNDPARAM_BIN, PARAM_ENEMYWEAPONSOUNDPARAM_BIN,
@@ -86,18 +88,28 @@ pub enum Hand {
 }
 
 /// The two hand weapons, two bay weapons, and shoulder unit of the shown design.
-/// `hands` / `bays` are `[right, left]`.
+/// `hands` / `bays` are `[right, left]`. When `weapon_arm` is true (`acvparts` cat-2 byte
+/// `+0x13c == 1`, `0x824793c8`), `hands[0]` holds the unified built-in weapon-arm record
+/// (`0x82479668` -> `0x8247e090`) and `hands[1]` / `bays` / `shoulder` are silent.
 #[derive(Component)]
 pub struct Armament {
     pub hands: [Gun; 2],
     pub bays: [Gun; 2],
     pub shoulder: Gun,
+    /// True when the equipped arms are weapon arms (`0x824793c8`).
+    pub weapon_arm: bool,
     /// Queued shoulder salvo rounds (`Some(target)` for locked missiles, `None` for dumbfire/rockets).
     pub salvo: Vec<Option<Entity>>,
     /// Remaining 60 Hz ticks before the next missile/round leaves the shoulder pod.
     pub salvo_timer: f32,
     /// Counter within the current salvo for alternating left/right launch fan-out.
     pub salvo_index: u32,
+    /// Queued missile/rocket salvo rounds for missile weapon arms (`am7210`/`7220`/`7230`).
+    pub arm_salvo: Vec<Option<Entity>>,
+    /// Remaining 60 Hz ticks before the next weapon-arm salvo round leaves the pod.
+    pub arm_salvo_timer: f32,
+    /// Counter within the current weapon-arm salvo for alternating right/left barrel muzzles.
+    pub arm_salvo_index: u32,
 }
 
 /// A bay shift in progress. While this exists the fire buttons do not shoot: they already
@@ -173,6 +185,24 @@ pub struct Flight {
     pub stall_to_vanish_frame: Option<f32>,
 }
 
+/// Sub-munition split specification from `BulletMissileSt` (`0x828ec1a0`, `0x828eaac0`,
+/// `0x828e9f48`, `0x828de278` -> `0x828de0c8` -> `0x828dded8` -> `0x828ddca8`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MissileSplit {
+    /// Minimum 60 Hz flight frames before `close_act` can trigger (`BulletMissileSt.force_trace_frame`, `0x828eaac0`).
+    pub force_trace_frame: f32,
+    /// Split trigger flight frame at 60 Hz (`BulletMissileSt.close_act_start_frame`; `<= 0` disables timer trigger).
+    pub start_frame: f32,
+    /// Split trigger target distance in m (`BulletMissileSt.close_act_start_dist`, `0x828eaac0`).
+    pub start_dist: f32,
+    /// `BULLET_BULLETARISE_BIN` row id (`BulletMissileSt.shoot_bullet_id`, `+0x7c`).
+    pub arise_id: u32,
+    /// Number of sub-munitions spawned (`BulletMissileSt.once_shoot_count`, `+0x80`).
+    pub count: u8,
+    /// Additional child launch speed in m/s (`BulletMissileSt.shoot_speed`, `+0x82`, `0x828ddca8`).
+    pub shoot_speed: f32,
+}
+
 /// Missile flight parameters from `bullet/bulletmissile.bin` (`0x828ec898` -> `0x828e98c0`,
 /// `0x828e9b50`, `0x828ea520`, `0x828eb9c8` -> `0x828eaf88`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -203,6 +233,8 @@ pub struct MissileFlight {
     pub hit_radius: f32,
     /// Proximity fuse detonation distance in m (`+0x10`; 0 = direct impact only).
     pub proximity_fuse_range: f32,
+    /// Sub-munition split specification (`close_act_id == 8 && shoot_bullet_id > 0 && once_shoot_count > 0`).
+    pub split: Option<MissileSplit>,
 }
 
 /// Melee blade parameters from `bullet/bulletblade.bin` (`BulletBladeSt`, `0x828a4928`) and
@@ -265,9 +297,47 @@ pub struct Gun {
     pub stance: bool,
     /// Sniper rifle (`weapon_kind` 5): shots kick with `sniper_$(LR)` instead of `gun_$(LR)`.
     pub sniper: bool,
+    /// Weapon reload stability interpolation factor (`sub +0x2c`, `0x82478b90`, used by `0x8286adf8`).
+    pub reload_stab_factor: f32,
+}
+
+/// Exact 360 arm firing-stability & attack-balance reload multiplier (`0x8286adf8`, called by
+/// `0x8286bd00` from `0x82858638` for every weapon slot):
+/// - `balance = snipe_attack_balance` if `ready_position`, else `attack_balance` (`0x8286a0b0`).
+/// - `t = (reload_stab_factor - 1.0) / (attack_stab_max_rate - 1.0)`.
+/// - `factor = (1.0 - t) + t * balance`.
+/// - When `!ready_position`, multiplies by `ctrl.arm_shoot_stability` (`AcCtrlParam +0x18c`).
+pub fn reload_multiplier(
+    ctrl: &AcCtrlParam,
+    reload_stab_factor: f32,
+    ready_position: bool,
+) -> f32 {
+    let balance = if ready_position {
+        ctrl.snipe_attack_balance
+    } else {
+        ctrl.attack_balance
+    };
+    let denom = ctrl.attack_stab_max_rate - 1.0;
+    let mut factor = if denom.abs() > 1.0e-6 {
+        let t = (reload_stab_factor - 1.0) / denom;
+        (1.0 - t) + t * balance
+    } else {
+        1.0
+    };
+    if !ready_position {
+        factor *= ctrl.arm_shoot_stability;
+    }
+    factor.max(0.05)
 }
 
 impl Gun {
+    /// Applies the 360 firing-stability & attack-balance reload multiplier (`0x8286bd00` / `0x8286adf8`).
+    pub fn apply_reload_stability(&mut self, ctrl: &AcCtrlParam) {
+        if self.kind != Kind::Skip && self.reload_time > 0.0 {
+            self.reload_time *= reload_multiplier(ctrl, self.reload_stab_factor, self.stance);
+        }
+    }
+
     /// Effective `(damage_power, damage_recoil)` at flight distance `dist` in metres
     /// (`0x827cf1c0` -> `0x827cee08` / `0x827cee18`).
     #[cfg(test)]
@@ -590,12 +660,34 @@ pub struct Missile {
     pub ignited: bool,
     pub distance: f32,
     pub life: f32,
+    pub bullet_fx: i32,
     pub hit: i32,
     pub hit_low: i32,
     pub hit_hi: i32,
     pub delete_fx: i32,
     pub after_accel_fx: i32,
     pub hit_se: HitSe,
+    /// Recursion depth for sub-munition splitting (`0` for parent, `1` for spawned children).
+    pub split_depth: u8,
+}
+
+/// One sub-munition spawned when a split missile executes `close_act_id == 8` (`0x828de0c8`).
+#[derive(Clone, Copy, Debug)]
+pub enum SplitChild {
+    Missile(Missile),
+    Projectile {
+        projectile: Projectile,
+        kind: Kind,
+        bullet_fx: i32,
+    },
+}
+
+/// Complete sub-munition burst generated by `Missile::build_split_burst`.
+#[derive(Clone, Debug)]
+pub struct SplitBurst {
+    pub children: Vec<(Vec3, SplitChild)>,
+    pub split_fx: i32,
+    pub split_se: i16,
 }
 
 impl Missile {
@@ -629,12 +721,207 @@ impl Missile {
             ignited: false,
             distance: 0.0,
             life: max_life,
+            bullet_fx: gun.fx.bullet,
             hit: gun.fx.hit,
             hit_low: gun.fx.hit_low,
             hit_hi: gun.fx.hit_hi,
             delete_fx: gun.fx.delete_fx,
             after_accel_fx: gun.fx.after_accel,
             hit_se: gun.hit_se,
+            split_depth: 0,
+        }
+    }
+
+    /// Returns `Some(split)` when `close_act_id == 8` triggers (`0x828eaac0`):
+    /// 1. `age_frames >= force_trace_frame` (when `force_trace_frame > 0`).
+    /// 2. Either `start_frame > 0 && age_frames >= start_frame`, OR `target_pos` is within
+    ///    `start_dist` metres.
+    pub fn should_split(&self, pos: Vec3, target_pos: Option<Vec3>) -> Option<MissileSplit> {
+        if self.split_depth >= 2 {
+            return None;
+        }
+        let split = self.flight.split?;
+        if split.count == 0 || split.arise_id == 0 {
+            return None;
+        }
+        if split.force_trace_frame > 0.0 && self.age_frames < split.force_trace_frame {
+            return None;
+        }
+        let by_frame = split.start_frame > 0.0 && self.age_frames >= split.start_frame;
+        let by_dist = split.start_dist > 0.0
+            && target_pos
+                .is_some_and(|t| pos.distance_squared(t) < split.start_dist * split.start_dist);
+        if by_frame || by_dist {
+            Some(split)
+        } else {
+            None
+        }
+    }
+
+    /// Builds the `once_shoot_count` sub-munition children from `BULLET_BULLETARISE_BIN`
+    /// (`0x828de0c8` -> `0x828dded8` -> `0x828ddca8`).
+    pub fn build_split_burst(
+        &self,
+        pos: Vec3,
+        target_pos: Option<Vec3>,
+        split: MissileSplit,
+    ) -> SplitBurst {
+        let Some(arise_row) = find(BULLET_BULLETARISE_BIN, split.arise_id) else {
+            return SplitBurst {
+                children: Vec::new(),
+                split_fx: self.delete_fx,
+                split_se: self.hit_se.low,
+            };
+        };
+        let arise = &arise_row.data;
+        let count = split.count.max(1) as usize;
+        let (kind, child_flight, child_mf, child_spd) = match self.owner {
+            Owner::Player => flight(arise.bullet_id, split.shoot_speed),
+            Owner::Enemy => enemy_flight(arise.bullet_id, split.shoot_speed),
+        };
+        let sfx_id = u32::try_from(arise.sfx_type).unwrap_or(0);
+        let (mut child_fx, mut child_hit_se) = match self.owner {
+            Owner::Player => fx_and_hit_se_for(sfx_id),
+            Owner::Enemy => enemy_fx_and_hit_se_for(sfx_id),
+        };
+        if arise.hit_effect_id > 0 {
+            if let Some(h) = find(PARAM_BULLETHITSFXPARAM_BIN, arise.hit_effect_id) {
+                child_fx.hit = h.data.default2.into();
+                child_fx.hit_low = h.data.dry_ac_low_damage.into();
+                child_fx.hit_hi = h.data.ac_hi_damage.into();
+            }
+            if let Some(s) = find(PARAM_BULLETHITSEPARAM_BIN, arise.hit_effect_id) {
+                child_hit_se.low = s.data.dry_ac_low_damage;
+                child_hit_se.hi = s.data.ac_hi_damage;
+            }
+        }
+        let (damage_type, damage_power, damage_recoil) = if arise.damage_power > 0.0 {
+            (
+                DamageType::from_raw(arise.damage_type),
+                arise.damage_power,
+                arise.damage_recoil,
+            )
+        } else {
+            (
+                self.damage_type,
+                self.damage_power / count as f32,
+                self.damage_recoil / count as f32,
+            )
+        };
+        let fwd = target_pos
+            .map(|t| (t - pos).normalize_or_zero())
+            .filter(|&d| d != Vec3::ZERO)
+            .unwrap_or_else(|| self.velocity.normalize_or(Vec3::NEG_Z));
+        let up_hint = if fwd.y.abs() > 0.98 { Vec3::X } else { Vec3::Y };
+        let right = fwd.cross(up_hint).normalize_or(Vec3::X);
+        let up = right.cross(fwd).normalize_or(Vec3::Y);
+        let cone = if count <= 4 {
+            20.0_f32.to_radians()
+        } else {
+            28.0_f32.to_radians()
+        };
+
+        let mut children = Vec::with_capacity(count);
+        for k in 0..count {
+            let fan_dir = if count == 1 {
+                fwd
+            } else {
+                let az = std::f32::consts::TAU * (k as f32) / (count as f32) + 0.35;
+                let radial = right * az.cos() + up * az.sin();
+                (fwd * cone.cos() + radial * cone.sin()).normalize_or(fwd)
+            };
+            let spawn_pos = pos + fan_dir * 1.2;
+            match kind {
+                Kind::Missile => {
+                    let mf = child_mf.unwrap_or_default();
+                    // `0x828ddca8`: child_vel = parent_vel + launch_dir * shoot_speed.
+                    let vel = if split.shoot_speed > 0.0 {
+                        self.velocity + fan_dir * split.shoot_speed
+                    } else {
+                        fan_dir * self.velocity.length().max(mf.min_speed).max(40.0)
+                    };
+                    let max_life = ((mf.accel_end_frame + 120.0) / TICK_RATE).clamp(5.0, 14.0);
+                    children.push((
+                        spawn_pos,
+                        SplitChild::Missile(Missile {
+                            owner: self.owner,
+                            velocity: vel,
+                            flight: mf,
+                            decay: self.decay,
+                            damage_type,
+                            damage_power,
+                            damage_recoil,
+                            target: self.target,
+                            age_frames: 0.0,
+                            ignited: false,
+                            distance: 0.0,
+                            life: max_life,
+                            bullet_fx: child_fx.bullet,
+                            hit: child_fx.hit,
+                            hit_low: child_fx.hit_low,
+                            hit_hi: child_fx.hit_hi,
+                            delete_fx: child_fx.delete_fx,
+                            after_accel_fx: child_fx.after_accel,
+                            hit_se: child_hit_se,
+                            split_depth: self.split_depth + 1,
+                        }),
+                    ));
+                }
+                Kind::Rigid | Kind::Energy => {
+                    let vel = if split.shoot_speed > 0.0 {
+                        self.velocity + fan_dir * split.shoot_speed
+                    } else {
+                        fan_dir * child_spd.max(self.velocity.length()).max(40.0)
+                    };
+                    children.push((
+                        spawn_pos,
+                        SplitChild::Projectile {
+                            projectile: Projectile {
+                                owner: self.owner,
+                                velocity: vel,
+                                flight: child_flight,
+                                decay: self.decay,
+                                damage_type,
+                                damage_power,
+                                damage_recoil,
+                                distance: 0.0,
+                                stall_drop: 0.0,
+                                stall_frames: 0.0,
+                                life: MAX_LIFE,
+                                hit: child_fx.hit,
+                                hit_low: child_fx.hit_low,
+                                hit_hi: child_fx.hit_hi,
+                                hit_se: child_hit_se,
+                            },
+                            kind,
+                            bullet_fx: child_fx.bullet,
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let split_fx = if self.delete_fx > 0 {
+            self.delete_fx
+        } else if child_fx.muzzle > 0 {
+            child_fx.muzzle
+        } else {
+            self.hit
+        };
+        let split_se = match self.owner {
+            Owner::Player => find(PARAM_ACWEAPONSOUNDPARAM_BIN, sfx_id)
+                .map(|r| r.data.shoot)
+                .filter(|&s| s > 0)
+                .unwrap_or(self.hit_se.low),
+            Owner::Enemy => find(PARAM_ENEMYWEAPONSOUNDPARAM_BIN, sfx_id)
+                .map(|r| r.data.shoot)
+                .filter(|&s| s > 0)
+                .unwrap_or(self.hit_se.low),
+        };
+        SplitBurst {
+            children,
+            split_fx,
+            split_se,
         }
     }
 
@@ -724,14 +1011,47 @@ pub(crate) struct Tracers {
 
 impl Armament {
     pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
-        let arms_mount = (part_field(design.arms as i64, 2, "shoulder_mount_count").round() as u8).max(1);
+        let ctrl = AcCtrlParam::calculate(design);
+        let weapon_arm = part_field(design.arms as i64, 2, "is_weapon_arm") != 0.0;
+        if weapon_arm {
+            // `0x824793c8` -> `0x82479668` -> `0x8247e090`: weapon arms embed a single unified
+            // category-10 weapon record (9020..9620) and disable hand/hanger/shoulder slots.
+            let wid = part_field(design.arms as i64, 2, "weapon_arm_id") as i64;
+            let mut wa = gun(wid);
+            wa.apply_reload_stability(&ctrl);
+            return Self {
+                hands: [wa, silent()],
+                bays: [silent(), silent()],
+                shoulder: silent(),
+                weapon_arm: true,
+                salvo: Vec::new(),
+                salvo_timer: 0.0,
+                salvo_index: 0,
+                arm_salvo: Vec::new(),
+                arm_salvo_timer: 0.0,
+                arm_salvo_index: 0,
+            };
+        }
+        let arms_mount =
+            (part_field(design.arms as i64, 2, "shoulder_mount_count").round() as u8).max(1);
+        let mut hands = [gun(design.armwep_r as i64), gun(design.armwep_l as i64)];
+        let mut bays = [gun(design.hanger_r as i64), gun(design.hanger_l as i64)];
+        let mut shoulder = shoulder_gun(design.shoulder as i64, arms_mount);
+        for g in hands.iter_mut().chain(bays.iter_mut()) {
+            g.apply_reload_stability(&ctrl);
+        }
+        shoulder.apply_reload_stability(&ctrl);
         Self {
-            hands: [gun(design.armwep_r as i64), gun(design.armwep_l as i64)],
-            bays: [gun(design.hanger_r as i64), gun(design.hanger_l as i64)],
-            shoulder: shoulder_gun(design.shoulder as i64, arms_mount),
+            hands,
+            bays,
+            shoulder,
+            weapon_arm: false,
             salvo: Vec::new(),
             salvo_timer: 0.0,
             salvo_index: 0,
+            arm_salvo: Vec::new(),
+            arm_salvo_timer: 0.0,
+            arm_salvo_index: 0,
         }
     }
 }
@@ -933,7 +1253,7 @@ pub fn fire(
         Without<ClipJoint>,
     >,
     rigging: Rigging,
-    points: Query<(Entity, &EffectPoint)>,
+    points: Query<(Entity, &EffectPoint, &GlobalTransform)>,
     mut body: Body,
     mut posed: Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
 ) {
@@ -990,6 +1310,337 @@ pub fn fire(
             }
         }
     }
+    if arms.weapon_arm {
+        let want_wa = want[0] || want[1];
+        // Collect weapon-arm muzzle effect points (even IDs 102/104/106/108 = right arm,
+        // odd IDs 101/103/105/107 = left arm), interleaved right-then-left.
+        let mut right_muzzles: Vec<(u8, Entity, Vec3)> = Vec::new();
+        let mut left_muzzles: Vec<(u8, Entity, Vec3)> = Vec::new();
+        for (ent, pt, gt) in points.iter() {
+            if pt.column == "arms" && (101..=112).contains(&pt.id) {
+                if pt.id % 2 == 0 {
+                    right_muzzles.push((pt.id, ent, gt.translation()));
+                } else {
+                    left_muzzles.push((pt.id, ent, gt.translation()));
+                }
+            }
+        }
+        right_muzzles.sort_by_key(|m| m.0);
+        left_muzzles.sort_by_key(|m| m.0);
+        let mut muzzles: Vec<(Entity, Vec3)> = Vec::new();
+        let max_len = right_muzzles.len().max(left_muzzles.len());
+        for k in 0..max_len {
+            if let Some(&(_, e, p)) = right_muzzles.get(k) {
+                muzzles.push((e, p));
+            }
+            if let Some(&(_, e, p)) = left_muzzles.get(k) {
+                muzzles.push((e, p));
+            }
+        }
+        let fallback_origin = rigging
+            .hardpoints
+            .iter()
+            .next()
+            .map_or(ac_tf.translation + Vec3::Y * 4.5, |(_, t)| t.translation());
+
+        arms.hands[0].cooldown = (arms.hands[0].cooldown - frames).max(0.0);
+        if arms.hands[0].kind == Kind::Blade {
+            let gun = &mut arms.hands[0];
+            if let Some(blade) = gun.blade {
+                let has_ammo = blade.infinite_ammo || gun.remaining > 0;
+                if want_wa
+                    && has_ammo
+                    && gun.cooldown <= 0.0
+                    && !pilot.in_blade()
+                    && !pilot.in_kick()
+                    && pilot.en >= gun.en_drain
+                {
+                    let target = fcs
+                        .as_deref()
+                        .and_then(|f| f.locked.as_ref())
+                        .map(|l| (l.entity, l.world_pos));
+                    let launch = BladeLaunch {
+                        hand_idx: 0,
+                        physical: blade.physical,
+                        target,
+                        hit_radius: blade.hit_radius,
+                        blade_radius: blade.blade_radius,
+                        max_hits: blade.max_hits,
+                        decay_power: blade.decay_power,
+                        decay_recoil: blade.decay_recoil,
+                        damage_type: gun.damage_type,
+                        damage_power: gun.damage_power,
+                        damage_recoil: gun.damage_recoil,
+                        trail_fx: gun.fx.bullet,
+                        hit_low_fx: gun.fx.hit_low,
+                        hit_hi_fx: gun.fx.hit_hi,
+                        hit_low_se: gun.hit_se.low,
+                        hit_hi_se: gun.hit_se.hi,
+                    };
+                    if pilot.start_blade(launch) {
+                        let _ = pilot.try_drain_en(gun.en_drain);
+                        if !blade.infinite_ammo {
+                            gun.remaining = gun.remaining.saturating_sub(1);
+                        }
+                        gun.cooldown = gun.reload_time.max(1.0);
+                        if let Some(status) = status.as_deref_mut() {
+                            status.en = pilot.en;
+                            status.en_max = pilot.en_max;
+                        }
+                        sound::shot(
+                            &mut commands,
+                            &mut speaker.cues,
+                            &mut speaker.sources,
+                            gun.shoot,
+                        );
+                    }
+                }
+            }
+        } else if arms.hands[0].kind == Kind::Missile {
+            if arms.arm_salvo.is_empty()
+                && want_wa
+                && arms.hands[0].remaining > 0
+                && arms.hands[0].cooldown <= 0.0
+                && pilot.en >= arms.hands[0].en_drain
+            {
+                let burst = arms.hands[0].burst_count.max(1) as usize;
+                let rem = arms.hands[0].remaining as usize;
+                if arms.hands[0].is_missile {
+                    let locks = fcs
+                        .as_deref_mut()
+                        .map_or_else(Vec::new, crate::fcs::Fcs::take_missile_locks);
+                    if locks.is_empty() {
+                        for _ in 0..burst.min(rem) {
+                            arms.arm_salvo.push(None);
+                        }
+                    } else {
+                        for target in locks {
+                            for _ in 0..burst {
+                                if arms.arm_salvo.len() >= rem {
+                                    break;
+                                }
+                                arms.arm_salvo.push(Some(target));
+                            }
+                        }
+                    }
+                } else {
+                    // Rocket / dumbfire weapon arm (e.g. am7230 wep 9230: burst_count=2, lock_once=8).
+                    let salvo_count = (burst * arms.hands[0].weapon_lock_max.max(1) as usize).min(rem);
+                    for _ in 0..salvo_count {
+                        arms.arm_salvo.push(None);
+                    }
+                }
+                if !arms.arm_salvo.is_empty() {
+                    arms.arm_salvo_timer = 0.0;
+                    arms.arm_salvo_index = 0;
+                    arms.hands[0].cooldown = arms.hands[0].reload_time.max(1.0);
+                }
+            }
+            if !arms.arm_salvo.is_empty() {
+                arms.arm_salvo_timer = (arms.arm_salvo_timer - frames).max(0.0);
+                if arms.arm_salvo_timer <= 0.0 {
+                    let target_opt = arms.arm_salvo.remove(0);
+                    if arms.hands[0].remaining > 0 && pilot.try_drain_en(arms.hands[0].en_drain) {
+                        if let Some(status) = status.as_deref_mut() {
+                            status.en = pilot.en;
+                            status.en_max = pilot.en_max;
+                        }
+                        let (muzzle_ent, origin) = if muzzles.is_empty() {
+                            (None, fallback_origin)
+                        } else {
+                            let (e, p) = muzzles[(arms.arm_salvo_index as usize) % muzzles.len()];
+                            (Some(e), p)
+                        };
+                        arms.hands[0].remaining = arms.hands[0].remaining.saturating_sub(1);
+                        sound::shot(
+                            &mut commands,
+                            &mut speaker.cues,
+                            &mut speaker.sources,
+                            arms.hands[0].shoot,
+                        );
+                        if arms.hands[0].fx.muzzle > 0 {
+                            if let Some(point) = muzzle_ent {
+                                commands.spawn((
+                                    Sfx::new(arms.hands[0].fx.muzzle),
+                                    Transform::from_scale(Vec3::splat(MUZZLE_SCALE)),
+                                    Visibility::default(),
+                                    ChildOf(point),
+                                ));
+                            } else {
+                                commands.spawn((
+                                    Sfx::new(arms.hands[0].fx.muzzle),
+                                    Transform::from_translation(origin)
+                                        .looking_to(-aim, Vec3::Y)
+                                        .with_scale(Vec3::splat(MUZZLE_SCALE)),
+                                ));
+                            }
+                        }
+                        let wa_aim = if target_opt.is_none() {
+                            fcs.as_deref()
+                                .and_then(|f| f.locked.as_ref())
+                                .map(|l| (l.world_pos - origin).normalize_or_zero())
+                                .filter(|&d| d != Vec3::ZERO)
+                                .unwrap_or(aim)
+                        } else {
+                            aim
+                        };
+                        let right = wa_aim.cross(Vec3::Y).normalize_or_zero();
+                        let side = if arms.arm_salvo_index % 2 == 0 { 1.0 } else { -1.0 };
+                        let launch_dir = if target_opt.is_some() {
+                            (wa_aim + Vec3::Y * 0.25 + right * (0.22 * side)).normalize_or(wa_aim)
+                        } else {
+                            wa_aim
+                        };
+                        arms.arm_salvo_index = arms.arm_salvo_index.wrapping_add(1);
+                        let missile = Missile::from_gun(&arms.hands[0], launch_dir, target_opt);
+                        let tf = Transform::from_translation(origin).looking_to(launch_dir, Vec3::Y);
+                        if arms.hands[0].fx.bullet > 0 {
+                            commands
+                                .spawn((
+                                    tf,
+                                    missile,
+                                    Visibility::default(),
+                                    Mesh3d(assets.mesh.clone()),
+                                    MeshMaterial3d(assets.missile.clone()),
+                                ))
+                                .with_child((Sfx::new(arms.hands[0].fx.bullet), Transform::default()));
+                        } else {
+                            commands.spawn((
+                                Mesh3d(assets.mesh.clone()),
+                                MeshMaterial3d(assets.missile.clone()),
+                                tf,
+                                missile,
+                            ));
+                        }
+                    }
+                    arms.arm_salvo_timer = arms.hands[0].burst_interval.max(3.0);
+                }
+            }
+        } else {
+            let gun = &mut arms.hands[0];
+            let can = gun.kind != Kind::Skip
+                && gun.remaining > 0
+                && gun.cooldown <= 0.0
+                && pilot.en >= gun.en_drain;
+            if let Some(anims) = body.anims.as_mut() {
+                for arm in &mut anims.arms {
+                    arm.playback.tick(want_wa, false, frames);
+                    arm.apply(&mut posed);
+                }
+            }
+            if want_wa && can && pilot.try_drain_en(gun.en_drain) {
+                if let Some(anims) = body.anims.as_mut() {
+                    anims.kick(Hand::Right, gun.sniper);
+                    anims.kick(Hand::Left, gun.sniper);
+                }
+                if let Some(status) = status.as_deref_mut() {
+                    status.en = pilot.en;
+                    status.en_max = pilot.en_max;
+                }
+                let shots = (gun.burst_count.max(1) as usize).min(gun.remaining as usize);
+                gun.remaining = gun.remaining.saturating_sub(shots as u16);
+                gun.cooldown = gun.reload_time.max(1.0);
+                sound::shot(
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    gun.shoot,
+                );
+                // Spawn muzzle flash once per active barrel (up to `shots`).
+                let barrel_count = muzzles.len().min(shots);
+                if gun.fx.muzzle > 0 {
+                    if barrel_count > 0 {
+                        for &(point, _) in muzzles.iter().take(barrel_count) {
+                            commands.spawn((
+                                Sfx::new(gun.fx.muzzle),
+                                Transform::from_scale(Vec3::splat(MUZZLE_SCALE)),
+                                Visibility::default(),
+                                ChildOf(point),
+                            ));
+                        }
+                    } else {
+                        commands.spawn((
+                            Sfx::new(gun.fx.muzzle),
+                            Transform::from_translation(fallback_origin)
+                                .looking_to(-aim, Vec3::Y)
+                                .with_scale(Vec3::splat(MUZZLE_SCALE)),
+                        ));
+                    }
+                }
+                let pellets_per_barrel = if muzzles.is_empty() {
+                    shots
+                } else {
+                    shots.div_ceil(muzzles.len())
+                };
+                for k in 0..shots {
+                    let origin = if muzzles.is_empty() {
+                        fallback_origin
+                    } else {
+                        muzzles[k % muzzles.len()].1
+                    };
+                    let base_aim = fcs
+                        .as_deref()
+                        .map_or(aim, |f| f.aim_for_hand(0, origin, gun.init_speed, aim));
+                    let shot_aim = if pellets_per_barrel > 1 {
+                        // Scatter/shotgun weapon arm (e.g. am7410/7420): slight deterministic pellet cone.
+                        let right = base_aim.cross(Vec3::Y).normalize_or(Vec3::X);
+                        let up = right.cross(base_aim).normalize_or(Vec3::Y);
+                        let az = std::f32::consts::TAU * (k as f32) / (shots as f32);
+                        let spread = 0.035;
+                        (base_aim + (right * az.cos() + up * az.sin()) * spread)
+                            .normalize_or(base_aim)
+                    } else {
+                        base_aim
+                    };
+                    let shot = (
+                        Transform::from_translation(origin).looking_to(shot_aim, Vec3::Y),
+                        Projectile::from_gun(gun, shot_aim),
+                    );
+                    if gun.fx.bullet > 0 {
+                        commands
+                            .spawn((shot, Visibility::default()))
+                            .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+                    } else {
+                        let material = match gun.kind {
+                            Kind::Energy => assets.energy.clone(),
+                            _ => assets.rigid.clone(),
+                        };
+                        commands.spawn((
+                            Mesh3d(assets.mesh.clone()),
+                            MeshMaterial3d(material),
+                            shot,
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(anims) = body.anims.as_mut() {
+            for (i, hand) in [Hand::Right, Hand::Left].into_iter().enumerate() {
+                let muzzle = if hand == Hand::Right {
+                    right_muzzles.first().or_else(|| left_muzzles.first()).map(|m| m.1)
+                } else {
+                    left_muzzles.first().or_else(|| right_muzzles.first()).map(|m| m.1)
+                };
+                let origin = rigging
+                    .hardpoints
+                    .iter()
+                    .find(|(h, _)| h.hand == hand)
+                    .map_or(fallback_origin, |(_, t)| t.translation());
+                let hand_aim = fcs
+                    .as_deref()
+                    .map_or(aim, |f| f.aim_for_hand(0, origin, arms.hands[0].init_speed, aim));
+                let arm = &mut anims.aim[i];
+                arm.sniper = arms.hands[0].sniper;
+                arm.step(want_wa && arms.hands[0].kind != Kind::Skip && arms.hands[0].kind != Kind::Blade, frames);
+                arm.frame = arm
+                    .shoulder
+                    .and_then(|s| rigging.aim_frame(s, hand, muzzle, hand_aim));
+            }
+            anims.apply_recoil(frames, &mut posed);
+        }
+        return;
+    }
+
     for (i, gun) in arms.hands.iter_mut().enumerate() {
         gun.cooldown = (gun.cooldown - dt * TICK_RATE).max(0.0);
         let hand = if i == 0 { Hand::Right } else { Hand::Left };
@@ -1114,9 +1765,9 @@ pub fn fire(
         if gun.fx.muzzle > 0 {
             match points
                 .iter()
-                .find(|(_, p)| p.column == column && p.id == MUZZLE_POINT)
+                .find(|(_, p, _)| p.column == column && p.id == MUZZLE_POINT)
             {
-                Some((point, _)) => commands.spawn((
+                Some((point, _, _)) => commands.spawn((
                     Sfx::new(gun.fx.muzzle),
                     Transform::from_scale(Vec3::splat(MUZZLE_SCALE)),
                     Visibility::default(),
@@ -1294,8 +1945,8 @@ pub fn fire(
                 };
                 let muzzle = points
                     .iter()
-                    .find(|(_, p)| p.column == column && p.id == MUZZLE_POINT)
-                    .map(|(e, _)| e);
+                    .find(|(_, p, _)| p.column == column && p.id == MUZZLE_POINT)
+                    .map(|(e, _, _)| e);
                 let origin = rigging
                     .hardpoints
                     .iter()
@@ -1522,6 +2173,7 @@ pub fn step_missiles(
     time: Res<Time>,
     piloting: Res<Piloting>,
     collision: Res<Collision>,
+    assets: Res<Tracers>,
     mut speaker: Speaker,
     mut commands: Commands,
     mut targets: Query<
@@ -1564,6 +2216,87 @@ pub fn step_missiles(
                 .with_child((Sfx::new(missile.after_accel_fx), Transform::default()));
         }
         let next = prev + delta;
+
+        // Sub-munition split detonation (`close_act_id == 8` / `shoot_bullet_id` ->
+        // `BULLET_BULLETARISE_BIN`, `0x828eaac0` -> `0x828e9f48` -> `0x828de0c8` -> `0x828ddca8`).
+        if let Some(split) = missile.should_split(next, target_pos) {
+            let burst = missile.build_split_burst(next, target_pos, split);
+            if burst.split_fx > 0 {
+                commands.spawn((Sfx::new(burst.split_fx), Transform::from_translation(next)));
+            }
+            if burst.split_se > 0 {
+                sound::cue(
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    &format!("w{:08}", burst.split_se),
+                );
+            }
+            for (spawn_pos, child) in burst.children {
+                match child {
+                    SplitChild::Missile(cm) => {
+                        let dir = cm.velocity.normalize_or(Vec3::NEG_Z);
+                        let tf = Transform::from_translation(spawn_pos).looking_to(dir, Vec3::Y);
+                        let mat = match cm.owner {
+                            Owner::Player => assets.missile.clone(),
+                            Owner::Enemy => assets.enemy_missile.clone(),
+                        };
+                        if cm.bullet_fx > 0 {
+                            commands
+                                .spawn((
+                                    tf,
+                                    cm,
+                                    Visibility::default(),
+                                    Mesh3d(assets.mesh.clone()),
+                                    MeshMaterial3d(mat),
+                                ))
+                                .with_child((Sfx::new(cm.bullet_fx), Transform::default()));
+                        } else {
+                            commands.spawn((
+                                Mesh3d(assets.mesh.clone()),
+                                MeshMaterial3d(mat),
+                                tf,
+                                cm,
+                            ));
+                        }
+                    }
+                    SplitChild::Projectile {
+                        projectile,
+                        kind,
+                        bullet_fx,
+                    } => {
+                        let dir = projectile.velocity.normalize_or(Vec3::NEG_Z);
+                        let tf = Transform::from_translation(spawn_pos).looking_to(dir, Vec3::Y);
+                        let mat = match (projectile.owner, kind) {
+                            (Owner::Player, Kind::Energy) => assets.energy.clone(),
+                            (Owner::Player, _) => assets.rigid.clone(),
+                            (Owner::Enemy, Kind::Energy) => assets.enemy_energy.clone(),
+                            (Owner::Enemy, _) => assets.enemy_rigid.clone(),
+                        };
+                        if bullet_fx > 0 {
+                            commands
+                                .spawn((
+                                    tf,
+                                    projectile,
+                                    Visibility::default(),
+                                    Mesh3d(assets.mesh.clone()),
+                                    MeshMaterial3d(mat),
+                                ))
+                                .with_child((Sfx::new(bullet_fx), Transform::default()));
+                        } else {
+                            commands.spawn((
+                                Mesh3d(assets.mesh.clone()),
+                                MeshMaterial3d(mat),
+                                tf,
+                                projectile,
+                            ));
+                        }
+                    }
+                }
+            }
+            commands.entity(e).despawn();
+            continue;
+        }
 
         let extra_r = missile
             .flight
@@ -2068,6 +2801,7 @@ pub(crate) fn silent() -> Gun {
         hit_se: HitSe::default(),
         stance: false,
         sniper: false,
+        reload_stab_factor: 1.0,
     }
 }
 
@@ -2135,6 +2869,7 @@ fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
         hit_se,
         stance: category == 10 && part_field(id, 10, "ready_position") != 0.0,
         sniper: category == 10 && part_field(id, 10, "weapon_kind") == 5.0,
+        reload_stab_factor: part_field(id, category, "reload_stab_factor"),
     }
 }
 
@@ -2198,6 +2933,7 @@ fn enemy_gun_from_record(data: &[u8]) -> Gun {
         hit_se,
         stance: false,
         sniper: false,
+        reload_stab_factor: 1.0,
     }
 }
 
@@ -2258,6 +2994,16 @@ fn enemy_flight(id: u32, init_speed: f32) -> (Kind, Flight, Option<MissileFlight
             max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
             hit_radius: d.hit_radius,
             proximity_fuse_range: d.proximity_fuse_range,
+            split: (d.close_act_id == 8 && d.shoot_bullet_id > 0 && d.once_shoot_count > 0).then_some(
+                MissileSplit {
+                    force_trace_frame: d.force_trace_frame as f32,
+                    start_frame: d.close_act_start_frame as f32,
+                    start_dist: d.close_act_start_dist,
+                    arise_id: d.shoot_bullet_id,
+                    count: d.once_shoot_count,
+                    shoot_speed: d.shoot_speed as f32,
+                },
+            ),
         };
         let spd = if init_speed > 0.0 {
             init_speed
@@ -2389,6 +3135,16 @@ fn flight(id: u32, init_speed: f32) -> (Kind, Flight, Option<MissileFlight>, f32
             max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
             hit_radius: d.hit_radius,
             proximity_fuse_range: d.proximity_fuse_range,
+            split: (d.close_act_id == 8 && d.shoot_bullet_id > 0 && d.once_shoot_count > 0).then_some(
+                MissileSplit {
+                    force_trace_frame: d.force_trace_frame as f32,
+                    start_frame: d.close_act_start_frame as f32,
+                    start_dist: d.close_act_start_dist,
+                    arise_id: d.shoot_bullet_id,
+                    count: d.once_shoot_count,
+                    shoot_speed: d.shoot_speed as f32,
+                },
+            ),
         };
         return (
             Kind::Missile,
@@ -3704,5 +4460,210 @@ mod tests {
         let (at, normal) = hit.expect("projectile must impact vertical wall instead of clipping");
         assert!((at.z - (-30.0)).abs() < 1e-3, "impact at {at}");
         assert!((normal - Vec3::Z).length() < 1e-3, "wall normal {normal}");
+    }
+
+    #[test]
+    fn arm_firing_stability_and_attack_balance_scale_reload() {
+        let base = acvd_data::find(
+            acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN,
+            5001,
+        )
+        .unwrap()
+        .data;
+        let ctrl_base = AcCtrlParam::calculate(&base);
+        let arms_base = Armament::from_design(&base);
+
+        // High firing-stability arms (5520: shoot_stability = 199 -> arm_shoot_stability = 0.67)
+        // vs low firing-stability arms (120: shoot_stability = 122 -> arm_shoot_stability = 0.927).
+        let mut high_stab = base;
+        high_stab.arms = 5520;
+        let mut low_stab = base;
+        low_stab.arms = 120;
+        let ctrl_hi = AcCtrlParam::calculate(&high_stab);
+        let ctrl_lo = AcCtrlParam::calculate(&low_stab);
+        assert!(
+            (ctrl_hi.arm_shoot_stability - (1.0 - (199.0 - 100.0) / 300.0)).abs() < 1e-4,
+            "arm_shoot_stability = {}",
+            ctrl_hi.arm_shoot_stability
+        );
+        assert!(ctrl_hi.arm_shoot_stability < ctrl_lo.arm_shoot_stability);
+
+        let arm_hi = Armament::from_design(&high_stab);
+        let arm_lo = Armament::from_design(&low_stab);
+        let raw_r = gun(base.armwep_r as i64);
+        let expected_base =
+            raw_r.reload_time * reload_multiplier(&ctrl_base, raw_r.reload_stab_factor, raw_r.stance);
+        assert!(
+            (arms_base.hands[0].reload_time - expected_base).abs() < 1e-4,
+            "expected {expected_base}, got {}",
+            arms_base.hands[0].reload_time
+        );
+        assert!(
+            arm_hi.hands[0].reload_time < arm_lo.hands[0].reload_time,
+            "higher firing stability must reload faster: hi={} lo={}",
+            arm_hi.hands[0].reload_time,
+            arm_lo.hands[0].reload_time
+        );
+
+        // Ready-position cannon (2010: ready_position = 1) uses snipe_attack_balance without
+        // arm_shoot_stability (`0x8286adf8`), so quad legs (1110) reload much faster than biped.
+        let mut quad = base;
+        quad.legs = 1110;
+        quad.armwep_r = 2010;
+        let mut biped = base;
+        biped.armwep_r = 2010;
+        let ctrl_quad = AcCtrlParam::calculate(&quad);
+        let ctrl_biped = AcCtrlParam::calculate(&biped);
+        assert!(ctrl_quad.snipe_attack_balance < ctrl_biped.snipe_attack_balance * 0.5);
+        let arm_quad = Armament::from_design(&quad);
+        let arm_biped = Armament::from_design(&biped);
+        assert!(
+            arm_quad.hands[0].reload_time < arm_biped.hands[0].reload_time,
+            "quad ready-position cannon reload {} must be faster than biped {}",
+            arm_quad.hands[0].reload_time,
+            arm_biped.hands[0].reload_time
+        );
+    }
+
+    #[test]
+    fn split_missiles_trigger_and_spawn_sub_munitions() {
+        // Player Spread Missile sh1010 (bullet 51010 -> BulletAriseSt 51010 -> 3x child 61010).
+        let sh1010 = shoulder_gun(1010, 1);
+        assert_eq!(sh1010.kind, Kind::Missile);
+        let mf = sh1010.missile_flight.expect("missile flight");
+        let split = mf.split.expect("51010 must have MissileSplit (close_act_id == 8)");
+        assert_eq!(split.arise_id, 51010);
+        assert_eq!(split.count, 3);
+        assert_eq!(split.start_frame, 45.0);
+        assert_eq!(split.force_trace_frame, 25.0);
+        assert_eq!(split.shoot_speed, 100.0);
+
+        let mut parent = Missile::from_gun(&sh1010, Vec3::NEG_Z, None);
+        let mut pos = Vec3::new(0.0, 10.0, 0.0);
+        let target = Vec3::new(0.0, 10.0, -350.0);
+        let dt = 1.0 / TICK_RATE;
+        let mut split_tick = None;
+        for tick in 1..=90 {
+            let (delta, _) = parent.step(pos, Some(target), dt).expect("parent alive");
+            pos += delta;
+            if parent.should_split(pos, Some(target)).is_some() {
+                split_tick = Some(tick);
+                break;
+            }
+        }
+        assert_eq!(split_tick, Some(45), "Spread missile 51010 splits at frame 45");
+
+        let burst = parent.build_split_burst(pos, Some(target), split);
+        assert_eq!(burst.children.len(), 3, "must spawn 3 child missiles");
+        let mut dirs = Vec::new();
+        for (cpos, child) in burst.children {
+            let SplitChild::Missile(mut cm) = child else {
+                panic!("expected child Missile for 61010");
+            };
+            assert_eq!(cm.damage_power, 652.0);
+            assert_eq!(cm.damage_recoil, 1523.0);
+            assert_eq!(cm.split_depth, 1);
+            assert!(cm.flight.split.is_none(), "child 61010 does not split again");
+            dirs.push(cm.velocity.normalize());
+            // Confirm each child homes toward target.
+            let mut p = cpos;
+            let mut min_d = f32::MAX;
+            for _ in 0..360 {
+                let Some((d, _)) = cm.step(p, Some(target), dt) else {
+                    break;
+                };
+                p += d;
+                min_d = min_d.min(p.distance(target));
+            }
+            assert!(min_d < 8.0, "child missile should home to target (min_d = {min_d})");
+        }
+        // Children fan out in distinct directions.
+        assert!(dirs[0].dot(dirs[1]) < 0.99);
+        assert!(dirs[1].dot(dirs[2]) < 0.99);
+
+        // Distance-triggered split (enemy cluster missile 3521 -> BulletAriseSt 5122 -> 4x 3522).
+        let (ekind, _, emf, _) = enemy_flight(3521, 60.0);
+        assert_eq!(ekind, Kind::Missile);
+        let esplit = emf.unwrap().split.expect("3521 split spec");
+        assert_eq!(esplit.arise_id, 5122);
+        assert_eq!(esplit.count, 4);
+        assert_eq!(esplit.start_dist, 120.0);
+        let em = Missile::from_gun_owned(
+            &Gun {
+                missile_flight: emf,
+                kind: Kind::Missile,
+                init_speed: 60.0,
+                ..silent()
+            },
+            Vec3::NEG_Z,
+            None,
+            Owner::Enemy,
+        );
+        assert!(em.should_split(Vec3::ZERO, Some(Vec3::new(0.0, 0.0, -200.0))).is_none());
+        assert!(em.should_split(Vec3::ZERO, Some(Vec3::new(0.0, 0.0, -100.0))).is_some());
+        let eburst = em.build_split_burst(Vec3::ZERO, Some(Vec3::new(0.0, 0.0, -100.0)), esplit);
+        assert_eq!(eburst.children.len(), 4);
+    }
+
+    #[test]
+    fn weapon_arms_resolve_embedded_weapons_and_stats() {
+        let get = |id: u32| {
+            acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+                .iter()
+                .flat_map(|(_, r)| r.iter())
+                .find(|r| r.id == id)
+                .unwrap()
+                .data
+        };
+
+        // 6001: am7020 dual blade weapon arms -> wep10 9020 (KE physical blade, infinite ammo).
+        let a6001 = Armament::from_design(&get(6001));
+        assert!(a6001.weapon_arm);
+        assert_eq!(a6001.hands[0].kind, Kind::Blade);
+        assert_eq!(a6001.hands[0].damage_type, DamageType::Ke);
+        assert_eq!(a6001.hands[0].damage_power, 7735.0);
+        assert!(a6001.hands[0].blade.unwrap().infinite_ammo);
+        assert_eq!(a6001.hands[1].kind, Kind::Skip);
+        assert_eq!(a6001.shoulder.kind, Kind::Skip);
+
+        // 6009: am7420 scatter cannon arms -> wep10 9420 (CE rigid, burst 8, mag 192; ignores stale hand slots).
+        let a6009 = Armament::from_design(&get(6009));
+        assert!(a6009.weapon_arm);
+        assert_eq!(a6009.hands[0].kind, Kind::Rigid);
+        assert_eq!(a6009.hands[0].damage_type, DamageType::Ce);
+        assert_eq!(a6009.hands[0].burst_count, 8);
+        assert_eq!(a6009.hands[0].magazine, 192);
+        assert_eq!(a6009.hands[1].kind, Kind::Skip);
+
+        // 6120: am7230 rocket weapon arms -> wep10 9230 (Missile, mag 480, burst 2).
+        let a6120 = Armament::from_design(&get(6120));
+        assert!(a6120.weapon_arm);
+        assert_eq!(a6120.hands[0].kind, Kind::Missile);
+        assert_eq!(a6120.hands[0].magazine, 480);
+        assert_eq!(a6120.hands[0].burst_count, 2);
+
+        // 6260: am7110 sniper cannon weapon arms -> wep10 9110 (Rigid, 1036 m/s, 9865 dmg).
+        let a6260 = Armament::from_design(&get(6260));
+        assert!(a6260.weapon_arm);
+        assert_eq!(a6260.hands[0].kind, Kind::Rigid);
+        assert_eq!(a6260.hands[0].init_speed, 1036.0);
+        assert_eq!(a6260.hands[0].damage_power, 9865.0);
+
+        // 6302: am7510 laser cannon weapon arms -> wep10 9510 (Energy TE, EN drain 25369, mag 40).
+        let a6302 = Armament::from_design(&get(6302));
+        assert!(a6302.weapon_arm);
+        assert_eq!(a6302.hands[0].kind, Kind::Energy);
+        assert_eq!(a6302.hands[0].damage_type, DamageType::Te);
+        assert_eq!(a6302.hands[0].en_drain, 25369.0);
+        assert_eq!(a6302.hands[0].magazine, 40);
+
+        // Homing missile weapon arm am7210 -> wep10 9210 (is_missile = true, multi-lock).
+        let mut d7210 = get(6001);
+        d7210.arms = 7210;
+        let a7210 = Armament::from_design(&d7210);
+        assert!(a7210.weapon_arm);
+        assert_eq!(a7210.hands[0].kind, Kind::Missile);
+        assert!(a7210.hands[0].is_missile);
+        assert_eq!(a7210.hands[0].magazine, 160);
     }
 }

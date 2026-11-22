@@ -736,10 +736,33 @@ fn show(
             }
         }
         if part.placement.column == "arms" {
-            for bone_name in ["r_kata", "l_kata"] {
+            let is_wa =
+                acvd_data::part_field(part.placement.part as i64, 2, "is_weapon_arm") != 0.0;
+            for (bone_name, hand) in [
+                ("r_kata", weapons::Hand::Right),
+                ("l_kata", weapons::Hand::Left),
+            ] {
                 if let Some(idx) = part.rig.bones.iter().position(|b| b.name == bone_name) {
                     if let Some(&e) = joints.get(idx) {
                         commands.entity(e).insert(weapons::ShoulderHardpoint);
+                    }
+                }
+                if is_wa {
+                    let hp_bone = if hand == weapons::Hand::Right {
+                        "r_armhand"
+                    } else {
+                        "l_armhand"
+                    };
+                    let idx = part
+                        .rig
+                        .bones
+                        .iter()
+                        .position(|b| b.name == hp_bone)
+                        .or_else(|| part.rig.bones.iter().position(|b| b.name == bone_name));
+                    if let Some(idx) = idx {
+                        if let Some(&e) = joints.get(idx) {
+                            commands.entity(e).insert(weapons::Hardpoint { hand });
+                        }
                     }
                 }
             }

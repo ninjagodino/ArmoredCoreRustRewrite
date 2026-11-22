@@ -131,6 +131,9 @@ pub(crate) fn shift(
     let Ok((pilot, mut arms)) = acs.single_mut() else {
         return;
     };
+    if arms.weapon_arm {
+        return;
+    }
 
     if let Some(shift) = active.as_mut() {
         let frame = motion

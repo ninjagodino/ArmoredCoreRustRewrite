@@ -129,3 +129,8 @@ param/newacbehavior.bin,401,ブレード時に上下旋回制限角度,blade_pit
 param/newacbehavior.bin,402,ブレード時の上下旋回速度(deg/frame),blade_pitch_speed_deg,deg/tick,done,"+0x5b6 (u16 = 1); vertical pitch turn speed during blade swing"
 param/newacbehavior.bin,455,フレーム：実ブレードのタメ,phys_blade_charge_frames,ticks,done,"+0x648 (f32 = 5.0); 360 0x828af660 reads +0x648 x 1/60 at 0x828af690 as physical blade / heat pile Phase 0 charge duration in 0x828ae9e0"
 param/newacbehavior.bin,556,【 Sys_ブレード上昇率 】,blade_rise_rate,AcCtrlParamCalc input,done,"GetExcelParam(62) = 0.3; AcCtrlParamCalc.lua line 155 Scr_SetParam 79 (levitate_max_speed * this -> AcMove +0x160 blade vertical rise cap)"
+param/newacbehavior.bin,528,安定性による基本上昇倍率,attack_stab_base,AcCtrlParamCalc input,done,"GetExcelParam(34) = 1.0; AcCtrlParamCalc.lua line 353 attackBalance base"
+param/newacbehavior.bin,529,姿勢制御基準値（攻撃）,attack_leg_stab_ref,AcCtrlParamCalc input,done,"GetExcelParam(35) = 500.0; AcCtrlParamCalc.lua line 353 legStability reference"
+param/newacbehavior.bin,530,安定制御基準値（攻撃）,attack_head_bal_ref,AcCtrlParamCalc input,done,"GetExcelParam(36) = 500.0; AcCtrlParamCalc.lua line 353 headBalance reference"
+param/newacbehavior.bin,531,攻撃安定特性がこの値で最大,attack_stab_max_rate,AcCtrlParamCalc input,done,"GetExcelParam(37) = 0.3; AcCtrlParamCalc.lua line 367 Scr_SetParam 78 -> AcCtrlParam +0x13c (360 0x8286adf8 reload interpolation endpoint)"
+param/newacbehavior.bin,563,【 Sys_安定性能調整値 】,attack_stab_div,AcCtrlParamCalc input,done,"GetExcelParam(69) = 5.0; AcCtrlParamCalc.lua line 353 attackBalance divisor"

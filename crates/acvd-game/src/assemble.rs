@@ -67,7 +67,13 @@ pub struct Assembly {
 pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
     let mut out = Assembly::default();
     let mut placed: Vec<(&str, usize)> = Vec::new();
+    let mut weapon_arm = false;
     for s in slots {
+        // Weapon arms (`acvparts` cat-2 byte +0x13c == 1, 360 `0x824793c8` / `0x82457400` /
+        // `0x8288e218`) replace separate hand, hanger, and shoulder weapon slots.
+        if weapon_arm && matches!(s.name, "weapon_r" | "weapon_l" | "hanger_r" | "hanger_l" | "shoulder") {
+            continue;
+        }
         let id = (s.part)(design);
         if id <= 0 {
             continue;
@@ -80,6 +86,9 @@ pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
             problem("not in the parts catalogue".into());
             continue;
         };
+        if s.category == 2 && acvd_data::part_field(part.id as i64, 2, "is_weapon_arm") != 0.0 {
+            weapon_arm = true;
+        }
         let Some(model) = part.model(s.prefix) else {
             problem(format!("no {} model {:04}", s.prefix, part.model_id));
             continue;
@@ -475,5 +484,43 @@ mod tests {
         let ahead = orient_basis(4, [0.0, 0.0, 1.0]);
         close(neg(ahead[2]), [0.0, 0.0, 1.0]);
         close(ahead[1], [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn weapon_arms_skip_separate_hand_and_hanger_slots() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+
+        let mut checked = 0;
+        for row in AC_ASSEMBLY_DESIGN_ST_FILES.iter().flat_map(|(_, r)| r.iter()) {
+            let is_wa = acvd_data::part_field(row.data.arms as i64, 2, "is_weapon_arm") != 0.0;
+            if !is_wa {
+                continue;
+            }
+            let built = assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &row.data);
+            assert!(
+                built.problems.is_empty(),
+                "weapon-arm design {} ({}) had assembly problems: {:?}",
+                row.id,
+                row.name,
+                built.problems
+            );
+            let arms = built
+                .placements
+                .iter()
+                .find(|p| p.column == "arms")
+                .expect("arms placement");
+            assert!(arms.mounts.iter().any(|m| m.root == "l_kata"));
+            assert!(arms.mounts.iter().any(|m| m.root == "r_kata"));
+            for forbidden in ["armwep_r", "armwep_l", "hanger_r", "hanger_l", "rack_r", "rack_l"] {
+                assert!(
+                    !built.placements.iter().any(|p| p.column == forbidden),
+                    "weapon-arm design {} must not mount {forbidden}",
+                    row.id
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected weapon-arm designs on disc, checked {checked}");
     }
 }

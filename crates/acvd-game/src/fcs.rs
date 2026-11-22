@@ -478,8 +478,13 @@ pub fn update(
         }
     }
 
-    // Multi-target missile lock accumulation (`0x82858638` + `0x82857688`).
-    let sh = &arms.shoulder;
+    // Multi-target missile lock accumulation (`0x82858638` + `0x82857688`):
+    // supports shoulder missiles as well as missile weapon arms (`am7210`/`am7220`).
+    let (sh, salvo_empty) = if arms.weapon_arm && arms.hands[0].is_missile {
+        (&arms.hands[0], arms.arm_salvo.is_empty())
+    } else {
+        (&arms.shoulder, arms.salvo.is_empty())
+    };
     let effective_max = if sh.is_missile && sh.remaining > 0 {
         spec.missile_lock_max
             .min(sh.weapon_lock_max)
@@ -490,7 +495,7 @@ pub fn update(
     };
     fcs.missile_lock_max = effective_max;
     let step_time = missile_lock_time(sh.lock_time_ticks, spec.missile_lock_effective_rate);
-    let can_acquire = sh.is_missile && sh.remaining > 0 && sh.cooldown <= 0.0 && arms.salvo.is_empty();
+    let can_acquire = sh.is_missile && sh.remaining > 0 && sh.cooldown <= 0.0 && salvo_empty;
     let mut locks = std::mem::take(&mut fcs.missile_locks);
     let mut timer = fcs.missile_lock_timer;
     step_missile_locks(

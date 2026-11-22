@@ -578,7 +578,8 @@ fn gun(arms: Option<&Armament>, which: Readout) -> Option<Gun> {
         Readout::RightArm => 0,
         _ => return None,
     };
-    arms.map(|a| a.hands[hand]).filter(|g| g.kind != Kind::Skip)
+    arms.map(|a| if a.weapon_arm { a.hands[0] } else { a.hands[hand] })
+        .filter(|g| g.kind != Kind::Skip)
 }
 
 /// Shown value (digits), fill and whether it is below its red zone; None hides the readout.
