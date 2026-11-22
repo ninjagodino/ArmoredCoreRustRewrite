@@ -82,7 +82,7 @@ in order:
     whether that is the design (AC TEST may use another AC) or a 2x step.
   - Slopes too steep to stand on, AC vs objects that move, AC vs AC (wall kick / `ackickrhit`
     filter is now in, see Done "Wall Kick / Wall Jump").
-- **AC test targets**: spawning, rendering, hit shapes, AP/defense damage, and destruction from `m4000_actest.msb` are in (see Done "AC test targets" and "Damage model & target hits"); still open: enemy/AC AI (`script/enemy/*_actest.lc`, `script/arena/actest_*.lc`).
+- **AC test targets**: spawning, rendering, hit shapes, AP/defense damage, destruction (`_b.flv`), AC TEST enemy & test-AC AI (`script/enemy/*_actest.lc`, `script/arena/actest_*.lc`), and player AC damage/stagger/respawn are in (see Done "AC TEST Enemy AI & Player Damage / AP"); still open: enemy skeletal animations, navmesh pathfinding (`HNAV`/`HTR`), and vs-UNAC (`actest7`).
 - **Boost gauge** (Lock-on / FCS, Generator EN drain & recharge, and Damage model are now in, see Done).
 
 - **Animation**: TAE event reader; core control (upper body faces the aim while legs strafe);
@@ -210,10 +210,10 @@ in order:
   maps, movies); `NoiseSprite` and the other undecoded shape classes; Dialog color tint (inferred,
   see Notes). Open: Text word +0x0c (0, 502, 1000-1004, 1030, 1200-1204; not a scale), Text flags
   byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0).
-  HUD: `Gauge_APEffect` damage blink (StaticDrawParam +0x430 / +0x434), the lock-sight show scale
+  HUD: the lock-sight show scale
   (StaticDrawParam +0x448 = 0.53, not applied), the weapon-gauge fill formula inside `0x829d0580`,
-  shoulder / hanger panels (no weapons there yet). Live EN capacity / drain / recharge and red-zone
-  HUD are now wired (Xenia probes `private/xenia/en_drain{,2}.jsonl` confirmed HUD status EN
+  hanger panels (shoulder panels, live EN, `Gauge_APEffect` damage lag/blink, and `ErrorLog_Stagger`
+  are now wired; Xenia probes `private/xenia/en_drain{,2}.jsonl` confirmed HUD status EN
   `+0x10`/`+0x14` = `58630/58630`). **Param enums**:
   TDF reader.
 - **Effects leftovers** (FFX player done, see Done): every slot meaning in
@@ -279,6 +279,12 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **AC TEST Enemy AI & Player Damage / AP** (`acvd-formats::acv_parts`, `acvd-game::ai`, `damage`, `weapons`, `targets`, `hud`, `sound`, `main`, `sheets/tuning_fields.csv`):
+  - **Enemy weapon catalogue (`param/enemy/parts/acvenemyparts.bin`, `0x824a1498` → `0x824a1118` → `0x824a0430`)**: `0x824a1498` loads both `acvparts.bin` (`0x824a14bc`, `this+0x2f8`) and `acvenemyparts.bin` (`0x824a14e4`, `this+0x4dc`) through the identical category-table loader `0x824a0430` (all 24 category sizes extracted into `acvd_formats::acv_parts::record_size`; category 10 = `0x1a0` = 416 bytes with identical weapon sub-record offsets). AC TEST enemies resolve `EnemyCommonSt` → `EnemyWeaponSt.weapon_id` → `acvenemyparts.bin` category 10 → `PARAM_ENEMY_BULLET_ENEMYBULLET{RIGID,ENERGY,MISSILE}_BIN` + `PARAM_ENEMYWEAPONSFXPARAM_BIN` + `PARAM_ENEMYWEAPONSOUNDPARAM_BIN` (`acv2_se_enemy.fev` added to `sound::Cues`): `e1020` tank `8120` (1500 rigid, 800 KE, 800 recoil, 100 m/s), `e2030` CHheli `8231` (3630 homing missile, 200 CE), `e0010` ATK-MT `8000` (2500 energy, 500 TE, 160 m/s), `e0110` SNP-MT `8030`/`8031` (sniper 3000 KE / 1200 recoil @ 900 m/s + sub gatling 70 KE @ 350 m/s), `e0210` DEF-MT `8060` (gatling 400 KE @ 350 m/s). Test ACs (`a0000`–`a0003`, designs `5011`–`5014`) use their real `AcCtrlParam::calculate` and `weapons::Armament::from_design`.
+  - **AC TEST AI behaviors (`acvd-game::ai`)**: mirrors the decompiled 360 Lua scripts (`private/lua360/script/enemy/e{1020,2020,0010,0110,0210}_actest.lua`, `script/arena/actest_{acai,def,snp,erik}.lua`) with `EnemyBasicSt` turn speeds, `EnemyPerformanceSt.no_controll_dist`, `HeriBehaviorParamSt`/`MechBehaviorParamSt` speeds, sight/hearing cones, last-hit alert (`TargetHealth::record_hit_from`), tank patrol/firing, heli 7 s altitude oscillation & missile launches, ATK-MT pass-attack sweeps, SNP-MT snipe vs escape state switch, DEF-MT shield-break dash at `< 50%` AP, and test AC circling/strafing + arm/shoulder fire.
+  - **Player AC damage, stagger & clean respawn (`damage::PlayerHealth`, `weapons::Owner`, `weapons::tick_player_health`)**: `Projectile` and `Missile` carry `Owner::{Player, Enemy}`; `Owner::Enemy` sweeps against the player AC's `ac_hit_spheres()` (`0x82863b60`), applies `damage::calculate_damage` (`0x827d0b50`) against `DefenseProfile::from_ac(&design)`, updates `Status::ap`, triggers stagger (`2.0` s, 0.8× KE/CE/TE defense thresholds) when recoil `>= stagger_penalty_threshold`, shows `ACV_FE_Normal::Stagger` (`ErrorLog_Stagger`, dialog `208`, `0x825aefe0`), and handles AP = 0 cleanly with explosion FFX `4041` + `c00000089` and automatic 3.0 s AC TEST respawn at `Start`.
+  - **`Gauge_APEffect` lag bar & damage blink (`0x825b3678` → `0x8258c808` / `0x8258c868` / `0x8258c7d8`, `0x829d0290`, `0x829d0b30`)**: traced all 8 fields into `sheets/tuning_fields.csv` (`NewAcBehavior` 379 `ap_lag_decay_frames` = 120 ticks / 2.0 s, 380 `ap_alert_drop_rate` = 0.03; `StaticDrawParam` 300 `+0x430` `ap_damage_blink_hz` = 5.0 Hz, 301 `+0x434` `ap_double_gauge_threshold` = 0.02, 325–328 `+0x484..+0x487` `ap_damage_r..a` = `(255, 80, 0, 255)`). `hud::ApEffectState` decays `lag_ap` at `(peak_ap - cur_ap) / 2.0` s, counts down `AP*` digits in orange, and blinks `Gauge_APEffect` at `((sin(t * 5 * pi) + 1) / 2)` whenever `(lag_ap - cur_ap) / ap_max >= 0.02`. Verified by unit tests (`acv_parts::tests::reads_enemy_parts_catalogue_from_disc`, `ai::tests::*`, `damage::tests::player_health_takes_damage_staggers_and_respawns`, `hud::tests::ap_effect_lag_bar_blinks_and_decays_over_120_ticks`, 79/79 `acvd-game` tests, 143 workspace tests), `acvd-sheets all`, `acvd-index audit`, and `--shot` (`private/tmp/enemy_ai_all_*.png`, `private/tmp/enemy_ai_stagger_*.png`).
 
 - **Scan Mode & Recon Units** (`acvd-game::scan`, `control`, `fcs`, `weapons`, `hud`, `main`, `sheets/design_parts.csv`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`):
   - **Scan Mode toggle, EN recharge & fire lockout (`AC + 0xdb0`, `0x828bbb00`, `0x828b41a0`, `0x828b51e0`, `0x828bef18`)**: `0x828bbb00` (`0x828bbb78..0x828bbbc0`) toggles `AC + 0xdb0` (`0` Combat / `1` Scan, sending events `0x74`/`0x73` via `0x828b5cf0`). `0x828b51e0` passes `0` to `0x82879d58` when `0x828b41a0 != 0`, disabling all weapon firing while in Scan Mode (`manual.fmg` 20407). `0x8286a558` sums `part.en_consumption * (1 - 0x82869370(slot))` using `NewAcBehavior` fields 319–331 (`+0x4c6..+0x4de × 0.01`: 0% cut on head/legs/booster/recon, 50% on core, 100% on arms/FCS/weapons/shoulder/OW/hangers), scaled by `Assemble.bin +0x14` (`0x8286bd68` → `+0x414` / `0x82868268`); `0x828bef18` (`0x828bf6d4..0x828bf6f4`) selects `0x82868268` in Scan Mode for markedly faster EN recharge.

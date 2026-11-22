@@ -34,6 +34,7 @@ use bevy::prelude::*;
 use bevy::ui::px;
 use bevy::window::PrimaryWindow;
 
+use crate::damage::PlayerHealth;
 use crate::fcs::Fcs;
 use crate::scan::{ReconUnit, ScanState, MAX_RECON_SLOTS};
 use crate::weapons::{Armament, Gun, Kind};
@@ -50,6 +51,89 @@ const DIALOGS: [(&str, bool); 2] = [
 const PANELS: [(&str, usize); 2] = [("LeftArm", 1), ("RightArm", 0)];
 const STATIC_DRAW: &str = "StaticDrawParam";
 
+/// 360 AP lag tracker (`0x8258c808` / `0x8258c868` / `0x8258c7d8`) & `Gauge_APEffect` blink state
+/// (`0x829d0b30`: `StaticDrawParam +0x430` `ap_damage_blink_hz`, `+0x434` `ap_double_gauge_threshold`,
+/// `+0x484..+0x487` `ap_damage_r..a`, `NewAcBehavior +0x57c` `ap_lag_decay_frames`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ApEffectState {
+    pub cur_ap: f32,
+    pub lag_ap: f32,
+    pub peak_ap: f32,
+    pub blink_timer: f32,
+    pub effect_alpha: f32,
+    /// `0..=1` blend toward `ap_damage_r..a` while `lag_ap != cur_ap` (`0x829d0d28` -> `0x829d00c8`).
+    pub damage_blend: f32,
+    initialized: bool,
+}
+
+impl ApEffectState {
+    /// Steps the AP lag bar and blink alpha for `dt` seconds (`0x8258c868` + `0x829d0b30`).
+    pub fn step(&mut self, cur_ap: f32, ap_max: f32, dt: f32) {
+        if !self.initialized || cur_ap > self.lag_ap {
+            // Initial spawn, design change, or respawn: snap lag bar up immediately (`0x8258c8e0`).
+            self.cur_ap = cur_ap;
+            self.lag_ap = cur_ap;
+            self.peak_ap = cur_ap;
+            self.blink_timer = 0.0;
+            self.effect_alpha = 0.0;
+            self.damage_blend = 0.0;
+            self.initialized = true;
+            return;
+        }
+        self.cur_ap = cur_ap;
+        // `0x825b36e8`: `NewAcBehavior +0x57c` (`ap_lag_decay_frames` = 120) * 1/60 = 2.0 s.
+        let decay_secs = (acvd_data::tuning("NewAcBehavior", 379).unwrap_or(120.0) as f32 / 60.0)
+            .max(0.05);
+        if self.lag_ap > cur_ap {
+            // `0x8258c7d8`: `rate = (peak_ap - cur_ap) / decay_secs`.
+            let rate = ((self.peak_ap - cur_ap) / decay_secs).max(0.0);
+            self.lag_ap = (self.lag_ap - rate * dt).max(cur_ap);
+            if self.lag_ap <= cur_ap {
+                self.peak_ap = cur_ap;
+            }
+        } else {
+            self.peak_ap = cur_ap;
+        }
+
+        // `0x829d0c58..0x829d0d08`: `Gauge_APEffect` double-gauge threshold & sine alpha blink.
+        let diff_frac = if ap_max > 0.0 {
+            (self.lag_ap - cur_ap) / ap_max
+        } else {
+            0.0
+        };
+        let threshold = tuning(301);
+        if diff_frac < threshold {
+            self.blink_timer = 0.0;
+            self.effect_alpha = 0.0;
+        } else {
+            self.blink_timer += dt;
+            let blink_hz = tuning(300);
+            // `0x829d0cdc..0x829d0cf4`: `((sin(timer * blink_hz * PI) + 1.0) * 127.5) / 255.0`.
+            self.effect_alpha =
+                ((self.blink_timer * blink_hz * std::f32::consts::PI).sin() + 1.0) * 0.5;
+        }
+
+        // `0x829d0d28..0x829d0d64` -> `0x829d00c8`: ease damaged AP digit tint over `gauge_color_time`.
+        let color_time = tuning(298);
+        let step = if color_time > 0.0 {
+            dt / color_time
+        } else {
+            1.0
+        };
+        let damaged = self.lag_ap > cur_ap + 0.5;
+        self.damage_blend = (self.damage_blend + if damaged { step } else { -step }).clamp(0.0, 1.0);
+    }
+
+    /// Trailing fill fraction `lag_ap / ap_max` (`0x829d0c0c`).
+    pub fn lag_fraction(&self, ap_max: f32) -> f32 {
+        if ap_max > 0.0 {
+            (self.lag_ap / ap_max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
 #[derive(Resource)]
 pub struct Sortie {
     layout: Layout,
@@ -61,6 +145,8 @@ pub struct Sortie {
     show: f32,
     /// Per-readout blend toward the low colour (gauge controller +0x14).
     low: [f32; 5],
+    /// Trailing AP lag bar and damage-blink state (`0x8258c808` + `0x829d0b30`).
+    pub ap_effect: ApEffectState,
 }
 
 pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
@@ -70,6 +156,7 @@ pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
         scale: 1.0,
         show: 0.0,
         low: [0.0; 5],
+        ap_effect: ApEffectState::default(),
     })
 }
 
@@ -159,6 +246,10 @@ pub struct ScanProgressHud;
 #[derive(Component)]
 pub struct ScanEnemyParamHud;
 
+/// Marker on `ACV_FE_Normal::Stagger` (`ErrorLog_Stagger`, dialog 208, rect `[158, 126, 346, 196]`).
+#[derive(Component)]
+pub struct StaggerHud;
+
 /// Marker on `FE_EspialMachineInfo` (anchored at `ACV_FE_Normal::EspialMachineInfo`: recon ammo).
 #[derive(Component)]
 pub struct ReconAmmoHud;
@@ -205,6 +296,12 @@ fn lock_color(secondary: bool) -> Color {
 /// `gauge_low_r..a` (StaticDrawParam +0x444).
 fn low_color() -> Color {
     let [r, g, b, a] = [305, 306, 307, 308].map(|i| tuning(i) as u8);
+    Color::srgba_u8(r, g, b, a)
+}
+
+/// `ap_damage_r..a` (StaticDrawParam +0x484, `0x829d0290` at `0x829d03e8..0x829d0424`).
+fn ap_damage_color() -> Color {
+    let [r, g, b, a] = [325, 326, 327, 328].map(|i| tuning(i) as u8);
     Color::srgba_u8(r, g, b, a)
 }
 
@@ -321,6 +418,23 @@ pub fn layout(
         commands
             .entity(root)
             .insert((ReconRadarHud, Visibility::Hidden));
+    }
+    // Stagger warning panel (`ACV_FE_Normal::Stagger` -> `ErrorLog_Stagger` dialog 208,
+    // rect [158, 126, 346, 196]; `0x825aefe0`).
+    if let (Some(anchor), Some(dlg)) = (
+        hud.layout.drb.dialogs[normal]
+            .objects
+            .iter()
+            .find(|o| o.name == "Stagger"),
+        dialog("ErrorLog_Stagger"),
+    ) {
+        let rect = anchor.shape.rect();
+        let origin =
+            corner + Vec2::new(rect[0].min(rect[2]) as f32, rect[1].min(rect[3]) as f32) * scale;
+        let root = menu::spawn(&mut commands, &hud.layout, dlg, origin, scale);
+        commands
+            .entity(root)
+            .insert((StaggerHud, Visibility::Hidden));
     }
     // World-projected Recon markers (`ACV_MapScan_EspialMachine*`, `ACV_MapScan_ReconInfo*`)
     // and recon-detected enemy markers (`ACV_MapScan_SubTargetS`).
@@ -532,6 +646,9 @@ pub fn tick(
     };
     let color_time = tuning(298);
     let (status, arms) = (status.single().ok(), arms.single().ok());
+    if let Some(s) = status {
+        hud.ap_effect.step(s.ap as f32, s.ap_max as f32, dt);
+    }
     for which in [
         Readout::LeftArm,
         Readout::RightArm,
@@ -637,14 +754,25 @@ pub fn readouts(
             Visibility::Hidden
         });
         let Some((value, ..)) = value else { continue };
-        let color = mix(color, low, hud.low[slot(which)]);
+        // `0x829d0bd4` -> `0x825979e8`: AP digits count down smoothly using `lag_ap` and tint
+        // toward `ap_damage_r..a` while damaged (`0x829d0d28` -> `0x829d00c8` / `0x829d09e8`).
+        let (shown_value, base_color) = if which == Readout::Ap {
+            let lag_val = (hud.ap_effect.lag_ap.round().max(0.0) as u32).min(999_999);
+            (
+                lag_val,
+                mix(color, ap_damage_color(), hud.ap_effect.damage_blend),
+            )
+        } else {
+            (value, color)
+        };
+        let color = mix(base_color, low, hud.low[slot(which)]);
         if sprite.color != color {
             sprite.color = color;
         }
         if place == 0 {
             continue;
         }
-        let digit = (value / place % 10) as f32;
+        let digit = (shown_value / place % 10) as f32;
         let uv = Rect {
             min: rect.min + Vec2::X * rect.width() * digit,
             max: rect.max + Vec2::X * rect.width() * digit,
@@ -665,6 +793,28 @@ pub fn readouts(
             });
         }
         let value = reading(which, status, arms_for_hud);
+        if object.0 == "Gauge_APEffect" {
+            // `0x829d0c6c..0x829d0d24`: trailing damage bar fills to `lag_ap / ap_max * show`
+            // and blinks at `ap_damage_blink_hz` when `(lag_ap - cur_ap) / ap_max >= ap_double_gauge_threshold`.
+            let alpha = hud.ap_effect.effect_alpha;
+            let shown = value.is_some() && alpha > 0.0;
+            visibility.set_if_neq(if shown {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            });
+            if shown {
+                let ap_max = status.map_or(0.0, |s| s.ap_max as f32);
+                let fill = hud.ap_effect.lag_fraction(ap_max) * hud.show;
+                let base = color.to_srgba();
+                let blink_color = Color::srgba(base.red, base.green, base.blue, alpha);
+                if g.fill != fill || g.color != blink_color {
+                    g.fill = fill;
+                    g.color = blink_color;
+                }
+            }
+            continue;
+        }
         visibility.set_if_neq(if value.is_some() {
             Visibility::Inherited
         } else {
@@ -674,15 +824,27 @@ pub fn readouts(
             continue;
         };
         let fill = fraction.clamp(0.0, 1.0) * hud.show;
-        let color = if object.0 == "Gauge_APEffect" {
-            color
-        } else {
-            mix(color, low, hud.low[slot(which)])
-        };
+        let color = mix(color, low, hud.low[slot(which)]);
         if g.fill != fill || g.color != color {
             g.fill = fill;
             g.color = color;
         }
+    }
+}
+
+/// Shows `ACV_FE_Normal::Stagger` (`ErrorLog_Stagger`, dialog 208) while the player AC is
+/// staggered (`PlayerHealth::is_staggered()`).
+pub fn stagger_hud(
+    health: Query<&PlayerHealth>,
+    mut panel: Query<&mut Visibility, With<StaggerHud>>,
+) {
+    let staggered = health.single().is_ok_and(PlayerHealth::is_staggered);
+    for mut vis in &mut panel {
+        vis.set_if_neq(if staggered {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
     }
 }
 
@@ -1455,7 +1617,40 @@ mod tests {
     #[test]
     fn tuning_rows() {
         assert!((tuning(298) - 0.3).abs() < 1e-6 && (tuning(322) - 0.3).abs() < 1e-6);
+        assert!((tuning(300) - 5.0).abs() < 1e-6 && (tuning(301) - 0.02).abs() < 1e-6);
         assert_eq!(low_color().to_srgba().to_u8_array(), [255, 0, 0, 255]);
+        assert_eq!(ap_damage_color().to_srgba().to_u8_array(), [255, 80, 0, 255]);
+    }
+
+    #[test]
+    fn ap_effect_lag_bar_blinks_and_decays_over_120_ticks() {
+        let mut fx = ApEffectState::default();
+        // Initial sync at full AP 30000: no lag, alpha 0.
+        fx.step(30000.0, 30000.0, 1.0 / 60.0);
+        assert_eq!(fx.lag_ap, 30000.0);
+        assert_eq!(fx.effect_alpha, 0.0);
+
+        // Small chip damage (< 2% threshold = 600 AP): lag decays, but Gauge_APEffect stays hidden.
+        fx.step(29700.0, 30000.0, 1.0 / 60.0);
+        assert_eq!(fx.effect_alpha, 0.0);
+
+        // Heavy hit (-6000 AP = 20% > 2% threshold): double gauge activates and blinks at 5 Hz.
+        fx.step(24000.0, 30000.0, 0.1);
+        assert!(fx.lag_ap < 30000.0 && fx.lag_ap > 24000.0);
+        assert!(fx.effect_alpha > 0.5, "at t=0.1 s, sin(0.5*pi)=1 -> alpha=1.0, got {}", fx.effect_alpha);
+        assert!(fx.damage_blend > 0.0);
+
+        // After 2.5 s total decay (> 120 ticks = 2.0 s), lag catches up to cur_ap and blink turns off.
+        for _ in 0..150 {
+            fx.step(24000.0, 30000.0, 1.0 / 60.0);
+        }
+        assert!((fx.lag_ap - 24000.0).abs() < 1e-3);
+        assert_eq!(fx.effect_alpha, 0.0);
+
+        // Respawn snap-up: lag jumps immediately back to full AP.
+        fx.step(30000.0, 30000.0, 1.0 / 60.0);
+        assert_eq!(fx.lag_ap, 30000.0);
+        assert_eq!(fx.effect_alpha, 0.0);
     }
 
     #[test]

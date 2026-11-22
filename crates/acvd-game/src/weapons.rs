@@ -28,21 +28,26 @@ use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::bullet::{
     BULLET_BULLETENERGY_BIN, BULLET_BULLETMISSILE_BIN, BULLET_BULLETRIGID_BIN,
     PARAM_BULLETHITSEPARAM_BIN, PARAM_BULLETHITSFXPARAM_BIN,
+    PARAM_ENEMY_BULLET_ENEMYBULLETENERGY_BIN, PARAM_ENEMY_BULLET_ENEMYBULLETMISSILE_BIN,
+    PARAM_ENEMY_BULLET_ENEMYBULLETRIGID_BIN,
 };
-use acvd_data::generated::sfx::PARAM_ACWEAPONSFXPARAM_BIN;
-use acvd_data::generated::sound::PARAM_ACWEAPONSOUNDPARAM_BIN;
+use acvd_data::generated::sfx::{PARAM_ACWEAPONSFXPARAM_BIN, PARAM_ENEMYWEAPONSFXPARAM_BIN};
+use acvd_data::generated::sound::{
+    PARAM_ACSOUNDPARAM_BIN, PARAM_ACWEAPONSOUNDPARAM_BIN, PARAM_ENEMYWEAPONSOUNDPARAM_BIN,
+};
 use acvd_data::{ac_state, find, part_field};
+use acvd_formats::reader::Be;
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{ani, jcon};
+use acvd_formats::{acv_parts, ani, jcon};
 use acvd_render::Rig;
 use bevy::audio::AudioSource;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use crate::assemble::Placement;
-use crate::collision::Collision;
+use crate::collision::{Collision, RAY_HALF};
 use crate::control::{Held, Pilot, Piloting};
-use crate::damage::{self, DamageType};
+use crate::damage::{self, DamageType, PlayerHealth};
 use crate::hud::Status;
 use crate::pose::{self, Driven, Motion};
 use crate::sfx::{EffectPoint, Sfx};
@@ -397,8 +402,52 @@ impl Default for SniperStance {
     }
 }
 
+/// Raw `param/enemy/parts/acvenemyparts.bin` loaded once from the 360 disc (`0x824a14e4`).
+#[derive(Resource, Default, Clone)]
+pub struct EnemyParts {
+    pub bytes: Vec<u8>,
+}
+
+impl EnemyParts {
+    pub fn load(disc: &Disc) -> Self {
+        let bytes = disc
+            .read("param/enemy/parts/acvenemyparts.bin")
+            .unwrap_or_default();
+        Self { bytes }
+    }
+
+    /// Resolves one enemy weapon (`EnemyWeaponSt.weapon_id`, category 10 in `acvenemyparts.bin`)
+    /// into a `Gun` with real `enemybullet*`, `enemyweaponsfxparam`, and `enemyweaponsoundparam`
+    /// stats.
+    pub fn weapon(&self, weapon_id: u16) -> Gun {
+        if weapon_id == 0 || self.bytes.is_empty() {
+            return silent();
+        }
+        let Ok(parsed) = acv_parts::read(&self.bytes, acv_parts::record_size) else {
+            return silent();
+        };
+        let Some(rec) = parsed
+            .records
+            .iter()
+            .find(|r| r.category == 10 && r.id == weapon_id)
+        else {
+            return silent();
+        };
+        enemy_gun_from_record(rec.data)
+    }
+}
+
+/// Which side fired a `Projectile` or `Missile`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Owner {
+    #[default]
+    Player,
+    Enemy,
+}
+
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Projectile {
+    pub owner: Owner,
     velocity: Vec3,
     flight: Flight,
     decay: RangeDecay,
@@ -416,9 +465,15 @@ pub struct Projectile {
 }
 
 impl Projectile {
-    /// Creates a projectile fired from `gun` along `aim` (`0x828a3138` -> `0x829c0160`).
+    /// Creates a player projectile fired from `gun` along `aim` (`0x828a3138` -> `0x829c0160`).
     pub fn from_gun(gun: &Gun, aim: Vec3) -> Self {
+        Self::from_gun_owned(gun, aim, Owner::Player)
+    }
+
+    /// Creates a projectile fired by `owner` from `gun` along `aim`.
+    pub fn from_gun_owned(gun: &Gun, aim: Vec3, owner: Owner) -> Self {
         Self {
+            owner,
             velocity: aim * gun.init_speed.max(1.0),
             flight: gun.flight,
             decay: gun.decay,
@@ -500,6 +555,7 @@ impl Projectile {
 /// `0x828e9b50`, `0x828ea520`, `0x828eb9c8` -> `0x828eaf88`).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Missile {
+    pub owner: Owner,
     pub velocity: Vec3,
     pub flight: MissileFlight,
     pub decay: RangeDecay,
@@ -520,14 +576,25 @@ pub struct Missile {
 }
 
 impl Missile {
-    /// Creates a homing missile launched from `gun` along `launch_dir` toward `target`.
+    /// Creates a player homing missile launched from `gun` along `launch_dir` toward `target`.
     pub fn from_gun(gun: &Gun, launch_dir: Vec3, target: Option<Entity>) -> Self {
+        Self::from_gun_owned(gun, launch_dir, target, Owner::Player)
+    }
+
+    /// Creates a homing missile owned by `owner`.
+    pub fn from_gun_owned(
+        gun: &Gun,
+        launch_dir: Vec3,
+        target: Option<Entity>,
+        owner: Owner,
+    ) -> Self {
         let flight = gun.missile_flight.unwrap_or_default();
         let dir = launch_dir.normalize_or_zero();
         let dir = if dir == Vec3::ZERO { Vec3::NEG_Z } else { dir };
         let init_speed = gun.init_speed.max(flight.min_speed).max(10.0);
         let max_life = ((flight.accel_end_frame + 120.0) / TICK_RATE).clamp(5.0, 14.0);
         Self {
+            owner,
             velocity: dir * init_speed,
             flight,
             decay: gun.decay,
@@ -627,6 +694,9 @@ pub(crate) struct Tracers {
     rigid: Handle<StandardMaterial>,
     energy: Handle<StandardMaterial>,
     missile: Handle<StandardMaterial>,
+    enemy_rigid: Handle<StandardMaterial>,
+    enemy_energy: Handle<StandardMaterial>,
+    enemy_missile: Handle<StandardMaterial>,
 }
 
 impl Armament {
@@ -678,7 +748,96 @@ pub fn setup(
             unlit: true,
             ..default()
         }),
+        enemy_rigid: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.35, 0.15),
+            emissive: LinearRgba::rgb(12.0, 3.0, 0.8),
+            unlit: true,
+            ..default()
+        }),
+        enemy_energy: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.45, 0.95, 1.0),
+            emissive: LinearRgba::rgb(1.5, 6.0, 12.0),
+            unlit: true,
+            ..default()
+        }),
+        enemy_missile: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.25, 0.25),
+            emissive: LinearRgba::rgb(12.0, 2.5, 1.0),
+            unlit: true,
+            ..default()
+        }),
     });
+}
+
+/// Spawns one enemy projectile or homing missile (`Owner::Enemy`) from `origin` along `aim`,
+/// with muzzle flash FFX, bullet FFX + glowing tracer mesh, and sound cue.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_enemy_shot(
+    commands: &mut Commands,
+    assets: &Tracers,
+    cues: &mut Cues,
+    sources: &mut Assets<AudioSource>,
+    gun: &Gun,
+    origin: Vec3,
+    aim: Vec3,
+    target_entity: Option<Entity>,
+) {
+    let dir = aim.normalize_or_zero();
+    if dir == Vec3::ZERO || gun.kind == Kind::Skip {
+        return;
+    }
+    if gun.shoot > 0 {
+        sound::shot(commands, cues, sources, gun.shoot);
+    }
+    if gun.fx.muzzle > 0 {
+        commands.spawn((
+            Sfx::new(gun.fx.muzzle),
+            Transform::from_translation(origin)
+                .looking_to(-dir, Vec3::Y)
+                .with_scale(Vec3::splat(MUZZLE_SCALE)),
+        ));
+    }
+    let tf = Transform::from_translation(origin).looking_to(dir, Vec3::Y);
+    if gun.kind == Kind::Missile {
+        let missile = Missile::from_gun_owned(gun, dir, target_entity, Owner::Enemy);
+        if gun.fx.bullet > 0 {
+            commands
+                .spawn((
+                    tf,
+                    missile,
+                    Visibility::default(),
+                    Mesh3d(assets.mesh.clone()),
+                    MeshMaterial3d(assets.enemy_missile.clone()),
+                ))
+                .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+        } else {
+            commands.spawn((
+                Mesh3d(assets.mesh.clone()),
+                MeshMaterial3d(assets.enemy_missile.clone()),
+                tf,
+                missile,
+            ));
+        }
+    } else {
+        let shot = Projectile::from_gun_owned(gun, dir, Owner::Enemy);
+        let material = match gun.kind {
+            Kind::Energy => assets.enemy_energy.clone(),
+            _ => assets.enemy_rigid.clone(),
+        };
+        if gun.fx.bullet > 0 {
+            commands
+                .spawn((
+                    tf,
+                    shot,
+                    Visibility::default(),
+                    Mesh3d(assets.mesh.clone()),
+                    MeshMaterial3d(material),
+                ))
+                .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+        } else {
+            commands.spawn((Mesh3d(assets.mesh.clone()), MeshMaterial3d(material), tf, shot));
+        }
+    }
 }
 
 /// One system parameter, so `fire` stays inside Bevy's 16-parameter limit.
@@ -740,7 +899,14 @@ pub fn fire(
     mut speaker: Speaker,
     mut commands: Commands,
     mut acs: Query<
-        (&mut Pilot, &mut Armament, &Transform, Option<&mut Status>, Option<&mut crate::fcs::Fcs>),
+        (
+            &mut Pilot,
+            &mut Armament,
+            &Transform,
+            Option<&mut Status>,
+            Option<&mut crate::fcs::Fcs>,
+            Option<&PlayerHealth>,
+        ),
         Without<ClipJoint>,
     >,
     rigging: Rigging,
@@ -752,9 +918,13 @@ pub fn fire(
         return;
     }
     let dt = time.delta_secs();
-    let Ok((mut pilot, mut arms, ac_tf, mut status, mut fcs)) = acs.single_mut() else {
+    let Ok((mut pilot, mut arms, ac_tf, mut status, mut fcs, player_health)) = acs.single_mut()
+    else {
         return;
     };
+    if player_health.is_some_and(|h| h.destroyed) {
+        return;
+    }
     let down = |k: KeyCode| keys.pressed(k) || held.0.contains(&k);
     let mut want = [
         down(KeyCode::KeyF) || mouse.pressed(MouseButton::Left),
@@ -1070,15 +1240,24 @@ pub fn fire(
     }
 }
 
-/// Steps in-flight projectiles against target hit spheres and map ground collision, applying
-/// the 360 damage formula (`0x827d0b50`) and spawning hit VFX/SFX.
+/// Steps in-flight projectiles against target hit spheres (for `Owner::Player`), the player AC's
+/// hit spheres (for `Owner::Enemy`), and map ground collision, applying the 360 damage formula
+/// (`0x827d0b50`) and spawning hit VFX/SFX.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn step_projectiles(
     time: Res<Time>,
     piloting: Res<Piloting>,
     collision: Res<Collision>,
     mut speaker: Speaker,
     mut commands: Commands,
-    mut targets: Query<(Entity, &Target, &mut TargetHealth, &Transform), Without<Projectile>>,
+    mut targets: Query<
+        (Entity, &Target, &mut TargetHealth, &Transform),
+        (Without<Projectile>, Without<PlayerHealth>),
+    >,
+    mut player: Query<
+        (&mut PlayerHealth, Option<&mut Status>, &Transform),
+        (Without<Projectile>, Without<Target>),
+    >,
     mut shots: Query<(Entity, &mut Projectile, &mut Transform)>,
 ) {
     if !piloting.0 {
@@ -1093,22 +1272,6 @@ pub fn step_projectiles(
         let prev = transform.translation;
         let next = prev + delta;
 
-        // Test against all living target hit spheres, keeping the earliest intersection.
-        let mut best_target: Option<(f32, Vec3, Vec3, Entity)> = None;
-        for (t_entity, _, health, t_tf) in &targets {
-            if health.destroyed {
-                continue;
-            }
-            for sphere in &health.spheres {
-                let center = t_tf.translation + Vec3::Y * sphere.offset_y;
-                if let Some((t, pos, normal)) = damage::segment_hits_sphere(prev, next, center, sphere.radius) {
-                    if best_target.is_none_or(|(best_t, _, _, _)| t < best_t) {
-                        best_target = Some((t, pos, normal, t_entity));
-                    }
-                }
-            }
-        }
-
         let ground = collision
             .ground_below(prev)
             .filter(|&g| delta.y < 0.0 && next.y <= g)
@@ -1121,48 +1284,140 @@ pub fn step_projectiles(
                 (t, Vec3::new(prev.x + delta.x * t, g, prev.z + delta.z * t))
             });
 
-        if let Some((t_hit, pos, normal, t_entity)) = best_target {
-            if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
-                if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
-                    let (power, recoil) = shot.effective_damage();
-                    let (res, lethal) = health.apply_hit(shot.damage_type, power, recoil);
-                    let ffx = if res.effective {
-                        if shot.hit_hi > 0 { shot.hit_hi } else { shot.hit }
-                    } else if shot.hit_low > 0 {
-                        shot.hit_low
-                    } else {
-                        shot.hit
-                    };
-                    if ffx > 0 {
-                        let rot = Quat::from_rotation_arc(Vec3::Z, normal);
-                        commands.spawn((
-                            Sfx::new(ffx),
-                            Transform::from_translation(pos).with_rotation(rot),
-                        ));
+        match shot.owner {
+            Owner::Player => {
+                // Test against all living target hit spheres, keeping the earliest intersection.
+                let mut best_target: Option<(f32, Vec3, Vec3, Entity)> = None;
+                for (t_entity, _, health, t_tf) in &targets {
+                    if health.destroyed {
+                        continue;
                     }
-                    let se = if res.effective { shot.hit_se.hi } else { shot.hit_se.low };
-                    if se > 0 {
-                        sound::cue(
-                            &mut commands,
-                            &mut speaker.cues,
-                            &mut speaker.sources,
-                            &format!("w{se:08}"),
-                        );
+                    for sphere in &health.spheres {
+                        let center = t_tf.translation + Vec3::Y * sphere.offset_y;
+                        if let Some((t, pos, normal)) =
+                            damage::segment_hits_sphere(prev, next, center, sphere.radius)
+                        {
+                            if best_target.is_none_or(|(best_t, _, _, _)| t < best_t) {
+                                best_target = Some((t, pos, normal, t_entity));
+                            }
+                        }
                     }
-                    info!(
-                        "hit {} ({}) [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
-                        target.name,
-                        target.model,
-                        if res.effective { "EFFECTIVE" } else { "RICOCHET" },
-                        res.damage,
-                        health.ap,
-                        health.ap_max,
-                        if health.is_staggered() { " STAGGER" } else { "" },
-                        if lethal { " DESTROYED" } else { "" },
-                    );
                 }
-                commands.entity(e).despawn();
-                continue;
+                if let Some((t_hit, pos, normal, t_entity)) = best_target {
+                    if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                        if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
+                            let (power, recoil) = shot.effective_damage();
+                            let (res, lethal) = health.apply_hit(shot.damage_type, power, recoil);
+                            health.record_hit_from(prev);
+                            let ffx = if res.effective {
+                                if shot.hit_hi > 0 { shot.hit_hi } else { shot.hit }
+                            } else if shot.hit_low > 0 {
+                                shot.hit_low
+                            } else {
+                                shot.hit
+                            };
+                            if ffx > 0 {
+                                let rot = Quat::from_rotation_arc(Vec3::Z, normal);
+                                commands.spawn((
+                                    Sfx::new(ffx),
+                                    Transform::from_translation(pos).with_rotation(rot),
+                                ));
+                            }
+                            let se = if res.effective {
+                                shot.hit_se.hi
+                            } else {
+                                shot.hit_se.low
+                            };
+                            if se > 0 {
+                                sound::cue(
+                                    &mut commands,
+                                    &mut speaker.cues,
+                                    &mut speaker.sources,
+                                    &format!("w{se:08}"),
+                                );
+                            }
+                            info!(
+                                "hit {} ({}) [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
+                                target.name,
+                                target.model,
+                                if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                                res.damage,
+                                health.ap,
+                                health.ap_max,
+                                if health.is_staggered() { " STAGGER" } else { "" },
+                                if lethal { " DESTROYED" } else { "" },
+                            );
+                        }
+                        commands.entity(e).despawn();
+                        continue;
+                    }
+                }
+            }
+            Owner::Enemy => {
+                // Sweep enemy projectile against the player AC's `ac_hit_spheres()` (`0x82863b60`).
+                if let Ok((mut health, mut status, p_tf)) = player.single_mut() {
+                    if !health.destroyed {
+                        let mut best: Option<(f32, Vec3, Vec3)> = None;
+                        for sphere in &health.spheres {
+                            let center = p_tf.translation + Vec3::Y * sphere.offset_y;
+                            if let Some((t, pos, normal)) =
+                                damage::segment_hits_sphere(prev, next, center, sphere.radius)
+                            {
+                                if best.is_none_or(|(best_t, _, _)| t < best_t) {
+                                    best = Some((t, pos, normal));
+                                }
+                            }
+                        }
+                        if let Some((t_hit, pos, normal)) = best {
+                            if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                                let (power, recoil) = shot.effective_damage();
+                                let (res, lethal) =
+                                    health.apply_hit(shot.damage_type, power, recoil);
+                                if let Some(s) = status.as_deref_mut() {
+                                    s.ap = health.ap_u32();
+                                }
+                                let ffx = if res.effective {
+                                    if shot.hit_hi > 0 { shot.hit_hi } else { shot.hit }
+                                } else if shot.hit_low > 0 {
+                                    shot.hit_low
+                                } else {
+                                    shot.hit
+                                };
+                                if ffx > 0 {
+                                    let rot = Quat::from_rotation_arc(Vec3::Z, normal);
+                                    commands.spawn((
+                                        Sfx::new(ffx),
+                                        Transform::from_translation(pos).with_rotation(rot),
+                                    ));
+                                }
+                                let se = if res.effective {
+                                    shot.hit_se.hi
+                                } else {
+                                    shot.hit_se.low
+                                };
+                                if se > 0 {
+                                    sound::cue(
+                                        &mut commands,
+                                        &mut speaker.cues,
+                                        &mut speaker.sources,
+                                        &format!("w{se:08}"),
+                                    );
+                                }
+                                info!(
+                                    "player hit [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
+                                    if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                                    res.damage,
+                                    health.ap,
+                                    health.ap_max,
+                                    if health.is_staggered() { " STAGGER" } else { "" },
+                                    if lethal { " DESTROYED" } else { "" },
+                                );
+                                commands.entity(e).despawn();
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1187,14 +1442,22 @@ pub fn step_projectiles(
 
 /// Steps in-flight homing missiles (`BulletMissile`, `0x828ec898` -> `0x828eaf88`) toward their
 /// locked targets, spawns booster-ignition trail VFX, and resolves hits against target spheres
-/// and map terrain.
+/// (or player AC spheres for `Owner::Enemy`) and map terrain.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn step_missiles(
     time: Res<Time>,
     piloting: Res<Piloting>,
     collision: Res<Collision>,
     mut speaker: Speaker,
     mut commands: Commands,
-    mut targets: Query<(Entity, &Target, &mut TargetHealth, &Transform), Without<Missile>>,
+    mut targets: Query<
+        (Entity, &Target, &mut TargetHealth, &Transform),
+        (Without<Missile>, Without<PlayerHealth>),
+    >,
+    mut player: Query<
+        (Entity, &mut PlayerHealth, Option<&mut Status>, &Transform),
+        (Without<Missile>, Without<Target>),
+    >,
     mut missiles: Query<(Entity, &mut Missile, &mut Transform)>,
 ) {
     if !piloting.0 {
@@ -1202,13 +1465,20 @@ pub fn step_missiles(
     }
     let dt = time.delta_secs();
     for (e, mut missile, mut transform) in &mut missiles {
-        let target_pos = missile.target.and_then(|t_ent| {
-            targets
-                .get(t_ent)
+        let target_pos = match missile.owner {
+            Owner::Player => missile.target.and_then(|t_ent| {
+                targets
+                    .get(t_ent)
+                    .ok()
+                    .filter(|(_, _, h, _)| !h.destroyed)
+                    .map(|(_, _, h, tf)| tf.translation + Vec3::Y * h.center_offset_y())
+            }),
+            Owner::Enemy => player
+                .single()
                 .ok()
-                .filter(|(_, _, h, _)| !h.destroyed)
-                .map(|(_, _, h, tf)| tf.translation + Vec3::Y * h.center_offset_y())
-        });
+                .filter(|(_, h, _, _)| !h.destroyed)
+                .map(|(_, _, _, tf)| tf.translation + Vec3::Y * 4.5),
+        };
         let prev = transform.translation;
         let Some((delta, just_ignited)) = missile.step(prev, target_pos, dt) else {
             commands.entity(e).despawn();
@@ -1221,27 +1491,10 @@ pub fn step_missiles(
         }
         let next = prev + delta;
 
-        // Test against all living target hit spheres (inflated by missile hit_radius / proximity fuse).
         let extra_r = missile
             .flight
             .proximity_fuse_range
             .max(missile.flight.hit_radius.min(2.0));
-        let mut best_target: Option<(f32, Vec3, Vec3, Entity)> = None;
-        for (t_entity, _, health, t_tf) in &targets {
-            if health.destroyed {
-                continue;
-            }
-            for sphere in &health.spheres {
-                let center = t_tf.translation + Vec3::Y * sphere.offset_y;
-                if let Some((t, pos, normal)) =
-                    damage::segment_hits_sphere(prev, next, center, sphere.radius + extra_r)
-                {
-                    if best_target.is_none_or(|(best_t, _, _, _)| t < best_t) {
-                        best_target = Some((t, pos, normal, t_entity));
-                    }
-                }
-            }
-        }
 
         let ground = collision
             .ground_below(prev)
@@ -1255,60 +1508,158 @@ pub fn step_missiles(
                 (t, Vec3::new(prev.x + delta.x * t, g, prev.z + delta.z * t))
             });
 
-        if let Some((t_hit, pos, normal, t_entity)) = best_target {
-            if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
-                if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
-                    let (power, recoil) = missile.effective_damage();
-                    let (res, lethal) = health.apply_hit(missile.damage_type, power, recoil);
-                    let ffx = if res.effective {
-                        if missile.hit_hi > 0 {
-                            missile.hit_hi
-                        } else if missile.hit > 0 {
-                            missile.hit
-                        } else {
-                            missile.delete_fx
+        match missile.owner {
+            Owner::Player => {
+                let mut best_target: Option<(f32, Vec3, Vec3, Entity)> = None;
+                for (t_entity, _, health, t_tf) in &targets {
+                    if health.destroyed {
+                        continue;
+                    }
+                    for sphere in &health.spheres {
+                        let center = t_tf.translation + Vec3::Y * sphere.offset_y;
+                        if let Some((t, pos, normal)) =
+                            damage::segment_hits_sphere(prev, next, center, sphere.radius + extra_r)
+                        {
+                            if best_target.is_none_or(|(best_t, _, _, _)| t < best_t) {
+                                best_target = Some((t, pos, normal, t_entity));
+                            }
                         }
-                    } else if missile.hit_low > 0 {
-                        missile.hit_low
-                    } else if missile.hit > 0 {
-                        missile.hit
-                    } else {
-                        missile.delete_fx
-                    };
-                    if ffx > 0 {
-                        let rot = Quat::from_rotation_arc(Vec3::Z, normal);
-                        commands.spawn((
-                            Sfx::new(ffx),
-                            Transform::from_translation(pos).with_rotation(rot),
-                        ));
                     }
-                    let se = if res.effective {
-                        missile.hit_se.hi
-                    } else {
-                        missile.hit_se.low
-                    };
-                    if se > 0 {
-                        sound::cue(
-                            &mut commands,
-                            &mut speaker.cues,
-                            &mut speaker.sources,
-                            &format!("w{se:08}"),
-                        );
-                    }
-                    info!(
-                        "missile hit {} ({}) [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
-                        target.name,
-                        target.model,
-                        if res.effective { "EFFECTIVE" } else { "RICOCHET" },
-                        res.damage,
-                        health.ap,
-                        health.ap_max,
-                        if health.is_staggered() { " STAGGER" } else { "" },
-                        if lethal { " DESTROYED" } else { "" },
-                    );
                 }
-                commands.entity(e).despawn();
-                continue;
+                if let Some((t_hit, pos, normal, t_entity)) = best_target {
+                    if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                        if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
+                            let (power, recoil) = missile.effective_damage();
+                            let (res, lethal) =
+                                health.apply_hit(missile.damage_type, power, recoil);
+                            health.record_hit_from(prev);
+                            let ffx = if res.effective {
+                                if missile.hit_hi > 0 {
+                                    missile.hit_hi
+                                } else if missile.hit > 0 {
+                                    missile.hit
+                                } else {
+                                    missile.delete_fx
+                                }
+                            } else if missile.hit_low > 0 {
+                                missile.hit_low
+                            } else if missile.hit > 0 {
+                                missile.hit
+                            } else {
+                                missile.delete_fx
+                            };
+                            if ffx > 0 {
+                                let rot = Quat::from_rotation_arc(Vec3::Z, normal);
+                                commands.spawn((
+                                    Sfx::new(ffx),
+                                    Transform::from_translation(pos).with_rotation(rot),
+                                ));
+                            }
+                            let se = if res.effective {
+                                missile.hit_se.hi
+                            } else {
+                                missile.hit_se.low
+                            };
+                            if se > 0 {
+                                sound::cue(
+                                    &mut commands,
+                                    &mut speaker.cues,
+                                    &mut speaker.sources,
+                                    &format!("w{se:08}"),
+                                );
+                            }
+                            info!(
+                                "missile hit {} ({}) [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
+                                target.name,
+                                target.model,
+                                if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                                res.damage,
+                                health.ap,
+                                health.ap_max,
+                                if health.is_staggered() { " STAGGER" } else { "" },
+                                if lethal { " DESTROYED" } else { "" },
+                            );
+                        }
+                        commands.entity(e).despawn();
+                        continue;
+                    }
+                }
+            }
+            Owner::Enemy => {
+                if let Ok((_, mut health, mut status, p_tf)) = player.single_mut() {
+                    if !health.destroyed {
+                        let mut best: Option<(f32, Vec3, Vec3)> = None;
+                        for sphere in &health.spheres {
+                            let center = p_tf.translation + Vec3::Y * sphere.offset_y;
+                            if let Some((t, pos, normal)) = damage::segment_hits_sphere(
+                                prev,
+                                next,
+                                center,
+                                sphere.radius + extra_r,
+                            ) {
+                                if best.is_none_or(|(best_t, _, _)| t < best_t) {
+                                    best = Some((t, pos, normal));
+                                }
+                            }
+                        }
+                        if let Some((t_hit, pos, normal)) = best {
+                            if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                                let (power, recoil) = missile.effective_damage();
+                                let (res, lethal) =
+                                    health.apply_hit(missile.damage_type, power, recoil);
+                                if let Some(s) = status.as_deref_mut() {
+                                    s.ap = health.ap_u32();
+                                }
+                                let ffx = if res.effective {
+                                    if missile.hit_hi > 0 {
+                                        missile.hit_hi
+                                    } else if missile.hit > 0 {
+                                        missile.hit
+                                    } else {
+                                        missile.delete_fx
+                                    }
+                                } else if missile.hit_low > 0 {
+                                    missile.hit_low
+                                } else if missile.hit > 0 {
+                                    missile.hit
+                                } else {
+                                    missile.delete_fx
+                                };
+                                if ffx > 0 {
+                                    let rot = Quat::from_rotation_arc(Vec3::Z, normal);
+                                    commands.spawn((
+                                        Sfx::new(ffx),
+                                        Transform::from_translation(pos).with_rotation(rot),
+                                    ));
+                                }
+                                let se = if res.effective {
+                                    missile.hit_se.hi
+                                } else {
+                                    missile.hit_se.low
+                                };
+                                if se > 0 {
+                                    sound::cue(
+                                        &mut commands,
+                                        &mut speaker.cues,
+                                        &mut speaker.sources,
+                                        &format!("w{se:08}"),
+                                    );
+                                }
+                                info!(
+                                    "player missile hit [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
+                                    if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                                    res.damage,
+                                    health.ap,
+                                    health.ap_max,
+                                    if health.is_staggered() { " STAGGER" } else { "" },
+                                    if lethal { " DESTROYED" } else { "" },
+                                );
+                                commands.entity(e).despawn();
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1333,6 +1684,65 @@ pub fn step_missiles(
         if delta.length_squared() > 0.0 {
             transform.look_to(delta.normalize(), Vec3::Y);
         }
+    }
+}
+
+/// Steps the player AC's stagger timer, plays destruction explosion on AP == 0, and cleanly
+/// respawns the player at the map start point after `PLAYER_RESPAWN_SECS`.
+#[allow(clippy::too_many_arguments)]
+pub fn tick_player_health(
+    time: Res<Time>,
+    start: Res<crate::map::Start>,
+    collision: Res<Collision>,
+    mut speaker: Speaker,
+    mut commands: Commands,
+    mut acs: Query<(&mut PlayerHealth, &mut Pilot, &mut Transform, Option<&mut Status>)>,
+) {
+    let dt = time.delta_secs();
+    let Ok((mut health, mut pilot, mut tf, mut status)) = acs.single_mut() else {
+        return;
+    };
+    if health.just_destroyed {
+        health.just_destroyed = false;
+        pilot.velocity = Vec3::ZERO;
+        let center = tf.translation + Vec3::Y * 4.5;
+        commands.spawn((Sfx::new(4041), Transform::from_translation(center)));
+        let destroy_se = find(PARAM_ACSOUNDPARAM_BIN, 0)
+            .filter(|r| r.data.se_destroy > 0)
+            .map(|r| format!("c{:08}", r.data.se_destroy))
+            .unwrap_or_else(|| "c00000089".to_string());
+        sound::cue(
+            &mut commands,
+            &mut speaker.cues,
+            &mut speaker.sources,
+            &destroy_se,
+        );
+        info!(
+            "player AC destroyed at ({:.1}, {:.1}, {:.1}); respawning in {:.1}s",
+            center.x, center.y, center.z, damage::PLAYER_RESPAWN_SECS
+        );
+    }
+    if health.destroyed {
+        pilot.velocity = Vec3::ZERO;
+    }
+    let respawn = health.tick(dt);
+    if respawn {
+        health.reset();
+        pilot.velocity = Vec3::ZERO;
+        pilot.en = pilot.en_max;
+        pilot.yaw = start.yaw;
+        let spawn_y = collision
+            .ground_below(start.position + Vec3::Y * RAY_HALF)
+            .unwrap_or(start.position.y);
+        tf.translation = start.position.with_y(spawn_y);
+        tf.rotation = Quat::from_rotation_y(start.yaw);
+        if let Some(s) = status.as_deref_mut() {
+            s.ap = health.ap_u32();
+            s.en = pilot.en;
+        }
+        info!("player AC respawned at start with {:.0} AP", health.ap);
+    } else if let Some(s) = status.as_deref_mut() {
+        s.ap = health.ap_u32();
     }
 }
 
@@ -1434,6 +1844,170 @@ fn gun(id: i64) -> Gun {
 
 fn shoulder_gun(id: i64, arms_mount: u8) -> Gun {
     gun_from_category(id, 12, arms_mount)
+}
+
+/// Decodes one category-10 enemy weapon record from `param/enemy/parts/acvenemyparts.bin`
+/// (`0x824a14e4` -> `0x824a0430`, identical category-10 weapon sub-record offsets to `acvparts.bin`).
+fn enemy_gun_from_record(data: &[u8]) -> Gun {
+    let be = Be(data);
+    let Ok(bullet_id) = be.u32(316) else {
+        return silent();
+    };
+    if bullet_id == 0 {
+        return silent();
+    }
+    let hit_id = be.u32(320).unwrap_or(0);
+    let init_speed = be.f32(328).unwrap_or(0.0);
+    let (kind, flight, missile_flight, speed) = enemy_flight(bullet_id, init_speed);
+    if kind == Kind::Skip {
+        return silent();
+    }
+    let (fx, hit_se) = enemy_fx_and_hit_se_for(hit_id);
+    let is_missile = be.u8(308).unwrap_or(0) == 1 || kind == Kind::Missile;
+    let magazine = be.u16(374).unwrap_or(9999).max(1);
+    let burst_count = be.u8(337).unwrap_or(1).max(1);
+    let burst_interval = be.u16(342).unwrap_or(0) as f32;
+    let reload_time = be.u16(344).unwrap_or(60) as f32;
+    Gun {
+        remaining: magazine,
+        magazine,
+        reload_time,
+        lock_time_ticks: be.u16(314).unwrap_or(0) as f32,
+        cooldown: 0.0,
+        init_speed: speed,
+        kind,
+        flight,
+        missile_flight,
+        is_missile,
+        weapon_lock_max: if is_missile { 1 } else { 0 },
+        burst_count,
+        burst_interval,
+        damage_type: DamageType::from_raw(be.u8(392).unwrap_or(0)),
+        damage_power: be.f32(396).unwrap_or(0.0),
+        damage_recoil: be.f32(400).unwrap_or(0.0),
+        en_drain: 0.0,
+        decay: RangeDecay {
+            no_decay_range: be.u16(380).unwrap_or(0) as f32,
+            damp_range: be.u16(312).unwrap_or(0) as f32,
+            guarantee_rate: be.u8(382).unwrap_or(100) as f32,
+            min_power_rate: be.u8(383).unwrap_or(100) as f32,
+        },
+        fx,
+        shoot: enemy_shoot_of_hit(hit_id),
+        hit_se,
+        stance: false,
+        sniper: false,
+    }
+}
+
+fn enemy_shoot_of_hit(hit_id: u32) -> i16 {
+    find(PARAM_ENEMYWEAPONSOUNDPARAM_BIN, hit_id)
+        .or_else(|| find(PARAM_ACWEAPONSOUNDPARAM_BIN, hit_id))
+        .map(|r| r.data.shoot)
+        .unwrap_or(DEFAULT_SHOOT)
+}
+
+fn enemy_fx_and_hit_se_for(hit_id: u32) -> (Fx, HitSe) {
+    let Some(row) = find(PARAM_ENEMYWEAPONSFXPARAM_BIN, hit_id)
+        .or_else(|| find(PARAM_ACWEAPONSFXPARAM_BIN, hit_id))
+        .or_else(|| find(PARAM_ACWEAPONSFXPARAM_BIN, 1))
+        .map(|r| &r.data)
+    else {
+        return (Fx::default(), HitSe::default());
+    };
+    let hit_type = u32::try_from(row.hit_sfx_type).ok();
+    let hit_sfx = hit_type
+        .and_then(|t| find(PARAM_BULLETHITSFXPARAM_BIN, t))
+        .map(|r| &r.data);
+    let hit_se = hit_type
+        .and_then(|t| find(PARAM_BULLETHITSEPARAM_BIN, t))
+        .map(|r| HitSe {
+            low: r.data.dry_ac_low_damage,
+            hi: r.data.ac_hi_damage,
+        })
+        .unwrap_or_default();
+    let fx = Fx {
+        bullet: row.bullet_sfx_id.into(),
+        muzzle: row.muzzle_sfx_id.into(),
+        hit: hit_sfx.map_or(0, |d| d.default2.into()),
+        hit_low: hit_sfx.map_or(0, |d| d.dry_ac_low_damage.into()),
+        hit_hi: hit_sfx.map_or(0, |d| d.ac_hi_damage.into()),
+        after_accel: row.after_accel_follow_sfx_id.into(),
+        delete_fx: row.delete_sfx_id.into(),
+    };
+    (fx, hit_se)
+}
+
+fn enemy_flight(id: u32, init_speed: f32) -> (Kind, Flight, Option<MissileFlight>, f32) {
+    if let Some(row) = find(PARAM_ENEMY_BULLET_ENEMYBULLETMISSILE_BIN, id)
+        .or_else(|| find(BULLET_BULLETMISSILE_BIN, id))
+    {
+        let d = &row.data;
+        let mf = MissileFlight {
+            accel: d.accel,
+            air_cp: d.air_cp,
+            before_accel_gravity: d.before_accel_gravity,
+            after_accel_gravity: d.after_accel_gravity,
+            brake: d.brake,
+            accel_start_frame: d.accel_start_frame as f32,
+            accel_end_frame: d.accel_end_frame as f32,
+            act_start_frame: d.act_start_frame as f32,
+            trace_turn_deg_s: d.trace_trun_angle,
+            min_speed: d.min_speed_km_h as f32 / KMH_PER_MS,
+            max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
+            hit_radius: d.hit_radius,
+            proximity_fuse_range: d.proximity_fuse_range,
+        };
+        let spd = if init_speed > 0.0 {
+            init_speed
+        } else if mf.min_speed > 0.0 {
+            mf.min_speed
+        } else {
+            speed(init_speed, d.max_speed_km_h).min(120.0)
+        };
+        return (Kind::Missile, Flight::default(), Some(mf), spd);
+    }
+    if let Some(row) = find(PARAM_ENEMY_BULLET_ENEMYBULLETRIGID_BIN, id)
+        .or_else(|| find(BULLET_BULLETRIGID_BIN, id))
+    {
+        let d = &row.data;
+        return (
+            Kind::Rigid,
+            Flight {
+                min_speed: d.min_speed_km_h as f32 / KMH_PER_MS,
+                max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
+                air_cp: d.air_cp,
+                stalled_air_cp_h: d.stalled_air_cp_h,
+                stalled_air_cp_v: d.stalled_air_cp_v,
+                gravity: d.gravity,
+                brake: d.brake,
+                stall_to_vanish_frame: None,
+            },
+            None,
+            speed(init_speed, d.max_speed_km_h),
+        );
+    }
+    if let Some(row) = find(PARAM_ENEMY_BULLET_ENEMYBULLETENERGY_BIN, id)
+        .or_else(|| find(BULLET_BULLETENERGY_BIN, id))
+    {
+        let d = &row.data;
+        return (
+            Kind::Energy,
+            Flight {
+                min_speed: d.min_speed_km_h as f32 / KMH_PER_MS,
+                max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
+                air_cp: d.air_cp,
+                stalled_air_cp_h: d.stalled_air_cp,
+                stalled_air_cp_v: 0.0,
+                gravity: 0.0,
+                brake: d.brake,
+                stall_to_vanish_frame: Some(d.stall_to_vanish_frame as f32),
+            },
+            None,
+            speed(init_speed, d.max_speed_km_h),
+        );
+    }
+    (Kind::Skip, Flight::default(), None, init_speed)
 }
 
 fn shoot_of_hit(hit_id: u32) -> i16 {

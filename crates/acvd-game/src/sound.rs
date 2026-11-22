@@ -50,6 +50,7 @@ impl Cues {
             "acv2_se_bombs.fev",
             "acv2_se_booster.fev",
             "acv2_se_ac.fev",
+            "acv2_se_enemy.fev",
         ] {
             match disc
                 .read(&format!("sound/{name}"))
@@ -297,9 +298,10 @@ mod tests {
         let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
         let Ok(disc) = Disc::open(&iso) else { return };
         let mut cues = Cues::load(&disc);
-        assert_eq!(cues.projects.len(), 4);
+        assert_eq!(cues.projects.len(), 5);
         for cue in [
             "w00000034",
+            "w00001012",
             "w00009027",
             "w00009224",
             "w00009600",

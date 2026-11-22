@@ -25,6 +25,7 @@
 use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
 use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::generated::enemy::{EnemyBasicSt, EnemyGraphicsSt};
+use acvd_data::part_field;
 use bevy::prelude::*;
 
 /// Damage attribute byte (`0x8247d4d8` `+0x54` / `acvparts.bin` category 10 `+0x188`,
@@ -293,6 +294,129 @@ pub fn segment_hits_sphere(
     ))
 }
 
+/// Live AP, KE/CE/TE defense profile, stagger state, and hit spheres on the piloted player AC.
+#[derive(Component, Debug, Clone)]
+pub struct PlayerHealth {
+    pub ap: f32,
+    pub ap_max: f32,
+    pub defense: DefenseProfile,
+    /// Recoil threshold triggering stagger (`AcCtrlParam::stagger_penalty_threshold` =
+    /// `clashThreshold * 0.8` per `AcCtrlParamCalc.lua` line 337).
+    pub stagger_threshold: f32,
+    /// Stagger penalty duration in seconds (`2.0` s per `AcCtrlParamCalc.lua` line 338).
+    pub stagger_penalty_time: f32,
+    /// Remaining stagger seconds (`> 0.0` applies the 0.8× defense threshold penalty and shows
+    /// `ACV_FE_Normal::Stagger` / `ErrorLog_Stagger` dialog 208).
+    pub stagger_timer: f32,
+    /// Local-space hit spheres (`0x82863b60`, `ac_hit_spheres()`).
+    pub spheres: Vec<HitSphere>,
+    /// True once player AP has reached 0.
+    pub destroyed: bool,
+    /// Consumed once on the lethal hit to play AC destruction explosion + cue.
+    pub just_destroyed: bool,
+    /// Seconds remaining until automatic AC TEST respawn after AP reaches 0.
+    pub respawn_timer: f32,
+    /// Number of enemy hits absorbed since spawn/reset.
+    pub hits_taken: u32,
+}
+
+/// Automatic AC TEST respawn delay after player AP reaches 0 (not game data; keeps free play
+/// running cleanly without a garage reload).
+pub const PLAYER_RESPAWN_SECS: f32 = 3.0;
+
+impl PlayerHealth {
+    /// Builds `PlayerHealth` for the piloted AC from its `AcAssemblyDesignSt`.
+    pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
+        let ap_max = [
+            (design.head, 0u8),
+            (design.core, 1),
+            (design.arms, 2),
+            (design.legs, 3),
+        ]
+        .into_iter()
+        .map(|(id, cat)| part_field(id as i64, cat, "ap").max(0.0))
+        .sum::<f32>()
+        .max(1.0);
+        let ctrl = AcCtrlParam::calculate(design);
+        Self {
+            ap: ap_max,
+            ap_max,
+            defense: DefenseProfile::from_ac(design),
+            stagger_threshold: ctrl.stagger_penalty_threshold,
+            stagger_penalty_time: 2.0,
+            stagger_timer: 0.0,
+            spheres: ac_hit_spheres(),
+            destroyed: false,
+            just_destroyed: false,
+            respawn_timer: 0.0,
+            hits_taken: 0,
+        }
+    }
+
+    pub fn is_staggered(&self) -> bool {
+        self.stagger_timer > 0.0
+    }
+
+    /// Applies one incoming hit using the 360 three-zone KE/CE/TE formula (`0x827d0b50`) and
+    /// stagger threshold check (`AcCtrlParamCalc.lua` lines 337–338).
+    /// Returns `(hit_result, lethal)`.
+    pub fn apply_hit(
+        &mut self,
+        attr: DamageType,
+        power: f32,
+        recoil: f32,
+    ) -> (HitResult, bool) {
+        let res = calculate_damage(attr, power, recoil, &self.defense, self.is_staggered());
+        if self.destroyed {
+            return (res, false);
+        }
+        self.hits_taken = self.hits_taken.saturating_add(1);
+        self.ap = (self.ap - res.damage).max(0.0);
+        if self.stagger_threshold > 0.0 && res.recoil >= self.stagger_threshold {
+            self.stagger_timer = self.stagger_penalty_time;
+        }
+        let lethal = self.ap <= 0.0;
+        if lethal {
+            self.destroyed = true;
+            self.just_destroyed = true;
+            self.respawn_timer = PLAYER_RESPAWN_SECS;
+        }
+        (res, lethal)
+    }
+
+    /// Current integer AP for `hud::Status::ap`.
+    pub fn ap_u32(&self) -> u32 {
+        if self.ap <= 0.0 {
+            0
+        } else {
+            self.ap.ceil() as u32
+        }
+    }
+
+    /// Advances stagger and respawn timers. Returns `true` when respawn should execute.
+    pub fn tick(&mut self, dt: f32) -> bool {
+        if self.stagger_timer > 0.0 {
+            self.stagger_timer = (self.stagger_timer - dt).max(0.0);
+        }
+        if self.destroyed && self.respawn_timer > 0.0 {
+            self.respawn_timer = (self.respawn_timer - dt).max(0.0);
+            if self.respawn_timer <= 0.0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Restores full AP and clears stagger / destroyed state on AC TEST respawn.
+    pub fn reset(&mut self) {
+        self.ap = self.ap_max;
+        self.stagger_timer = 0.0;
+        self.destroyed = false;
+        self.just_destroyed = false;
+        self.respawn_timer = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +555,49 @@ mod tests {
             2.0,
         )
         .is_none());
+    }
+
+    #[test]
+    fn player_health_takes_damage_staggers_and_respawns() {
+        let design = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| &r.data)
+            .expect("design 5001");
+        let mut ph = PlayerHealth::from_design(design);
+        assert_eq!(ph.ap_u32(), 34695);
+        assert!(!ph.is_staggered());
+        assert_eq!(ph.spheres.len(), 2);
+
+        // High-recoil SNP-MT sniper shot (3000 KE, 1200 recoil): penetrates & triggers stagger!
+        let (res1, lethal1) = ph.apply_hit(DamageType::Ke, 3000.0, 1200.0);
+        assert!(res1.effective && !lethal1);
+        assert!(ph.ap < ph.ap_max);
+        assert!(
+            ph.is_staggered(),
+            "recoil 1200 >= stagger_threshold {} must stagger player AC",
+            ph.stagger_threshold
+        );
+
+        // While staggered, defense threshold drops to 0.8x: a shot at 0.9x normal threshold penetrates!
+        let normal_ke_thr = f32::from(ph.defense.ke.threshold);
+        let probe_power = normal_ke_thr * 0.9;
+        let (res_stag, _) = ph.apply_hit(DamageType::Ke, probe_power, 0.0);
+        assert!(res_stag.effective, "0.9x normal KE threshold must penetrate while staggered");
+
+        // After stagger_penalty_time (2.0 s), stagger clears and same shot ricochets.
+        assert!(!ph.tick(2.1));
+        assert!(!ph.is_staggered());
+        let (res_clear, _) = ph.apply_hit(DamageType::Ke, probe_power, 0.0);
+        assert!(!res_clear.effective, "0.9x normal KE threshold must ricochet once stagger clears");
+
+        // Lethal hit drops AP to 0, sets destroyed + just_destroyed, and respawns cleanly after 3.0 s.
+        let (_, lethal) = ph.apply_hit(DamageType::Unmitigated, 100_000.0, 0.0);
+        assert!(lethal && ph.destroyed && ph.just_destroyed && ph.ap_u32() == 0);
+        assert!(!ph.tick(1.5));
+        assert!(ph.tick(2.0), "respawn triggers after PLAYER_RESPAWN_SECS");
+        ph.reset();
+        assert!(!ph.destroyed && ph.ap_u32() == 34695 && !ph.is_staggered());
     }
 }

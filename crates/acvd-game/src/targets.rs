@@ -36,7 +36,7 @@ use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
 
-use crate::{assemble, boost, damage, map, paint, pose, sfx, sound};
+use crate::{ai, assemble, boost, damage, map, paint, pose, sfx, sound, weapons};
 
 /// `PARTS_PARAM_ST` kind for enemies and test ACs.
 const KIND_TARGET: u32 = 2;
@@ -116,11 +116,21 @@ pub struct TargetHealth {
     pub destroy_sfx: i32,
     /// Destruction sound cue name (`w00009600` / `w00009601` / `c00000089`).
     pub destroy_se: String,
+    /// World position of the last incoming hit (`IsLastHitRemember` / `GetLastHitAngle`).
+    pub last_hit_from: Option<Vec3>,
+    /// Seconds remaining before the last-hit alert expires.
+    pub last_hit_timer: f32,
 }
 
 impl TargetHealth {
     pub fn is_staggered(&self) -> bool {
         self.stagger_timer > 0.0
+    }
+
+    /// Remembers the source of an incoming hit for 5 seconds (`IsLastHitRemember`).
+    pub fn record_hit_from(&mut self, origin: Vec3) {
+        self.last_hit_from = Some(origin);
+        self.last_hit_timer = 5.0;
     }
 
     /// Applies one projectile hit (`0x827d0b50` + `0x82984438` + `0x82837f30`).
@@ -183,6 +193,8 @@ impl TargetHealth {
             broken_asset: Some(enemy_broken_asset(model)),
             destroy_sfx,
             destroy_se,
+            last_hit_from: None,
+            last_hit_timer: 0.0,
         }
     }
 
@@ -220,6 +232,8 @@ impl TargetHealth {
             broken_asset: None,
             destroy_sfx,
             destroy_se,
+            last_hit_from: None,
+            last_hit_timer: 0.0,
         }
     }
 
@@ -285,6 +299,7 @@ pub fn spawn(
     images: &mut Assets<Image>,
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
     disc: &Disc,
+    enemy_parts: &weapons::EnemyParts,
     map_id: &str,
     layout: &str,
     mode: &TestMode,
@@ -362,6 +377,12 @@ pub fn spawn(
             continue;
         };
         let health = TargetHealth::from_enemy(&part.model);
+        let enemy_ai = ai::EnemyAi::for_enemy(
+            &part.model,
+            xf.translation,
+            ai::yaw_from_quat(xf.rotation),
+            enemy_parts,
+        );
         commands
             .spawn((
                 Target {
@@ -371,6 +392,7 @@ pub fn spawn(
                     ac_design_id: None,
                 },
                 health,
+                enemy_ai,
                 Name::new(part.name.clone()),
                 xf,
                 Visibility::default(),
@@ -444,6 +466,12 @@ fn spawn_ac_target(
         }
     };
     let health = TargetHealth::from_ac(design);
+    let enemy_ai = ai::EnemyAi::for_ac(
+        design_id,
+        design,
+        xf.translation,
+        ai::yaw_from_quat(xf.rotation),
+    );
     let root = commands
         .spawn((
             Target {
@@ -453,6 +481,7 @@ fn spawn_ac_target(
                 ac_design_id: Some(design_id),
             },
             health,
+            enemy_ai,
             Name::new(part.name.clone()),
             xf,
             Visibility::default(),
@@ -518,6 +547,9 @@ pub fn tick(
     for (entity, target, mut health, xf, children) in &mut targets {
         if health.stagger_timer > 0.0 {
             health.stagger_timer = (health.stagger_timer - dt).max(0.0);
+        }
+        if health.last_hit_timer > 0.0 {
+            health.last_hit_timer = (health.last_hit_timer - dt).max(0.0);
         }
         if !health.just_destroyed {
             continue;

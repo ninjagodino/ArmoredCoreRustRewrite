@@ -11,6 +11,24 @@ use crate::reader::Be;
 pub const CATEGORIES: usize = 24;
 pub const HEADER_SIZE: usize = 4 + CATEGORIES * 2;
 
+/// Record size in bytes for each `acvparts.bin` / `acvenemyparts.bin` category
+/// (360 loader `0x824a0430`, called for both files by `0x824a1498`).
+pub fn record_size(category: usize) -> Option<usize> {
+    Some(match category {
+        0 | 1 | 5 => 0x144,
+        2 | 4 | 7 | 8 => 0x148,
+        3 => 0x174,
+        6 => 0x150,
+        9 => 0x16c,
+        10 => 0x1a0,
+        11 => 0x1ac,
+        12 => 0x1c4,
+        13 => 0x134,
+        14..=23 => 0x13c,
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Record<'a> {
     pub category: usize,
@@ -104,5 +122,30 @@ mod tests {
         assert!(read(&d, |_| None).is_err());
         d.extend_from_slice(&[0, 3]);
         assert_eq!(read(&d, |_| Some(4)).unwrap().tail, Some(d.len() - 1));
+    }
+
+    #[test]
+    fn reads_enemy_parts_catalogue_from_disc() {
+        let root = crate::vfs::repo_root();
+        let Ok(disc) = crate::vfs::Disc::open(&crate::vfs::default_disc(&root)) else {
+            return;
+        };
+        let data = disc.read("param/enemy/parts/acvenemyparts.bin").unwrap();
+        let parts = read(&data, record_size).unwrap();
+        assert!(parts.records.len() > 100);
+        // Verify AC TEST enemy weapon IDs exist in category 10 with valid firing fields.
+        // (`8990` is DEF-MT's shield bash placeholder with `bullet_id == 0`.)
+        for wanted in [8000u16, 8030, 8031, 8060, 8120, 8230, 8231, 8990] {
+            let rec = parts
+                .records
+                .iter()
+                .find(|r| r.category == 10 && r.id == wanted)
+                .unwrap_or_else(|| panic!("missing enemy weapon {wanted} in acvenemyparts.bin"));
+            let be = Be(rec.data);
+            let bullet_id = be.u32(316).unwrap();
+            if wanted != 8990 {
+                assert!(bullet_id > 0, "enemy weapon {wanted} missing bullet_id");
+            }
+        }
     }
 }

@@ -40,6 +40,7 @@
 //! effect `id` playing in front of the AC. Shots, boost and jump play their FMOD cues (see
 //! `sound`). `--burst <n>` makes `--shot` save `n` frames 0.05 s apart (`<stem>_<i>.png`).
 
+mod ai;
 mod assemble;
 mod bay;
 mod blur;
@@ -244,6 +245,7 @@ fn main() {
         eprintln!("no design {id}; starting at the first");
     }
 
+    let enemy_parts = weapons::EnemyParts::load(&disc);
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -257,6 +259,7 @@ fn main() {
     .add_plugins(sound::SoundPlugin { disc: disc.clone() })
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
+    .insert_resource(enemy_parts)
     .insert_resource(Garage {
         disc,
         designs,
@@ -300,8 +303,10 @@ fn main() {
             (
                 bay::shift,
                 weapons::fire,
+                ai::update,
                 weapons::step_projectiles,
                 weapons::step_missiles,
+                weapons::tick_player_health,
                 targets::tick,
                 orbit,
                 reframe,
@@ -320,9 +325,10 @@ fn main() {
             hud::lock_cursor,
             hud::scan_hud,
             hud::recon_hud,
+            hud::stagger_hud,
         )
             .chain()
-            .after(weapons::fire),
+            .after(weapons::tick_player_health),
     );
     if let Some(id) = preview {
         app.insert_resource(sfx::Preview(id));
@@ -387,6 +393,7 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     garage: Res<Garage>,
+    enemy_parts: Res<weapons::EnemyParts>,
     yaw: Res<StartYaw>,
     collision: Res<Collision>,
     scene: Res<Scene>,
@@ -445,6 +452,7 @@ fn setup(
             &mut images,
             &mut bindposes,
             &garage.disc,
+            &enemy_parts,
             map_id,
             layout,
             &scene.test,
@@ -902,6 +910,7 @@ fn show(
         fcs,
         scan::ScanState::from_design(&design.data),
         weapons::Armament::from_design(&design.data),
+        damage::PlayerHealth::from_design(&design.data),
         hud::Status::from_design(&design.data),
     ));
     if min.x <= max.x {
