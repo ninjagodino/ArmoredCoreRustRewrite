@@ -57,12 +57,18 @@ use crate::sfx::{EffectPoint, Sfx};
 use crate::sound::{self, Cues};
 use crate::targets::{Target, TargetHealth};
 
-/// Hand-weapon muzzle effect point (FLVER dummy colour byte 1 on the arm weapons).
+/// Hand-weapon muzzle effect point (FLVER dummy colour byte 1 on the arm weapons, 360 `0x8288f280`).
 const MUZZLE_POINT: u8 = 101;
-/// Uniform scale the muzzle effect plays at. Not game data: f0001218 as stored is a 16 m
-/// flash (s4021 × 8 × 9.5) and a 20 m sprite, so the game must scale it at spawn; the scale's
-/// source is not traced.
-const MUZZLE_SCALE: f32 = 0.25;
+/// Hand-weapon cartridge ejection port dummy (`0x6f` = 111, registered in `0x8288f280` at `+0xfc`;
+/// spawned by `0x829bee70` -> `0x82892df0` -> `0x82b88a78` at scale 1.0, `private/xenia/fx_polish.jsonl`).
+const CARTRIDGE_POINT: u8 = 111;
+/// Uniform scale the muzzle effect plays at on the 360 (`0x829c0160` -> `0x829bf848` ->
+/// `0x829bfb48` -> `0x829bef38` -> `AcSfxCtrl` vtable `+0x08` = `0x82891f08` -> `0x82b88a78`).
+/// `SfxRequest` (`0x82b88e88`, `DAT_82000fc4`) initializes `+0x30` scale = `1.0` and `0x82891f08`
+/// never rescales it (verified `[r4+0x30]:f32 = 1.0` on all shots in `private/xenia/fx_polish.jsonl`
+/// and `fx_polish2.jsonl`; f0001218's oversized 20 m card was action 107
+/// `FXParticleAppearance_RadialBlur`, `0x835b3658`, not a world-space billboard).
+const MUZZLE_SCALE: f32 = 1.0;
 
 /// Game ticks per second (`DAT_82004408` = 1/60):
 /// - `reload_time` (`+344`, `0x8247cb80`) is in 60 Hz ticks (`0x8286bd00` multiplies by `1/60`).
@@ -898,6 +904,9 @@ impl Gun {
 pub struct Fx {
     pub bullet: i32,
     pub muzzle: i32,
+    /// `acweaponsfxparam.cartridge_sfx_id` (`+0x04`, spawned by `0x829bee70` -> `0x82892df0` on
+    /// dummy `111` at scale `1.0`, `private/xenia/fx_polish.jsonl`).
+    pub cartridge: i32,
     pub hit: i32,
     /// `bullethitsfxparam.dry_ac_low_damage` (ricochet hit VFX).
     pub hit_low: i32,
@@ -1712,6 +1721,12 @@ pub(crate) fn spawn_enemy_shot(
                 .with_scale(Vec3::splat(MUZZLE_SCALE)),
         ));
     }
+    if gun.fx.cartridge > 0 {
+        commands.spawn((
+            Sfx::new(gun.fx.cartridge),
+            Transform::from_translation(origin).looking_to(-dir, Vec3::Y),
+        ));
+    }
     let tf = Transform::from_translation(origin).looking_to(dir, Vec3::Y);
     if gun.kind == Kind::Missile {
         let missile = Missile::from_gun_owned(gun, dir, target_entity, Owner::Enemy);
@@ -2175,6 +2190,40 @@ pub fn fire(
                         ));
                     }
                 }
+                if gun.fx.cartridge > 0 {
+                    let carts: Vec<Entity> = points
+                        .iter()
+                        .filter(|(_, p, _)| {
+                            (p.column == "arms" || p.column == "armwep_r" || p.column == "armwep_l")
+                                && p.id == CARTRIDGE_POINT
+                        })
+                        .map(|(e, _, _)| e)
+                        .collect();
+                    if !carts.is_empty() {
+                        for &point in carts.iter().take(shots) {
+                            commands.spawn((
+                                Sfx::new(gun.fx.cartridge),
+                                Transform::default(),
+                                Visibility::default(),
+                                ChildOf(point),
+                            ));
+                        }
+                    } else if barrel_count > 0 {
+                        for &(point, _) in muzzles.iter().take(barrel_count) {
+                            commands.spawn((
+                                Sfx::new(gun.fx.cartridge),
+                                Transform::default(),
+                                Visibility::default(),
+                                ChildOf(point),
+                            ));
+                        }
+                    } else {
+                        commands.spawn((
+                            Sfx::new(gun.fx.cartridge),
+                            Transform::from_translation(fallback_origin).looking_to(-aim, Vec3::Y),
+                        ));
+                    }
+                }
                 let pellets_per_barrel = if muzzles.is_empty() {
                     shots
                 } else {
@@ -2414,6 +2463,30 @@ pub fn fire(
                     Transform::from_translation(origin)
                         .looking_to(-hand_aim, Vec3::Y)
                         .with_scale(Vec3::splat(MUZZLE_SCALE)),
+                )),
+            };
+        }
+        // Ejected shell cartridge (`0x829bee70` -> `0x82892df0` -> `0x82b88a78` at scale 1.0 on
+        // dummy 111 registered in `0x8288f280`; falls back to muzzle dummy 101 if absent).
+        if gun.fx.cartridge > 0 {
+            let port = points
+                .iter()
+                .find(|(_, p, _)| p.column == column && p.id == CARTRIDGE_POINT)
+                .or_else(|| {
+                    points
+                        .iter()
+                        .find(|(_, p, _)| p.column == column && p.id == MUZZLE_POINT)
+                });
+            match port {
+                Some((point, _, _)) => commands.spawn((
+                    Sfx::new(gun.fx.cartridge),
+                    Transform::default(),
+                    Visibility::default(),
+                    ChildOf(point),
+                )),
+                None => commands.spawn((
+                    Sfx::new(gun.fx.cartridge),
+                    Transform::from_translation(origin).looking_to(-hand_aim, Vec3::Y),
                 )),
             };
         }
@@ -2898,7 +2971,7 @@ pub fn step_overed_weapon(
                         Sfx::new(gun.fx.muzzle),
                         Transform::from_translation(ow_muzzle)
                             .looking_to(-aim, Vec3::Y)
-                            .with_scale(Vec3::splat(MUZZLE_SCALE * 2.0)),
+                            .with_scale(Vec3::splat(MUZZLE_SCALE)),
                     ));
                 }
                 let locked = fcs.and_then(|f| f.locked.as_ref());
@@ -4255,6 +4328,7 @@ fn enemy_fx_and_hit_se_for(hit_id: u32) -> (Fx, HitSe) {
     let fx = Fx {
         bullet: row.bullet_sfx_id.into(),
         muzzle: row.muzzle_sfx_id.into(),
+        cartridge: row.cartridge_sfx_id.into(),
         hit: hit_sfx.map_or(0, |d| d.default2.into()),
         hit_low: hit_sfx.map_or(0, |d| d.dry_ac_low_damage.into()),
         hit_hi: hit_sfx.map_or(0, |d| d.ac_hi_damage.into()),
@@ -4380,6 +4454,7 @@ fn fx_and_hit_se_for(hit_id: u32) -> (Fx, HitSe) {
     let fx = Fx {
         bullet: row.bullet_sfx_id.into(),
         muzzle: row.muzzle_sfx_id.into(),
+        cartridge: row.cartridge_sfx_id.into(),
         hit: hit_sfx.map_or(0, |d| d.default2.into()),
         hit_low: hit_sfx.map_or(0, |d| d.dry_ac_low_damage.into()),
         hit_hi: hit_sfx.map_or(0, |d| d.ac_hi_damage.into()),
@@ -6198,6 +6273,30 @@ mod tests {
                 power_scale: 1.0,
                 pellets: 1,
             }
+        );
+    }
+
+    #[test]
+    fn muzzle_scale_and_cartridge_sfx_from_weaponsfxparam() {
+        // 360 0x82891f08 -> 0x82b88a78 spawns muzzle_sfx_id at SfxRequest.scale = 1.0
+        // (private/xenia/fx_polish.jsonl / fx_polish2.jsonl).
+        assert_eq!(MUZZLE_SCALE, 1.0);
+        assert_eq!(CARTRIDGE_POINT, 111);
+
+        // Rifle hit_id on design 5001 starter AC has muzzle and cartridge SFX.
+        let design = &find(
+            acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN,
+            5001,
+        )
+        .expect("design 5001")
+        .data;
+        let arms = Armament::from_design(design);
+        let rifle = &arms.hands[0];
+        assert!(rifle.fx.muzzle > 0, "rifle must have muzzle_sfx_id");
+        assert!(
+            rifle.fx.cartridge > 0,
+            "ballistic rifle must populate cartridge_sfx_id (got {})",
+            rifle.fx.cartridge
         );
     }
 }

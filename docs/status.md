@@ -244,22 +244,15 @@ in order:
   - Not drawn: distortion (43), radial blur, tracer/line actions, actions 2031/2035/2118/3000.
 
   Gameplay gaps:
-  - Booster routing is traced (see Done). Still open: heat-haze distortion (action 43) draws
+  - Booster routing, QB shortage/large (`304`/`305`) + `HighBoostState` TAE (`0xC1D..0xC22`),
+    ground/landing/slide/wall-kick dust (`groundsfxparam.bin`), water splashes & near-water
+    spray (`envsfxparam.bin`), shell cartridges (`cartridge_sfx_id`), real 360 muzzle scale
+    (`1.0` + `action 107` radial blur), Circle/Sphere emitters (`30`/`31`), and particle
+    material sharing are done (see Done). Still open: heat-haze distortion (action 43) draws
     as a refractive quad; the 360 shot's blown-out white core is the additive stack plus the
-    engine bloom, which Bevy's tonemap does not match. QB shortage 304 and QB large 305 are
-    built into lists at the sfx object `+0xb0` and the four `0x82891c50` slots, and
-    `0x82892f08` never plays them (EN shortage and the `0x8283c8d0` TAE events `0xC1D..0xC22`
-    from `HighBoostState` are not wired to SFX yet; Boost Charge movement and row 284 wind-up
-    are done in `control.rs`). Also not
-    wired: ground dust from `groundsfxparam.bin` (walk/landing rows), water splashes,
-    cartridges (`cartridge_sfx_id`).
-  - Muzzle scale: f0001218 as stored is a 16 m flash and a 20 m sprite (user: far too
-    large), so the game scales weapon effects at spawn. `weapons::MUZZLE_SCALE` 0.25 is a
-    guess; find the spawn call that reads `muzzle_sfx_id` (+0x02 of the weaponsfx row) and its
-    scale argument (`acvd-index q field 0x2` / `q name muzzle`), then a Xenia probe on that
-    call while firing.
-  - Hits always use `default2`: the collision mesh keeps no material.
-  - The `hit_sfx_type` to `bullethitsfxparam.bin` row mapping is assumed.
+    engine bloom, which Bevy's tonemap does not match.
+  - Hits always use `default2`: bullet/missile wall-hit SFX do not yet map HMD surface material
+    to `bullethitsfxparam.bin` columns (`hit_sfx_type` mapping is still assumed).
 - **Sheet values from the PS3 balance data**: the generated data (`acvd-data`) now comes from the
   360 disc (migration 4), so it matches the Xenia probes. The two discs differ in 112 of 622
   `acvparts.bin` records, 95 rows of 6 PARAM files and 6 tuning values
@@ -286,6 +279,15 @@ in order:
   `LogAI` state names; no sheet yet).
 
 ## Done
+
+- **Effects & Visual Polish: Ground/Water Dust, Cartridges, QB Shortage/Large + `HighBoostState` TAE, Real 360 Muzzle Scale, Circle/Sphere Emitters & Particle Material Sharing** (`acvd-game::collision`, `control`, `sfx`, `weapons`, `sheets/ffx_actions.csv`, `sheets/systems.csv`):
+  - **Real 360 Muzzle Scale & Action `107` Radial Blur (`0x82891f08` → `0x82b88a78`, `0x83197ba0` → `0x831971b0` → `0x835b3658`, `private/xenia/fx_polish.jsonl`, `fx_polish2.jsonl`, `fx_m61_muzzle.jsonl`)**: proved via Xenia probes that the 360 spawns hand-weapon muzzle flashes (`f0001218`) at `SfxRequest.scale = 1.0` (`[r4+0x30] = 1.0`) and draws action-61 models (`s4021` at `8.0×8.0×9.5`, `s4023` at `5.0→21.0`) at instance scale `1.0`; the earlier giant 20 m flash in `acvd-game` came from misinterpreting FFX action `107` (`0x6b`, `FXParticleAppearance_RadialBlur`, a post-process radial blur ring) as an additive world billboard. Replaced guessed `weapons::MUZZLE_SCALE = 0.25` with `1.0`, updated `Look::RadialBlur` in `sfx.rs` (no-op instead of world quad), and documented actions `61` and `107` in `sheets/ffx_actions.csv`.
+  - **Ejected Shell Cartridges (`cartridge_sfx_id`, `0x829bee70` → `0x82892df0` → `0x82b88a78`, `0x8288f280` `+0xfc`)**: wired `weapons::CARTRIDGE_POINT = 111` (`0x6f`) and `Fx::cartridge` from `PARAM_ACWEAPONSFXPARAM_BIN` (e.g. `hr1720` `f0001270`, `hl1820` `f0001269`) spawning at scale `1.0` on every shot.
+  - **Ground Dust & Water Splashes/Spray (`groundsfxparam.bin`, `envsfxparam.bin`, `0x82835570` → `0x82833d54`, `0x828338c0`, `0x82382688` → `0x82895200` / `0x82895240` / `0x82895290`)**: added HMD material classification (`collision::GroundSurface::{Default, Concrete, Sand, Grass, Snow, Water, Wood, Metal}` + `Hit::surface` / `ground_below_with_surface`), `Pilot::ground_surface` / `landings` / `water_splash_at`, and `sfx::ground_and_water_sfx`: footstep walk dust (row 1, `1404`/`1407`), landing dust (row 2, `1405`/`1408`), continuous grounded boost/slide dust (row 3, looping `1406`/`1409` via `sync_loop_sfx`), wall-kick / surface kick-off dust (row 7, `116`, gated to wall-jump contact per `0x828358a0..0x82835918` rather than mid-air Boost Charge Kick), water entry/exit splashes (`envsfxparam` row 0 `1419`), and continuous near-water spray (`1420`, guarded against firing through solid ground above `water_height`).
+  - **Circle (`30`) & Sphere (`31`) Emitters (`0x8314ea40` → `0x8314e558` `FXClusterEmitter_Circle`, `0x8314d218` → `0x8314cd58` `FXClusterEmitter_Sphere`)**: implemented `EmitterShape::{Cone, Circle, Sphere}` in `sfx.rs` and documented actions `28`, `30`, and `31` in `sheets/ffx_actions.csv` so `f0001404`/`f0001405` dust rings expand radially outward in XZ instead of stacking billboards at the AC origin.
+  - **QB Shortage (`304`), QB Large (`305`) & `HighBoostState` TAE `0xC1D..0xC22` (`0x82891ce8`, `0x828926b0`, `0x8283c8d0`, `private/xenia/fx_polish2.jsonl`)**: wired `control::high_boost_tae_id`, `Pilot::{qb_charge_starts, qb_shortages, qb_airborne, qb_eighth, last_qb_tae}`, and `sfx::{qb_sfx_id, qb_tae_ffx, qb_sfx}` dispatching EN shortage (`304`, scale `0.6`), normal QB (`303`, `1.0`) + TAE `0xC1F`/`0xC20` (`766` @ `1.5`), and second-stage/large QB (`305`, `1.5`) + TAE `0xC21`/`0xC22` (`121` + `766` @ `1.5`).
+  - **Particle Material Sharing (`sfx::MaterialKey`, `Library::shared_materials`, `cached_material`)**: deduplicated identical `(texture, Blend, color)` `StandardMaterial` handles across all particle clusters and static billboard/model nodes instead of allocating a fresh material per emitter.
+  - Verified with `acvd-sheets all` (0 errors), `acvd-index audit` (0 mismatches, 0 PS3 citations), `cargo test --workspace` (all unit tests passing including `sfx::tests::circle_and_sphere_emitters_read_disc_dust_effects`, `qb_sfx_id_matches_360_dispatcher_and_tae_bursts`, `ground_and_water_sfx_rows_resolve_from_disc_params`, and `particle_material_cache_reuses_identical_handles`), and live 1280×720 game-window-only video review via `watch-skill` across firing/turning, boost/QB/kick/landing, and water scenarios.
 
 - **Fast FFT-Based XMA IMDCT & Async BGM Streaming** (`acvd-formats::xma`, `fsb`, `vfs`, `env`, `acvd-game::sound`, `main`):
   - **FFT IMDCT + Fast VLC/Bitreader (`crates/acvd-formats/src/xma.rs`)**: replaced the `O(N²)` cosine matrix IMDCT with an `N/2`-point complex radix-2 FFT via DCT-IV (`ImdctPlan`, 64/128/256-point stack-allocated FFT), added a 9-bit (512-entry) fast lookup table in `Vlc::read`, and added a `u64::from_be_bytes` fast path in `Bits::peek`. Full `bgm.fsb` (26 full-length stereo tracks) decode in `xmacheck` dropped from **33 s → 10.9 s** (3.0× faster, ~0.42 s per full track, 0 frame errors, identical peak `1.105`).

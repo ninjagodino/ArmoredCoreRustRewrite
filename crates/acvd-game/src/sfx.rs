@@ -14,10 +14,12 @@ use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
 use acvd_data::find;
-use acvd_data::generated::sfx::PARAM_MAPSFXPARAM_BIN;
+use acvd_data::generated::sfx::{
+    MapSfxparamSt, PARAM_ENVSFXPARAM_BIN, PARAM_GROUNDSFXPARAM_BIN, PARAM_MAPSFXPARAM_BIN,
+};
 use acvd_formats::ffx::{self, Param, ParamList, Value};
 use acvd_formats::vfs::{self, Disc};
-use bevy::asset::RenderAssetUsages;
+use bevy::asset::{AssetId, RenderAssetUsages};
 use bevy::camera::visibility::{NoFrustumCulling, VisibilitySystems};
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::math::{Affine2, Affine3A};
@@ -28,6 +30,7 @@ use bevy::transform::TransformSystems;
 
 use acvd_render::app::ShotMark;
 
+use crate::collision::{Collision, GroundSurface, Layer};
 use crate::control::{self, Pilot};
 
 const EFFECTS: &str = "sfx/acv_commoneffects.ffxbnd";
@@ -58,6 +61,20 @@ const GLIDE_FOOT: i32 = 120;
 /// Built in `0x82893ec0` and selected by `0x82892f08`.
 const MAIN_NOZZLES: std::ops::RangeInclusive<u8> = 31..=34;
 const LEG_NOZZLES: std::ops::RangeInclusive<u8> = 21..=24;
+/// Quick Boost effect scales fed to `0x82891ce8` (`> 1.0 => ac_qb_large 305`, `< 1.0 =>
+/// ac_qb_shortage 304`, `== 1.0 => ac_qb_normal 303`).
+const QB_SHORTAGE_SCALE: f32 = 0.75;
+const QB_LARGE_SCALE: f32 = 1.5;
+/// `param/groundsfxparam.bin` row IDs (`0x82835570` -> `0x82833d54`, `0x829ee1d0`).
+const GROUND_ROW_WALK: u32 = 1;
+const GROUND_ROW_LAND: u32 = 2;
+const GROUND_ROW_SLIDE: u32 = 3;
+const GROUND_ROW_KICK: u32 = 7;
+/// Minimum horizontal speed (m/tick) for grounded boost/slide dust emission (`groundsfxparam` row 3).
+const GROUND_SLIDE_SPEED: f32 = 0.25;
+/// Height clearance (m, `0x82382688` `water_y - 5.0 < ac_y`) for near-water continuous spray
+/// (`envsfxparam.bin` row 0 `water_spray_sfx_id = 1420`).
+const WATER_SPRAY_CLEARANCE: f32 = 6.0;
 
 pub struct SfxPlugin {
     pub disc: Disc,
@@ -71,6 +88,10 @@ impl Plugin for SfxPlugin {
                 Update,
                 (
                     boosters.after(control::pilot),
+                    qb_sfx.after(control::pilot),
+                    ground_and_water_sfx
+                        .after(control::pilot)
+                        .after(crate::pose::animate),
                     tae_events.after(crate::pose::animate),
                     preview,
                 ),
@@ -191,15 +212,27 @@ fn mirror(v: Vec3) -> Vec3 {
 // ---------------------------------------------------------------------------------------------
 // Library: effect definitions, textures and models, loaded on first use.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MaterialKey {
+    texture: Option<AssetId<Image>>,
+    blend: Blend,
+    color: [u8; 4],
+}
+
 #[derive(Resource)]
 struct Library {
     disc: Disc,
     effects: HashMap<i32, Option<Arc<Vec<Arc<NodeDef>>>>>,
     textures: HashMap<String, Option<Handle<Image>>>,
     models: HashMap<i32, Option<Arc<Vec<Part>>>>,
+    /// Shared [`StandardMaterial`] cache keyed by `(texture, blend, quantized_srgba)` so particle
+    /// clusters and static billboards/models reuse identical materials instead of allocating a
+    /// new GPU material per spawned effect.
+    shared_materials: HashMap<MaterialKey, Handle<StandardMaterial>>,
     packs: acvd_render::Packs,
     quad: Handle<Mesh>,
     /// Billboard quad with tangents, so a normal map can refract (action 43).
+    #[allow(dead_code)]
     haze: Handle<Mesh>,
     dot: Handle<Image>,
     seed: u32,
@@ -251,12 +284,54 @@ fn setup(
         effects: HashMap::new(),
         textures: HashMap::new(),
         models: HashMap::new(),
+        shared_materials: HashMap::new(),
         packs: acvd_render::Packs::default(),
         quad: meshes.add(Rectangle::new(1.0, 1.0)),
         haze: meshes.add(haze),
         dot: images.add(dot),
         seed: 0x2545_f491,
     });
+}
+
+fn quantize_rgba(c: Vec4) -> [u8; 4] {
+    [
+        (c.x.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.y.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.z.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.w.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+fn cached_material(
+    cache: &mut HashMap<MaterialKey, Handle<StandardMaterial>>,
+    texture: Option<Handle<Image>>,
+    blend: Blend,
+    color: Vec4,
+    materials: &mut Assets<StandardMaterial>,
+) -> Handle<StandardMaterial> {
+    let key = MaterialKey {
+        texture: texture.as_ref().map(|h| h.id()),
+        blend,
+        color: quantize_rgba(color),
+    };
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            materials.add(StandardMaterial {
+                base_color: srgba(color),
+                base_color_texture: texture,
+                unlit: true,
+                alpha_mode: match blend {
+                    Blend::Alpha => AlphaMode::Blend,
+                    Blend::Add => AlphaMode::Add,
+                },
+                double_sided: true,
+                cull_mode: None,
+                fog_enabled: false,
+                ..default()
+            })
+        })
+        .clone()
 }
 
 impl Library {
@@ -573,7 +648,7 @@ fn action(l: &ParamList, i: usize) -> Option<(i32, &ParamList)> {
 // ---------------------------------------------------------------------------------------------
 // Definitions read from the effect tree.
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Blend {
     Add,
     Alpha,
@@ -692,11 +767,16 @@ enum Look {
     /// Action 43 heat haze: a camera-facing quad that refracts the scene through `texture`
     /// (the normal map). Width and height are metres.
     Haze {
+        #[allow(dead_code)]
         texture: i32,
         width: Curve,
         height: Curve,
         spin: Curve,
     },
+    /// Action 107 (`0x6b`): `FXParticleAppearance_RadialBlur` (360 `0x83197ba0` -> `0x831971b0`
+    /// -> `0x835b3658`, `FXParticleAppearance_RadialBlur.cpp`). Post-process radial blur ring,
+    /// not a world-space additive billboard.
+    RadialBlur,
 }
 
 fn look(id: i32, l: &ParamList) -> Option<Look> {
@@ -712,16 +792,7 @@ fn look(id: i32, l: &ParamList) -> Option<Look> {
             rotation: pair(l, 21),
             spin: float_curve(p(22)),
         },
-        107 => Look::Billboard {
-            texture: int(l, 2),
-            blend: Blend::Add,
-            width: float_curve(p(3)),
-            height: float_curve(p(4)),
-            color: color_curve(p(5)),
-            frames: Frames::default(),
-            rotation: (0.0, 0.0),
-            spin: Curve::constant(0.0),
-        },
+        107 => Look::RadialBlur,
         61 => Look::Model {
             model: int(l, 0),
             blend: blend(int(l, 8)),
@@ -833,9 +904,26 @@ fn particle_look(id: i32, l: &ParamList) -> Option<ParticleLook> {
     })
 }
 
-/// Where particles start: a cone about +Z of full apex `angle` degrees (360 = every direction).
+/// Spatial emitter shape for a particle cluster (`FXClusterEmitter_*`).
+#[derive(Clone, Debug)]
+enum EmitterShape {
+    /// Actions `28` (`FXClusterEmitter_Cone`, `0x831501b0`), `117`, `4`: cone about +Z of full
+    /// apex `angle` degrees (360 = every direction).
+    Cone,
+    /// Action `30` (`FXClusterEmitter_Circle`, `0x8314ea40` -> `0x8314e558`): horizontal XZ ring
+    /// of `radius` metres (slot `[1]`) emitting radially outward at polar angle `angle` (slot `[2]`,
+    /// 90° = pure horizontal XZ). Used by walk/landing dust (`f0001404`, `f0001405`).
+    Circle { radius: Curve },
+    /// Action `31` (`FXClusterEmitter_Sphere`, `0x8314d218` -> `0x8314cd58`): sphere of `radius`
+    /// metres (slot `[1]`) emitting outward over full angle `angle` (slot `[2]`). Used by
+    /// wall-kick dust (`f0000116`).
+    Sphere { radius: Curve },
+}
+
+/// Where particles start: shape, spread angle, speed, size multipliers, and emitter tint curve.
 #[derive(Clone, Debug)]
 struct Emitter {
+    shape: EmitterShape,
     angle: f32,
     speed: Spread,
     size: [Spread; 3],
@@ -847,6 +935,7 @@ impl Emitter {
         let p = |l, i| param(l, i);
         match a {
             Some((28, l)) => Self {
+                shape: EmitterShape::Cone,
                 angle: float_curve(p(l, 1)).at(0.0),
                 speed: Spread::read(p(l, 3)),
                 size: [
@@ -856,7 +945,34 @@ impl Emitter {
                 ],
                 color: color_curve(p(l, 9)),
             },
+            Some((30, l)) => Self {
+                shape: EmitterShape::Circle {
+                    radius: float_curve(p(l, 1)),
+                },
+                angle: float_curve(p(l, 2)).at(0.0),
+                speed: Spread::read(p(l, 4)),
+                size: [
+                    Spread::read(p(l, 5)),
+                    Spread::read(p(l, 6)),
+                    Spread::read(p(l, 10)),
+                ],
+                color: color_curve(p(l, 12)),
+            },
+            Some((31, l)) => Self {
+                shape: EmitterShape::Sphere {
+                    radius: float_curve(p(l, 1)),
+                },
+                angle: float_curve(p(l, 2)).at(0.0),
+                speed: Spread::read(p(l, 4)),
+                size: [
+                    Spread::read(p(l, 5)),
+                    Spread::read(p(l, 6)),
+                    Spread::read(p(l, 9)),
+                ],
+                color: color_curve(p(l, 11)),
+            },
             Some((117, l)) => Self {
+                shape: EmitterShape::Cone,
                 angle: float_curve(p(l, 4)).at(0.0),
                 speed: Spread::read(p(l, 6)),
                 size: [
@@ -873,6 +989,7 @@ impl Emitter {
             _ => {
                 let one = || Spread::Curve(Curve::constant(1.0), 0.0);
                 Self {
+                    shape: EmitterShape::Cone,
                     angle: 0.0,
                     speed: Spread::Curve(Curve::constant(0.0), 0.0),
                     size: [one(), one(), one()],
@@ -1084,6 +1201,7 @@ fn sparks(l: &ParamList) -> ClusterDef {
         emit_for: -1.0,
         max: int(l, 5).max(int(l, 9)).max(1) as usize,
         emitter: Emitter {
+            shape: EmitterShape::Cone,
             angle: float_curve(param(l, 12)).at(0.0),
             speed: Spread::Range(pair(l, 14).0, pair(l, 14).1),
             size: [
@@ -1168,6 +1286,8 @@ struct Run {
 struct Visual {
     entities: Vec<Entity>,
     material: Handle<StandardMaterial>,
+    /// True when `material` comes from [`Library::shared_materials`] and must not be mutated.
+    shared_material: bool,
     mesh: Option<Handle<Mesh>>,
 }
 
@@ -1232,6 +1352,25 @@ struct Cx<'a, 'w, 's> {
 }
 
 impl Cx<'_, '_, '_> {
+    /// Returns a cached, immutable [`StandardMaterial`] shared across all particle clusters and
+    /// static effect visuals with matching `(texture, blend, color)`.
+    fn shared_material(
+        &mut self,
+        texture: Option<Handle<Image>>,
+        blend: Blend,
+        color: Vec4,
+    ) -> Handle<StandardMaterial> {
+        cached_material(
+            &mut self.lib.shared_materials,
+            texture,
+            blend,
+            color,
+            self.materials,
+        )
+    }
+
+    /// Allocates a unique mutable [`StandardMaterial`] for nodes whose `base_color` or
+    /// `uv_transform` animates per frame.
     fn material(
         &mut self,
         texture: Option<Handle<Image>>,
@@ -1338,6 +1477,7 @@ fn look_span(def: &NodeDef) -> f32 {
         } => curve_end(width)
             .max(curve_end(height))
             .max(curve_end(spin)),
+        Look::RadialBlur => 0.0,
     }
 }
 
@@ -1502,7 +1642,12 @@ impl NodeRt {
             } => {
                 if self.visual.is_none() {
                     let tex = cx.lib.texture(*texture, cx.images);
-                    let material = cx.material(tex, *blend);
+                    let static_mat = color.keys.len() <= 1 && frames.total <= 1;
+                    let material = if static_mat {
+                        cx.shared_material(tex, *blend, color.at(0.0))
+                    } else {
+                        cx.material(tex, *blend)
+                    };
                     let e = cx.spawn(
                         (
                             Mesh3d(cx.lib.quad.clone()),
@@ -1513,6 +1658,7 @@ impl NodeRt {
                     self.visual = Some(Visual {
                         entities: vec![e],
                         material,
+                        shared_material: static_mat,
                         mesh: None,
                     });
                 }
@@ -1524,10 +1670,12 @@ impl NodeRt {
                     rotation: cx.camera_rot * Quat::from_rotation_z(roll),
                     scale,
                 };
-                if let Some(mut m) = cx.materials.get_mut(&v.material) {
-                    m.base_color = srgba(color.at(t));
-                    let (o, s) = frames.rect(t, 0.0);
-                    m.uv_transform = Affine2::from_scale_angle_translation(s, 0.0, o);
+                if !v.shared_material {
+                    if let Some(mut m) = cx.materials.get_mut(&v.material) {
+                        m.base_color = srgba(color.at(t));
+                        let (o, s) = frames.rect(t, 0.0);
+                        m.uv_transform = Affine2::from_scale_angle_translation(s, 0.0, o);
+                    }
                 }
                 cx.moves.push((v.entities[0], tf, None));
             }
@@ -1544,7 +1692,12 @@ impl NodeRt {
                         return;
                     };
                     let tex = parts.first().and_then(|p| p.texture.clone());
-                    let material = cx.material(tex, *blend);
+                    let static_mat = color.keys.len() <= 1 && frames.total <= 1;
+                    let material = if static_mat {
+                        cx.shared_material(tex, *blend, color.at(0.0))
+                    } else {
+                        cx.material(tex, *blend)
+                    };
                     let entities = parts
                         .iter()
                         .map(|p| {
@@ -1557,6 +1710,7 @@ impl NodeRt {
                     self.visual = Some(Visual {
                         entities,
                         material,
+                        shared_material: static_mat,
                         mesh: None,
                     });
                 }
@@ -1571,21 +1725,23 @@ impl NodeRt {
                     rotation: rot,
                     scale: s * k,
                 };
-                // s1020 / s1011 UVs already sit in one atlas cell. Scaling them by the
-                // cell (right for a 0–1 billboard quad) samples an empty corner and the
-                // flame mesh disappears. Slide the cell instead.
-                let (o, s) = frames.rect(t, 0.0);
-                let slide = cx.lib.model(*model, cx.meshes, cx.images).is_some_and(|parts| {
-                    parts.iter().all(|p| uvs_in_cell(&p.uvs, s))
-                });
-                let material = v.material.clone();
-                if let Some(mut m) = cx.materials.get_mut(&material) {
-                    m.base_color = srgba(color.at(t));
-                    m.uv_transform = if slide {
-                        Affine2::from_translation(o)
-                    } else {
-                        Affine2::from_scale_angle_translation(s, 0.0, o)
-                    };
+                if !v.shared_material {
+                    // s1020 / s1011 UVs already sit in one atlas cell. Scaling them by the
+                    // cell (right for a 0–1 billboard quad) samples an empty corner and the
+                    // flame mesh disappears. Slide the cell instead.
+                    let (o, s) = frames.rect(t, 0.0);
+                    let slide = cx.lib.model(*model, cx.meshes, cx.images).is_some_and(|parts| {
+                        parts.iter().all(|p| uvs_in_cell(&p.uvs, s))
+                    });
+                    let material = v.material.clone();
+                    if let Some(mut m) = cx.materials.get_mut(&material) {
+                        m.base_color = srgba(color.at(t));
+                        m.uv_transform = if slide {
+                            Affine2::from_translation(o)
+                        } else {
+                            Affine2::from_scale_angle_translation(s, 0.0, o)
+                        };
+                    }
                 }
                 for &e in &v.entities {
                     cx.moves.push((e, tf, None));
@@ -1608,14 +1764,15 @@ impl NodeRt {
                         self.visual = Some(Visual {
                             entities: vec![e],
                             material: Handle::default(),
+                            shared_material: true,
                             mesh: None,
                         });
                     }
                 }
             }
-            Look::Haze { .. } => {
-                // The DXN normal map loads, but a transmissive quad draws as a solid card
-                // (white or black) instead of warping the scene, so it is not shown.
+            Look::Haze { .. } | Look::RadialBlur => {
+                // Action 43 (heat haze) and action 107 (FXParticleAppearance_RadialBlur,
+                // 0x835b3658) are screen/post-process effects, not world-space cards.
                 if let Some(v) = self.visual.take() {
                     cx.despawn(v);
                 }
@@ -1684,7 +1841,27 @@ impl NodeRt {
         force_world: bool,
         rng: &mut Rng,
     ) -> Particle {
-        let dir = rng.cone(c.emitter.angle);
+        let (local_offset, dir) = match &c.emitter.shape {
+            EmitterShape::Cone => (Vec3::ZERO, rng.cone(c.emitter.angle)),
+            EmitterShape::Circle { radius } => {
+                // Action 30 (`FXClusterEmitter_Circle`): uniform around the horizontal XZ ring of
+                // radius `r`, moving radially outward at polar tilt `angle` from +Y (`90°` = XZ).
+                let phi = rng.next() * std::f32::consts::TAU;
+                let (s, cs) = phi.sin_cos();
+                let r = radius.at(t).max(0.0);
+                let polar = c.emitter.angle.to_radians();
+                let dir = Vec3::new(cs * polar.sin(), polar.cos(), s * polar.sin())
+                    .normalize_or(Vec3::X);
+                (Vec3::new(cs * r, 0.0, s * r), dir)
+            }
+            EmitterShape::Sphere { radius } => {
+                // Action 31 (`FXClusterEmitter_Sphere`): random direction over `angle` (full apex
+                // or full sphere when >= 180°), placed at distance `r` along that direction.
+                let dir = rng.cone((c.emitter.angle * 2.0).min(360.0));
+                let r = radius.at(t).max(0.0);
+                (dir * r, dir)
+            }
+        };
         let speed = c.emitter.speed.sample(t, rng);
         let size = Vec3::new(
             c.emitter.size[0].sample(t, rng),
@@ -1695,16 +1872,16 @@ impl NodeRt {
         // Slot 21 = 1 (the main-booster flame) stores the particle in the emitter frame, so the
         // jet stays on the nozzle. Slot 21 = 0 leaves it where it was born.
         let in_world = force_world || !c.look.follow;
-        let (_, rot, origin) = world.to_scale_rotation_translation();
+        let (_, rot, _) = world.to_scale_rotation_translation();
         let (pos, vel, orient) = if in_world {
             (
-                origin,
+                world.transform_point3(local_offset),
                 world.transform_vector3(dir) * speed,
                 rot * Quat::from_rotation_arc(Vec3::Z, dir),
             )
         } else {
             (
-                Vec3::ZERO,
+                local_offset,
                 dir * speed,
                 Quat::from_rotation_arc(Vec3::Z, dir),
             )
@@ -1814,7 +1991,7 @@ impl NodeRt {
                 }
                 _ => (None, Blend::Add),
             };
-            let material = cx.material(texture, blend);
+            let material = cx.shared_material(texture, blend, Vec4::ONE);
             let mesh = cx.meshes.add(b.mesh());
             let e = cx.spawn(
                 (Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())),
@@ -1823,6 +2000,7 @@ impl NodeRt {
             self.batch = Some(Visual {
                 entities: vec![e],
                 material,
+                shared_material: true,
                 mesh: Some(mesh),
             });
             return;
@@ -2312,6 +2490,346 @@ pub fn boosters(
     }
 }
 
+/// Selects the Quick Boost effect ID from `MapSfxparamSt` matching 360 `0x82891ce8`:
+/// - `scale > 1.0` -> `ac_qb_large` (`305`)
+/// - `scale < 1.0` -> `ac_qb_shortage` (`304`)
+/// - `scale == 1.0` -> `ac_qb_normal` (`303`)
+pub(crate) fn qb_sfx_id(scale: f32, row: &MapSfxparamSt) -> i32 {
+    if scale > 1.0 {
+        i32::from(row.ac_qb_large)
+    } else if scale < 1.0 {
+        i32::from(row.ac_qb_shortage)
+    } else {
+        i32::from(row.ac_qb_normal)
+    }
+}
+
+/// Extra FFX bursts triggered by `HighBoostState` TAE events `0xC1D..=0xC22` (`0x8283c8d0` ->
+/// `0x828a816c`, verified in `private/xenia/fx_polish2.jsonl` lines 95–98, 134–138, 195–198):
+/// - `0xC1D`/`0xC1E` (charge enter, ground/air): wind-up only
+/// - `0xC1F`/`0xC20` (normal release, ground/air): `f0000766` (`0x2FE`) at scale `1.5`
+/// - `0xC21`/`0xC22` (second-stage release, ground/air): `f0000121` (`0x79`) + `f0000766` at `1.5`
+pub(crate) fn qb_tae_ffx(tae_id: u32) -> &'static [(i32, f32)] {
+    match tae_id {
+        0x0C1F | 0x0C20 => &[(766, 1.5)],
+        0x0C21 | 0x0C22 => &[(121, 1.5), (766, 1.5)],
+        _ => &[],
+    }
+}
+
+/// Which booster dummy sockets fire on a Quick Boost in body-relative eighth `0..=7`
+/// (`0` forward, `2` right, `4` back, `6` left; 360 `0x828926b0` / `0x82893ec0`).
+fn qb_nozzle_matches(eighth: u8, dummy_id: u8) -> bool {
+    match eighth & 7 {
+        0 => MAIN_NOZZLES.contains(&dummy_id),
+        1 => MAIN_NOZZLES.contains(&dummy_id) || matches!(dummy_id, 11 | 12),
+        2 => matches!(dummy_id, 11 | 12),
+        3 => LEG_NOZZLES.contains(&dummy_id) || matches!(dummy_id, 11 | 12),
+        4 => LEG_NOZZLES.contains(&dummy_id) || MAIN_NOZZLES.contains(&dummy_id),
+        5 => LEG_NOZZLES.contains(&dummy_id) || matches!(dummy_id, 13 | 14),
+        6 => matches!(dummy_id, 13 | 14),
+        7 => MAIN_NOZZLES.contains(&dummy_id) || matches!(dummy_id, 13 | 14),
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct QbSfxState {
+    quick_boosts: u32,
+    qb_shortages: u32,
+}
+
+/// Fires one-shot Quick Boost effects:
+/// - EN shortage (`304`, `ac_qb_shortage`, scale `< 1.0`, `0x82891ce8`)
+/// - Normal QB (`303`, `ac_qb_normal`, scale `1.0`) + TAE `0xC1F`/`0xC20` (`766` @ 1.5)
+/// - Second-Stage / Large QB (`305`, `ac_qb_large`, scale `> 1.0`) + TAE `0xC21`/`0xC22`
+///   (`121` + `766` @ 1.5)
+fn qb_sfx(
+    mut commands: Commands,
+    pilots: Query<(&Pilot, &Transform)>,
+    points: Query<(Entity, &EffectPoint)>,
+    mut state: Local<QbSfxState>,
+) {
+    let Ok((pilot, ac_tf)) = pilots.single() else {
+        return;
+    };
+    let Some(row) = find(PARAM_MAPSFXPARAM_BIN, 0).map(|r| &r.data) else {
+        return;
+    };
+
+    if pilot.qb_shortages != state.qb_shortages {
+        state.qb_shortages = pilot.qb_shortages;
+        let id = qb_sfx_id(QB_SHORTAGE_SCALE, row);
+        if id > 0 {
+            let mut spawned = false;
+            for (e, p) in &points {
+                if MAIN_NOZZLES.contains(&p.id) {
+                    commands.spawn((
+                        Sfx::new(id),
+                        Transform::from_scale(Vec3::splat(QB_SHORTAGE_SCALE)),
+                        Visibility::default(),
+                        ChildOf(e),
+                    ));
+                    spawned = true;
+                }
+            }
+            if !spawned {
+                commands.spawn((
+                    Sfx::new(id),
+                    Transform::from_translation(ac_tf.translation + Vec3::Y * 4.0)
+                        .with_scale(Vec3::splat(QB_SHORTAGE_SCALE)),
+                ));
+            }
+        }
+    }
+
+    if pilot.quick_boosts != state.quick_boosts {
+        state.quick_boosts = pilot.quick_boosts;
+        let scale = if pilot.second_stage_qb {
+            QB_LARGE_SCALE
+        } else {
+            1.0
+        };
+        let id = qb_sfx_id(scale, row);
+        if id > 0 {
+            let mut matched = Vec::new();
+            let mut main_fallback = Vec::new();
+            for (e, p) in &points {
+                if qb_nozzle_matches(pilot.qb_eighth, p.id) {
+                    matched.push(e);
+                }
+                if MAIN_NOZZLES.contains(&p.id) {
+                    main_fallback.push(e);
+                }
+            }
+            let targets = if matched.is_empty() {
+                &main_fallback
+            } else {
+                &matched
+            };
+            if targets.is_empty() {
+                commands.spawn((
+                    Sfx::new(id),
+                    Transform::from_translation(ac_tf.translation + Vec3::Y * 4.0)
+                        .with_scale(Vec3::splat(scale)),
+                ));
+            } else {
+                for &e in targets {
+                    commands.spawn((
+                        Sfx::new(id),
+                        Transform::from_scale(Vec3::splat(scale)),
+                        Visibility::default(),
+                        ChildOf(e),
+                    ));
+                }
+            }
+        }
+        // HighBoostState TAE 0xC1F..0xC22 bursts (`0x8283c8d0` -> `0x828a816c`, `fx_polish2.jsonl`).
+        let primary_nozzle = points.iter().find(|(_, p)| p.id == 31).map(|(e, _)| e);
+        for &(tae_fx, tae_scale) in qb_tae_ffx(pilot.last_qb_tae) {
+            match primary_nozzle {
+                Some(e) => {
+                    commands.spawn((
+                        Sfx::new(tae_fx),
+                        Transform::from_scale(Vec3::splat(tae_scale)),
+                        Visibility::default(),
+                        ChildOf(e),
+                    ));
+                }
+                None => {
+                    commands.spawn((
+                        Sfx::new(tae_fx),
+                        Transform::from_translation(ac_tf.translation + Vec3::Y * 4.0)
+                            .with_scale(Vec3::splat(tae_scale)),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Resolves a `param/groundsfxparam.bin` effect ID for `row_id` (1 walk, 2 landing, 3 grounded
+/// slide/boost, 7 kick) and HMD [`GroundSurface`] (360 `0x829ee1d0`).
+pub(crate) fn ground_sfx_id(row_id: u32, surface: GroundSurface) -> i32 {
+    let Some(row) = find(PARAM_GROUNDSFXPARAM_BIN, row_id) else {
+        return 0;
+    };
+    let id = surface.sfx_id(&row.data);
+    if id > 0 {
+        id
+    } else if surface == GroundSurface::Default {
+        // `groundsfxparam.bin` leaves `default` at 0 on rows 1-3; fall back to `concrete`
+        // (`1404`/`1405`/`1406`, confirmed on m4000 in `private/xenia/fx_polish.jsonl`).
+        i32::from(row.data.concrete)
+    } else {
+        0
+    }
+}
+
+#[derive(Default)]
+struct GroundWaterState {
+    landings: u32,
+    wall_jumps: u32,
+    /// Continuous looping grounded-slide dust entity (`groundsfxparam` row 3, e.g. `f0001406`,
+    /// whose nodes have infinite life `-1/60` and must be stopped when sliding ends).
+    slide_fx: Option<(i32, Entity)>,
+    /// Continuous looping near-water spray entity (`envsfxparam` row 0 `water_spray_sfx_id = 1420`,
+    /// `AcSfxCtrl + 0x690` `0x82382688`, whose nodes have infinite life `-1/60`).
+    water_spray_fx: Option<(i32, Entity)>,
+    submerged: bool,
+}
+
+/// Maintains a single continuous looping [`Sfx`] handle (`f0001406` / `f0001420`) at `at` when
+/// `want_id > 0`, and stops it cleanly when `want_id <= 0` or the ID changes.
+fn sync_loop_sfx(
+    commands: &mut Commands,
+    slot: &mut Option<(i32, Entity)>,
+    want_id: i32,
+    at: Vec3,
+    effects: &mut Query<(&mut Sfx, &mut Transform), Without<Pilot>>,
+) {
+    if let Some((cur_id, e)) = *slot {
+        match effects.get_mut(e) {
+            Ok((mut sfx, mut tf)) => {
+                if cur_id == want_id && want_id > 0 && !sfx.stopping {
+                    tf.translation = at;
+                    return;
+                }
+                sfx.stop();
+                *slot = None;
+            }
+            Err(_) => {
+                *slot = None;
+            }
+        }
+    }
+    if want_id > 0 {
+        let e = commands
+            .spawn((Sfx::new(want_id), Transform::from_translation(at)))
+            .id();
+        *slot = Some((want_id, e));
+    }
+}
+
+/// Spawns ground walk/landing/grounded-boost/kick dust from `param/groundsfxparam.bin`
+/// (`0x82835570` -> `0x82833d54`) and water entry/exit splashes + near-water spray from
+/// `param/envsfxparam.bin` (`0x82382688` -> `0x82895200` / `0x82895240` / `0x82895290`).
+#[allow(clippy::too_many_arguments)]
+fn ground_and_water_sfx(
+    mut commands: Commands,
+    collision: Res<Collision>,
+    water_return: Option<Res<crate::map::WaterReturnPoints>>,
+    motion: Option<Res<crate::pose::Motion>>,
+    mut pilots: Query<(&mut Pilot, &Transform)>,
+    mut loop_fx: Query<(&mut Sfx, &mut Transform), Without<Pilot>>,
+    mut state: Local<GroundWaterState>,
+) {
+    let Ok((mut pilot, ac_tf)) = pilots.single_mut() else {
+        return;
+    };
+    let pos = ac_tf.translation;
+    let surface = pilot.ground_surface;
+
+    // 1. Walk dust (`groundsfxparam` row 1, `1404` on concrete) on TAE footsteps while grounded.
+    if !pilot.airborne {
+        if let Some(m) = motion.as_deref() {
+            let walk_id = ground_sfx_id(GROUND_ROW_WALK, surface);
+            if walk_id > 0 {
+                for ev in &m.tae_events {
+                    if let crate::pose::TaeFired::Footstep { .. } = ev {
+                        commands.spawn((Sfx::new(walk_id), Transform::from_translation(pos)));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Landing dust (`groundsfxparam` row 2, `1405` on concrete) on touchdown.
+    if pilot.landings != state.landings {
+        state.landings = pilot.landings;
+        let land_id = ground_sfx_id(GROUND_ROW_LAND, surface);
+        if land_id > 0 {
+            commands.spawn((Sfx::new(land_id), Transform::from_translation(pos)));
+        }
+    }
+
+    // 3. Grounded boost / slide dust (`groundsfxparam` row 3, continuous looping `1406` on concrete).
+    let horiz_speed = pilot.velocity.with_y(0.0).length();
+    let want_slide = if !pilot.airborne
+        && (pilot.boost || pilot.in_quick_boost() || pilot.glide)
+        && horiz_speed > GROUND_SLIDE_SPEED
+    {
+        ground_sfx_id(GROUND_ROW_SLIDE, surface)
+    } else {
+        0
+    };
+    sync_loop_sfx(&mut commands, &mut state.slide_fx, want_slide, pos, &mut loop_fx);
+
+    // 4. Wall-kick / surface kick-off dust (`groundsfxparam` row 7, `116`, `0x828358a0..0x82835918`:
+    //    only fires on wall-jump or grounded surface kick contact, not mid-air boost-charge kick).
+    if pilot.wall_jumps != state.wall_jumps {
+        state.wall_jumps = pilot.wall_jumps;
+        let kick_id = ground_sfx_id(GROUND_ROW_KICK, surface);
+        if kick_id > 0 {
+            commands.spawn((Sfx::new(kick_id), Transform::from_translation(pos)));
+        }
+    }
+
+    // 5. Water splashes & continuous near-water spray (`envsfxparam.bin` row 0: 1419 / 1420).
+    let Some(env_row) = find(PARAM_ENVSFXPARAM_BIN, 0).map(|r| &r.data) else {
+        return;
+    };
+    let splash_id = i32::from(env_row.water_splash_sfx_id);
+    let fly_out_id = i32::from(env_row.water_fly_out_sfx_id);
+    let spray_id = i32::from(env_row.water_spray_sfx_id);
+
+    if let Some(impact_at) = pilot.water_splash_at.take() {
+        if splash_id > 0 {
+            commands.spawn((Sfx::new(splash_id), Transform::from_translation(impact_at)));
+        }
+        state.submerged = false;
+    }
+
+    let water_y = collision
+        .ray_down(pos + Vec3::Y * 54.6, pos.y - 50.0, Layer::Water)
+        .or_else(|| water_return.as_deref().and_then(|w| w.water_height));
+    if let Some(wy) = water_y {
+        let now_submerged = pos.y <= wy;
+        let at_water = Vec3::new(pos.x, wy, pos.z);
+        if !state.submerged && now_submerged && splash_id > 0 {
+            commands.spawn((Sfx::new(splash_id), Transform::from_translation(at_water)));
+        } else if state.submerged && !now_submerged && fly_out_id > 0 {
+            commands.spawn((Sfx::new(fly_out_id), Transform::from_translation(at_water)));
+        }
+        state.submerged = now_submerged;
+
+        // Only emit continuous near-water spray over open water (not through a solid concrete
+        // bridge or road surface that sits above `wy`).
+        let ground_above_water = collision
+            .ground_below(pos)
+            .is_some_and(|gy| gy > wy + 0.1);
+        let clearance = pos.y - wy;
+        let want_spray = if !ground_above_water
+            && (-2.0..=WATER_SPRAY_CLEARANCE).contains(&clearance)
+            && (pilot.boost || horiz_speed > BOOST_MOVING)
+        {
+            spray_id
+        } else {
+            0
+        };
+        sync_loop_sfx(
+            &mut commands,
+            &mut state.water_spray_fx,
+            want_spray,
+            at_water,
+            &mut loop_fx,
+        );
+    } else {
+        state.submerged = false;
+        sync_loop_sfx(&mut commands, &mut state.water_spray_fx, 0, pos, &mut loop_fx);
+    }
+}
+
 /// `--sfx`: keeps one copy of the effect playing 20 m ahead of and 5 m above the AC, facing up.
 fn preview(
     mut commands: Commands,
@@ -2339,8 +2857,17 @@ fn preview(
 
 #[cfg(test)]
 mod tests {
-    use super::rear_stick;
-    use bevy::prelude::Vec2;
+    use std::collections::HashMap;
+
+    use acvd_data::find;
+    use acvd_data::generated::sfx::{PARAM_ENVSFXPARAM_BIN, PARAM_MAPSFXPARAM_BIN};
+    use bevy::prelude::{Assets, Image, StandardMaterial, Vec2, Vec4};
+
+    use super::{
+        cached_material, ground_sfx_id, qb_sfx_id, qb_tae_ffx, rear_stick, Blend, GROUND_ROW_KICK,
+        GROUND_ROW_LAND, GROUND_ROW_SLIDE, GROUND_ROW_WALK, QB_LARGE_SCALE, QB_SHORTAGE_SCALE,
+    };
+    use crate::collision::GroundSurface;
 
     #[test]
     fn stick_sectors_match_the_360_table() {
@@ -2351,5 +2878,120 @@ mod tests {
         assert!(rear_stick(Vec2::new(0.0, -1.0)), "back");
         assert!(rear_stick(Vec2::new(0.5, -1.0)), "back-right");
         assert!(!rear_stick(Vec2::new(1.0, 0.4)), "forward-right");
+    }
+
+    #[test]
+    fn qb_sfx_id_matches_360_dispatcher_and_tae_bursts() {
+        let row = &find(PARAM_MAPSFXPARAM_BIN, 0).expect("mapsfxparam row 0").data;
+        assert_eq!(qb_sfx_id(QB_SHORTAGE_SCALE, row), 304, "scale < 1.0 -> ac_qb_shortage");
+        assert_eq!(qb_sfx_id(1.0, row), 303, "scale == 1.0 -> ac_qb_normal");
+        assert_eq!(qb_sfx_id(QB_LARGE_SCALE, row), 305, "scale > 1.0 -> ac_qb_large");
+
+        // HighBoostState TAE 0xC1D..0xC22 (private/xenia/fx_polish2.jsonl).
+        assert!(qb_tae_ffx(0x0C1D).is_empty());
+        assert!(qb_tae_ffx(0x0C1E).is_empty());
+        assert_eq!(qb_tae_ffx(0x0C1F), &[(766, 1.5)]);
+        assert_eq!(qb_tae_ffx(0x0C20), &[(766, 1.5)]);
+        assert_eq!(qb_tae_ffx(0x0C21), &[(121, 1.5), (766, 1.5)]);
+        assert_eq!(qb_tae_ffx(0x0C22), &[(121, 1.5), (766, 1.5)]);
+    }
+
+    #[test]
+    fn ground_and_water_sfx_rows_resolve_from_disc_params() {
+        assert_eq!(ground_sfx_id(GROUND_ROW_WALK, GroundSurface::Concrete), 1404);
+        assert_eq!(ground_sfx_id(GROUND_ROW_LAND, GroundSurface::Concrete), 1405);
+        assert_eq!(ground_sfx_id(GROUND_ROW_SLIDE, GroundSurface::Concrete), 1406);
+        assert_eq!(ground_sfx_id(GROUND_ROW_WALK, GroundSurface::Sand), 1407);
+        assert_eq!(ground_sfx_id(GROUND_ROW_LAND, GroundSurface::Sand), 1408);
+        assert_eq!(ground_sfx_id(GROUND_ROW_SLIDE, GroundSurface::Sand), 1409);
+        assert_eq!(ground_sfx_id(GROUND_ROW_KICK, GroundSurface::Concrete), 116);
+        // Default falls back to concrete on rows 1-3 where `default == 0`.
+        assert_eq!(ground_sfx_id(GROUND_ROW_WALK, GroundSurface::Default), 1404);
+
+        let env = &find(PARAM_ENVSFXPARAM_BIN, 0).expect("envsfxparam row 0").data;
+        assert_eq!(env.water_splash_sfx_id, 1419);
+        assert_eq!(env.water_fly_out_sfx_id, 1419);
+        assert_eq!(env.water_spray_sfx_id, 1420);
+    }
+
+    #[test]
+    fn particle_material_cache_reuses_identical_handles() {
+        let mut cache = HashMap::new();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let mut images = Assets::<Image>::default();
+        let img_a = images.add(Image::default());
+        let img_b = images.add(Image::default());
+
+        let h1 = cached_material(&mut cache, Some(img_a.clone()), Blend::Add, Vec4::ONE, &mut materials);
+        let h2 = cached_material(&mut cache, Some(img_a.clone()), Blend::Add, Vec4::ONE, &mut materials);
+        assert_eq!(h1.id(), h2.id(), "identical (texture, blend, color) must share one material");
+        assert_eq!(materials.len(), 1);
+
+        // Different blend mode -> distinct material.
+        let h3 = cached_material(&mut cache, Some(img_a.clone()), Blend::Alpha, Vec4::ONE, &mut materials);
+        assert_ne!(h1.id(), h3.id());
+        assert_eq!(materials.len(), 2);
+
+        // Different texture -> distinct material.
+        let h4 = cached_material(&mut cache, Some(img_b), Blend::Add, Vec4::ONE, &mut materials);
+        assert_ne!(h1.id(), h4.id());
+        assert_eq!(materials.len(), 3);
+    }
+
+    #[test]
+    fn circle_and_sphere_emitters_read_disc_dust_effects() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let Ok(disc) = acvd_formats::vfs::Disc::default_for(root) else {
+            return;
+        };
+        let load = |id: i32| {
+            let bytes = acvd_formats::vfs::open(&disc, &format!("{}|f{id:07}.ffx", super::EFFECTS))
+                .expect("ffx entry");
+            let eff = acvd_formats::ffx::read(&bytes).expect("parse ffx");
+            eff.states
+                .first()
+                .into_iter()
+                .flat_map(|s| &s.actions)
+                .flat_map(|a| super::nodes(&a.params))
+                .collect::<Vec<_>>()
+        };
+        fn find_any(
+            list: &[std::sync::Arc<super::NodeDef>],
+            f: &dyn Fn(&super::NodeDef) -> bool,
+        ) -> bool {
+            list.iter().any(|n| {
+                f(n) || find_any(&n.children, f)
+                    || matches!(&n.kind, super::Kind::Spawner { child, .. } if find_any(child, f))
+            })
+        }
+
+        let walk = load(1404);
+        assert!(
+            find_any(&walk, &|n| {
+                matches!(
+                    &n.kind,
+                    super::Kind::Cluster(c)
+                        if matches!(&c.emitter.shape, super::EmitterShape::Circle { radius }
+                            if (radius.at(0.0) - 2.0).abs() < 0.01)
+                )
+            }),
+            "f0001404 walk dust must parse action 30 Circle emitter (radius 2.0 m)"
+        );
+
+        let kick = load(116);
+        assert!(
+            find_any(&kick, &|n| {
+                matches!(
+                    &n.kind,
+                    super::Kind::Cluster(c)
+                        if matches!(&c.emitter.shape, super::EmitterShape::Sphere { .. })
+                )
+            }),
+            "f0000116 kick dust must parse action 31 Sphere emitter"
+        );
     }
 }

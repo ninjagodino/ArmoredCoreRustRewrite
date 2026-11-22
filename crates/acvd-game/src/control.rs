@@ -290,6 +290,23 @@ pub struct Pilot {
     pub quick_boosts: u32,
     pub second_stage_qb: bool,
     pub quick_dir: Vec3,
+    /// `HighBoostState` Phase 0 charge entries (`0x8237ba10` -> `0x8283c8d0` TAE `0xC1D`/`0xC1E`).
+    pub qb_charge_starts: u32,
+    /// Quick-boost attempts rejected for EN shortage (plays `ac_qb_shortage` `304`, `0x82891ce8`).
+    pub qb_shortages: u32,
+    /// Whether the most recent High Boost / charge started airborne (selects ground vs air TAE
+    /// `0xC1D/0xC1F/0xC21` vs `0xC1E/0xC20/0xC22`).
+    pub qb_airborne: bool,
+    /// Body-relative eighth (`0..=7`) of the most recent High Boost release.
+    pub qb_eighth: u8,
+    /// Most recent `HighBoostState` TAE event ID fired (`0xC1D..=0xC22`, `0x8283c8d0`).
+    pub last_qb_tae: u32,
+    /// Surface material directly beneath the AC from `.hmd` triangles (`0x829ee1d0`).
+    pub ground_surface: crate::collision::GroundSurface,
+    /// Monotonic counter of ground touchdowns (so `sfx` observes every landing cleanly).
+    pub landings: u32,
+    /// World point where the AC entered water before `check_water_return` teleported it.
+    pub water_splash_at: Option<Vec3>,
     /// Wall kicks launched so far (`WallJumpState` Phase 0 -> Phase 1, `0x828438c0`).
     pub wall_jumps: u32,
     /// Boost Charge Kicks started and landed (`KickState` `0x820928d0`).
@@ -1288,6 +1305,14 @@ impl Pilot {
             quick_boosts: 0,
             second_stage_qb: false,
             quick_dir: FORWARD,
+            qb_charge_starts: 0,
+            qb_shortages: 0,
+            qb_airborne: false,
+            qb_eighth: 0,
+            last_qb_tae: 0,
+            ground_surface: crate::collision::GroundSurface::Default,
+            landings: 0,
+            water_splash_at: None,
             wall_jumps: 0,
             kicks_started: 0,
             kicks_landed: 0,
@@ -1459,18 +1484,40 @@ fn charge_curve(x: f32, start: f32, base: f32, center: f32, width: f32, over: f3
     }
 }
 
+/// `HighBoostState` TAE event IDs (`360 0x8283c8d0`, verified in `private/xenia/fx_polish2.jsonl`):
+/// - Charge enter (`0x8237ba10`): `0xC1D` (ground) / `0xC1E` (air)
+/// - Normal release (`0x8237c1b8`): `0xC1F` (ground) / `0xC20` (air) -> FFX `0x2FE` (`766`, 1.5)
+/// - Second-Stage release (`0x8237c1b8`, `w2 >= 1.0`): `0xC21` (ground) / `0xC22` (air)
+///   -> FFX `0x79` (`121`, 1.5) + `0x2FE` (`766`, 1.5)
+pub fn high_boost_tae_id(release: bool, second_stage: bool, airborne: bool) -> u32 {
+    match (release, second_stage, airborne) {
+        (false, _, false) => 0x0C1D,
+        (false, _, true) => 0x0C1E,
+        (true, false, false) => 0x0C1F,
+        (true, false, true) => 0x0C20,
+        (true, true, false) => 0x0C21,
+        (true, true, true) => 0x0C22,
+    }
+}
+
 /// Enters `HighBoostState` Phase 0 (`360 0x8283ed98` -> `0x82844ea8` -> `0x8237bec8`).
 /// Drains `qb_en_drain` (`BST__HI_EN * 0.7`, Lua param 57) via `0x828b2648` -> `0x82830910` and
-/// blocks launch when EN is insufficient (Xenia probe `private/xenia/en_drain2.jsonl`).
+/// blocks launch when EN is insufficient (Xenia probe `private/xenia/en_drain2.jsonl`), recording
+/// an EN-shortage QB attempt so `sfx` can fire `ac_qb_shortage` (`304`, `0x82891ce8`).
 fn start_quick_boost(p: &mut Pilot) -> bool {
     if p.qb.is_some() || p.kick.is_some() || p.blade.is_some() || p.qb_cooldown >= 1.0 {
         return false;
     }
     if !p.try_drain_en(p.ctrl.qb_en_drain) {
+        p.qb_shortages += 1;
+        p.qb_airborne = p.airborne;
         return false;
     }
     p.qb_cooldown = p.ctrl.qb_reload_ticks;
     p.glide = false;
+    p.qb_charge_starts += 1;
+    p.qb_airborne = p.airborne;
+    p.last_qb_tae = high_boost_tae_id(false, false, p.airborne);
     p.qb = Some(QbPhase::Charge { held_ticks: 0.0 });
     true
 }
@@ -1501,6 +1548,9 @@ fn fire_quick_boost(p: &mut Pilot, stick: Vec2, hold_ratio: f32) {
     p.quick_dir = world;
     p.quick_boosts += 1;
     p.second_stage_qb = w2 >= 1.0;
+    p.qb_airborne = p.airborne;
+    p.qb_eighth = eighth;
+    p.last_qb_tae = high_boost_tae_id(true, p.second_stage_qb, p.airborne);
     let p1_ticks = c.qb_phase1_frames * w1;
     let p2_ticks = c.qb_phase2_frames * w2;
     p.qb = Some(QbPhase::Phase1 {
@@ -2313,16 +2363,25 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     } else {
         horizontal.length().max(0.05)
     };
-    let ground = collision.ground_below(Vec3::new(position.x, position.y + lift, position.z));
+    let ground = collision.ground_below_with_surface(Vec3::new(
+        position.x,
+        position.y + lift,
+        position.z,
+    ));
     if p.airborne {
-        if let Some(g) = ground.filter(|&g| position.y <= g && p.velocity.y <= 0.0) {
+        if let Some((g, surf)) = ground.filter(|&(g, _)| position.y <= g && p.velocity.y <= 0.0) {
             let impact_kmh = p.velocity.y.abs() * TICK_TO_KMH;
             p.landing_impact_kmh = p.landing_impact_kmh.max(impact_kmh);
+            p.ground_surface = surf;
+            p.landings += 1;
             (position.y, p.velocity.y, p.airborne, p.landed, p.wj) = (g, 0.0, false, true, None);
         }
     } else {
-        match ground.filter(|&g| g >= position.y - lift) {
-            Some(g) => position.y = g,
+        match ground.filter(|&(g, _)| g >= position.y - lift) {
+            Some((g, surf)) => {
+                position.y = g;
+                p.ground_surface = surf;
+            }
             None => p.airborne = true,
         }
     }
@@ -2532,6 +2591,7 @@ pub fn check_water_return(
     if pos.y >= wy {
         return false;
     }
+    p.water_splash_at = Some(Vec3::new(pos.x, wy, pos.z));
     let dest = water_return.nearest(*pos, fallback);
     let y = collision
         .ground_below(dest.position + Vec3::Y * 10.0)
@@ -3812,5 +3872,38 @@ mod tests {
             cam_step.blur,
             cam_ref.blur
         );
+    }
+
+    #[test]
+    fn qb_shortage_and_high_boost_tae_ids() {
+        assert_eq!(high_boost_tae_id(false, false, false), 0x0C1D);
+        assert_eq!(high_boost_tae_id(false, false, true), 0x0C1E);
+        assert_eq!(high_boost_tae_id(true, false, false), 0x0C1F);
+        assert_eq!(high_boost_tae_id(true, false, true), 0x0C20);
+        assert_eq!(high_boost_tae_id(true, true, false), 0x0C21);
+        assert_eq!(high_boost_tae_id(true, true, true), 0x0C22);
+
+        let design = &find(acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN, 5001)
+            .expect("design 5001")
+            .data;
+        let mut p = Pilot::new(AcCtrlParam::calculate(design), 10);
+        // Drain EN below qb_en_drain -> QB attempt fails and increments qb_shortages.
+        p.en = (p.ctrl.qb_en_drain * 0.5).max(0.0);
+        assert!(!start_quick_boost(&mut p));
+        assert_eq!(p.qb_shortages, 1);
+        assert_eq!(p.qb_charge_starts, 0);
+
+        // Refill EN -> QB charge starts and records 0xC1D (grounded).
+        p.en = p.en_max;
+        assert!(start_quick_boost(&mut p));
+        assert_eq!(p.qb_charge_starts, 1);
+        assert_eq!(p.last_qb_tae, 0x0C1D);
+
+        // Release at second-stage sweet spot while airborne -> records 0xC22.
+        p.airborne = true;
+        let sweet_ratio = p.ctrl.qb_sweet_frames / p.ctrl.qb_charge_max_frames;
+        fire_quick_boost(&mut p, Vec2::Y, sweet_ratio);
+        assert!(p.second_stage_qb);
+        assert_eq!(p.last_qb_tae, 0x0C22);
     }
 }

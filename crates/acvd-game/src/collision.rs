@@ -51,12 +51,84 @@ pub enum RayFilter {
     Ground,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// HMD ground surface material mapped from the 360 material table (`0x8371d460`, `0x82b9da38`)
+/// to `param/groundsfxparam.bin` columns (`0x829ee1d0`).
+pub enum GroundSurface {
+    Sand,
+    Clay,
+    Stone,
+    Snow,
+    Ice,
+    Concrete,
+    Iron,
+    Water,
+    Bog,
+    BottomWater,
+    Glass,
+    #[default]
+    Default,
+}
+
+impl GroundSurface {
+    /// Classifies an HMD material name into a `groundsfxparam.bin` surface column
+    /// (360 material table `0x8371d460` / `0x82b9da38`).
+    pub fn from_material(name: &str) -> Self {
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("bottomwater") {
+            Self::BottomWater
+        } else if lower.contains("water") || lower.contains("ashore") {
+            Self::Water
+        } else if lower.contains("bog") {
+            Self::Bog
+        } else if lower.contains("concrete") {
+            Self::Concrete
+        } else if lower.contains("stone") {
+            Self::Stone
+        } else if lower.contains("sand") {
+            Self::Sand
+        } else if lower.contains("clay") {
+            Self::Clay
+        } else if lower.contains("snow") {
+            Self::Snow
+        } else if lower.contains("ice") {
+            Self::Ice
+        } else if lower.contains("iron") {
+            Self::Iron
+        } else if lower.contains("glass") {
+            Self::Glass
+        } else {
+            Self::Default
+        }
+    }
+
+    /// Selects the FFX ID for this surface from a `GroundSfxparamSt` row (360 `0x829ee1d0`).
+    pub fn sfx_id(self, row: &acvd_data::generated::sfx::GroundSfxparamSt) -> i32 {
+        i32::from(match self {
+            Self::Sand => row.sand,
+            Self::Clay => row.clay,
+            Self::Stone => row.stone,
+            Self::Snow => row.snow,
+            Self::Ice => row.ice,
+            Self::Concrete => row.concrete,
+            Self::Iron => row.iron,
+            Self::Water => row.water,
+            Self::Bog => row.bog,
+            Self::BottomWater => row.bottom_water,
+            Self::Glass => row.glass,
+            Self::Default => row.default,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Hit {
     pub a: Vec3,
     pub b: Vec3,
     pub c: Vec3,
     pub layer: Layer,
+    /// Surface material for `groundsfxparam.bin` walk/landing/grounded dust (`0x829ee1d0`).
+    pub surface: GroundSurface,
     /// Whether `WallJumpHitChecker` (`0x828aa500`, filter `0x100042`) can kick off this triangle.
     /// False for `water`/`ashore` (mask `0x02`), `camera` (`0x08`), `enehit` (`0x10`),
     /// `ackickrhit` (`0x60`, bit `0x40`), and objects with `AcObjectParam.enable_wall_jump == 0`
@@ -85,6 +157,7 @@ impl Hit {
             b,
             c,
             layer: Layer::Ground,
+            surface: GroundSurface::Concrete,
             wall_kickable: true,
             blocks_fcs_los: true,
             blocks_ai_los: true,
@@ -321,28 +394,53 @@ impl Collision {
         )
     }
 
-    /// Height of the first `layer` surface a ray straight down from `from` meets before `to`.
-    pub fn ray_down(&self, from: Vec3, to: f32, layer: Layer) -> Option<f32> {
+    /// Height and surface material of the first `layer` surface a ray straight down from `from`
+    /// meets before `to`. Synthetic `--plane` ground floors report `GroundSurface::Concrete`.
+    pub fn ray_down_with_surface(
+        &self,
+        from: Vec3,
+        to: f32,
+        layer: Layer,
+    ) -> Option<(f32, GroundSurface)> {
         let plane = self
             .planes
             .iter()
             .filter(|p| p.layer == layer && (to..=from.y).contains(&p.y))
-            .map(|p| p.y)
-            .reduce(f32::max);
+            .map(|p| {
+                let s = if layer == Layer::Water {
+                    GroundSurface::Water
+                } else {
+                    GroundSurface::Concrete
+                };
+                (p.y, s)
+            })
+            .reduce(|a, b| if b.0 > a.0 { b } else { a });
         let mesh = self
             .near(from.x, from.z)
             .filter(|h| h.layer == layer)
-            .filter_map(|h| tri_y(h.a, h.b, h.c, from.x, from.z, from.y, to))
-            .reduce(f32::max);
+            .filter_map(|h| {
+                tri_y(h.a, h.b, h.c, from.x, from.z, from.y, to).map(|y| (y, h.surface))
+            })
+            .reduce(|a, b| if b.0 > a.0 { b } else { a });
         match (plane, mesh) {
-            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), Some(b)) => Some(if b.0 > a.0 { b } else { a }),
             (a, b) => a.or(b),
         }
+    }
+
+    /// Height of the first `layer` surface a ray straight down from `from` meets before `to`.
+    pub fn ray_down(&self, from: Vec3, to: f32, layer: Layer) -> Option<f32> {
+        self.ray_down_with_surface(from, to, layer).map(|(y, _)| y)
     }
 
     /// The ground the AC lands on falling from `at`: the highest ground hit at or below it.
     pub fn ground_below(&self, at: Vec3) -> Option<f32> {
         self.ray_down(at, f32::NEG_INFINITY, Layer::Ground)
+    }
+
+    /// Highest ground hit at or below `at` together with its HMD [`GroundSurface`].
+    pub fn ground_below_with_surface(&self, at: Vec3) -> Option<(f32, GroundSurface)> {
+        self.ray_down_with_surface(at, f32::NEG_INFINITY, Layer::Ground)
     }
 
     /// Ground triangles whose XZ bounds may come within `r` of (`x`, `z`), each once.
@@ -958,6 +1056,7 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
                 b,
                 c,
                 layer: layer_of(mask),
+                surface: GroundSurface::from_material(mat),
                 wall_kickable: obj_kickable && (mask & 0x5a) == 0,
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los && !obj_look_penetrate,
@@ -1063,6 +1162,7 @@ mod tests {
                 b: Vec3::from(b),
                 c: Vec3::from(c),
                 layer: layer_of(mask),
+                surface: GroundSurface::from_material(mat),
                 wall_kickable: (mask & 0x5a) == 0,
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los,
@@ -1138,6 +1238,7 @@ mod tests {
                 b: Vec3::from(b),
                 c: Vec3::from(c),
                 layer: layer_of(mask),
+                surface: GroundSurface::from_material(mat),
                 wall_kickable: (mask & 0x5a) == 0,
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los,
@@ -1280,5 +1381,49 @@ mod tests {
             .expect("lower ray should hit broken _b_h.hmd rubble");
         assert_eq!(rubble.3, Some(7));
         assert!((rubble.1.z - (-15.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ground_surface_maps_hmd_materials_to_groundsfxparam() {
+        use acvd_data::generated::sfx::PARAM_GROUNDSFXPARAM_BIN;
+
+        assert_eq!(GroundSurface::from_material("concrete"), GroundSurface::Concrete);
+        assert_eq!(GroundSurface::from_material("sand"), GroundSurface::Sand);
+        assert_eq!(GroundSurface::from_material("clay"), GroundSurface::Clay);
+        assert_eq!(GroundSurface::from_material("stone"), GroundSurface::Stone);
+        assert_eq!(GroundSurface::from_material("iron"), GroundSurface::Iron);
+        assert_eq!(GroundSurface::from_material("snow"), GroundSurface::Snow);
+        assert_eq!(GroundSurface::from_material("ice"), GroundSurface::Ice);
+        assert_eq!(GroundSurface::from_material("water"), GroundSurface::Water);
+        assert_eq!(GroundSurface::from_material("ashore"), GroundSurface::Water);
+        assert_eq!(GroundSurface::from_material("as_bottomwater"), GroundSurface::BottomWater);
+        assert_eq!(GroundSurface::from_material("bog"), GroundSurface::Bog);
+        assert_eq!(GroundSurface::from_material("glass"), GroundSurface::Glass);
+        assert_eq!(GroundSurface::from_material("virtual"), GroundSurface::Default);
+
+        let walk = find(PARAM_GROUNDSFXPARAM_BIN, 1).expect("walk row 1");
+        let land = find(PARAM_GROUNDSFXPARAM_BIN, 2).expect("landing row 2");
+        let slide = find(PARAM_GROUNDSFXPARAM_BIN, 3).expect("grounded row 3");
+        assert_eq!(GroundSurface::Concrete.sfx_id(&walk.data), 1404);
+        assert_eq!(GroundSurface::Concrete.sfx_id(&land.data), 1405);
+        assert_eq!(GroundSurface::Concrete.sfx_id(&slide.data), 1406);
+        assert_eq!(GroundSurface::Sand.sfx_id(&walk.data), 1407);
+        assert_eq!(GroundSurface::Sand.sfx_id(&land.data), 1408);
+        assert_eq!(GroundSurface::Iron.sfx_id(&walk.data), 1410);
+        assert_eq!(GroundSurface::Snow.sfx_id(&walk.data), 1413);
+        assert_eq!(GroundSurface::Ice.sfx_id(&walk.data), 1401);
+
+        let mut sand_tri = Hit::solid(
+            Vec3::new(-10.0, 2.0, -10.0),
+            Vec3::new(10.0, 2.0, -10.0),
+            Vec3::new(0.0, 2.0, 10.0),
+        );
+        sand_tri.surface = GroundSurface::Sand;
+        let col = Collision::with_hits(Vec::new(), vec![sand_tri]);
+        let (y, surf) = col
+            .ground_below_with_surface(Vec3::new(0.0, 5.0, 0.0))
+            .expect("sand floor hit");
+        assert!((y - 2.0).abs() < 1e-4);
+        assert_eq!(surf, GroundSurface::Sand);
     }
 }
