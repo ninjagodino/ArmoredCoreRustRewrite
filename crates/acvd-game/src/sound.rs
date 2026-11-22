@@ -200,14 +200,15 @@ struct Heard {
     sustain: Vec<Entity>,
 }
 
-/// Boost start, boost sustain, high boost, glide start and jump. Runs after the pilot step that
-/// sets those flags.
+/// Boost start, boost sustain, high boost, glide start, jump, and animation TAE sound/footstep
+/// events (360 `0x8289acd0`). Runs after the pilot and pose steps.
 fn motion(
     mut commands: Commands,
     mut cues: ResMut<Cues>,
     mut assets: ResMut<Assets<AudioSource>>,
     piloting: Res<Piloting>,
     pilots: Query<&Pilot>,
+    anim: Option<Res<crate::pose::Motion>>,
     mut heard: Local<Heard>,
 ) {
     let Ok(pilot) = pilots.single() else { return };
@@ -271,6 +272,29 @@ fn motion(
                 &format!("c{:08}", row.data.se_jump),
                 false,
             );
+        }
+    }
+
+    // Animation TAE sound & footstep cues (360 `0x8289acd0`: kind 103 footstep, kinds 1/2/602 sound).
+    if let Some(anim) = anim.as_deref() {
+        for ev in &anim.tae_events {
+            match ev {
+                crate::pose::TaeFired::Footstep { .. } => {
+                    let base = if anim.sound_param_id == 0 {
+                        100
+                    } else {
+                        anim.sound_param_id
+                    };
+                    let cue = format!("c{:08}", base + 33);
+                    if cues.play(&mut commands, &mut assets, &cue, false).is_empty() {
+                        cues.play(&mut commands, &mut assets, "c00000133", false);
+                    }
+                }
+                crate::pose::TaeFired::Sound { cue } => {
+                    cues.play(&mut commands, &mut assets, cue, false);
+                }
+                crate::pose::TaeFired::Ffx { .. } => {}
+            }
         }
     }
 }

@@ -2235,6 +2235,39 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
     }
 }
 
+/// Computes the Core Control target `(yaw, pitch)` in AC-local radians (360 `0x8289e730`).
+///
+/// When an FCS target is locked, aims the upper body directly at `locked_pos`; otherwise tracks
+/// camera aim (`cam_yaw_off`, `cam_pitch`) plus turn lead (`turn`) and sideways strafe
+/// counter-twist (`strafe_x`) so the torso stays squared to the aim while legs strafe/dash.
+pub fn core_aim_angles(
+    body_yaw: f32,
+    ac_pos: Vec3,
+    cam_yaw_off: f32,
+    cam_pitch: f32,
+    strafe_x: f32,
+    turn: f32,
+    locked_pos: Option<Vec3>,
+) -> (f32, f32) {
+    if let Some(target) = locked_pos {
+        let to_target = target - (ac_pos + Vec3::Y * 5.0);
+        if to_target.length_squared() > 1e-4 {
+            let local = Quat::from_rotation_y(-body_yaw) * to_target;
+            let yaw = local.x.atan2(local.z);
+            let horiz = Vec2::new(local.x, local.z).length().max(1e-4);
+            let pitch = (-local.y).atan2(horiz);
+            return (yaw, pitch);
+        }
+    }
+    let strafe_counter = if cam_yaw_off.abs() < 1e-3 {
+        strafe_x.clamp(-1.0, 1.0) * 18.0_f32.to_radians()
+    } else {
+        0.0
+    };
+    let turn_lead = turn.clamp(-1.0, 1.0) * 26.0_f32.to_radians();
+    (cam_yaw_off + strafe_counter + turn_lead, cam_pitch)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn pilot(
     time: Res<Time>,
@@ -2246,7 +2279,13 @@ pub fn pilot(
     collision: Res<Collision>,
     area_bounds: Option<Res<crate::map::AreaBounds>>,
     motion: Option<ResMut<Motion>>,
-    mut acs: Query<(&mut Pilot, &mut Transform, &GlobalTransform, Option<&mut Status>)>,
+    mut acs: Query<(
+        &mut Pilot,
+        &mut Transform,
+        &GlobalTransform,
+        Option<&mut Status>,
+        Option<&crate::fcs::Fcs>,
+    )>,
     mut cams: Query<(&mut Orbit, &mut Transform, &mut Projection, &mut ZoomBlur), Without<Pilot>>,
     joints: Query<(&Driven, &GlobalTransform)>,
     mut window: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
@@ -2275,7 +2314,7 @@ pub fn pilot(
             c.visible = visible;
         }
     }
-    let (Some(mut motion), Ok((mut p, mut transform, ac_global, mut status))) =
+    let (Some(mut motion), Ok((mut p, mut transform, ac_global, mut status, fcs))) =
         (motion, acs.single_mut())
     else {
         return;
@@ -2440,6 +2479,26 @@ pub fn pilot(
             (p.velocity.with_y(0.0).length() / p.ctrl.boost_max_tick.max(1e-4)).clamp(0.0, 1.0)
         };
     }
+
+    // Core Control (360 `0x8284a828` -> `0x8289e730` -> `jcondata.bin` "Core"):
+    // track locked FCS target or camera aim on `core` (+ slight `head_01` lead), gated by
+    // `AC_MOTIONINFO.b_disable_core_ctrl` and blade attacks.
+    let core_allowed = acvd_data::ac_state(next.0, next.1)
+        .and_then(|s| acvd_data::find(PARAM_ACMOTION_BIN, s.row))
+        .is_none_or(|r| r.data.b_disable_core_ctrl == 0)
+        && !p.in_blade();
+    let (core_yaw, core_pitch) = core_aim_angles(
+        p.yaw,
+        transform.translation,
+        p.cam.yaw_off,
+        p.cam.pitch,
+        body.stick.x,
+        input.turn,
+        fcs.and_then(|f| f.locked.as_ref()).map(|l| l.world_pos),
+    );
+    motion.core_ctrl.enabled = core_allowed;
+    motion.core_ctrl.target_yaw = core_yaw;
+    motion.core_ctrl.target_pitch = core_pitch;
 
     if let Ok((mut o, mut cam, mut proj, mut blur)) = cams.single_mut() {
         o.follow = true;
@@ -3141,5 +3200,26 @@ mod tests {
             "homing blade dash should close significant distance toward target (z={})",
             pos.z
         );
+    }
+
+    #[test]
+    fn core_aim_angles_tracks_fcs_lock_and_strafe() {
+        // Locked target 100 m forward (+Z) and 100 m left (+X) at AC torso height (+5 Y) -> +45 deg yaw, 0 pitch.
+        let (yaw, pitch) = core_aim_angles(
+            0.0,
+            Vec3::ZERO,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            Some(Vec3::new(100.0, 5.0, 100.0)),
+        );
+        assert!((yaw.to_degrees() - 45.0).abs() < 0.1, "yaw={}", yaw.to_degrees());
+        assert!(pitch.abs() < 0.01);
+
+        // Unlocked strafe right (stick.x = +1) counter-twists torso left (+yaw) to hold forward aim.
+        let (syaw, spitch) = core_aim_angles(0.0, Vec3::ZERO, 0.0, -0.1, 1.0, 0.0, None);
+        assert!((syaw.to_degrees() - 18.0).abs() < 0.1);
+        assert!((spitch + 0.1).abs() < 1e-5);
     }
 }

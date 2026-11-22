@@ -24,6 +24,7 @@ pub mod msb;
 pub mod param;
 pub mod paramdef;
 pub mod reader;
+pub mod tae;
 pub mod tpf;
 pub mod vfs;
 pub mod xdvdfs;

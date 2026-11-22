@@ -67,7 +67,14 @@ impl Plugin for SfxPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Dir(self.disc.clone()))
             .add_systems(Startup, setup)
-            .add_systems(Update, (boosters.after(control::pilot), preview))
+            .add_systems(
+                Update,
+                (
+                    boosters.after(control::pilot),
+                    tae_events.after(crate::pose::animate),
+                    preview,
+                ),
+            )
             .add_systems(
                 PostUpdate,
                 (simulate, probe_shot, sweep)
@@ -119,6 +126,30 @@ pub struct EffectPoint {
     pub column: &'static str,
     /// Effects currently parented here, with the uniform scale last applied.
     playing: Vec<(i32, Entity, f32)>,
+}
+
+/// Spawns FFX effects triggered by animation TAE kind `0` events (360 `0x8289acd0`) on the
+/// matching [`EffectPoint`] dummy socket.
+fn tae_events(
+    mut commands: Commands,
+    motion: Option<Res<crate::pose::Motion>>,
+    points: Query<(Entity, &EffectPoint)>,
+) {
+    let Some(motion) = motion else { return };
+    for ev in &motion.tae_events {
+        if let crate::pose::TaeFired::Ffx { ffx_id, dummy_id } = ev {
+            if *ffx_id > 0 {
+                if let Some((entity, _)) = points.iter().find(|(_, p)| p.id == *dummy_id) {
+                    commands.spawn((
+                        Sfx::new(*ffx_id),
+                        Transform::default(),
+                        Visibility::default(),
+                        ChildOf(entity),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Plays effect `.0` in front of the AC, again each time it ends (`--sfx <id>`).

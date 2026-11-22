@@ -84,12 +84,8 @@ in order:
 - **AC test targets**: spawning, rendering, hit shapes, AP/defense damage, destruction (`_b.flv`), AC TEST enemy & test-AC AI (`script/enemy/*_actest.lc`, `script/arena/actest_*.lc`), and player AC damage/stagger/respawn are in (see Done "AC TEST Enemy AI & Player Damage / AP"); still open: enemy skeletal animations, navmesh pathfinding (`HNAV`/`HTR`), and vs-UNAC (`actest7`).
 - **Boost gauge** (Lock-on / FCS, Generator EN drain & recharge, and Damage model are now in, see Done).
 
-- **Animation**: TAE event reader; core control (upper body faces the aim while legs strafe);
-  upper/lower body layering; part `*_a` clips beyond the hand weapons, arms and boosters.
-  - TAE lead: `motioncollate` `motion_ow_disarm` / `motion_ow_equip` are the TAE owner ids
-    (100, 1100, 1200, 4100, 7100, 8100, ... = `tae/ac/action_ow_disarm/own000100.tae` ...); the
-    360 TAE event dispatcher is `0x8238eb08` (switch on event type: 10, 20, 100-104, 150-152,
-    200-202, 300, 301, 400, 405, 410, 450, 500, 900, 910, 920, 1000, 1010, 1020, 1030, 1040).
+- **Animation**: part `*_a` clips beyond the hand weapons, arms and boosters; overed-weapon sets
+  (TAE reader, Core Control, and upper/lower body layering are now in, see Done).
   - Blend units open (see Done): find the 360 reader of a hokan row's `GeneralFrame`
     (`acvd-index q field` on the `ACANIM_HOKANPARAM_ST` offsets; `AcMotion_loadCollate`
     `0x8249e840` stores `HokanParamID`), then one Xenia probe on it while walking (row 2 = 60).
@@ -278,6 +274,12 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **Core Control (Upper/Lower Body Layering) & Animation TAE Event Reader** (`acvd-formats::tae`, `acvd-game::pose`, `control`, `weapons`, `bay`, `sound`, `sfx`, `sheets/formats.csv`, `sheets/systems.csv`):
+  - **TAE Binary Format (`crates/acvd-formats/src/tae.rs`)**: decoded big-endian `.tae` v`0x0001000B` (plus legacy `0x0001000A` on `_unknown/tae/4246306883.tae`) verified against 360 parsers `0x8239d928` / `0x825d3c40` / `0x82a21150` / `0x82b94d10` and all **618/618 `.tae` files** on the 360 ISO (15,218 animations, 57,737 events, 0 errors). Traced 360 loader path formats (`0x8284e7c8`: `tae/ac/motion_ow_disarm/own{:06}.tae`) and AC TAE event dispatcher (`0x8289acd0`, vtable `0x820997a0` slot `+0x68`): kind `0` FFX (`[ffx_id, dummy_id]`), kinds `1`/`2`/`602` sound (formatted via 360 category table `0x8371c688`), and kind `103` footstep (`[foot_side, step_kind]`, e.g. `own000100.tae` walk `anim 2` at frames `19` and `44`).
+  - **Core Control & Upper/Lower Body Layering (`pose.rs`, `control.rs`, `weapons.rs`, `bay.rs`)**: traced 360 Core Control chain `0x8284a828` → `0x8289ea40` → `0x8289e730` → `0x8287f448` (`param/jcondata.bin` `"Core"`: `bone = "core"`, `axis_bone = "c_center"`, yaw `±90°`, pitch `±10°`, `limit_rot_vel = 180°/s`, plus `head_01` lead from `0x8289e608` / `0x8289e158`; engage/release `5`/`120` frames from `param/acanimparam.bin` `0x8289e7cc`, gated by `AC_MOTIONINFO.b_disable_core_ctrl`). `pose::Motion::core_ctrl` tracks FCS locked targets or camera aim + strafe/turn counter-twist while legs dash/strafe. `Driven::upper` splits the `c_center`/`core` subtree from `k_center`/`kosi`/legs so `Motion::play_upper` layers bay shifts (`bay.rs`) and `b_apply_lower == 0` sniper ready/stow clips (`weapons.rs`) over lower-body locomotion without freezing the legs.
+  - **TAE Event Playback (`pose.rs`, `sound.rs`, `sfx.rs`)**: `pose::motion` loads the legs' `motion_ow_disarm` `.tae` file alongside the motion set; `pose::animate` emits `TaeFired::{Footstep, Sound, Ffx}` on frame crossing (including loop wrap), consumed by `sound::motion` (leg-type footsteps via `MotionCollateSt.sound_param_id` + direct TAE cues) and `sfx::tae_events` (FFX spawns on matching `EffectPoint` dummy IDs).
+  - Verified visually on `m4000` (`private/shots/core_control.png`: sideways boost-dash with upper body cleanly twisted to aim/fire) and with workspace unit tests (`acvd-formats` 60, `acvd-game` 94, `acvd-sheets all` 0 errors, `acvd-index audit` 0 mismatches).
 
 - **3D Terrain Raycasting (FCS `LockCheckRay` LOS, Projectile/Missile Wall Hits, AI Sightlines) & Map Area Bounds** (`acvd-formats::msb`, `acvd-game::collision`, `fcs`, `weapons`, `scan`, `ai`, `map`, `control`, `hud`, `main`, `sheets/hmd.csv`, `sheets/systems.csv`):
   - **360 HMD collision filter & `LockCheckRay` (`ACV2.pe`, `sheets/hmd.csv`)**: traced HMD material mask table `0x8371d460` (`0x82b9db78` → `0x82b9dc38` → `0x82c52498`: `0x00` solid terrain, `0x02` `water`/`ashore`, `0x04` wire, `0x08` `camera`, `0x10` `enehit`, `0x20` `plyerhit`, `0x60` `ackickrhit`), `LockCheckRay` (`0x829c5f20` → `0x829c5e30` → `0x82b9df28`, filter `0x80100006`; mode 1 `0x829c5c00` for FCS `0x829d8d58` skips map objects with `AcObjectParam.camera_collidable == 0` `0x829aabc8`; mode 2 `0x829c5cd0` for AI also skips `AcObjectParam.b_look_line_penetrate != 0` `0x829aacb8`), and bullet/missile raycast (`0x828eea28` → `0x82b9df28`, filter `0x00100004`, solid terrain + water).

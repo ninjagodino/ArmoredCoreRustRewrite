@@ -2594,30 +2594,52 @@ impl SniperStance {
                     || self.hand != hand;
                 if restart {
                     self.hand = hand;
-                    self.phase = if play_stance(hand, false, motion, disc, pilot) {
-                        SniperPhase::Engage
-                    } else {
-                        SniperPhase::Hold
-                    };
-                    pilot.body_held(true);
-                } else if self.phase == SniperPhase::Engage && motion.finished() {
+                    match play_stance(hand, false, motion, disc, pilot) {
+                        StancePlay::Upper => {
+                            self.phase = SniperPhase::Engage;
+                            pilot.body_held(false);
+                        }
+                        StancePlay::Full => {
+                            self.phase = SniperPhase::Engage;
+                            pilot.body_held(true);
+                        }
+                        StancePlay::None => {
+                            self.phase = SniperPhase::Hold;
+                            pilot.body_held(false);
+                        }
+                    }
+                } else if self.phase == SniperPhase::Engage
+                    && (motion.upper_finished() && (motion.upper.is_some() || motion.finished()))
+                {
                     self.phase = SniperPhase::Hold;
                 }
             }
             None => match self.phase {
                 SniperPhase::Off => {}
-                SniperPhase::Release if motion.finished() => {
+                SniperPhase::Release
+                    if motion.upper_finished() && (motion.upper.is_some() || motion.finished()) =>
+                {
                     self.phase = SniperPhase::Off;
+                    motion.clear_upper(0.15);
                     pilot.body_held(false);
                 }
                 SniperPhase::Release => {}
                 SniperPhase::Engage | SniperPhase::Hold => {
-                    self.phase = if play_stance(self.hand, true, motion, disc, pilot) {
-                        SniperPhase::Release
-                    } else {
-                        SniperPhase::Off
-                    };
-                    pilot.body_held(self.phase != SniperPhase::Off);
+                    match play_stance(self.hand, true, motion, disc, pilot) {
+                        StancePlay::Upper => {
+                            self.phase = SniperPhase::Release;
+                            pilot.body_held(false);
+                        }
+                        StancePlay::Full => {
+                            self.phase = SniperPhase::Release;
+                            pilot.body_held(true);
+                        }
+                        StancePlay::None => {
+                            self.phase = SniperPhase::Off;
+                            motion.clear_upper(0.15);
+                            pilot.body_held(false);
+                        }
+                    }
                 }
             },
         }
@@ -2629,8 +2651,22 @@ impl SniperStance {
     }
 }
 
+enum StancePlay {
+    None,
+    Upper,
+    Full,
+}
+
 /// `sniper_ready_*` / `sniper_stow_*` in `sheets/ac_states.csv`.
-fn play_stance(hand: Hand, release: bool, motion: &mut Motion, disc: &Disc, pilot: &Pilot) -> bool {
+/// Upper-body-only rows (`b_apply_lower == 0`) play on the upper-body layer so leg locomotion
+/// continues uninterrupted.
+fn play_stance(
+    hand: Hand,
+    release: bool,
+    motion: &mut Motion,
+    disc: &Disc,
+    pilot: &Pilot,
+) -> StancePlay {
     let state = match (hand, release) {
         (Hand::Right, false) => "sniper_ready_r",
         (Hand::Right, true) => "sniper_stow_r",
@@ -2638,9 +2674,23 @@ fn play_stance(hand: Hand, release: bool, motion: &mut Motion, disc: &Disc, pilo
         (Hand::Left, true) => "sniper_stow_l",
     };
     let Some(row) = ac_state(state, None).and_then(|s| find(PARAM_ACMOTION_BIN, s.row)) else {
-        return false;
+        return StancePlay::None;
     };
-    motion
+    if row.data.b_apply_lower == 0 {
+        if motion
+            .play_upper(
+                disc,
+                row.data.anim_id,
+                row.data.b_loop != 0,
+                1.0,
+                pilot.fade(row.data.interpolate_id),
+                row.data.upper_priority.max(1),
+            )
+            .is_ok()
+        {
+            return StancePlay::Upper;
+        }
+    } else if motion
         .play(
             disc,
             row.data.anim_id,
@@ -2649,6 +2699,10 @@ fn play_stance(hand: Hand, release: bool, motion: &mut Motion, disc: &Disc, pilo
             pilot.fade(row.data.interpolate_id),
         )
         .is_ok()
+    {
+        return StancePlay::Full;
+    }
+    StancePlay::None
 }
 
 impl WeaponAnims {

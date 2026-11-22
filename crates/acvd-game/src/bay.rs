@@ -128,12 +128,15 @@ pub(crate) fn shift(
     let Some(loadout) = loadout.as_mut() else {
         return;
     };
-    let Ok((mut pilot, mut arms)) = acs.single_mut() else {
+    let Ok((pilot, mut arms)) = acs.single_mut() else {
         return;
     };
 
     if let Some(shift) = active.as_mut() {
-        let frame = motion.as_ref().map_or(shift.swap_at, |m| m.frame);
+        let frame = motion
+            .as_ref()
+            .and_then(|m| m.upper.as_ref().map(|u| u.frame))
+            .unwrap_or(shift.swap_at);
         if !shift.swapped && frame >= shift.swap_at {
             if shift.purge {
                 exchange(
@@ -171,9 +174,11 @@ pub(crate) fn shift(
             let span = (shift.grab_at - shift.swap_at).max(1.0);
             shift.present = ((frame - shift.swap_at) / span).clamp(0.0, 1.0);
         }
-        let body_done = motion.as_ref().is_none_or(|m| m.finished());
+        let body_done = motion.as_ref().is_none_or(|m| m.upper_finished());
         if shift.grabbed && shift.present <= 0.0 && body_done {
-            pilot.body_held(false);
+            if let Some(m) = motion.as_mut() {
+                m.clear_upper(0.15);
+            }
             commands.remove_resource::<Shift>();
         }
         return;
@@ -222,18 +227,18 @@ pub(crate) fn shift(
             return false;
         };
         let ok = motion
-            .play(
+            .play_upper(
                 &garage.disc,
                 row.data.anim_id,
                 row.data.b_loop != 0,
                 1.0,
                 pilot.fade(row.data.interpolate_id),
+                row.data.upper_priority.max(1),
             )
             .is_ok();
-        if ok {
-            pilot.body_held(true);
-            if !purge {
-                grab_at = (motion.clip.frames as f32 - GRAB_BEFORE_END).max(swap_at);
+        if ok && !purge {
+            if let Some(ref u) = motion.upper {
+                grab_at = (u.clip.frames as f32 - GRAB_BEFORE_END).max(swap_at);
             }
         }
         ok

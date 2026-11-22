@@ -34,7 +34,7 @@ extension,magic,format,system,parser,evidence
 .png,89 PNG,PNG image,ui,n/a,standard PNG; readable with the png crate
 .properties,text,Java-style properties (logging/config),config,todo,system/*.properties (Shift-JIS comments)
 .smd,SMD4,unidentified model companion (*_s.smd),models,todo,inside binders only: model/**/*_m.bnd.dcx (am0010_s.smd 24576 bytes); 2257 entries
-.tae,TAE\0,TAE animation event timeline,animation,todo,tae/*.tae (621)
+.tae,"TAE ",TAE animation event timeline (version 0x0001000B / 0x0001000A; 360 0x8239d928 / 0x825d3c40 / 0x8289acd0),animation,done,tae/*.tae (618/618 parsed)
 .tdf,text,TDF enum definition (Shift-JIS CSV),param_enums,todo,"param/tdf/*.tdf begin with ""ENUM_NAME"" then base type"
 .tpf,TPF\0,TPF texture pack (uncompressed),textures,done,"acvd-formats::tpf reads all 1136 (+ 42 inside binders); platform byte 1 with 28-byte entries and Xenos tiled data that tpf::xenos untiles on 10552 of the 10556 packs; the 4 model/ene/e9110-e9113 packs keep the PS3 platform byte 2, 32-byte entries and linear chains (PS3 disc copies); every stored size matches; one truncated texture (e4050.tpf.dcx #9, container_exceptions.csv)"
 .tpf.dcx,DCX,DCX-compressed TPF texture pack,textures;fonts;ui,done,acvd-formats::dcx + acvd-formats::tpf; 5877 on disc (expanded contents begin TPF\0) and 3501 inside binders
