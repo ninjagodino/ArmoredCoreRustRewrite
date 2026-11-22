@@ -113,23 +113,20 @@ in order:
     (`acvd-index q field` on the `ACANIM_HOKANPARAM_ST` offsets; `AcMotion_loadCollate`
     `0x8249e840` stores `HokanParamID`), then one Xenia probe on it while walking (row 2 = 60).
     Recipe in `sheets/anim_blend.csv` row `blend`.
-- **Camera leftovers**: impact / foot-step shake and the ready-position first-person view (both
-  need triggers free play doesn't produce: earlier emulator breakpoints on the camera message
-  0x68 / 0x69 handlers never fired; ready position waits on weapons). Xenia re-check: probe the
-  handlers `0x8285cf48` / `0x8285cf68` / `0x8285cf88` / `0x8285cfb0` (registered for messages
-  0x66-0x69 by `0x836cad88` into the table at `0x83713b70`) in AC TEST with a recipe that lands
-  from a boost jump (`walkabout` / `boost_vfx` jump steps) and boosts sideways / back; hits on
-  the AC need the AC TEST targets (layers `actest2`-`8`) or a story mission. The same run re-checks `dash_inv` (0x66) and `side_moving` (0x67) in
-  `sheets/camera_follow.csv`. Speed blur: the per-call ease runs once per 1/30 s
-  game frame (Xenia probe, `frame_time` / `speed_blur` in `sheets/camera_follow.csv`); the
-  runtime (`blur.rs`) still steps it per 60 Hz tick and needs to step per 1/30 s. A camera action
-  with BlurRate 2 (seen for about 0.8 s in a run that included firing) is not mapped: probe the
-  row id controller slot `0x48` (`0x8285e500`) returns to name it. Speed blur open points: the
-  zoom-blur source width (taken as 1280) and the filter fade at +0x54 (taken as 1).
-  Follow-camera open points: which base-transform factor carries the waist offset (the dump
-  shows the result, see `look_at_height`); the writer of controller +0x18 (taken as the turn
-  input for `eye_shift`); `FollowOffsetY` (+0x18 of the offset row, 3.5 m, "when the camera
-  approaches the AC") has no reader found.
+- **Camera leftovers**: impact / foot-step / rumble camera shake (`0x82bfab38` / `0x8285cf88` /
+  `0x8285cfb0` / `0x82bf8f00` wired on landing, TAE kind 103 footsteps, incoming hits/stagger,
+  heavy ready-weapon & OW fire, and Boost Charge Kick contact), ready-position zoom camera
+  (`accameraaction` row `40` `狙撃構え` -> row `49` `狙撃構え完了後` via `0x8285db68` / `0x8285d548`,
+  `EyeDistance 6 m`, `FovMaxAngle` overridden by `cat-10 +0x168` `snipe_fov` via `0x8285e418` ->
+  `0x8287a100` -> `0x828516b0` <- `0x82856c60` <- `0x8247b550`, aim turn speed scaled by
+  `cat-10 +0x16c` `snipe_turn_scale` via `0x8287b658` <- `0x82478e00`), and 30 Hz speed-blur
+  step rate (`BLUR_RATE = 30.0`, `FollowCam::blur_step` matching `0x82bfb748` -> `0x82bfa9f0`;
+  the probed `BlurRate == 2` row is row `19` `ドリフト`) are now implemented in `control.rs` /
+  `weapons.rs` / `damage.rs`. Remaining open points: `dash_inv` (msg `0x66` `0x8285cf48`),
+  `side_moving` (msg `0x67` `0x8285cf68`), distance-attenuated rumble shakes (`0x82bf9de0`,
+  `0x82bf9ee8` using `ACCAM_RAMBLE_PARAM_ST`), zoom-blur source width (taken as 1280) and filter
+  fade at `+0x54` (taken as 1), which base-transform factor carries the waist offset, the writer
+  of controller `+0x18`, and `FollowOffsetY` (`+0x18` of the offset row, 3.5 m).
 - **Movement leftovers** (360 movement vtable `0x8208fea0`, builder `0x828212f8`, integrator
   `0x82822ea0`):
   - Non-boost air steering: struct index 0x14 (Lua param 50; not yet in `ac_ctrl_calc.csv`).

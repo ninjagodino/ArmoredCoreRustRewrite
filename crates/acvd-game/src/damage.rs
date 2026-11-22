@@ -397,6 +397,9 @@ pub struct PlayerHealth {
     pub respawn_timer: f32,
     /// Number of enemy hits absorbed since spawn/reset.
     pub hits_taken: u32,
+    /// Pending camera shake from the latest hit: `(recoil, staggered)`, consumed by
+    /// `weapons::tick_player_health` to trigger `Pilot::trigger_impact_shake` / `trigger_rumble_shake`.
+    pub hit_shake: Option<(f32, bool)>,
 }
 
 /// Automatic AC TEST respawn delay after player AP reaches 0 (not game data; keeps free play
@@ -429,6 +432,7 @@ impl PlayerHealth {
             just_destroyed: false,
             respawn_timer: 0.0,
             hits_taken: 0,
+            hit_shake: None,
         }
     }
 
@@ -451,9 +455,13 @@ impl PlayerHealth {
         }
         self.hits_taken = self.hits_taken.saturating_add(1);
         self.ap = (self.ap - res.damage).max(0.0);
+        let mut triggered_stagger = false;
         if self.stagger_threshold > 0.0 && res.recoil >= self.stagger_threshold {
             self.stagger_timer = self.stagger_penalty_time;
+            triggered_stagger = true;
         }
+        let prev = self.hit_shake.unwrap_or((0.0, false));
+        self.hit_shake = Some((prev.0.max(res.recoil), prev.1 || triggered_stagger));
         let lethal = self.ap <= 0.0;
         if lethal {
             self.destroyed = true;
@@ -490,6 +498,7 @@ impl PlayerHealth {
     pub fn reset(&mut self) {
         self.ap = self.ap_max;
         self.stagger_timer = 0.0;
+        self.hit_shake = None;
         self.destroyed = false;
         self.just_destroyed = false;
         self.respawn_timer = 0.0;

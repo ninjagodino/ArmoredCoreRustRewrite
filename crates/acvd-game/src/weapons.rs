@@ -49,7 +49,7 @@ use bevy::prelude::*;
 
 use crate::assemble::Placement;
 use crate::collision::{Collision, RayFilter, RAY_HALF};
-use crate::control::{BladeLaunch, BladePhase, Held, Pilot, Piloting};
+use crate::control::{BladeLaunch, BladePhase, Held, Pilot, Piloting, ReadyCamera};
 use crate::damage::{self, DamageType, PlayerHealth, SpeedWeightScale};
 use crate::hud::Status;
 use crate::pose::{self, Driven, Motion};
@@ -725,6 +725,10 @@ pub struct Gun {
     pub stance: bool,
     /// Sniper rifle (`weapon_kind` 5): shots kick with `sniper_$(LR)` instead of `gun_$(LR)`.
     pub sniper: bool,
+    /// Ready-position zoom vertical FOV in degrees (`cat-10 +0x168`, `0x8247b550` -> `0x8285e418`).
+    pub snipe_fov: f32,
+    /// Ready-position aim turn speed multiplier (`cat-10 +0x16c`, `0x82478e00` -> `0x8287b658`).
+    pub snipe_turn_scale: f32,
     /// Weapon reload stability interpolation factor (`sub +0x2c`, `0x82478b90`, used by `0x8286adf8`).
     pub reload_stab_factor: f32,
     /// Firing mode (`Auto`, `PelletSpread`, `Burst`, or `Charge`).
@@ -1882,6 +1886,34 @@ pub fn fire(
             }
         }
     }
+    // Ready-position camera stance (`0x8285db68` row 40 -> 49 + `0x8285e418` zoom FOV override).
+    pilot.ready_cam = if let Some(hand) = sniper_hand {
+        let gun = &arms.hands[usize::from(hand == Hand::Left)];
+        let deployed = body
+            .anims
+            .as_ref()
+            .is_none_or(|a| a.sniper.allows(hand));
+        if deployed && gun.snipe_fov > 0.0 {
+            ReadyCamera::Zoomed {
+                fov_deg: gun.snipe_fov,
+                turn_scale: gun.snipe_turn_scale,
+            }
+        } else {
+            ReadyCamera::Deploying
+        }
+    } else if arms.weapon_arm && arms.hands[0].stance && (want[0] || want[1]) {
+        let gun = &arms.hands[0];
+        if gun.snipe_fov > 0.0 {
+            ReadyCamera::Zoomed {
+                fov_deg: gun.snipe_fov,
+                turn_scale: gun.snipe_turn_scale,
+            }
+        } else {
+            ReadyCamera::Deploying
+        }
+    } else {
+        ReadyCamera::Off
+    };
     if arms.weapon_arm {
         let want_wa = want[0] || want[1];
         // Collect weapon-arm muzzle effect points (even IDs 102/104/106/108 = right arm,
@@ -2101,6 +2133,10 @@ pub fn fire(
                 }
             }
             if want_wa && can && pilot.try_drain_en(gun.en_drain) {
+                if gun.stance {
+                    pilot.trigger_impact_shake(220.0);
+                    pilot.trigger_rumble_shake(0.14, Vec2::new(0.06, 0.12), Vec2::new(0.02, 0.02));
+                }
                 if let Some(anims) = body.anims.as_mut() {
                     anims.kick(Hand::Right, gun.sniper);
                     anims.kick(Hand::Left, gun.sniper);
@@ -2326,6 +2362,10 @@ pub fn fire(
         };
         if !pilot.try_drain_en(gun.en_drain) {
             continue;
+        }
+        if gun.stance {
+            pilot.trigger_impact_shake(220.0);
+            pilot.trigger_rumble_shake(0.14, Vec2::new(0.06, 0.12), Vec2::new(0.02, 0.02));
         }
         if let Some(anims) = body.anims.as_mut() {
             anims.kick(hand, gun.sniper);
@@ -2835,6 +2875,8 @@ pub fn step_overed_weapon(
                 info!("OW {} CHARGE COMPLETE — release trigger to unleash!", ow.spec.part_id);
             }
             OwEvent::Fired => {
+                pilot.trigger_impact_shake(250.0);
+                pilot.trigger_rumble_shake(0.35, Vec2::new(0.20, 0.30), Vec2::new(0.025, 0.025));
                 let aim = pilot.aim_direction();
                 let ow_muzzle = points
                     .iter()
@@ -3598,6 +3640,18 @@ pub fn tick_player_health(
     let Ok((mut health, mut pilot, mut tf, mut status)) = acs.single_mut() else {
         return;
     };
+    if let Some((recoil, staggered)) = health.hit_shake.take() {
+        // Scale incoming recoil into the `ShakeImpactAccelMin..Max` (150..250) band and add
+        // a timed rumble impulse (`0x82bf8f00`), stronger on stagger hits.
+        let accel = 150.0 + (recoil / 12.0).min(100.0);
+        pilot.trigger_impact_shake(accel);
+        if staggered {
+            pilot.trigger_rumble_shake(0.28, Vec2::new(0.16, 0.24), Vec2::new(0.022, 0.022));
+        } else {
+            let s = (recoil / 1500.0).clamp(0.25, 1.0);
+            pilot.trigger_rumble_shake(0.12, Vec2::new(0.05 * s, 0.08 * s), Vec2::new(0.02, 0.02));
+        }
+    }
     if health.just_destroyed {
         health.just_destroyed = false;
         pilot.velocity = Vec3::ZERO;
@@ -3930,6 +3984,8 @@ pub(crate) fn silent() -> Gun {
         hit_se: HitSe::default(),
         stance: false,
         sniper: false,
+        snipe_fov: 0.0,
+        snipe_turn_scale: 1.0,
         reload_stab_factor: 1.0,
         fire_mode: FireMode::Auto,
         charge_time: 0.0,
@@ -4038,6 +4094,17 @@ fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
         hit_se,
         stance: category == 10 && part_field(id, 10, "ready_position") != 0.0,
         sniper: category == 10 && part_field(id, 10, "weapon_kind") == 5.0,
+        snipe_fov: if category == 10 {
+            part_field(id, 10, "snipe_fov")
+        } else {
+            0.0
+        },
+        snipe_turn_scale: if category == 10 {
+            let s = part_field(id, 10, "snipe_turn_scale");
+            if s > 0.0 { s } else { 1.0 }
+        } else {
+            1.0
+        },
         reload_stab_factor,
         fire_mode,
         charge_time,
@@ -4145,6 +4212,8 @@ fn enemy_gun_from_record(data: &[u8]) -> Gun {
         hit_se,
         stance: false,
         sniper: false,
+        snipe_fov: 0.0,
+        snipe_turn_scale: 1.0,
         reload_stab_factor: 1.0,
         fire_mode: FireMode::Auto,
         charge_time: 0.0,

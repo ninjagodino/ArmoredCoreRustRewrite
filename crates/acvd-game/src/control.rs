@@ -29,6 +29,9 @@ use crate::pose::{Driven, Fade, Motion};
 
 /// Movement ticks per second; `AcCtrlParam`'s `_tick` values are per tick.
 const TICK_RATE: f32 = 60.0;
+/// Speed blur ease rate (360 `CamFx_update` `0x82bfb748` -> `0x82bfa9f0` runs once per 1/30 s game
+/// frame; Xenia probe `private/xenia/blur_rate.txt`).
+const BLUR_RATE: f32 = 30.0;
 /// Metres per tick to km/h.
 const TICK_TO_KMH: f32 = TICK_RATE * 3.6;
 /// Pitch block at AC+0x234 +0x5c (01.02 dump): each tick `vel = vel x (1 - 0.4) + look x 0.007`,
@@ -237,6 +240,19 @@ pub(crate) fn lean_heading(yaw: f32, velocity: Vec3, stick: Vec2) -> f32 {
     (-local.x).atan2(local.y).to_degrees().rem_euclid(360.0)
 }
 
+/// Ready-position camera stance state (360 `ac_action == 0xc`, `snipe_ctrl +0x11c`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ReadyCamera {
+    #[default]
+    Off,
+    /// Deploying ready stance (`snipe_ctrl +0x11c <= 1`): `accameraaction` row `40` (`0x28`, `狙撃構え`).
+    Deploying,
+    /// Deployed & zoomed (`snipe_ctrl +0x11c >= 2`, `0x8285d548`): `accameraaction` row `49` (`0x31`,
+    /// `狙撃構え完了後`) with `FovMaxAngle` overridden to `fov_deg` (`0x8285e418` -> `cat-10 +0x168`)
+    /// and aim turn speed scaled by `turn_scale` (`0x8287b658` -> `cat-10 +0x16c`).
+    Zoomed { fov_deg: f32, turn_scale: f32 },
+}
+
 /// Movement state of the AC root. Velocity is in metres per tick, Bevy axes; `yaw` turns
 /// about +Y (positive turns left), 0 facing `FORWARD`.
 #[derive(Component)]
@@ -303,8 +319,11 @@ pub struct Pilot {
     /// Ticks of take-off acceleration left.
     takeoff: f32,
     jump_queued: bool,
-    /// Touched down during the last steps.
+    /// Touched down during the last steps, and downward impact speed at touchdown (km/h).
     landed: bool,
+    landing_impact_kmh: f32,
+    /// Ready-position camera stance (`accameraaction` row 40 -> 49 + zoom FOV override `0x8285e418`).
+    pub ready_cam: ReadyCamera,
     /// The state playing, and whether its clip is in the set.
     state: Option<(&'static str, Option<u8>)>,
     /// A sniper stance clip owns the body until it is released.
@@ -346,14 +365,29 @@ struct FollowCam {
     /// Behavior FovAngle (degrees) and the camera action's offset from it.
     base_fov: f32,
     fov: Envelope,
-    /// The `accameraaction` row in use and its id.
+    /// The `accameraaction` row in use and its id, plus any weapon-driven FOV override (`0x8285e418`).
     action: Option<(u32, &'static AcCameraActionSt)>,
+    fov_override: Option<f32>,
     /// Behavior ShakeMoveAmpl / ShakeMoveFreq x, y (the "freq" is a period in seconds), the
     /// shake's running phase, and the AC's change in horizontal speed over the last tick (km/h).
     shake_ampl: Vec2,
     shake_period: Vec2,
     shake_phase: f32,
     accel: f32,
+    /// Impact shake (`0x8285cf88` msg 0x68 -> `CamFx_shake` `0x82bfabdc..0x82bfad08`): pending
+    /// accel value (km/h) and remaining decay timer (s).
+    impact_pending: f32,
+    impact_timer: f32,
+    /// Footstep shake (`0x8285cfb0` msg 0x69 -> `CamFx_shake` `0x82bfad08..0x82bfadd4`): pending
+    /// step pulse and remaining decay timer (s).
+    footstep_pending: bool,
+    footstep_timer: f32,
+    /// Timed impulse / rumble shake (`CamFx_shake` `0x82bfaea0` -> `0x82bf8f00`): linearly decays
+    /// over `rumble_duration` seconds.
+    rumble_duration: f32,
+    rumble_elapsed: f32,
+    rumble_ampl: Vec2,
+    rumble_freq: Vec2,
     /// Behavior follow rates x / y / front / back, on the ground and in the air.
     eye_rates: [[f32; 4]; 2],
     look_at_rates: [[f32; 4]; 2],
@@ -379,9 +413,11 @@ struct FollowCam {
     tilt_max: f32,
     tilt_secs: (f32, f32),
     tilt: Blend,
-    /// Behavior row 0, for the speed blur's Blur* fields, and the blur's eased 0..1 intensity.
+    /// Behavior row 0, for the speed blur's Blur* fields, and the blur's eased 0..1 intensity
+    /// stepped at 30 Hz (`BLUR_RATE`, 360 `0x82bfb748` -> `0x82bfa9f0`).
     behavior: &'static AccamBehaviorParamSt,
     blur: f32,
+    blur_accum: f32,
     /// Shown eye and look-at, and last frame's targets; `None` until the first frame snaps.
     shown: Option<Shown>,
 }
@@ -501,9 +537,15 @@ fn shake_wave(phase: f32, ampl: Vec2, period: Vec2) -> Vec2 {
 }
 
 /// The `accameraaction` row id for a movement state (360 0x8285db68, AC action names): stop 0,
-/// walk 2, turn 3, flight 8, landing 9, glide 26 (急加速), high boost 50 (クイックブースト); boost
-/// mode turns the rest into 38 / 39 (in the air).
-fn camera_action(state: &str, boost: bool, airborne: bool) -> u32 {
+/// walk 2, turn 3, flight 8, landing 9, glide 26 (急加速), ready-position 40 (狙撃構え) -> 49
+/// (狙撃構え完了後, `0x8285d548`), high boost 50 (クイックブースト); boost mode turns the rest
+/// into 38 / 39 (in the air).
+fn camera_action(state: &str, boost: bool, airborne: bool, ready: ReadyCamera) -> u32 {
+    match ready {
+        ReadyCamera::Deploying => return 0x28,
+        ReadyCamera::Zoomed { .. } => return 0x31,
+        ReadyCamera::Off => {}
+    }
     let base = match state {
         "idle" => 0,
         "walk" | "dash" => 2,
@@ -650,10 +692,19 @@ impl FollowCam {
             base_fov: behavior.fov_angle,
             fov: Envelope::default(),
             action: None,
+            fov_override: None,
             shake_ampl: Vec2::new(behavior.shake_move_ampl_x, behavior.shake_move_ampl_y),
             shake_period: Vec2::new(behavior.shake_move_freq_x, behavior.shake_move_freq_y),
             shake_phase: 0.0,
             accel: 0.0,
+            impact_pending: 0.0,
+            impact_timer: 0.0,
+            footstep_pending: false,
+            footstep_timer: 0.0,
+            rumble_duration: 0.0,
+            rumble_elapsed: 0.0,
+            rumble_ampl: Vec2::ZERO,
+            rumble_freq: Vec2::ZERO,
             eye_rates: [
                 [
                     behavior.eye_follow_rate_x,
@@ -702,11 +753,22 @@ impl FollowCam {
             tilt: Blend::default(),
             behavior,
             blur: 0.0,
+            blur_accum: 0.0,
             shown: None,
         }
     }
 
-    /// One tick of the speed blur (360 0x82bfa9f0 / 0x82bf9c98): the horizontal and vertical
+    /// Advances speed blur at the 360's 30 Hz `CamFx_update` rate (`1 / 30` s per `0x82bfa9f0`
+    /// ease step; Xenia probe `private/xenia/blur_rate.txt`).
+    fn blur_step(&mut self, velocity: Vec3, dt: f32) {
+        self.blur_accum = (self.blur_accum + dt).min(5.0 / BLUR_RATE);
+        while self.blur_accum >= 1.0 / BLUR_RATE {
+            self.blur_accum -= 1.0 / BLUR_RATE;
+            self.blur_tick(velocity);
+        }
+    }
+
+    /// One 30 Hz tick of the speed blur (360 0x82bfa9f0 / 0x82bf9c98): the horizontal and vertical
     /// speeds (km/h) each give (speed - BlurStartSpeed) / (BlurMaxSpeed - BlurStartSpeed) above
     /// the start; their sum, clamped to 0..1 and scaled by the camera action's BlurRate, is
     /// approached by BlurIntpRate of the gap, and the intensity stays within 0..1.
@@ -824,17 +886,18 @@ impl FollowCam {
     }
 
     /// Switches to the `accameraaction` row of `action` when there is one (360 0x82860100): the
-    /// old row's FOV fades over FovFadeFrame, the new one rises to FovMaxAngle over FovMaxFrame
-    /// and holds for FovKeepFrame (-1 = for good).
-    fn act(&mut self, action: u32) {
-        if self.action.is_some_and(|(id, _)| id == action) {
+    /// old row's FOV fades over FovFadeFrame, the new one rises to FovMaxAngle (or `fov_override`
+    /// from controller slot `0x14` `0x8285e418` when ready-position zoomed) over FovMaxFrame and
+    /// holds for FovKeepFrame (-1 = for good).
+    fn act(&mut self, action: u32, fov_override: Option<f32>) {
+        if self.action.is_some_and(|(id, _)| id == action) && self.fov_override == fov_override {
             return;
         }
         let Some(row) = find(PARAM_ACCAMERAACTION_BIN, action).map(|r| &r.data) else {
             return;
         };
         debug!(
-            "camera action {action}: eye follow {:?}, eye distance {}, fade-in {}",
+            "camera action {action}: eye follow {:?}, eye distance {}, fade-in {}, fov_override {:?}",
             [
                 row.eye_follow_rate_x,
                 row.eye_follow_rate_y,
@@ -842,14 +905,18 @@ impl FollowCam {
                 row.eye_follow_rate_b
             ],
             row.eye_distance,
-            row.eye_fade_in_frame
+            row.eye_fade_in_frame,
+            fov_override
         );
         let secs = |frames: i16| f32::from(frames) / TICK_RATE;
         if let Some((_, old)) = self.action.filter(|(_, old)| old.fov_enable != 0) {
             self.fov.fade(secs(old.fov_fade_frame));
         }
         if row.fov_enable != 0 {
-            let to = f32::from(row.fov_max_angle) - self.base_fov;
+            let max_angle = fov_override
+                .filter(|&f| f > 0.0)
+                .unwrap_or_else(|| f32::from(row.fov_max_angle));
+            let to = max_angle - self.base_fov;
             self.fov.start(
                 to,
                 secs(row.fov_max_frame),
@@ -858,6 +925,7 @@ impl FollowCam {
             );
         }
         self.action = Some((action, row));
+        self.fov_override = fov_override;
     }
 
     /// Eases the eye distance and lift toward the camera action's (360 eye blender 0x8285f1a8:
@@ -897,9 +965,12 @@ impl FollowCam {
         (self.base_fov + self.fov.step(dt)).to_radians()
     }
 
-    /// Move shake (360 0x82bfab38): weight ShakeNoMoveRate, plus ShakeAccelRate x where the
-    /// speed change sits between ShakeAccelMin and Max when Min < Max, clamped to 0..1 (360 0x82860100).
+    /// Camera shake (`CamFx_shake` 360 `0x82bfab38`): sums movement shake, impact shake
+    /// (`0x8285cf88` msg 0x68, `0x82bfabdc..0x82bfad08`), footstep shake (`0x8285cfb0` msg 0x69,
+    /// `0x82bfad08..0x82bfadd4`), and timed impulse/rumble shake (`0x82bfaea0` -> `0x82bf8f00`).
     fn shake(&mut self, dt: f32) -> Vec2 {
+        let mut out = Vec2::ZERO;
+        // 1. Movement shake (`0x82bfab70..0x82bfabdc`).
         let weight = self.action.map_or(0.0, |(_, a)| {
             if a.shake_accel_min < a.shake_accel_max {
                 let t = (self.accel - a.shake_accel_min) / (a.shake_accel_max - a.shake_accel_min);
@@ -908,12 +979,65 @@ impl FollowCam {
                 a.shake_no_move_rate
             }
         });
-        if weight <= 0.0 {
+        if weight > 0.0 {
+            self.shake_phase += dt;
+            out += shake_wave(self.shake_phase, self.shake_ampl, self.shake_period) * weight;
+        } else {
             self.shake_phase = 0.0;
-            return Vec2::ZERO;
         }
-        self.shake_phase += dt;
-        shake_wave(self.shake_phase, self.shake_ampl, self.shake_period) * weight
+
+        let b = self.behavior;
+
+        // 2. Impact shake (`0x82bfabdc..0x82bfad08`): timer = ShakeImpactTime * clamp((v - Min) / (Max - Min), 0, 1).
+        let impact = std::mem::take(&mut self.impact_pending);
+        if impact > 0.0
+            && b.shake_impact_time > 0.0
+            && b.shake_impact_accel_min < b.shake_impact_accel_max
+        {
+            let t = ((impact - b.shake_impact_accel_min)
+                / (b.shake_impact_accel_max - b.shake_impact_accel_min))
+                .clamp(0.0, 1.0);
+            self.impact_timer = self.impact_timer.max(b.shake_impact_time * t);
+        }
+        if self.impact_timer > 0.0 && b.shake_impact_time > 0.0 {
+            self.impact_timer = (self.impact_timer - dt).max(0.0);
+            let ratio = (self.impact_timer / b.shake_impact_time).clamp(0.0, 1.0);
+            let elapsed = b.shake_impact_time - self.impact_timer;
+            out += shake_wave(
+                elapsed,
+                Vec2::new(b.shake_impact_ampl_x, b.shake_impact_ampl_y),
+                Vec2::new(b.shake_impact_freq_x, b.shake_impact_freq_y),
+            ) * ratio;
+        }
+
+        // 3. Footstep shake (`0x82bfad08..0x82bfadd4`): runs down over ShakeFootStepTime.
+        if std::mem::take(&mut self.footstep_pending) && b.shake_foot_step_time > 0.0 {
+            self.footstep_timer = b.shake_foot_step_time;
+        }
+        if self.footstep_timer > 0.0 && b.shake_foot_step_time > 0.0 {
+            self.footstep_timer = (self.footstep_timer - dt).max(0.0);
+            let ratio = (self.footstep_timer / b.shake_foot_step_time).clamp(0.0, 1.0);
+            let elapsed = b.shake_foot_step_time - self.footstep_timer;
+            out += shake_wave(
+                elapsed,
+                Vec2::new(b.shake_foot_step_ampl_x, b.shake_foot_step_ampl_y),
+                Vec2::new(b.shake_foot_step_freq_x, b.shake_foot_step_freq_y),
+            ) * ratio;
+        }
+
+        // 4. Timed impulse / rumble shake (`0x82bfaea0` -> `0x82bf8f00`).
+        if self.rumble_duration > 0.0 {
+            self.rumble_elapsed += dt;
+            if self.rumble_elapsed > self.rumble_duration {
+                self.rumble_duration = 0.0;
+                self.rumble_elapsed = 0.0;
+            } else {
+                let ratio = (1.0 - self.rumble_elapsed / self.rumble_duration).clamp(0.0, 1.0);
+                out += shake_wave(self.rumble_elapsed, self.rumble_ampl, self.rumble_freq) * ratio;
+            }
+        }
+
+        out
     }
 
     /// The shown eye and look-at for this frame's targets.
@@ -1050,6 +1174,42 @@ impl Pilot {
             self.kicks_landed += 1;
             self.velocity.x = -kick.dir.x * (self.ctrl.walk_max_tick * 0.5);
             self.velocity.z = -kick.dir.z * (self.ctrl.walk_max_tick * 0.5);
+            self.trigger_impact_shake(250.0);
+            self.trigger_rumble_shake(0.22, Vec2::new(0.14, 0.22), Vec2::new(0.02, 0.02));
+        }
+    }
+
+    /// Queues an impact camera shake (360 message `0x68` handler `0x8285cf88` -> `CamFx_shake`
+    /// `0x82bfabdc`). `accel_kmh` is compared against `ShakeImpactAccelMin..Max` (`150..250`).
+    pub fn trigger_impact_shake(&mut self, accel_kmh: f32) {
+        if accel_kmh > self.cam.impact_pending {
+            self.cam.impact_pending = accel_kmh;
+        }
+    }
+
+    /// Queues a footstep camera shake (360 message `0x69` handler `0x8285cfb0` -> `CamFx_shake`
+    /// `0x82bfad08`, row 0: `0.15 m` vertical over `0.1 s`).
+    pub fn trigger_footstep_shake(&mut self) {
+        self.cam.footstep_pending = true;
+    }
+
+    /// Triggers a timed impulse/rumble shake (`CamFx_shake` `0x82bfaea0` -> `0x82bf8f00`) for
+    /// heavy weapon recoil, Overed Weapon fire, kick impact, or stagger hits.
+    pub fn trigger_rumble_shake(&mut self, duration: f32, ampl: Vec2, freq: Vec2) {
+        if duration <= 0.0 {
+            return;
+        }
+        let cur_strength = if self.cam.rumble_duration > 0.0 {
+            let rem = (1.0 - self.cam.rumble_elapsed / self.cam.rumble_duration).clamp(0.0, 1.0);
+            self.cam.rumble_ampl.length() * rem
+        } else {
+            0.0
+        };
+        if ampl.length() >= cur_strength {
+            self.cam.rumble_duration = duration;
+            self.cam.rumble_elapsed = 0.0;
+            self.cam.rumble_ampl = ampl;
+            self.cam.rumble_freq = freq;
         }
     }
 
@@ -1145,6 +1305,8 @@ impl Pilot {
             takeoff: 0.0,
             jump_queued: false,
             landed: false,
+            landing_impact_kmh: 0.0,
+            ready_cam: ReadyCamera::Off,
             state: None,
             suppress_locomotion: false,
             clip_ok: false,
@@ -2154,6 +2316,8 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     let ground = collision.ground_below(Vec3::new(position.x, position.y + lift, position.z));
     if p.airborne {
         if let Some(g) = ground.filter(|&g| position.y <= g && p.velocity.y <= 0.0) {
+            let impact_kmh = p.velocity.y.abs() * TICK_TO_KMH;
+            p.landing_impact_kmh = p.landing_impact_kmh.max(impact_kmh);
             (position.y, p.velocity.y, p.airborne, p.landed, p.wj) = (g, 0.0, false, true, None);
         }
     } else {
@@ -2461,11 +2625,35 @@ pub fn pilot(
         p.cam.tilt = Blend::default();
         (
             p.cam.action,
+            p.cam.fov_override,
             p.cam.fov,
             p.cam.shake_phase,
             p.cam.accel,
+            p.cam.impact_pending,
+            p.cam.impact_timer,
+            p.cam.footstep_pending,
+            p.cam.footstep_timer,
+            p.cam.rumble_duration,
+            p.cam.rumble_elapsed,
             p.cam.blur,
-        ) = (None, Envelope::default(), 0.0, 0.0, 0.0);
+            p.cam.blur_accum,
+            p.ready_cam,
+        ) = (
+            None,
+            None,
+            Envelope::default(),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            ReadyCamera::Off,
+        );
         if let Ok((mut o, _, _, mut blur)) = cams.single_mut() {
             *blur = ZoomBlur::default();
             if o.follow {
@@ -2476,14 +2664,22 @@ pub fn pilot(
         return;
     }
     let mut input = read_input(&keys, &held.0, &pads);
+    // Ready-position aim turn speed scaling (`0x8287b658` -> `cat-10 +0x16c`, `0.18..0.5`).
+    let zoom_turn_scale = match p.ready_cam {
+        ReadyCamera::Zoomed { turn_scale, .. } => turn_scale.clamp(0.1, 1.0),
+        _ => 1.0,
+    };
+    input.turn *= zoom_turn_scale;
+    input.look *= zoom_turn_scale;
     if !*mouselook {
         p.cam.yaw_off = 0.0;
     }
     if *mouselook {
         // AC6-style: the mouse moves the camera freely; the AC turns toward it at its turn rate.
-        p.cam.yaw_off = (p.cam.yaw_off - mouse.delta.x * MOUSE_YAW)
+        p.cam.yaw_off = (p.cam.yaw_off - mouse.delta.x * MOUSE_YAW * zoom_turn_scale)
             .clamp(-std::f32::consts::PI, std::f32::consts::PI);
-        p.cam.pitch = (p.cam.pitch - mouse.delta.y * MOUSE_PITCH).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        p.cam.pitch = (p.cam.pitch - mouse.delta.y * MOUSE_PITCH * zoom_turn_scale)
+            .clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
     if input.boost_toggle {
         p.boost = !p.boost;
@@ -2517,8 +2713,6 @@ pub fn pilot(
             step(&mut p, &input, &mut transform.translation, &collision);
         }
         p.cam.accel = (p.velocity - before).with_y(0.0).length() * TICK_TO_KMH;
-        let velocity = p.velocity;
-        p.cam.blur_tick(velocity);
     }
     p.area_zone = area_bounds
         .as_deref()
@@ -2545,8 +2739,30 @@ pub fn pilot(
         ..input
     };
     let had_quick_pending = p.quick_pending.is_some();
+    let landed_impact = if p.landed {
+        Some(std::mem::take(&mut p.landing_impact_kmh))
+    } else {
+        None
+    };
     let next = state(&p, &body, &motion);
     (p.landed, p.quick_pending) = (false, None);
+    // Landing camera shake (360 msg 0x68 `0x8285cf88` + msg 0x69 `0x8285cfb0`).
+    if let Some(impact_kmh) = landed_impact {
+        p.trigger_footstep_shake();
+        if impact_kmh > 0.0 {
+            p.trigger_impact_shake(impact_kmh);
+        }
+    }
+    // Footstep camera shake on TAE kind 103 events while walking/turning/landing
+    // (360 msg 0x69 `0x8285cfb0`, gated by controller slot 0x38 `0x8285e498`).
+    if matches!(next.0, "walk" | "turn_left" | "turn_right" | "land")
+        && motion
+            .tae_events
+            .iter()
+            .any(|ev| matches!(ev, crate::pose::TaeFired::Footstep { .. }))
+    {
+        p.trigger_footstep_shake();
+    }
     let ow_bank_changed = motion.ow_bank_active != motion.playing_ow_clip
         && (!motion.ow_bank_active
             || ow_locomotion_row(next.0, next.1)
@@ -2655,8 +2871,14 @@ pub fn pilot(
         o.follow = true;
         o.yaw += p.yaw - yaw;
         let airborne = p.airborne;
-        let action = camera_action(next.0, p.boost, airborne);
-        p.cam.act(action);
+        let action = camera_action(next.0, p.boost, airborne, p.ready_cam);
+        let fov_override = match p.ready_cam {
+            ReadyCamera::Zoomed { fov_deg, .. } => Some(fov_deg),
+            _ => None,
+        };
+        p.cam.act(action, fov_override);
+        let velocity = p.velocity;
+        p.cam.blur_step(velocity, time.delta_secs());
         // Mouselook turning is auto-generated and jittery near zero: ignore small values so the
         // side shift only flips for a real turn (the blend itself smooths the move).
         let cam_turn = if *mouselook && input.turn.abs() < 0.25 {
@@ -2972,8 +3194,8 @@ mod tests {
         };
         step(&mut p, &away, &mut pos, &world);
         assert!(matches!(p.wj, Some(WallJumpPhase::Prep { .. })));
-        assert_eq!(camera_action("wall_jump_prep", true, true), 43);
-        assert_eq!(camera_action("wall_jump", true, true), 43);
+        assert_eq!(camera_action("wall_jump_prep", true, true, ReadyCamera::Off), 43);
+        assert_eq!(camera_action("wall_jump", true, true, ReadyCamera::Off), 43);
 
         let mut peak_h = 0.0f32;
         let mut peak_v = 0.0f32;
@@ -3436,5 +3658,159 @@ mod tests {
         assert_eq!(ow_locomotion_row("jump", None), Some(258));
         assert_eq!(ow_locomotion_row("quick_boost", Some(0)), Some(254));
         assert_eq!(ow_locomotion_row("kick", None), Some(274));
+    }
+
+    #[test]
+    fn camera_shake_impact_footstep_and_rumble_decay() {
+        let mut cam = FollowCam::of(10);
+        // Idle action has zero movement shake.
+        cam.act(0, None);
+
+        // 1. Impact below ShakeImpactAccelMin (150) produces no shake.
+        cam.impact_pending = 120.0;
+        assert_eq!(cam.shake(1.0 / 60.0), Vec2::ZERO);
+        assert_eq!(cam.impact_timer, 0.0);
+
+        // Impact at ShakeImpactAccelMax (250) starts full ShakeImpactTime (0.1 s), shakes, then decays to 0.
+        cam.impact_pending = 250.0;
+        let mut peak_impact = 0.0f32;
+        for _ in 0..5 {
+            peak_impact = peak_impact.max(cam.shake(0.015).length());
+        }
+        assert!(peak_impact > 0.0, "impact shake must produce non-zero offset");
+        for _ in 0..10 {
+            cam.shake(0.02);
+        }
+        assert_eq!(cam.impact_timer, 0.0);
+        assert_eq!(cam.shake(1.0 / 60.0), Vec2::ZERO);
+
+        // 2. Footstep shake (row 0: ampl (0, 0.15), freq (0, 0.07), time 0.1 s) is purely vertical and decays.
+        cam.footstep_pending = true;
+        let step1 = cam.shake(0.017);
+        assert_eq!(step1.x, 0.0, "row 0 footstep shake is vertical-only");
+        assert!(step1.y.abs() > 0.0, "footstep shake must displace Y");
+        for _ in 0..10 {
+            cam.shake(0.02);
+        }
+        assert_eq!(cam.footstep_timer, 0.0);
+        assert_eq!(cam.shake(1.0 / 60.0), Vec2::ZERO);
+
+        // 3. Timed impulse / rumble shake (`0x82bf8f00`) decays over duration and clears.
+        cam.rumble_duration = 0.2;
+        cam.rumble_elapsed = 0.0;
+        cam.rumble_ampl = Vec2::new(0.1, 0.2);
+        cam.rumble_freq = Vec2::new(0.04, 0.04);
+        let early = cam.shake(0.01);
+        assert!(early.length() > 0.0, "rumble shake must be non-zero early");
+        for _ in 0..15 {
+            cam.shake(0.02);
+        }
+        assert_eq!(cam.rumble_duration, 0.0);
+        assert_eq!(cam.shake(1.0 / 60.0), Vec2::ZERO);
+    }
+
+    #[test]
+    fn ready_position_zoom_camera_transitions_and_stows() {
+        // Action mapping (`0x8285db68` + `0x8285d548`): Deploying -> 40, Zoomed -> 49, not overridden by boost.
+        assert_eq!(camera_action("idle", true, false, ReadyCamera::Deploying), 40);
+        assert_eq!(
+            camera_action(
+                "dash",
+                true,
+                true,
+                ReadyCamera::Zoomed {
+                    fov_deg: 10.0,
+                    turn_scale: 0.25
+                }
+            ),
+            49
+        );
+
+        let mut cam = FollowCam::of(10);
+        cam.act(0, None);
+        cam.blend_eye(0.0, 1.0 / 60.0);
+        cam.shown = Some(Shown {
+            eye: Vec3::ZERO,
+            look_at: Vec3::Z,
+            eye_target: Vec3::ZERO,
+            look_at_target: Vec3::Z,
+        });
+        assert!((cam.fov(1.0 / 60.0).to_degrees() - 45.0).abs() < 1e-3);
+        assert!((cam.eye_dist.value - 16.0).abs() < 1e-3);
+
+        // Enter zoomed ready stance with sniper cannon FOV 10 deg (`0x8285e418` -> row 49).
+        cam.act(49, Some(10.0));
+        for _ in 0..35 {
+            cam.blend_eye(0.0, 1.0 / 60.0);
+            let _ = cam.fov(1.0 / 60.0);
+        }
+        assert!(
+            (cam.fov(0.0).to_degrees() - 10.0).abs() < 0.2,
+            "zoomed sniper cannon FOV should reach 10 deg, got {}",
+            cam.fov(0.0).to_degrees()
+        );
+        assert!(
+            (cam.eye_dist.value - 6.0).abs() < 0.1,
+            "row 49 eye_dist should pull in to 6.0 m, got {}",
+            cam.eye_dist.value
+        );
+
+        // Release back to idle (row 0): FOV returns to 45 deg and eye_dist returns toward 16 m.
+        cam.act(0, None);
+        for _ in 0..130 {
+            cam.blend_eye(0.0, 1.0 / 60.0);
+            let _ = cam.fov(1.0 / 60.0);
+        }
+        assert!(
+            (cam.fov(0.0).to_degrees() - 45.0).abs() < 0.2,
+            "stowed FOV should return to 45 deg, got {}",
+            cam.fov(0.0).to_degrees()
+        );
+        assert!(
+            (cam.eye_dist.value - 16.0).abs() < 0.2,
+            "stowed eye_dist should return to 16.0 m, got {}",
+            cam.eye_dist.value
+        );
+    }
+
+    #[test]
+    fn speed_blur_steps_at_30hz_not_60hz() {
+        let mut cam = FollowCam::of(10);
+        // Boost on the ground (row 38) has BlurRate = 4.0.
+        cam.act(38, None);
+        // Velocity 190 km/h (halfway between 80 and 300 km/h -> ramp 0.5, target = 0.5 * 4 = 2.0).
+        let vel = Vec3::new(0.0, 0.0, 190.0 / TICK_TO_KMH);
+
+        // One 60 Hz frame (1/60 s) has not reached a 30 Hz step yet.
+        cam.blur_step(vel, 1.0 / 60.0);
+        assert_eq!(cam.blur, 0.0, "blur must not step after a single 1/60 s frame");
+
+        // Second 60 Hz frame completes 1/30 s -> exactly one 0x82bfa9f0 ease step.
+        cam.blur_step(vel, 1.0 / 60.0);
+        let expected_one_step = (2.0 * cam.behavior.blur_intp_rate).clamp(0.0, 1.0);
+        assert!(
+            (cam.blur - expected_one_step).abs() < 1e-5,
+            "one 30 Hz step expected {expected_one_step}, got {}",
+            cam.blur
+        );
+
+        // Over 0.5 s at 60 fps (30 frames = 15 steps at 30 Hz), must match 15 blur_tick calls.
+        let mut cam_step = FollowCam::of(10);
+        cam_step.act(38, None);
+        let mut cam_ref = FollowCam::of(10);
+        cam_ref.act(38, None);
+        let slow_vel = Vec3::new(0.0, 0.0, 100.0 / TICK_TO_KMH); // lower target so it doesn't saturate
+        for _ in 0..30 {
+            cam_step.blur_step(slow_vel, 1.0 / 60.0);
+        }
+        for _ in 0..15 {
+            cam_ref.blur_tick(slow_vel);
+        }
+        assert!(
+            (cam_step.blur - cam_ref.blur).abs() < 1e-5,
+            "30 Hz blur_step ({}) must match 15 discrete ticks ({})",
+            cam_step.blur,
+            cam_ref.blur
+        );
     }
 }
