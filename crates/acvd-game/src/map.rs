@@ -342,6 +342,14 @@ pub fn start(disc: &Disc, map: &str, layout: Option<&str>) -> Result<Option<Star
 #[derive(Component)]
 pub struct MapPart;
 
+/// Per-submesh FLVER material metadata passed from [`spawn`] to `env::relight`
+/// (`Map_Diffuse_Multi` secondary diffuse and `Water.spx` detection).
+#[derive(Component, Clone, Debug)]
+pub struct MapMeshMeta {
+    pub mtd: String,
+    pub diffuse2: Option<Handle<Image>>,
+}
+
 /// One placed part's two meshes. The full mesh is `{model}.flv`; `low` is `{model}_l1.flv`
 /// when the binder has one (`sheets/map_lod.csv`).
 #[derive(Component)]
@@ -382,10 +390,10 @@ fn sphere(xf: &Transform, min: Vec3, max: Vec3) -> (Vec3, f32) {
     (world, radius)
 }
 
-fn mesh_bounds(list: &[(Handle<Mesh>, Handle<StandardMaterial>, Vec3, Vec3)]) -> (Vec3, Vec3) {
+fn mesh_bounds(list: &[Loaded]) -> (Vec3, Vec3) {
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
-    for (_, _, a, b) in list {
+    for (_, _, _, a, b) in list {
         min = min.min(*a);
         max = max.max(*b);
     }
@@ -479,7 +487,7 @@ pub fn spawn(
     Ok(drawn)
 }
 
-type Loaded = (Handle<Mesh>, Handle<StandardMaterial>, Vec3, Vec3);
+type Loaded = (Handle<Mesh>, Handle<StandardMaterial>, MapMeshMeta, Vec3, Vec3);
 
 fn load_model(
     models: &mut HashMap<String, Option<Vec<Loaded>>>,
@@ -498,9 +506,17 @@ fn load_model(
             list.into_iter()
                 .map(|m| {
                     let material = textures.material(disc, &m, materials, images);
+                    let meta = MapMeshMeta {
+                        mtd: m.mtd.clone(),
+                        diffuse2: m
+                            .diffuse2
+                            .as_deref()
+                            .and_then(|n| textures.image_handle(disc, n, false, images)),
+                    };
                     (
                         meshes.add(m.mesh),
                         material,
+                        meta,
                         Vec3::from_array(m.min),
                         Vec3::from_array(m.max),
                     )
@@ -551,8 +567,12 @@ fn spawn_lod(
     commands
         .spawn((Transform::default(), visibility))
         .with_children(|c| {
-            for (mesh, material, _, _) in list {
-                c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())));
+            for (mesh, material, meta, _, _) in list {
+                c.spawn((
+                    Mesh3d(mesh.clone()),
+                    MeshMaterial3d(material.clone()),
+                    meta.clone(),
+                ));
             }
         })
         .id()
@@ -623,6 +643,7 @@ struct Textures {
     own: String,
     packs: Packs,
     by_name: HashMap<(Option<String>, Option<String>), Handle<StandardMaterial>>,
+    images: HashMap<(String, bool), Option<Handle<Image>>>,
     missing: usize,
 }
 
@@ -642,6 +663,31 @@ impl Textures {
         }
     }
 
+    fn image_handle(
+        &mut self,
+        disc: &Disc,
+        name: &str,
+        linear: bool,
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
+        let key = (name.to_string(), linear);
+        if let Some(cached) = self.images.get(&key) {
+            return cached.clone();
+        }
+        let handle = match self.load_tex(disc, name, linear) {
+            Ok(i) => Some(images.add(i)),
+            Err(e) => {
+                if !linear {
+                    self.missing += 1;
+                }
+                debug!("{e:#}");
+                None
+            }
+        };
+        self.images.insert(key, handle.clone());
+        handle
+    }
+
     fn material(
         &mut self,
         disc: &Disc,
@@ -653,19 +699,14 @@ impl Textures {
         if let Some(h) = self.by_name.get(&key) {
             return h.clone();
         }
-        let image = mesh.diffuse.as_deref().and_then(|name| {
-            match self.load_tex(disc, name, false) {
-                Ok(i) => Some(images.add(i)),
-                Err(e) => {
-                    self.missing += 1;
-                    debug!("{e:#}");
-                    None
-                }
-            }
-        });
-        let normal_map = mesh.bump.as_deref().and_then(|name| {
-            self.load_tex(disc, name, true).ok().map(|i| images.add(i))
-        });
+        let image = mesh
+            .diffuse
+            .as_deref()
+            .and_then(|name| self.image_handle(disc, name, false, images));
+        let normal_map = mesh
+            .bump
+            .as_deref()
+            .and_then(|name| self.image_handle(disc, name, true, images));
         let handle = materials.add(StandardMaterial {
             base_color: if image.is_some() {
                 Color::WHITE

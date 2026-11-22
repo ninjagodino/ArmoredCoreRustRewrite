@@ -850,11 +850,13 @@ impl Vertices {
                 snorm(b(1)?),
                 snorm(b(0)?),
             ]),
+            // Big-endian Xbox 360 D3DDECLTYPE_D3DCOLOR (0xAARRGGBB -> bytes [A, R, G, B]);
+            // verified on m9000.flv Map_Diffuse_Multi where byte 0 holds the blend alpha (0..255).
             MemberKind::Color => channel(&mut self.colors, idx).push([
-                b(0)? as f32 / 255.0,
                 b(1)? as f32 / 255.0,
                 b(2)? as f32 / 255.0,
                 b(3)? as f32 / 255.0,
+                b(0)? as f32 / 255.0,
             ]),
             MemberKind::Uv => channel(&mut self.uvs, idx).push(uv(0)?),
             MemberKind::UvPair => {

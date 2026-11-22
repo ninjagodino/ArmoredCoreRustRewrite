@@ -3,12 +3,11 @@
 // sky pass (0x827f3d38) zeroes the projection's depth row and sets the viewport MinZ to the far
 // end, so the dome sits on the far plane behind every other draw.
 
-#import bevy_pbr::{
-    pbr_fragment::pbr_input_from_standard_material,
-    forward_io::VertexOutput,
-}
+#import bevy_pbr::forward_io::VertexOutput
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> tonemap: vec4<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(101) var sky_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(102) var sky_sampler: sampler;
 
 struct SkyOut {
     @location(0) color: vec4<f32>,
@@ -38,9 +37,10 @@ fn apply_tonemap(hdr: vec3<f32>, tm: vec4<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> SkyOut {
-    let pbr = pbr_input_from_standard_material(in, is_front);
-    let raw = srgb_encode(pbr.material.base_color.rgb) * pbr.material.base_color.a;
+fn fragment(in: VertexOutput) -> SkyOut {
+    // Sample sky_tex directly so dome vertex alpha does not zero out tex.a near the horizon.
+    let s = textureSample(sky_tex, sky_sampler, in.uv);
+    let raw = srgb_encode(s.rgb) * s.a;
     var out: SkyOut;
     out.color = vec4(apply_tonemap(raw * raw, tonemap), 1.0);
     // Reverse Z: 0 is the far plane.

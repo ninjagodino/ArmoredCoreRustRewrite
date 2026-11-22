@@ -24,10 +24,12 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 pub struct LoadedMesh {
     pub mesh: Mesh,
     pub diffuse: Option<String>,
+    pub diffuse2: Option<String>,
     pub bump: Option<String>,
+    pub bump2: Option<String>,
     pub specular: Option<String>,
     pub emission: Option<String>,
-    /// FLVER material MTD name (e.g. `ACParts`, `ACParts_Glow`, `ACParts_Rim_ex`).
+    /// FLVER material MTD name (e.g. `ACParts`, `ACParts_Glow`, `ACParts_Rim_ex`, `Map_Diffuse_Multi`, `Water`).
     pub mtd: String,
     /// Root bone above the first boned vertex of this mesh (`None` when unboned).
     pub root: Option<String>,
@@ -37,7 +39,9 @@ pub struct LoadedMesh {
 }
 
 const DIFFUSE_TYPES: &[&str] = &["g_DiffuseTexture", "g_Diffuse"];
+const DIFFUSE2_TYPES: &[&str] = &["g_DiffuseTexture2", "g_Diffuse2"];
 const BUMP_TYPES: &[&str] = &["g_BumpmapTexture", "g_Bumpmap"];
+const BUMP2_TYPES: &[&str] = &["g_BumpmapTexture2", "g_Bumpmap2"];
 const SPECULAR_TYPES: &[&str] = &["g_SpecularTexture", "g_Specular"];
 const EMISSION_TYPES: &[&str] = &["g_EmissionTexture", "g_Emission"];
 
@@ -273,6 +277,12 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
             Some(uv) => mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv.clone()),
             None => mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; v.positions.len()]),
         }
+        if let Some(uv1) = v.uvs.get(1).filter(|u| u.len() == v.positions.len()) {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, uv1.clone());
+        }
+        if let Some(col) = v.colors.first().filter(|c| c.len() == v.positions.len()) {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, col.clone());
+        }
         mesh.insert_indices(Indices::U32(tris.into_iter().flatten().collect()));
         if v.normals.len() != v.positions.len() {
             mesh.compute_smooth_normals();
@@ -305,7 +315,9 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
             })
         };
         let diffuse = mat_tex(DIFFUSE_TYPES);
+        let diffuse2 = mat_tex(DIFFUSE2_TYPES);
         let bump = mat_tex(BUMP_TYPES);
+        let bump2 = mat_tex(BUMP2_TYPES);
         let specular = mat_tex(SPECULAR_TYPES);
         let emission = mat_tex(EMISSION_TYPES);
         let mtd = mat.map(|m| m.mtd.clone()).unwrap_or_default();
@@ -327,7 +339,7 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
             .and_then(|&b| bone_roots.get(b))
             .and_then(|&r| f.bones.get(r))
             .map(|b| b.name.clone());
-        out.push(LoadedMesh { mesh, diffuse, bump, specular, emission, mtd, root, min, max });
+        out.push(LoadedMesh { mesh, diffuse, diffuse2, bump, bump2, specular, emission, mtd, root, min, max });
     }
     Ok((out, f))
 }
@@ -585,5 +597,36 @@ mod tests {
         assert_eq!(dxn_n, 162, "expected 162 DXN (code 23) normal maps");
         assert_eq!(ctx24_n, 235, "expected 235 CTX1 (code 24) normal maps");
         assert_eq!(ctx25_n, 3536, "expected 3536 CTX1 (code 25) normal maps");
+    }
+
+    #[test]
+    fn x360_map_diffuse_multi_exposes_diffuse2_uv1_and_vertex_color() {
+        let iso = vfs::repo_root().join(vfs::X360_ISO);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let meshes = model(&disc, "model/map/m4000/m4000_m.dcx.bnd|m9000.flv").unwrap();
+        let multi = meshes
+            .iter()
+            .find(|m| m.mtd.contains("Map_Diffuse_Multi"))
+            .expect("m9000.flv should have a Map_Diffuse_Multi submesh");
+        assert_eq!(multi.diffuse.as_deref(), Some("m3110_m1000_0001"));
+        assert_eq!(multi.diffuse2.as_deref(), Some("m3110_m1000_0002"));
+        assert!(
+            multi.mesh.attribute(Mesh::ATTRIBUTE_UV_1).is_some(),
+            "Map_Diffuse_Multi should carry ATTRIBUTE_UV_1"
+        );
+        let Some(VertexAttributeValues::Float32x4(colors)) =
+            multi.mesh.attribute(Mesh::ATTRIBUTE_COLOR)
+        else {
+            panic!("Map_Diffuse_Multi should carry Float32x4 ATTRIBUTE_COLOR");
+        };
+        assert!(!colors.is_empty());
+        // Big-endian D3DCOLOR [A, R, G, B] -> [R, G, B, A]: RGB should be ~1.0, alpha blends 0..1.
+        assert!(colors.iter().all(|c| c[0] > 0.99 && c[1] > 0.99 && c[2] > 0.99));
+        let min_a = colors.iter().map(|c| c[3]).fold(1.0f32, f32::min);
+        let max_a = colors.iter().map(|c| c[3]).fold(0.0f32, f32::max);
+        assert!(min_a < 0.1 && max_a > 0.9, "alpha range {min_a}..{max_a}");
     }
 }

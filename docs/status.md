@@ -59,11 +59,35 @@ in order:
     `0x829a5d00` writes it into draw_info `+0x10..+0x1c`. m4000_map.msb: `m0000..m1010` and
     `m9050..m9051` = 1, `m9000..m9018` = 2, `m9100..m9101` = 3, `o9705` = 0. Replaces the
     `env.rs::model_slot` name-range heuristic.
+  - Done (bloom, `Map_Diffuse_Multi`, & `Water.spx`):
+    - **Bloom (`type-101` sub-block 2 `+0x19..+0x3c`, `0x827fc428` -> `0x82800450` -> `0x82c18580`)**:
+      `acvd-formats::env::Bloom` parses `+0x19` iters (`3`), `+0x1a` `bloom_enable` (`1`, checked
+      at `0x82c1858c`), `+0x1c` threshold (`0.9`, `0x82c17a48`), `+0x20` offset (`0.8`,
+      `0x82c17aac` -> `1/offset`), `+0x24/+0x28` separable Gaussian blur scales (`1.0`/`1.0`,
+      `0x82c183d0`/`0x82c184c8`), and `+0x2c..+0x38` tint/scale (`[1.0; 4]`). `acvd-game::env`
+      attaches `Hdr` + additive Bevy `Bloom` (threshold `0.9`, softness `0.4`, intensity `0.22`)
+      alongside `Tonemapping::None` so `_Glow` vents, booster jets, and emissive projectiles bloom
+      without double-tonemapping `env_lit.wgsl` / `env_sky.wgsl` / `env_water.wgsl`.
+    - **`Map_Diffuse_Multi` (`Flver_ColDifMul.fpo` / `Flver_ColDifBumpMul.fpo`)**:
+      Fixed `flver::MemberKind::Color` decoding for big-endian Xbox 360 `D3DDECLTYPE_D3DCOLOR`
+      (`[A, R, G, B]` -> `[R, G, B, A]`, verified on `m9000.flv` where byte 0 is the blend alpha);
+      `acvd-render::LoadedMesh` now exposes `diffuse2`, `bump2`, `ATTRIBUTE_UV_1`, and
+      `ATTRIBUTE_COLOR`. `acvd-game::map` passes `MapMeshMeta` to `env::relight`, and
+      `env_lit.wgsl` samples `diffuse1` at `UV0` and `diffuse2` at `UV1` directly (so vertex alpha
+      never zeroes `tex1.a`, and `env_sky.wgsl` samples `sky_tex` directly too), blending
+      `mix(t1, t2, 1 - vcol.a) * vcol.rgb` before squaring — `m4000` mountains (`m9000..m9017`)
+      now blend naturally into rocky grey-brown/green slopes instead of flat orange-brown.
+    - **`Water.spx` (`Normal/Flver_Water.vpo` / `.fpo`, `material/m4000_mtd.bnd` `Water.mtd`)**:
+      `acvd-game::env` detects `Water` / `WaterRiver` / `WaterWave` MTDs (`m9100`/`m9101`, light
+      set 3) and switches them to `WaterMaterial` (`env_water.wgsl`), animating 3 world-XZ scrolled
+      `water_n` normal layers (`g_TileScale` `0.0019 / 0.00268 / 0.0462`, `g_TexScroll`,
+      `g_BumpMapSmoose = 2.0`), Fresnel reflection (`g_FresnelPow = 70`, `g_FresnelBias = 0.5`,
+      `g_FresnelScale = 0.9`) over `g_WaterColor (0.15, 0.10, 0.05)`, directional specular lobes
+      from `colors_b` (`c11`/`c12`, `g_SpecularPower = 10`), distance/height fog, and tonemap.
   - Open, in order: (1) sky leftovers: which pixel shader the sky pass binds (NoLightNoFog vs
-    Flver_Sky.fpo with fog; the colour already matches the 360 shot). Bloom from type-101
-    sub-block 2 is not applied. (2) the Water.spx shader (water draws as ColDif with set 3).
-    (3) c0 / c16 / c19 / c136 values (taken as 1, no SSAO). (4) Map_Diffuse_Multi textures
-    (mountains read orange-brown; the 360 shows them grey-green).
+    Flver_Sky.fpo with fog; the colour already matches the 360 shot). (2) c0 / c16 / c19 / c136
+    values (taken as 1, no SSAO). (3) planar water reflection render target (currently reflects
+    hemisphere sky/horizon gradient).
 - **AC vs world collision leftovers** (walls are in, see Done "AC wall collision"):
   - The upper sphere is built with radius = height = tuning `+0x230` (`0x82863b60`) but runs at
     radius 5.5 / height 6.0; what shrinks the radius is not found. A third sphere (`+0x10`,
@@ -252,11 +276,6 @@ in order:
   in identical pairs), 3 DRB menus (`_unknown/lang/<hash>.drb.dcx`) and 1 PNG. Not found
   under `/lang/<l>/menu/`, `nowload/`, `model/image/`, `image/` with the exe / Lua / named
   stems (`private/tmp/guess360d.py`).
-- **Normal maps are not decoded**: codes 23 (DXN: BC4 x then BC4 y, uploadable as BC5
-  after `tpf::xenos::untile`) and 24/25 (CTX1: needs a CPU expand to RG8 or a BC5 re-pack)
-  are identified only (`texture_formats.csv`; Python decoders in
-  `private/tmp/t2/fmtguess.py`). Nothing renders normal maps yet; when it does, rebuild z
-  from x/y. A few `*_n` maps are still BC1/BC3 (the e9110-e9113 PS3 copies, B = 0 or 255).
 - **Xenia re-checks of earlier emulator captures** (rows say "Xenia re-check pending"):
   `camera_follow.csv` `look_at_height`, `base_transform`, `pitch` (probe the AC+0x234 pitch
   update; its 360 address is still to find from the AC update `0x828bef18`), `follow_ease`,
@@ -447,13 +466,18 @@ in order:
   nozzle plus f0000300 ground dust (`private/xenia/shots/boost_fwd.png`); it was not re-shot
   after the trail change. The glide shot still does not match.
 
-- Map lighting, fog, sky dome, tone map and per-draw light-set ids (`sheets/map_env.csv`,
-  `acvd-formats::env` / `msb`, `acvd-game::env`): env light sets / fog / scene record read and
-  matched to the 360's probed shader uploads; map pieces lit with the Flver_ColDif maths then
+- Map lighting, fog, sky dome, tone map, bloom, `Map_Diffuse_Multi`, `Water.spx`, and per-draw
+  light-set ids (`sheets/map_env.csv`, `acvd-formats::env` / `flver` / `msb`, `acvd-render`,
+  `acvd-game::env` / `map`): env light sets / fog / scene record read and matched to the 360's
+  probed shader uploads; map pieces lit with `Flver_ColDif` / `Flver_ColDifMul` (`UV0`/`UV1` +
+  big-endian `D3DCOLOR` vertex alpha blend on `Map_Diffuse_Multi` mountains `m9000..m9017`) then
   `c31 = 0.5` and `m_ToneMapFilter` (m4000 Divide: `1.1 * x / (1 + x)`, `x = col * 0.5 / 0.3`);
-  `o9705` sky dome behind everything, centred under the camera at the env sky scale when
-  `MODEL_PARAM_ST +0x14 +1` bit 7 is set (`0x829911f0`); light-set id from that same
-  sub-record `+0` (part `+0x4c +0` override). Open leftovers under Map look.
+  HDR additive `Bloom` wired from type-101 sub-block 2 (`+0x19..+0x3c`, `0x82c18580`); `Water.spx`
+  (`m9100`/`m9101`, `Flver_Water.fpo`, `Water.mtd`) rendered with 3 scrolled `water_n` normal
+  layers, Fresnel reflection, and `c11`/`c12` specular in `env_water.wgsl`; `o9705` sky dome
+  behind everything, centred under the camera at the env sky scale when `MODEL_PARAM_ST +0x14 +1`
+  bit 7 is set (`0x829911f0`); light-set id from that same sub-record `+0` (part `+0x4c +0`
+  override). Open leftovers under Map look.
 - Map piece LOD (`sheets/map_lod.csv`, `acvd-game::map`). m4000's piece binder has 57 full
   FLVERs and 39 `{model}_l1.flv` (54 of 72 kind-0 parts; no `_l2`; face flags 0). The model
   LOD metric is `max(distance - radius, 0.1) / (2 * radius)` (`0x82d13e70`, radius at model

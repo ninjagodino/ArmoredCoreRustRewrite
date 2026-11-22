@@ -1,6 +1,9 @@
 //! Map look from `ch_env/{map}_env.msb` (`sheets/map_env.csv`): map pieces switch to the
-//! `env_lit.wgsl` material with their light set's constants, the AC's Bevy lights take light set
-//! 0, and the clear colour comes from the scene record.
+//! `env_lit.wgsl` material (supporting single-texture `Flver_ColDif` and two-texture
+//! `Map_Diffuse_Multi` / `Flver_ColDifMul`) with their light set's constants, water pieces
+//! (`Water.spx`) switch to `env_water.wgsl` (`Flver_Water`), the AC's Bevy lights take light set
+//! 0, the clear colour comes from the scene record, and HDR `Bloom` is configured from type-101
+//! sub-block 2 (`m_ToneMapFilter`, `0x82c18628`).
 
 use std::collections::HashMap;
 
@@ -8,16 +11,19 @@ use acvd_formats::env::{self, Env, LightSet};
 use acvd_formats::vfs::{self, Disc};
 use acvd_formats::{bnd3, flver, msb};
 use acvd_render::Packs;
-use bevy::asset::embedded_asset;
-use bevy::camera::Exposure;
+use bevy::asset::{embedded_asset, RenderAssetUsages};
+use bevy::camera::{Exposure, Hdr};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
+use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::render::render_resource::{
+    AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat,
+};
 use bevy::shader::ShaderRef;
 use bevy::transform::TransformSystems;
 
-use crate::map::{self, MapPart};
+use crate::map::{self, MapMeshMeta, MapPart};
 
 pub type EnvMaterial = ExtendedMaterial<StandardMaterial, EnvLit>;
 
@@ -25,6 +31,12 @@ pub type EnvMaterial = ExtendedMaterial<StandardMaterial, EnvLit>;
 pub struct EnvLit {
     #[uniform(100)]
     params: EnvParams,
+    #[texture(101)]
+    #[sampler(102)]
+    diffuse1: Handle<Image>,
+    #[texture(103)]
+    #[sampler(104)]
+    diffuse2: Handle<Image>,
 }
 
 /// The light set's pixel-shader constants (`sheets/map_env.csv` light.* / fog.* rows), in
@@ -48,11 +60,57 @@ struct EnvParams {
     fog_col1: Vec4,
     /// `m_ToneMapFilter` (`0x82c18628`): `(c32 = 1 / (lum * key), c33 = mul, c34 = white, mode)`.
     tonemap: Vec4,
+    /// `x = has_diffuse1`, `y = has_diffuse2` (`Map_Diffuse_Multi`).
+    flags: Vec4,
 }
 
 impl MaterialExtension for EnvLit {
     fn fragment_shader() -> ShaderRef {
         "embedded://acvd_game/env_lit.wgsl".into()
+    }
+}
+
+pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterLit>;
+
+/// `Water.spx` surface (`env_water.wgsl`, `Normal/Flver_Water.fpo`, `m4000_mtd.bnd` `Water.mtd`).
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct WaterLit {
+    #[uniform(100)]
+    params: WaterParams,
+    #[texture(101)]
+    #[sampler(102)]
+    bump: Handle<Image>,
+}
+
+#[derive(ShaderType, Debug, Clone, Copy, Default)]
+struct WaterParams {
+    dir0: Vec4,
+    dir1: Vec4,
+    /// c11 / c12 (`colors_b`), directional water specular colours.
+    spec0: Vec4,
+    spec1: Vec4,
+    amb_mid: Vec4,
+    amb_half: Vec4,
+    fog_dist: Vec4,
+    fog_height: Vec4,
+    fog_col0: Vec4,
+    fog_col1: Vec4,
+    tonemap: Vec4,
+    /// `g_WaterColor` (`m4000_mtd.bnd` `Water.mtd`: `(0.15, 0.10, 0.05, 1.0)`).
+    water_color: Vec4,
+    /// `(g_FresnelPow, g_FresnelBias, g_FresnelScale, g_SpecularPower)`.
+    fresnel: Vec4,
+    /// `(g_TileScale_0, g_TileScale_1, g_TileScale_2, g_BumpMapSmoose)`.
+    tile_scale: Vec4,
+    /// `(g_TexScroll_0.xy, g_TexScroll_1.xy)`.
+    scroll01: Vec4,
+    /// `(g_TexScroll_2.xy, elapsed_secs, has_bump)`.
+    scroll2_time: Vec4,
+}
+
+impl MaterialExtension for WaterLit {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://acvd_game/env_water.wgsl".into()
     }
 }
 
@@ -63,6 +121,9 @@ pub type SkyMaterial = ExtendedMaterial<StandardMaterial, SkyLit>;
 pub struct SkyLit {
     #[uniform(100)]
     tonemap: Vec4,
+    #[texture(101)]
+    #[sampler(102)]
+    sky_tex: Handle<Image>,
 }
 
 impl MaterialExtension for SkyLit {
@@ -131,7 +192,40 @@ fn tonemap_vec(tm: env::ToneMap) -> Vec4 {
     Vec4::new(1.0 / denom, tm.mul, tm.white, tm.mode as f32)
 }
 
-fn params(set: &LightSet, tonemap: Vec4) -> EnvParams {
+/// Maps type-101 sub-block 2 bloom fields (`0x82c18580`, `0x82c17908`, `0x82c18308`) onto Bevy's
+/// HDR `Bloom` component (`None` when `+0x1a` `bloom_enable` is 0).
+pub(crate) fn bevy_bloom(b: env::Bloom) -> Option<Bloom> {
+    if !b.enabled {
+        return None;
+    }
+    let scale = b.color[3].clamp(0.0, 2.0);
+    Some(Bloom {
+        intensity: (0.22 * scale).clamp(0.0, 1.0),
+        low_frequency_boost: 0.5,
+        low_frequency_boost_curvature: 0.75,
+        high_pass_frequency: 1.0,
+        prefilter: BloomPrefilter {
+            threshold: b.threshold.max(0.0),
+            threshold_softness: (b.offset * 0.5).clamp(0.0, 1.0),
+        },
+        composite_mode: BloomCompositeMode::Additive,
+        ..default()
+    })
+}
+
+/// True for FLVER materials backed by `Flver_Water*` (`Water.spx`, `WaterRiver`, `WaterWave`),
+/// excluding `Water_Mask` (which uses `Flver_ColDif`).
+pub(crate) fn is_water_mtd(mtd: &str) -> bool {
+    let stem = mtd
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(mtd)
+        .trim_end_matches(".mtd")
+        .to_ascii_lowercase();
+    matches!(stem.as_str(), "water" | "waterriver" | "waterwave")
+}
+
+fn params(set: &LightSet, tonemap: Vec4, has_diffuse1: bool, has_diffuse2: bool) -> EnvParams {
     let sky = conv(set.sky);
     let ground = conv(set.ground);
     let f = &set.fog;
@@ -159,7 +253,50 @@ fn params(set: &LightSet, tonemap: Vec4) -> EnvParams {
         fog_col0: squared(f.color).extend(f.luma_tint),
         fog_col1: squared(f.height_color).extend(f.luma_tint),
         tonemap,
+        flags: Vec4::new(
+            if has_diffuse1 { 1.0 } else { 0.0 },
+            if has_diffuse2 { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
+        ),
     }
+}
+
+fn water_params(set: &LightSet, tonemap: Vec4, has_bump: bool) -> WaterParams {
+    let p = params(set, tonemap, false, false);
+    WaterParams {
+        dir0: p.dir0,
+        dir1: p.dir1,
+        spec0: conv(set.colors_b[0]).extend(0.0),
+        spec1: conv(set.colors_b[1]).extend(0.0),
+        amb_mid: p.amb_mid,
+        amb_half: p.amb_half,
+        fog_dist: p.fog_dist,
+        fog_height: p.fog_height,
+        fog_col0: p.fog_col0,
+        fog_col1: p.fog_col1,
+        tonemap,
+        // `material/m4000_mtd.bnd` `Water.mtd` (`sheets/map_env.csv` `ps.water` row).
+        water_color: Vec4::new(0.15, 0.10, 0.05, 1.0),
+        fresnel: Vec4::new(70.0, 0.5, 0.9, 10.0),
+        tile_scale: Vec4::new(0.0019, 0.00268, 0.0462, 2.0),
+        scroll01: Vec4::new(0.01, 0.03, -0.01, -0.02),
+        scroll2_time: Vec4::new(-0.05, 0.05, 0.0, if has_bump { 1.0 } else { 0.0 }),
+    }
+}
+
+fn solid_pixel(rgba: [u8; 4], format: TextureFormat) -> Image {
+    Image::new_fill(
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &rgba,
+        format,
+        RenderAssetUsages::default(),
+    )
 }
 
 pub struct EnvPlugin {
@@ -170,13 +307,15 @@ impl Plugin for EnvPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "env_lit.wgsl");
         embedded_asset!(app, "env_sky.wgsl");
+        embedded_asset!(app, "env_water.wgsl");
         app.add_plugins((
             MaterialPlugin::<EnvMaterial>::default(),
             MaterialPlugin::<SkyMaterial>::default(),
+            MaterialPlugin::<WaterMaterial>::default(),
         ))
         .insert_resource(EnvDisc(self.disc.clone()))
         .add_systems(PostStartup, load)
-        .add_systems(Update, relight)
+        .add_systems(Update, (relight, tick_water))
         .add_systems(PostUpdate, follow_sky.before(TransformSystems::Propagate));
     }
 }
@@ -201,18 +340,28 @@ fn follow_sky(
     }
 }
 
+fn tick_water(time: Res<Time>, mut waters: ResMut<Assets<WaterMaterial>>) {
+    let t = time.elapsed_secs();
+    for (_, mat) in waters.iter_mut() {
+        mat.extension.params.scroll2_time.z = t;
+    }
+}
+
 #[derive(Resource)]
 struct EnvDisc(Disc);
 
-/// The loaded env, the terrain parts by part name, the env materials made so far, and
+/// The loaded env, the terrain parts by part name, the env/water materials made so far, and
 /// each object model's sky material (`None`: not `Map_Sky`).
 #[derive(Resource)]
 struct MapEnv {
     env: Env,
     parts_by_name: HashMap<String, msb::Part>,
-    made: HashMap<(AssetId<StandardMaterial>, u32), Handle<EnvMaterial>>,
+    made: HashMap<(AssetId<StandardMaterial>, u32, Option<AssetId<Image>>), Handle<EnvMaterial>>,
+    waters: HashMap<(Option<AssetId<Image>>, u32), Handle<WaterMaterial>>,
     skies: HashMap<String, Option<Handle<SkyMaterial>>>,
     packs: Packs,
+    white_srgb: Handle<Image>,
+    flat_normal: Handle<Image>,
 }
 
 fn env_path(map: &str) -> String {
@@ -231,6 +380,7 @@ fn load(
     scene: Res<crate::Scene>,
     mut lights: Query<(&mut DirectionalLight, &mut Transform)>,
     cameras: Query<Entity, With<Camera3d>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let Some(map) = scene.map.as_deref() else {
         return;
@@ -269,44 +419,58 @@ fn load(
             ..default()
         });
     }
+    let bloom = env
+        .scene
+        .map(|s| s.tonemap.bloom)
+        .and_then(bevy_bloom);
     for camera in &cameras {
-        commands.entity(camera).insert(Tonemapping::None);
+        let mut cam = commands.entity(camera);
+        cam.insert((Hdr, Tonemapping::None));
+        if let Some(bloom) = bloom.clone() {
+            cam.insert(bloom);
+        }
     }
     info!(
         "{path}: {} light sets, scene {:?}",
         env.lights.len(),
         env.scene
     );
+    let white_srgb = images.add(solid_pixel([255, 255, 255, 255], TextureFormat::Rgba8UnormSrgb));
+    let flat_normal = images.add(solid_pixel([128, 128, 255, 255], TextureFormat::Rgba8Unorm));
     commands.insert_resource(MapEnv {
         env,
         parts_by_name,
         made: HashMap::new(),
+        waters: HashMap::new(),
         skies: HashMap::new(),
         packs: Packs::default(),
+        white_srgb,
+        flat_normal,
     });
 }
 
-/// Moves every newly spawned map-part mesh onto the env material of its model's light set, or
-/// onto the sky material when the part is a `Map_Sky` object.
+/// Moves every newly spawned map-part mesh onto `SkyMaterial` (`Map_Sky`), `WaterMaterial`
+/// (`Water.spx`), or `EnvMaterial` (`Flver_ColDif` / `Map_Diffuse_Multi`).
 #[allow(clippy::too_many_arguments)]
 fn relight(
     mut commands: Commands,
     disc: Res<EnvDisc>,
     env: Option<ResMut<MapEnv>>,
     added: Query<
-        (Entity, &MeshMaterial3d<StandardMaterial>),
+        (Entity, &MeshMaterial3d<StandardMaterial>, Option<&MapMeshMeta>),
         Added<MeshMaterial3d<StandardMaterial>>,
     >,
     parents: Query<&ChildOf>,
     parts: Query<(&Name, &Transform), With<MapPart>>,
     standard: Res<Assets<StandardMaterial>>,
     mut materials: ResMut<Assets<EnvMaterial>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut sky_materials: ResMut<Assets<SkyMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
     let Some(mut env) = env else { return };
     let env = &mut *env;
-    for (entity, material) in &added {
+    for (entity, material, meta) in &added {
         let Some((part, (name, part_xf))) = parents
             .iter_ancestors(entity)
             .find_map(|a| parts.get(a).ok().map(|p| (a, p)))
@@ -325,15 +489,19 @@ fn relight(
                 .entry(model.clone())
                 .or_insert_with(|| {
                     let image = sky_texture(&disc.0, &mut env.packs, &model)?;
+                    let handle = images.add(image);
                     info!("{model}: Map_Sky dome");
                     Some(sky_materials.add(SkyMaterial {
                         base: StandardMaterial {
-                            base_color_texture: Some(images.add(image)),
+                            base_color_texture: Some(handle.clone()),
                             unlit: true,
                             cull_mode: None,
                             ..default()
                         },
-                        extension: SkyLit { tonemap: tm },
+                        extension: SkyLit {
+                            tonemap: tm,
+                            sky_tex: handle,
+                        },
                     }))
                 })
                 .clone();
@@ -359,14 +527,56 @@ fn relight(
         let Some(base) = standard.get(&material.0) else {
             continue;
         };
+        if meta.is_some_and(|m| is_water_mtd(&m.mtd)) {
+            let bump_id = base.normal_map_texture.as_ref().map(Handle::id);
+            let handle = env
+                .waters
+                .entry((bump_id, slot))
+                .or_insert_with(|| {
+                    let has_bump = base.normal_map_texture.is_some();
+                    let bump = base
+                        .normal_map_texture
+                        .clone()
+                        .unwrap_or_else(|| env.flat_normal.clone());
+                    water_materials.add(WaterMaterial {
+                        base: StandardMaterial {
+                            unlit: true,
+                            ..default()
+                        },
+                        extension: WaterLit {
+                            params: water_params(set, tm, has_bump),
+                            bump,
+                        },
+                    })
+                })
+                .clone();
+            commands
+                .entity(entity)
+                .remove::<MeshMaterial3d<StandardMaterial>>()
+                .insert(MeshMaterial3d(handle));
+            continue;
+        }
+        let diffuse2_handle = meta.and_then(|m| m.diffuse2.clone());
+        let diffuse2_id = diffuse2_handle.as_ref().map(Handle::id);
         let handle = env
             .made
-            .entry((material.0.id(), slot))
+            .entry((material.0.id(), slot, diffuse2_id))
             .or_insert_with(|| {
+                let has_d1 = base.base_color_texture.is_some();
+                let has_d2 = diffuse2_handle.is_some();
+                let diffuse1 = base
+                    .base_color_texture
+                    .clone()
+                    .unwrap_or_else(|| env.white_srgb.clone());
+                let diffuse2 = diffuse2_handle
+                    .clone()
+                    .unwrap_or_else(|| env.white_srgb.clone());
                 materials.add(EnvMaterial {
                     base: base.clone(),
                     extension: EnvLit {
-                        params: params(set, tm),
+                        params: params(set, tm, has_d1, has_d2),
+                        diffuse1,
+                        diffuse2,
                     },
                 })
             })
@@ -389,5 +599,64 @@ mod tests {
         assert!((v.y - 1.1).abs() < 1e-5);
         assert!((v.z - 10.0).abs() < 1e-5);
         assert_eq!(v.w, 1.0);
+    }
+
+    #[test]
+    fn bloom_settings_from_m4000_env() {
+        let b = bevy_bloom(env::Bloom::default()).expect("m4000 bloom enabled");
+        assert!((b.prefilter.threshold - 0.9).abs() < 1e-5);
+        assert!((b.prefilter.threshold_softness - 0.4).abs() < 1e-5);
+        assert!((b.intensity - 0.22).abs() < 1e-5);
+        assert_eq!(b.composite_mode, BloomCompositeMode::Additive);
+
+        let off = env::Bloom {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(bevy_bloom(off).is_none());
+    }
+
+    #[test]
+    fn water_mtd_detection() {
+        assert!(is_water_mtd("Water"));
+        assert!(is_water_mtd("Water.mtd"));
+        assert!(is_water_mtd("model\\material\\Water.mtd"));
+        assert!(is_water_mtd("WaterRiver"));
+        assert!(is_water_mtd("WaterWave"));
+        assert!(!is_water_mtd("Water_Mask"));
+        assert!(!is_water_mtd("Map_Diffuse"));
+        assert!(!is_water_mtd("Map_Diffuse_Multi"));
+    }
+
+    #[test]
+    fn water_params_use_light_set_specular_and_fog() {
+        let set = LightSet {
+            name: "ID03".into(),
+            slot: 3,
+            angles: [[42, 140], [-6, 30]],
+            colors: [[1.0; 4]; 2],
+            colors_b: [[1.2, 1.1, 1.0, 2.0], [0.5, 0.5, 0.5, 1.0]],
+            sky: [0.5, 0.6, 0.7, 1.0],
+            ground: [0.2, 0.2, 0.2, 1.0],
+            extra: [0.0; 4],
+            fog: env::Fog {
+                color: [0.8, 0.8, 0.8, 0.6],
+                range: 375.0,
+                start: 30.0,
+                falloff: 10.0,
+                density: 1.0,
+                luma_tint: 0.5,
+                rising: true,
+                height_range: 0.0,
+                height_base: 0.0,
+                height_color: [0.0; 4],
+            },
+        };
+        let wp = water_params(&set, tonemap_vec(env::ToneMap::default()), true);
+        assert!((wp.spec0.x - 1.2 * 1.2 * 2.0).abs() < 1e-4);
+        assert_eq!(wp.fresnel, Vec4::new(70.0, 0.5, 0.9, 10.0));
+        assert_eq!(wp.scroll2_time.w, 1.0);
+        let ep = params(&set, tonemap_vec(env::ToneMap::default()), true, true);
+        assert_eq!(ep.flags, Vec4::new(1.0, 1.0, 0.0, 0.0));
     }
 }

@@ -80,6 +80,37 @@ impl LightSet {
     }
 }
 
+/// Bloom parameters from type-101 sub-block 2 (`+0x19..+0x3c`, unpacked by `0x827fc428` ->
+/// `0x82800450`, executed by `0x82c18580` -> `0x82c17908` bright-pass / `0x82c18308` blur).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Bloom {
+    /// `+0x19`: blur/shader selector (`ToneMapFilter +0x28`; m4000 = 3).
+    pub iters: u8,
+    /// `+0x1a`: nonzero enables the bloom pass (`ToneMapFilter +0x50`, checked at `0x82c1858c`).
+    pub enabled: bool,
+    /// `+0x1c`: bright-pass luminance threshold (`ToneMapFilter +0x2c`, `0x82c17a48` -> PS c120).
+    pub threshold: f32,
+    /// `+0x20`: bright-pass offset / range divisor (`ToneMapFilter +0x30`, `0x82c17aac` -> `1/offset`).
+    pub offset: f32,
+    /// `+0x24`, `+0x28`: horizontal and vertical Gaussian blur scales (`0x82c183d0`, `0x82c184c8`).
+    pub blur_scale: [f32; 2],
+    /// `+0x2c..+0x38`: bloom tint RGB and scale (`ToneMapFilter +0x40..+0x4c`).
+    pub color: [f32; 4],
+}
+
+impl Default for Bloom {
+    fn default() -> Self {
+        Self {
+            iters: 3,
+            enabled: true,
+            threshold: 0.9,
+            offset: 0.8,
+            blur_scale: [1.0, 1.0],
+            color: [1.0; 4],
+        }
+    }
+}
+
 /// Tone-map parameters from type-101 sub-block 2 (`data + u32_be(data + 8)`, `0x827fc428` ->
 /// `0x82800450`, executed by `m_ToneMapFilter` at `0x82c18628`).
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -94,6 +125,8 @@ pub struct ToneMap {
     pub key: f32,
     /// `+0x10` (`ToneMapFilter +0x1c`, `c34.x`).
     pub white: f32,
+    /// `+0x19..+0x3c`, bloom pass parameters.
+    pub bloom: Bloom,
 }
 
 impl Default for ToneMap {
@@ -104,6 +137,7 @@ impl Default for ToneMap {
             mul: 1.1,
             key: 0.6,
             white: 10.0,
+            bloom: Bloom::default(),
         }
     }
 }
@@ -195,12 +229,25 @@ pub fn read(data: &[u8]) -> Result<Env> {
                 let sub2_rel = r.u32(e.data + 8)? as usize;
                 let tonemap = if sub2_rel > 0 && e.data + sub2_rel + 0x14 <= data.len() {
                     let s2 = e.data + sub2_rel;
+                    let bloom = if s2 + 0x3c <= data.len() {
+                        Bloom {
+                            iters: r.u8(s2 + 0x19)?,
+                            enabled: r.u8(s2 + 0x1a)? != 0,
+                            threshold: r.f32(s2 + 0x1c)?,
+                            offset: r.f32(s2 + 0x20)?,
+                            blur_scale: [r.f32(s2 + 0x24)?, r.f32(s2 + 0x28)?],
+                            color: vec4(&r, s2 + 0x2c)?,
+                        }
+                    } else {
+                        Bloom::default()
+                    };
                     ToneMap {
                         mode: r.u32(s2)?,
                         lum: r.f32(s2 + 4)?,
                         mul: r.f32(s2 + 8)?,
                         key: r.f32(s2 + 0x0c)?,
                         white: r.f32(s2 + 0x10)?,
+                        bloom,
                     }
                 } else {
                     ToneMap::default()
@@ -273,5 +320,14 @@ mod tests {
         assert!(near(scene.tonemap.mul, 1.1));
         assert!(near(scene.tonemap.key, 0.6));
         assert!(near(scene.tonemap.white, 10.0));
+        assert!(scene.tonemap.bloom.enabled);
+        assert_eq!(scene.tonemap.bloom.iters, 3);
+        assert!(near(scene.tonemap.bloom.threshold, 0.9));
+        assert!(near(scene.tonemap.bloom.offset, 0.8));
+        assert!(
+            near(scene.tonemap.bloom.blur_scale[0], 1.0)
+                && near(scene.tonemap.bloom.blur_scale[1], 1.0)
+        );
+        assert!(scene.tonemap.bloom.color.iter().all(|&c| near(c, 1.0)));
     }
 }
