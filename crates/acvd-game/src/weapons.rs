@@ -508,6 +508,38 @@ pub struct OwHardpoint;
 #[derive(Component)]
 pub struct OwMesh;
 
+/// Dynamic re-attachment state for an Overed Weapon's secondary root `"60"` (`ow0110`, `ow0310`,
+/// `ow0610`, `ow6010`): stowed under root `"50"` (`acattachinfo` record 0: `(12, 60, 12, 1, "60")`),
+/// and dynamically re-attached onto arm dummy `60` (`acattachinfo` record 1: `(2, 60, 12, 0, "60")`)
+/// during OW deployment so the weapon swings into firing position.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct OwArmAttach {
+    pub root_60: Entity,
+    pub stowed_parent: Entity,
+    pub stowed_local: Transform,
+    pub deployed_parent: Entity,
+    pub deployed_local: Transform,
+    pub deployed: bool,
+}
+
+impl OwArmAttach {
+    /// Switches root `"60"` between stowed and arm-deployed mounting when `want_deployed`
+    /// differs from `self.deployed`. Returns `true` if a reparent occurred.
+    pub fn set_deployed(&mut self, commands: &mut Commands, want_deployed: bool) -> bool {
+        if self.deployed == want_deployed {
+            return false;
+        }
+        self.deployed = want_deployed;
+        let (parent, local) = if want_deployed {
+            (self.deployed_parent, self.deployed_local)
+        } else {
+            (self.stowed_parent, self.stowed_local)
+        };
+        commands.entity(self.root_60).insert((ChildOf(parent), local));
+        true
+    }
+}
+
 /// A bay shift in progress. While this exists the fire buttons do not shoot: they already
 /// started the exchange (`sheets/ac_states.csv` `bay_shift_*` / `bay_purge_*`).
 #[derive(Resource)]
@@ -2647,16 +2679,30 @@ fn apply_missile_impact_blast(
 ///   `ow_dmgtime_min..max`) while armed; auto-purges OW meshes and enters `lockout_secs` EN/FCS
 ///   lockout when limit hits zero (`0x828861d0`).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct OwInput<'w, 's> {
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    mouse: Res<'w, ButtonInput<MouseButton>>,
+    held: Res<'w, Held>,
+    pads: Query<'w, 's, &'static Gamepad>,
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct OwAnimCtx<'w> {
+    garage: Res<'w, crate::Garage>,
+    motion: Option<ResMut<'w, Motion>>,
+    ow_attach: Option<ResMut<'w, OwArmAttach>>,
+    loadout: Option<Res<'w, crate::bay::Loadout>>,
+}
+
 pub fn step_overed_weapon(
     time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    held: Res<Held>,
+    input: OwInput,
     piloting: Res<Piloting>,
     assets: Res<Tracers>,
-    pads: Query<&Gamepad>,
     mut speaker: Speaker,
     mut commands: Commands,
+    mut anim: OwAnimCtx,
     mut acs: Query<(
         &mut Pilot,
         &mut Armament,
@@ -2668,9 +2714,16 @@ pub fn step_overed_weapon(
     ow_hp: Query<&GlobalTransform, With<OwHardpoint>>,
     mut ow_meshes: Query<&mut Visibility, (With<OwMesh>, Without<crate::bay::WeaponMesh>)>,
     mut wep_meshes: Query<(&crate::bay::WeaponMesh, &mut Visibility), Without<OwMesh>>,
-    loadout: Option<Res<crate::bay::Loadout>>,
     points: Query<(&EffectPoint, &GlobalTransform)>,
 ) {
+    let keys = &input.keys;
+    let mouse = &input.mouse;
+    let held = &input.held;
+    let pads = &input.pads;
+    let garage = &anim.garage;
+    let motion = &mut anim.motion;
+    let ow_attach = &mut anim.ow_attach;
+    let loadout = &anim.loadout;
     if !piloting.0 {
         return;
     }
@@ -2699,7 +2752,7 @@ pub fn step_overed_weapon(
     let mut fire_held = down(KeyCode::KeyF) || mouse.pressed(MouseButton::Left);
     let mut left_fire = down(KeyCode::KeyC) || mouse.pressed(MouseButton::Right);
     let mut tri_held = down(KeyCode::KeyR);
-    for pad in &pads {
+    for pad in pads {
         fire_held |= pad.pressed(GamepadButton::RightTrigger2);
         left_fire |= pad.pressed(GamepadButton::LeftTrigger2);
         tri_held |= pad.pressed(GamepadButton::North);
@@ -2713,6 +2766,27 @@ pub fn step_overed_weapon(
 
     pilot.ow_active = ow.is_active();
     pilot.ow_lockout = ow.phase == OwPhase::Lockout;
+
+    // Switch body animation bank (`motion_ow_equip`, 360 `0x8284e9d8`) and dynamically re-attach
+    // OW root `"60"` onto arm dummy `60` (`acattachinfo` record 1) while OW is active.
+    if let Some(m) = motion.as_deref_mut() {
+        m.set_ow_bank(ow.is_active());
+    }
+    if let Some(att) = ow_attach.as_deref_mut() {
+        if att.set_deployed(&mut commands, ow.is_active()) {
+            info!(
+                "OW root 60 {} arm dummy 60",
+                if ow.is_active() { "re-attached to" } else { "stowed from" }
+            );
+        }
+    }
+    if matches!(ow.phase, OwPhase::Charging | OwPhase::Charged) {
+        if let Some(m) = motion.as_deref_mut() {
+            if m.upper.as_ref().map(|u| u.anim_id) != Some(209) && m.has_ow_clip(209) {
+                let _ = m.play_upper(&garage.disc, 209, true, 1.0, [0.15; 8], 8);
+            }
+        }
+    }
 
     if res.overload_damage > 0.0 {
         if let Some(health) = player_health.as_deref_mut() {
@@ -2742,6 +2816,11 @@ pub fn step_overed_weapon(
                     }
                 }
                 sound::cue(&mut commands, &mut speaker.cues, &mut speaker.sources, "b00000000");
+                if let Some(m) = motion.as_deref_mut() {
+                    if m.has_ow_clip(200) {
+                        let _ = m.play_upper(&garage.disc, 200, false, 1.0, [0.15; 8], 9);
+                    }
+                }
                 info!(
                     "OW {} (type {}) ARMED: limit {:.0}, charge_en {:.0}, ow_en_out {:.0}/s",
                     ow.spec.part_id,
@@ -2766,6 +2845,11 @@ pub fn step_overed_weapon(
                 let gun = &ow.spec.gun;
                 if gun.shoot > 0 {
                     sound::shot(&mut commands, &mut speaker.cues, &mut speaker.sources, gun.shoot);
+                }
+                if let Some(m) = motion.as_deref_mut() {
+                    if m.has_ow_clip(202) {
+                        let _ = m.play_upper(&garage.disc, 202, false, 1.0, [0.1; 8], 10);
+                    }
                 }
                 if gun.fx.muzzle > 0 {
                     commands.spawn((
@@ -2880,6 +2964,11 @@ pub fn step_overed_weapon(
                     *vis = Visibility::Hidden;
                 }
                 pilot.en = 0.0;
+                if let Some(m) = motion.as_deref_mut() {
+                    if m.has_ow_clip(205) {
+                        let _ = m.play_upper(&garage.disc, 205, false, 1.0, [0.15; 8], 10);
+                    }
+                }
                 sound::cue(&mut commands, &mut speaker.cues, &mut speaker.sources, "c00000024");
                 info!(
                     "OW {} AUTO-PURGED — entering {:.0}s EN/FCS lockout",
@@ -2920,6 +3009,7 @@ pub fn step_projectiles(
         (&mut PlayerHealth, Option<&mut Status>, &Transform),
         (Without<Projectile>, Without<Target>),
     >,
+    mut props: Query<&mut crate::map::DestructibleProp>,
     mut shots: Query<(Entity, &mut Projectile, &mut Transform)>,
 ) {
     if !piloting.0 {
@@ -2934,7 +3024,7 @@ pub fn step_projectiles(
         let prev = transform.translation;
         let next = prev + delta;
 
-        let terrain = collision.raycast(prev, next, RayFilter::Bullet);
+        let terrain = collision.raycast_with_prop(prev, next, RayFilter::Bullet);
 
         match shot.owner {
             Owner::Player => {
@@ -2956,7 +3046,7 @@ pub fn step_projectiles(
                     }
                 }
                 if let Some((t_hit, pos, normal, t_entity)) = best_target {
-                    if terrain.is_none_or(|(t_g, _, _)| t_hit <= t_g) {
+                    if terrain.is_none_or(|(t_g, _, _, _)| t_hit <= t_g) {
                         if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
                             let (power, recoil) = shot.effective_damage();
                             let (res, lethal) = health.apply_hit(shot.damage_type, power, recoil);
@@ -3031,7 +3121,7 @@ pub fn step_projectiles(
                             }
                         }
                         if let Some((t_hit, pos, normal)) = best {
-                            if terrain.is_none_or(|(t_g, _, _)| t_hit <= t_g) {
+                            if terrain.is_none_or(|(t_g, _, _, _)| t_hit <= t_g) {
                                 let (power, recoil) = shot.effective_damage();
                                 let (res, lethal) =
                                     health.apply_hit(shot.damage_type, power, recoil);
@@ -3083,7 +3173,16 @@ pub fn step_projectiles(
             }
         }
 
-        if let Some((_, at, normal)) = terrain {
+        if let Some((_, at, normal, prop_id)) = terrain {
+            if let Some(pid) = prop_id {
+                let (power, _) = shot.effective_damage();
+                for mut prop in &mut props {
+                    if prop.prop_id == pid {
+                        prop.apply_damage(power.max(1.0));
+                        break;
+                    }
+                }
+            }
             if shot.hit > 0 {
                 commands.spawn((
                     Sfx::new(shot.hit),
@@ -3102,6 +3201,11 @@ pub fn step_projectiles(
             if shot.owner == Owner::Player {
                 if let Some(blast) = shot.blast {
                     apply_impact_blast(blast, at, None, &mut commands, &mut speaker, &mut targets);
+                    for mut prop in &mut props {
+                        if !prop.broken && prop.center.distance(at) <= blast.radius + prop.radius {
+                            prop.apply_damage(blast.damage_power.max(1.0));
+                        }
+                    }
                 }
             }
             commands.entity(e).despawn();
@@ -3134,6 +3238,7 @@ pub fn step_missiles(
         (Entity, &mut PlayerHealth, Option<&mut Status>, &Transform),
         (Without<Missile>, Without<Target>),
     >,
+    mut props: Query<&mut crate::map::DestructibleProp>,
     mut missiles: Query<(Entity, &mut Missile, &mut Transform)>,
 ) {
     if !piloting.0 {
@@ -3253,7 +3358,7 @@ pub fn step_missiles(
             .proximity_fuse_range
             .max(missile.flight.hit_radius.min(2.0));
 
-        let terrain = collision.raycast(prev, next, RayFilter::Bullet);
+        let terrain = collision.raycast_with_prop(prev, next, RayFilter::Bullet);
 
         match missile.owner {
             Owner::Player => {
@@ -3274,7 +3379,7 @@ pub fn step_missiles(
                     }
                 }
                 if let Some((t_hit, pos, normal, t_entity)) = best_target {
-                    if terrain.is_none_or(|(t_g, _, _)| t_hit <= t_g) {
+                    if terrain.is_none_or(|(t_g, _, _, _)| t_hit <= t_g) {
                         if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
                             let (power, recoil) = missile.effective_damage();
                             let (res, lethal) =
@@ -3360,7 +3465,7 @@ pub fn step_missiles(
                             }
                         }
                         if let Some((t_hit, pos, normal)) = best {
-                            if terrain.is_none_or(|(t_g, _, _)| t_hit <= t_g) {
+                            if terrain.is_none_or(|(t_g, _, _, _)| t_hit <= t_g) {
                                 let (power, recoil) = missile.effective_damage();
                                 let (res, lethal) =
                                     health.apply_hit(missile.damage_type, power, recoil);
@@ -3420,7 +3525,16 @@ pub fn step_missiles(
             }
         }
 
-        if let Some((_, at, normal)) = terrain {
+        if let Some((_, at, normal, prop_id)) = terrain {
+            if let Some(pid) = prop_id {
+                let (power, _) = missile.effective_damage();
+                for mut prop in &mut props {
+                    if prop.prop_id == pid {
+                        prop.apply_damage(power.max(1.0));
+                        break;
+                    }
+                }
+            }
             let ffx = if missile.hit > 0 {
                 missile.hit
             } else {
@@ -3451,6 +3565,11 @@ pub fn step_missiles(
                         &mut speaker,
                         &mut targets,
                     );
+                    for mut prop in &mut props {
+                        if !prop.broken && prop.center.distance(at) <= blast.radius + prop.radius {
+                            prop.apply_damage(blast.damage_power.max(1.0));
+                        }
+                    }
                 }
             }
             commands.entity(e).despawn();
@@ -3538,6 +3657,7 @@ pub fn step_melee(
         (Entity, &Target, &mut TargetHealth, &mut Transform),
         Without<Pilot>,
     >,
+    mut props: Query<&mut crate::map::DestructibleProp>,
 ) {
     if !piloting.0 {
         return;
@@ -3591,6 +3711,28 @@ pub fn step_melee(
                             best = Some((t, entity, hit_pos));
                         }
                     }
+                }
+            }
+
+            // Also shatter any destructible map props swept by the kick sphere.
+            let (kick_dmg, _) = SpeedWeightScale::kick().scale(
+                pilot.ctrl.kick_power,
+                pilot.ctrl.kick_recoil,
+                horiz_kmh,
+                total_weight,
+            );
+            for mut prop in &mut props {
+                if !prop.broken
+                    && damage::swept_sphere_hits_sphere(
+                        a,
+                        b,
+                        kick_radius,
+                        prop.center,
+                        prop.radius,
+                    )
+                    .is_some()
+                {
+                    prop.apply_damage(kick_dmg.max(1.0));
                 }
             }
 
@@ -3674,6 +3816,21 @@ pub fn step_melee(
             let sweep_r = blade.launch.blade_radius.max(2.0);
             let tip = origin + forward * reach;
             let max_hits = blade.launch.max_hits.max(1) as usize;
+
+            for mut prop in &mut props {
+                if !prop.broken
+                    && damage::swept_sphere_hits_sphere(
+                        origin,
+                        tip,
+                        sweep_r,
+                        prop.center,
+                        prop.radius,
+                    )
+                    .is_some()
+                {
+                    prop.apply_damage(blade.launch.damage_power.max(1.0));
+                }
+            }
 
             for (entity, target, mut health, tf) in &mut targets {
                 if blade.hit_entities.len() >= max_hits {

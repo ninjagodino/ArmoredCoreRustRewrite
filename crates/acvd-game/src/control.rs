@@ -2323,6 +2323,77 @@ pub fn core_aim_angles(
     (cam_yaw_off + strafe_counter + turn_lead, cam_pitch)
 }
 
+/// Maps a locomotion state (`ac_states.csv` name + 8-way direction) to its `PARAM_ACMOTION_BIN`
+/// row in the `motion_ow_equip` bank (`0x8284e9d8`, anims `201..248`).
+pub fn ow_locomotion_row(name: &str, dir: Option<u8>) -> Option<u32> {
+    match name {
+        "stand" => Some(221), // anim 201: OW展開時 待機
+        "walk" => {
+            // Directions clockwise from forward: F, FR, R, BR, B, BL, L, FL.
+            const WALK: [u32; 8] = [194, 198, 202, 208, 204, 206, 200, 196];
+            WALK.get(dir.unwrap_or(0) as usize).copied()
+        }
+        "turn_left" => Some(248),  // anim 226
+        "turn_right" => Some(249), // anim 227
+        "dash" | "glide" => Some(268),     // anim 228: OW展開時 地上ブースト
+        "air_move" | "glide_air" => Some(269), // anim 229: OW展開時 空中ブースト
+        "jump" => Some(258), // anim 232
+        "rise" => Some(259), // anim 233
+        "fall" => Some(260), // anim 234
+        "quick_boost" => match dir.unwrap_or(0) {
+            0 | 1 | 7 => Some(254), // anim 245 front QB
+            2 => Some(257),         // anim 248 right QB
+            3 | 4 | 5 => Some(255), // anim 246 back QB
+            _ => Some(256),         // anim 247 left QB
+        },
+        "kick" => Some(274), // anim 243
+        _ => None,
+    }
+}
+
+/// Checks if the AC at `pos` has dropped below `water_height` (`env::Scene.water_height` from
+/// `m####_env.msb` sub-block 0 `+0x08`, 360 `0x827ffa80`, or `--water <y>`). When submerged,
+/// teleports the AC to the nearest `POINT_WATER_RETURN` (`50`) point, zeroes velocity, and
+/// clears active dash/air/melee states. Returns `true` if a water-return respawn occurred.
+pub fn check_water_return(
+    p: &mut Pilot,
+    pos: &mut Vec3,
+    water_return: &crate::map::WaterReturnPoints,
+    fallback: crate::map::Start,
+    collision: &Collision,
+) -> bool {
+    let Some(wy) = water_return.water_height else {
+        return false;
+    };
+    if pos.y >= wy {
+        return false;
+    }
+    let dest = water_return.nearest(*pos, fallback);
+    let y = collision
+        .ground_below(dest.position + Vec3::Y * 10.0)
+        .unwrap_or(dest.position.y);
+    *pos = Vec3::new(dest.position.x, y, dest.position.z);
+    p.prev_position = *pos;
+    p.yaw = dest.yaw;
+    p.velocity = Vec3::ZERO;
+    p.airborne = false;
+    p.glide = false;
+    p.qb = None;
+    p.wj = None;
+    p.kick = None;
+    p.blade = None;
+    p.cam.yaw_off = 0.0;
+    true
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct PilotWorld<'w> {
+    collision: Res<'w, Collision>,
+    area_bounds: Option<Res<'w, crate::map::AreaBounds>>,
+    water_return: Option<Res<'w, crate::map::WaterReturnPoints>>,
+    start: Option<Res<'w, crate::map::Start>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn pilot(
     time: Res<Time>,
@@ -2331,8 +2402,7 @@ pub fn pilot(
     pads: Query<&Gamepad>,
     mut piloting: ResMut<Piloting>,
     garage: Res<crate::Garage>,
-    collision: Res<Collision>,
-    area_bounds: Option<Res<crate::map::AreaBounds>>,
+    world: PilotWorld,
     motion: Option<ResMut<Motion>>,
     mut acs: Query<(
         &mut Pilot,
@@ -2348,6 +2418,10 @@ pub fn pilot(
     mouse: Res<bevy::input::mouse::AccumulatedMouseMotion>,
     mut mouselook: Local<bool>,
 ) {
+    let collision = &world.collision;
+    let area_bounds = &world.area_bounds;
+    let water_return = &world.water_return;
+    let start = &world.start;
     if keys.just_pressed(KeyCode::KeyP) {
         piloting.0 = !piloting.0;
     }
@@ -2451,6 +2525,14 @@ pub fn pilot(
         .map_or(crate::map::AreaZone::Inside, |b| {
             b.enforce(&mut transform.translation, &mut p.velocity)
         });
+    if let (Some(wr), Some(st)) = (water_return.as_deref(), start.as_deref()) {
+        if check_water_return(&mut p, &mut transform.translation, wr, *st, &collision) {
+            info!(
+                "water return triggered -> respawned at ({:.1}, {:.1}, {:.1})",
+                transform.translation.x, transform.translation.y, transform.translation.z
+            );
+        }
+    }
     if let Some(status) = status.as_deref_mut() {
         status.en = p.en;
         status.en_max = p.en_max;
@@ -2465,12 +2547,26 @@ pub fn pilot(
     let had_quick_pending = p.quick_pending.is_some();
     let next = state(&p, &body, &motion);
     (p.landed, p.quick_pending) = (false, None);
-    let changed = p.state != Some(next) || had_quick_pending;
+    let ow_bank_changed = motion.ow_bank_active != motion.playing_ow_clip
+        && (!motion.ow_bank_active
+            || ow_locomotion_row(next.0, next.1)
+                .and_then(|row_id| acvd_data::find(PARAM_ACMOTION_BIN, row_id))
+                .is_some_and(|r| motion.has_ow_clip(r.data.anim_id)));
+    let changed = p.state != Some(next) || had_quick_pending || ow_bank_changed;
     if changed {
         if !p.suppress_locomotion {
-            p.clip_ok = match acvd_data::ac_state(next.0, next.1)
-                .and_then(|s| acvd_data::find(PARAM_ACMOTION_BIN, s.row))
-            {
+            let ow_row = if motion.ow_bank_active {
+                ow_locomotion_row(next.0, next.1)
+                    .and_then(|row_id| acvd_data::find(PARAM_ACMOTION_BIN, row_id))
+                    .filter(|r| motion.has_ow_clip(r.data.anim_id))
+            } else {
+                None
+            };
+            let row = ow_row.or_else(|| {
+                acvd_data::ac_state(next.0, next.1)
+                    .and_then(|s| acvd_data::find(PARAM_ACMOTION_BIN, s.row))
+            });
+            p.clip_ok = match row {
                 Some(row) => {
                     let speed = if next.0.starts_with("turn_") {
                         AC_ANIM_PARAM.turn_clip_speed
@@ -3276,5 +3372,69 @@ mod tests {
         let (syaw, spitch) = core_aim_angles(0.0, Vec3::ZERO, 0.0, -0.1, 1.0, 0.0, None);
         assert!((syaw.to_degrees() - 18.0).abs() < 0.1);
         assert!((spitch + 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn water_return_respawns_submerged_ac_to_nearest_point() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        let mut p = Pilot::new(ctrl, 0);
+        p.velocity = Vec3::new(3.0, -2.0, 1.0);
+        p.airborne = true;
+        p.glide = true;
+
+        let wr = crate::map::WaterReturnPoints {
+            points: vec![
+                crate::map::Start {
+                    position: Vec3::new(100.0, 20.0, 0.0),
+                    yaw: 0.5,
+                },
+                crate::map::Start {
+                    position: Vec3::new(-50.0, 15.0, 10.0),
+                    yaw: -1.0,
+                },
+            ],
+            water_height: Some(3.0),
+        };
+        let fallback = crate::map::Start {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+        };
+        let ground = Collision::default();
+
+        // Above water: no respawn.
+        let mut above = Vec3::new(-45.0, 5.0, 12.0);
+        assert!(!check_water_return(&mut p, &mut above, &wr, fallback, &ground));
+
+        // Below water_height (3.0): teleports to nearest return point (-50, 15, 10).
+        let mut submerged = Vec3::new(-45.0, 2.5, 12.0);
+        assert!(check_water_return(
+            &mut p,
+            &mut submerged,
+            &wr,
+            fallback,
+            &ground
+        ));
+        assert_eq!(submerged, Vec3::new(-50.0, 15.0, 10.0));
+        assert_eq!(p.yaw, -1.0);
+        assert_eq!(p.velocity, Vec3::ZERO);
+        assert!(!p.airborne && !p.glide);
+    }
+
+    #[test]
+    fn ow_locomotion_row_maps_motion_ow_equip_states() {
+        assert_eq!(ow_locomotion_row("stand", None), Some(221));
+        assert_eq!(ow_locomotion_row("walk", Some(0)), Some(194));
+        assert_eq!(ow_locomotion_row("walk", Some(4)), Some(204));
+        assert_eq!(ow_locomotion_row("dash", Some(0)), Some(268));
+        assert_eq!(ow_locomotion_row("air_move", Some(0)), Some(269));
+        assert_eq!(ow_locomotion_row("jump", None), Some(258));
+        assert_eq!(ow_locomotion_row("quick_boost", Some(0)), Some(254));
+        assert_eq!(ow_locomotion_row("kick", None), Some(274));
     }
 }

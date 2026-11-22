@@ -364,16 +364,72 @@ pub struct Motion {
     pub core_ctrl: CoreControl,
     /// Loaded `tae/ac/motion_ow_disarm/own{:06}.tae` timeline for this legs motion set.
     pub tae: Option<tae::Tae>,
+    /// Optional `motion_ow_equip` binder path (`0x8284e9d8`, from `MotionCollateSt`) when the AC
+    /// equips an Overed Weapon.
+    #[allow(dead_code)]
+    pub ow_equip_set: Option<String>,
+    /// Clips inside `motion_ow_equip` (`a01_200.ani`..`a01_258.ani`).
+    pub ow_equip_clips: Vec<&'static Asset>,
+    /// Loaded `tae/ac/motion_ow_equip/own{:06}.tae` timeline (`0x8284e7c8`).
+    pub ow_equip_tae: Option<tae::Tae>,
+    /// True while the Overed Weapon is armed/deployed (`motion_ow_equip` bank active).
+    pub ow_bank_active: bool,
+    /// True when the currently loaded lower-body `self.clip` came from `ow_equip_clips`.
+    pub playing_ow_clip: bool,
     /// `MotionCollateSt.sound_param_id` for leg-specific footstep cues in `acv2_se_ac.fev`.
     pub sound_param_id: u32,
     /// TAE events fired during the most recent `pose::animate` tick.
     pub tae_events: Vec<TaeFired>,
     cache: HashMap<usize, ani::Anim>,
+    ow_cache: HashMap<u16, ani::Anim>,
 }
 
 impl Motion {
     pub fn name(&self) -> &'static str {
+        if self.playing_ow_clip {
+            let entry = format!("{}_{:03}.ani", self.prefix, self.current_anim_id);
+            if let Some(a) = self.ow_equip_clips.iter().find(|a| a.entry == entry) {
+                return a.entry;
+            }
+        }
         self.clips.get(self.index).map_or("", |a| a.entry)
+    }
+
+    /// True if the `motion_ow_equip` bank is loaded and contains clip `anim_id`.
+    pub fn has_ow_clip(&self, anim_id: u16) -> bool {
+        if self.ow_equip_clips.is_empty() {
+            return false;
+        }
+        let entry = format!("{}_{anim_id:03}.ani", self.prefix);
+        self.ow_equip_clips.iter().any(|a| a.entry == entry)
+    }
+
+    /// Switches between `motion_ow_disarm` and `motion_ow_equip` (`0x8284e9d8`).
+    pub fn set_ow_bank(&mut self, active: bool) {
+        self.ow_bank_active = active && !self.ow_equip_clips.is_empty();
+    }
+
+    fn load_ow_clip(&mut self, disc: &Disc, anim_id: u16) -> Result<ani::Anim> {
+        if let Some(c) = self.ow_cache.get(&anim_id) {
+            return Ok(c.clone());
+        }
+        let entry = format!("{}_{anim_id:03}.ani", self.prefix);
+        let asset = self
+            .ow_equip_clips
+            .iter()
+            .find(|a| a.entry == entry)
+            .copied()
+            .with_context(|| format!("motion_ow_equip has no {entry}"))?;
+        let clip = ani::read(&vfs::open(disc, &asset.path())?)?;
+        anyhow::ensure!(
+            clip.bones.len() == self.skeleton.bones.len(),
+            "{} has {} bones, the skeleton {}",
+            asset.entry,
+            clip.bones.len(),
+            self.skeleton.bones.len()
+        );
+        self.ow_cache.insert(anim_id, clip.clone());
+        Ok(clip)
     }
 
     /// Loads clip `index`; clips whose bone count differs from the skeleton's are refused.
@@ -394,7 +450,10 @@ impl Motion {
             }
         };
         let old = std::mem::replace(&mut self.clip, clip);
-        self.cache.insert(self.index, old);
+        if !self.playing_ow_clip {
+            self.cache.insert(self.index, old);
+        }
+        self.playing_ow_clip = false;
         self.current_anim_id = self
             .clips
             .get(index)
@@ -412,6 +471,8 @@ impl Motion {
 
     /// Plays clip `anim_id` of the set (`<prefix>_<anim_id>.ani`) from its first frame, unless
     /// it is already playing; a new clip crossfades in over `fade` seconds per bone group.
+    /// When `ow_bank_active` is true (or `anim_id >= 200`) and `motion_ow_equip` contains
+    /// `anim_id`, plays from the `motion_ow_equip` bank (`0x8284e9d8`).
     pub fn play(
         &mut self,
         disc: &Disc,
@@ -420,13 +481,36 @@ impl Motion {
         speed: f32,
         fade: [f32; 8],
     ) -> Result<()> {
+        if (self.ow_bank_active || anim_id >= 200) && self.has_ow_clip(anim_id) {
+            if !self.playing_ow_clip || self.current_anim_id != anim_id {
+                let clip = self.load_ow_clip(disc, anim_id)?;
+                let old = std::mem::replace(&mut self.clip, clip);
+                if !self.playing_ow_clip {
+                    self.cache.insert(self.index, old);
+                }
+                self.playing_ow_clip = true;
+                self.current_anim_id = anim_id;
+                self.frame = 0.0;
+                self.wheel = None;
+                self.center_ready = false;
+                self.fade = Fade {
+                    generation: self.fade.generation.wrapping_add(1),
+                    secs: fade,
+                    t: 0.0,
+                };
+            } else if !looping && self.wheel.is_none() {
+                self.frame = 0.0;
+            }
+            (self.looping, self.speed, self.playing) = (looping, speed, true);
+            return Ok(());
+        }
         let entry = format!("{}_{anim_id:03}.ani", self.prefix);
         let index = self
             .clips
             .iter()
             .position(|a| a.entry == entry)
             .with_context(|| format!("{} has no {entry}", self.set))?;
-        if index != self.index {
+        if self.playing_ow_clip || index != self.index {
             self.select(disc, index)?;
             self.fade.secs = fade;
         } else if !looping && self.wheel.is_none() {
@@ -457,26 +541,30 @@ impl Motion {
                 return Ok(());
             }
         }
-        let entry = format!("{}_{anim_id:03}.ani", self.prefix);
-        let index = self
-            .clips
-            .iter()
-            .position(|a| a.entry == entry)
-            .with_context(|| format!("{} has no {entry}", self.set))?;
-        let clip = match self.cache.get(&index) {
-            Some(c) => c.clone(),
-            None => {
-                let asset = self.clips.get(index).context("no such clip")?;
-                let c = ani::read(&vfs::open(disc, &asset.path())?)?;
-                anyhow::ensure!(
-                    c.bones.len() == self.skeleton.bones.len(),
-                    "{} has {} bones, the skeleton {}",
-                    asset.entry,
-                    c.bones.len(),
-                    self.skeleton.bones.len()
-                );
-                self.cache.insert(index, c.clone());
-                c
+        let clip = if (self.ow_bank_active || anim_id >= 200) && self.has_ow_clip(anim_id) {
+            self.load_ow_clip(disc, anim_id)?
+        } else {
+            let entry = format!("{}_{anim_id:03}.ani", self.prefix);
+            let index = self
+                .clips
+                .iter()
+                .position(|a| a.entry == entry)
+                .with_context(|| format!("{} has no {entry}", self.set))?;
+            match self.cache.get(&index) {
+                Some(c) => c.clone(),
+                None => {
+                    let asset = self.clips.get(index).context("no such clip")?;
+                    let c = ani::read(&vfs::open(disc, &asset.path())?)?;
+                    anyhow::ensure!(
+                        c.bones.len() == self.skeleton.bones.len(),
+                        "{} has {} bones, the skeleton {}",
+                        asset.entry,
+                        c.bones.len(),
+                        self.skeleton.bones.len()
+                    );
+                    self.cache.insert(index, c.clone());
+                    c
+                }
             }
         };
         let gen = self
@@ -582,6 +670,36 @@ impl Built {
         let (s, r, t) = local.to_scale_rotation_translation();
         Some(to_transform(t, r, s))
     }
+
+    /// Computes the local Bevy `Transform` of `(child_part, child_bone)` when its root is moved
+    /// from `stowed_place` to `deployed_place` and re-parented under `(parent_part, parent_bone)`
+    /// (used for OW root `"60"` -> arm dummy `60` re-attachment, `acattachinfo` record 1).
+    pub fn local_for_reattach(
+        &self,
+        child_part: usize,
+        child_bone: usize,
+        stowed_place: acvd_render::RootPlace,
+        deployed_place: acvd_render::RootPlace,
+        parent_part: usize,
+        parent_bone: usize,
+    ) -> Option<Transform> {
+        let (child_first, _) = *self.parts.get(child_part)?;
+        let (parent_first, _) = *self.parts.get(parent_part)?;
+        let child = self.joints.get(child_first + child_bone)?;
+        let parent = self.joints.get(parent_first + parent_bone)?;
+        let place_affine = |p: acvd_render::RootPlace| {
+            Affine3A::from_mat3_translation(
+                Mat3::from_cols(Vec3::from(p.x), Vec3::from(p.y), Vec3::from(p.z)),
+                Vec3::from(p.t),
+            )
+        };
+        let deployed_world = place_affine(deployed_place)
+            * place_affine(stowed_place).inverse()
+            * child.bind;
+        let local = parent.bind.inverse() * deployed_world;
+        let (s, r, t) = local.to_scale_rotation_translation();
+        Some(to_transform(t, r, s))
+    }
 }
 
 pub fn affine(x: &flver::Xform) -> Affine3A {
@@ -661,6 +779,44 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
         }
     });
 
+    // Load optional `motion_ow_equip` bank + TAE (`0x8284e9d8`, `0x8284e7c8`) if the design
+    // equips an Overed Weapon (`category == 11`).
+    let ow_type = parts
+        .iter()
+        .find(|p| p.placement.category == 11)
+        .map(|p| acvd_data::part_field(p.placement.part as i64, 11, "ow_type") as u8)
+        .filter(|&t| t > 0);
+    let ow_collate = ow_type.and_then(|ow_id| {
+        PARAM_MOTIONCOLLATE_BIN.iter().find(|r| {
+            r.data.arms_motion_id == 0
+                && r.data.legs_motion_id == legs_motion_id
+                && r.data.ow_motion_id == ow_id
+        })
+    });
+    let (ow_equip_set, ow_equip_clips, ow_equip_tae) = match ow_collate {
+        Some(r) => {
+            let name = r.data.ow_equip_ac_motion_name;
+            let binder = format!("model/ac/motion/motion_ow_equip/{name}/{name}_a.bnd.dcx");
+            let mut ow_clips: Vec<&'static Asset> = acvd_data::generated::assets::ALL
+                .iter()
+                .flat_map(|g| g.iter())
+                .filter(|a| a.binder == binder && a.ext == ".ani")
+                .collect();
+            ow_clips.sort_by_key(|a| a.entry);
+            let ow_tae_path = format!("tae/ac/motion_ow_equip/own{:06}.tae", r.data.motion_ow_equip);
+            let ow_tae = vfs::open(disc, &ow_tae_path)
+                .and_then(|b| tae::read(&b))
+                .ok();
+            debug!(
+                "loaded motion_ow_equip {binder} ({} clips, tae={})",
+                ow_clips.len(),
+                ow_tae.is_some()
+            );
+            (Some(binder), ow_clips, ow_tae)
+        }
+        None => (None, Vec::new(), None),
+    };
+
     Ok(Some(Motion {
         set: m.set,
         skeleton,
@@ -682,11 +838,17 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
         upper_return_fade: Fade::default(),
         core_ctrl: CoreControl::from_disc(disc),
         tae: tae_file,
+        ow_equip_set,
+        ow_equip_clips,
+        ow_equip_tae,
+        ow_bank_active: false,
+        playing_ow_clip: false,
         sound_param_id,
         tae_events: Vec::new(),
         center_shift: Vec3::ZERO,
         center_ready: false,
         cache: HashMap::new(),
+        ow_cache: HashMap::new(),
     }))
 }
 
@@ -1290,7 +1452,12 @@ pub fn animate(
             let curr = m.frame;
             let anim_id = u32::from(m.current_anim_id);
             let looping = m.looping;
-            if let Some(anim) = m.tae.as_ref().and_then(|t| t.animation(anim_id)) {
+            let active_tae = if m.playing_ow_clip {
+                m.ow_equip_tae.as_ref().or(m.tae.as_ref())
+            } else {
+                m.tae.as_ref()
+            };
+            if let Some(anim) = active_tae.and_then(|t| t.animation(anim_id)) {
                 let fired = crossed_events(anim, prev, curr, frames, looping);
                 m.tae_events.extend(fired);
             }
@@ -1315,7 +1482,12 @@ pub fn animate(
         None
     };
     if let Some((u_id, u_prev, u_curr, u_frames, u_looping)) = upper_step {
-        if let Some(anim) = m.tae.as_ref().and_then(|t| t.animation(u_id)) {
+        let upper_tae = if m.ow_bank_active {
+            m.ow_equip_tae.as_ref().or(m.tae.as_ref())
+        } else {
+            m.tae.as_ref()
+        };
+        if let Some(anim) = upper_tae.and_then(|t| t.animation(u_id)) {
             let fired = crossed_events(anim, u_prev, u_curr, u_frames, u_looping);
             m.tae_events.extend(fired);
         }
@@ -1599,5 +1771,110 @@ mod tests {
                 cue: "c00000089".into()
             }]
         );
+    }
+
+    #[test]
+    fn ow_design_loads_motion_ow_equip_bank_and_reattaches_root_60() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        // Pick a preset design with an OW that has secondary root `"60"` (`ow0110`/`ow0310`/`ow0610`).
+        let design = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| {
+                r.data.back_r > 0
+                    && assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &r.data)
+                        .placements
+                        .iter()
+                        .any(|p| p.column == "back_r" && p.model.root("60").is_some())
+            })
+            .expect("preset OW design with root 60");
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design.data);
+        let mut loaded = Vec::new();
+        let mut known = vec![None; built.placements.len()];
+        for (index, p) in built.placements.iter().enumerate() {
+            let places = assemble::root_places(p, &built.placements, &known);
+            let (meshes, rig) = acvd_render::rigged_model(&disc, p.model.path, &|root| {
+                assemble::place_of(&places, root)
+            })
+            .expect("rigged_model");
+            known[index] = Some(assemble::Stored {
+                places,
+                frames: rig.frames.clone(),
+            });
+            loaded.push(Loaded {
+                index,
+                placement: p,
+                meshes,
+                rig,
+            });
+        }
+        let mut rig = build(&disc, &loaded).expect("pose::build");
+        let motion = rig.motion.as_mut().expect("motion");
+        assert!(
+            motion
+                .ow_equip_set
+                .as_deref()
+                .is_some_and(|s| s.contains("motion_ow_equip")),
+            "ow_equip_set={:?}",
+            motion.ow_equip_set
+        );
+        assert!(motion.has_ow_clip(200), "should have OW arm clip 200");
+        assert!(motion.has_ow_clip(201), "should have OW armed idle clip 201");
+        assert!(motion.ow_equip_tae.is_some(), "should load motion_ow_equip TAE");
+
+        // Switch bank and play OW armed idle clip 201.
+        motion.set_ow_bank(true);
+        assert!(motion.ow_bank_active);
+        motion
+            .play(&disc, 201, true, 1.0, [0.0; 8])
+            .expect("play OW clip 201");
+        assert!(motion.playing_ow_clip);
+        assert_eq!(motion.current_anim_id, 201);
+        assert!(motion.name().contains("201"), "name={}", motion.name());
+
+        // Verify OW root "60" -> arm dummy 60 re-attachment transform computes cleanly.
+        let arms_li = loaded
+            .iter()
+            .position(|l| l.placement.column == "arms")
+            .expect("arms");
+        let ow_li = loaded
+            .iter()
+            .position(|l| l.placement.column == "back_r")
+            .expect("back_r");
+        let arm_bone = loaded[arms_li]
+            .rig
+            .sockets
+            .iter()
+            .find(|&&(id, _)| id == 60)
+            .and_then(|&(_, b)| b)
+            .expect("arm dummy 60 bone");
+        let b60 = loaded[ow_li]
+            .rig
+            .bones
+            .iter()
+            .position(|b| b.name == "60" && b.parent.is_none())
+            .expect("ow root 60");
+        let stowed = assemble::place_of(
+            &known[loaded[ow_li].index].as_ref().unwrap().places,
+            Some("60"),
+        );
+        let deployed = assemble::ow_deployed_place(
+            loaded[ow_li].placement,
+            loaded[arms_li].placement,
+            known[loaded[arms_li].index].as_ref().unwrap(),
+        )
+        .expect("ow_deployed_place");
+        let local = rig
+            .local_for_reattach(ow_li, b60, stowed, deployed, arms_li, arm_bone)
+            .expect("local_for_reattach");
+        assert!(local.translation.is_finite() && local.rotation.is_finite());
     }
 }

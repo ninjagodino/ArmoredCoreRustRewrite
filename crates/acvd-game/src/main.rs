@@ -251,6 +251,29 @@ fn main() {
         },
         None => map::MapNav::default(),
     };
+    let water_return = match map.as_deref().filter(|_| !plane) {
+        Some(id) => match map::WaterReturnPoints::load(&disc, id, layout.as_deref(), water) {
+            Ok(wr) => {
+                eprintln!(
+                    "map {id}: {} water-return points (kind 50), water_height={:?}",
+                    wr.points.len(),
+                    wr.water_height
+                );
+                wr
+            }
+            Err(e) => {
+                eprintln!("{id} water return: {e:#}");
+                map::WaterReturnPoints {
+                    points: Vec::new(),
+                    water_height: water,
+                }
+            }
+        },
+        None => map::WaterReturnPoints {
+            points: Vec::new(),
+            water_height: water,
+        },
+    };
     if let Some(y) = water {
         collision.planes.push(Plane {
             y,
@@ -304,6 +327,7 @@ fn main() {
     .insert_resource(start)
     .insert_resource(area_bounds)
     .insert_resource(map_nav)
+    .insert_resource(water_return)
     .insert_resource(Scene {
         map: map.filter(|_| !plane && !hits),
         layout: layout.filter(|_| !plane),
@@ -343,6 +367,7 @@ fn main() {
                 weapons::step_missiles,
                 weapons::tick_player_health,
                 targets::tick,
+                map::step_destructibles,
                 orbit,
                 reframe,
             )
@@ -729,6 +754,8 @@ fn show(
     let mut rack_bones: [Option<(usize, Vec<Entity>, usize)>; 2] = [None, None];
     let mut rack_named: [Option<Vec<(String, Entity)>>; 2] = [None, None];
     let mut rack_pose = [0u8; 2];
+    let mut arms_dummy60: Option<(usize, usize, &assemble::Placement, usize, Entity)> = None;
+    let mut ow_arm_attach: Option<weapons::OwArmAttach> = None;
     for (loaded_i, (part, (joints, binds))) in loaded.into_iter().zip(skins).enumerate() {
         boost::note(&part.placement, &part.rig, &joints, &mut nozzles);
         boost::fold(&mut commands, part.placement, &part.rig, &joints);
@@ -745,9 +772,67 @@ fn show(
                 commands.entity(root).insert(h);
             }
         }
+        if part.placement.column == "arms" {
+            if let Some(arm_bone) = part
+                .rig
+                .sockets
+                .iter()
+                .find(|&&(id, _)| id == 60)
+                .and_then(|&(_, b)| b)
+            {
+                if let Some(&arm_entity) = joints.get(arm_bone) {
+                    arms_dummy60 = Some((loaded_i, part.index, part.placement, arm_bone, arm_entity));
+                }
+            }
+        }
         if part.placement.column == "back_r" {
             if let Some(root) = root {
                 commands.entity(root).insert(weapons::OwHardpoint);
+            }
+            // Overed Weapons with secondary root `"60"` (`ow0110`, `ow0310`, `ow0610`, `ow6010`)
+            // re-attach root `"60"` onto arm dummy `60` (`acattachinfo` record 1) on deployment.
+            if let (Some(b60), Some((arms_li, arms_idx, arms_pl, arm_bone, arm_entity))) = (
+                part.rig
+                    .bones
+                    .iter()
+                    .position(|b| b.name == "60" && b.parent.is_none()),
+                arms_dummy60,
+            ) {
+                if let (Some(ow_stored), Some(arms_stored), Some(&root_60_entity)) = (
+                    known[part.index].as_ref(),
+                    known[arms_idx].as_ref(),
+                    joints.get(b60),
+                ) {
+                    let stowed_place = assemble::place_of(&ow_stored.places, Some("60"));
+                    if let Some(deployed_place) =
+                        assemble::ow_deployed_place(part.placement, arms_pl, arms_stored)
+                    {
+                        if let (Some(mounted), Some(deployed_local)) = (
+                            rig.mount_local(loaded_i, b60),
+                            rig.local_for_reattach(
+                                loaded_i,
+                                b60,
+                                stowed_place,
+                                deployed_place,
+                                arms_li,
+                                arm_bone,
+                            ),
+                        ) {
+                            let stowed_parent = mounted
+                                .0
+                                .map(|p| joint_entities[p])
+                                .unwrap_or(ac);
+                            ow_arm_attach = Some(weapons::OwArmAttach {
+                                root_60: root_60_entity,
+                                stowed_parent,
+                                stowed_local: mounted.1,
+                                deployed_parent: arm_entity,
+                                deployed_local,
+                                deployed: false,
+                            });
+                        }
+                    }
+                }
             }
         }
         if part.placement.column == "arms" {
@@ -903,6 +988,11 @@ fn show(
         }
     }
     commands.insert_resource(loadout);
+    if let Some(att) = ow_arm_attach {
+        commands.insert_resource(att);
+    } else {
+        commands.remove_resource::<weapons::OwArmAttach>();
+    }
     let racks = rack_named
         .into_iter()
         .enumerate()

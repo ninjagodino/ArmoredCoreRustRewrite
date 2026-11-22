@@ -512,5 +512,19 @@ mod tests {
         assert!(by_model("m9101").is_sky);
         assert_eq!(by_model("o9705").light_set, 0);
         assert!(by_model("o9705").follow_camera_xz);
+
+        let water_return: Vec<&Point> = actest_points
+            .iter()
+            .filter(|p| p.kind == POINT_WATER_RETURN)
+            .collect();
+        let map_points = points(&map).unwrap();
+        let map_water_return: Vec<&Point> = map_points
+            .iter()
+            .filter(|p| p.kind == POINT_WATER_RETURN)
+            .collect();
+        assert!(
+            !water_return.is_empty() || !map_water_return.is_empty(),
+            "expected at least one POINT_WATER_RETURN (50) on m4000"
+        );
     }
 }

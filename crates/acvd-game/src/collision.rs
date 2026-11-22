@@ -68,6 +68,12 @@ pub struct Hit {
     pub blocks_ai_los: bool,
     /// Blocks projectiles and missiles (`0x828eea28` `0x00100004`).
     pub blocks_bullet: bool,
+    /// `0` for static terrain / indestructible props; `part_index + 1` for destructible
+    /// `KIND_OBJECT` props that ship `{model}_b.flv`.
+    pub prop_id: u32,
+    /// `false` for intact `{model}_h.hmd` triangles; `true` for broken `{model}_b_h.hmd`
+    /// triangles (inactive until `Collision::break_prop(prop_id)` is called).
+    pub only_when_broken: bool,
 }
 
 impl Hit {
@@ -83,7 +89,19 @@ impl Hit {
             blocks_fcs_los: true,
             blocks_ai_los: true,
             blocks_bullet: true,
+            prop_id: 0,
+            only_when_broken: false,
         }
+    }
+
+    #[inline]
+    fn is_active(&self, broken: &[bool]) -> bool {
+        self.prop_id == 0
+            || broken
+                .get(self.prop_id as usize)
+                .copied()
+                .unwrap_or(false)
+                == self.only_when_broken
     }
 
     #[inline]
@@ -105,6 +123,8 @@ pub struct Collision {
     grid: Grid,
     /// Flat 3D BVH built by [`Collision::with_hits`] for fast arbitrary 3D segment raycasts.
     bvh: Bvh,
+    /// Per-`prop_id` broken state (`false` = intact `_h.hmd` active, `true` = `_b_h.hmd` active).
+    prop_broken: Vec<bool>,
 }
 
 /// Triangle indices per `CELL`-metre square of the XZ plane.
@@ -247,26 +267,58 @@ impl Collision {
                 }
             }
         }
+        let max_prop = hits.iter().map(|h| h.prop_id).max().unwrap_or(0) as usize;
         let bvh = Bvh::build(&hits);
         Self {
             planes,
             hits,
             grid: Grid { cells },
             bvh,
+            prop_broken: vec![false; max_prop + 1],
         }
+    }
+
+    /// Marks destructible map prop `prop_id` as broken: disables its intact `_h.hmd` triangles
+    /// and activates its broken `_b_h.hmd` triangles (if any) in O(1) without rebuilding the BVH.
+    pub fn break_prop(&mut self, prop_id: u32) {
+        if prop_id == 0 {
+            return;
+        }
+        let idx = prop_id as usize;
+        if idx >= self.prop_broken.len() {
+            self.prop_broken.resize(idx + 1, false);
+        }
+        self.prop_broken[idx] = true;
+    }
+
+    /// Returns whether destructible prop `prop_id` has been broken.
+    #[cfg(test)]
+    pub fn is_prop_broken(&self, prop_id: u32) -> bool {
+        self.prop_broken
+            .get(prop_id as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Triangles whose XZ bounds may contain the point (`x`, `z`).
     fn near(&self, x: f32, z: f32) -> Box<dyn Iterator<Item = &Hit> + '_> {
         if self.grid.cells.is_empty() {
-            return Box::new(self.hits.iter());
+            return Box::new(
+                self.hits
+                    .iter()
+                    .filter(|h| h.is_active(&self.prop_broken)),
+            );
         }
         let ids = self
             .grid
             .cells
             .get(&(cell(x), cell(z)))
             .map_or(&[][..], Vec::as_slice);
-        Box::new(ids.iter().map(|&i| &self.hits[i as usize]))
+        Box::new(
+            ids.iter()
+                .map(|&i| &self.hits[i as usize])
+                .filter(|h| h.is_active(&self.prop_broken)),
+        )
     }
 
     /// Height of the first `layer` surface a ray straight down from `from` meets before `to`.
@@ -296,7 +348,11 @@ impl Collision {
     /// Ground triangles whose XZ bounds may come within `r` of (`x`, `z`), each once.
     fn near_disc(&self, x: f32, z: f32, r: f32) -> Vec<&Hit> {
         if self.grid.cells.is_empty() {
-            return self.hits.iter().filter(|h| h.layer == Layer::Ground).collect();
+            return self
+                .hits
+                .iter()
+                .filter(|h| h.layer == Layer::Ground && h.is_active(&self.prop_broken))
+                .collect();
         }
         let mut ids: Vec<u32> = Vec::new();
         for cx in cell(x - r)..=cell(x + r) {
@@ -310,7 +366,7 @@ impl Collision {
         ids.dedup();
         ids.into_iter()
             .map(|i| &self.hits[i as usize])
-            .filter(|h| h.layer == Layer::Ground)
+            .filter(|h| h.layer == Layer::Ground && h.is_active(&self.prop_broken))
             .collect()
     }
 
@@ -402,12 +458,24 @@ impl Collision {
     /// Returns `Some((t, hit_point, normal))` for the earliest intersection with `t` in `0.0..=1.0`,
     /// where `normal` is a unit vector facing `origin`.
     pub fn raycast(&self, origin: Vec3, end: Vec3, filter: RayFilter) -> Option<(f32, Vec3, Vec3)> {
+        self.raycast_with_prop(origin, end, filter)
+            .map(|(t, at, n, _)| (t, at, n))
+    }
+
+    /// Like [`Collision::raycast`], also returning `Some(prop_id)` when the earliest hit belongs
+    /// to a destructible map prop (`Hit::prop_id != 0`).
+    pub fn raycast_with_prop(
+        &self,
+        origin: Vec3,
+        end: Vec3,
+        filter: RayFilter,
+    ) -> Option<(f32, Vec3, Vec3, Option<u32>)> {
         let delta = end - origin;
         if delta.length_squared() < 1e-12 {
             return None;
         }
         let mut best_t = 1.0_f32;
-        let mut best: Option<(f32, Vec3, Vec3)> = None;
+        let mut best: Option<(f32, Vec3, Vec3, Option<u32>)> = None;
 
         // Test synthetic planes (`--plane` / `--water`).
         for p in &self.planes {
@@ -424,19 +492,20 @@ impl Collision {
             if t >= 0.0 && t <= best_t {
                 best_t = t;
                 let n = if delta.y < 0.0 { Vec3::Y } else { Vec3::NEG_Y };
-                best = Some((t, origin + delta * t, n));
+                best = Some((t, origin + delta * t, n, None));
             }
         }
 
         // Traverse the flat BVH (or linear scan if `bvh` is empty, e.g. manually populated `hits`).
         if self.bvh.nodes.is_empty() {
             for h in &self.hits {
-                if !h.matches(filter) {
+                if !h.is_active(&self.prop_broken) || !h.matches(filter) {
                     continue;
                 }
                 if let Some((t, n)) = segment_hits_tri(origin, delta, h.a, h.b, h.c, best_t) {
                     best_t = t;
-                    best = Some((t, origin + delta * t, n));
+                    let prop = (h.prop_id != 0).then_some(h.prop_id);
+                    best = Some((t, origin + delta * t, n, prop));
                 }
             }
             return best;
@@ -458,12 +527,13 @@ impl Collision {
                 let last = first + node.count as usize;
                 for &idx in &self.bvh.indices[first..last] {
                     let h = &self.hits[idx as usize];
-                    if !h.matches(filter) {
+                    if !h.is_active(&self.prop_broken) || !h.matches(filter) {
                         continue;
                     }
                     if let Some((t, n)) = segment_hits_tri(origin, delta, h.a, h.b, h.c, best_t) {
                         best_t = t;
-                        best = Some((t, origin + delta * t, n));
+                        let prop = (h.prop_id != 0).then_some(h.prop_id);
+                        best = Some((t, origin + delta * t, n, prop));
                     }
                 }
             } else {
@@ -545,7 +615,7 @@ impl Collision {
 
         if self.bvh.nodes.is_empty() {
             for h in &self.hits {
-                if !h.matches(filter) {
+                if !h.is_active(&self.prop_broken) || !h.matches(filter) {
                     continue;
                 }
                 if let Some((t, _)) = segment_hits_tri(origin, delta, h.a, h.b, h.c, t_max) {
@@ -573,7 +643,7 @@ impl Collision {
                 let last = first + node.count as usize;
                 for &idx in &self.bvh.indices[first..last] {
                     let h = &self.hits[idx as usize];
-                    if !h.matches(filter) {
+                    if !h.is_active(&self.prop_broken) || !h.matches(filter) {
                         continue;
                     }
                     if let Some((t, _)) = segment_hits_tri(origin, delta, h.a, h.b, h.c, t_max) {
@@ -839,18 +909,18 @@ fn mirror(v: [f32; 3]) -> Vec3 {
 }
 
 /// Load the terrain MSB (`map::terrain_msb`) and every map piece or object whose `{model}_h.hmd`
-/// is in its binder (`map::binder`).
+/// is in its binder (`map::binder`). Destructible `KIND_OBJECT` props that ship `{model}_b.flv`
+/// also tag their intact triangles with `prop_id = part_idx + 1` and preload any `{model}_b_h.hmd`
+/// broken collision triangles as `only_when_broken = true` (360 `0x82c02498`, `0x82c84a60`).
 pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
     let parts = msb::parts(&vfs::open(disc, &crate::map::terrain_msb(disc, map))?)?;
     let mut cache: HashMap<String, Option<(hmd::Hmd, Vec<hmd::Vec3>)>> = HashMap::new();
+    let mut destructible_cache: HashMap<String, bool> = HashMap::new();
     let mut hits = Vec::new();
-    for part in &parts {
-        let Some(binder) = crate::map::binder(map, part) else {
-            continue;
-        };
-        let asset = format!("{binder}|{}_h.hmd", part.model);
-        if !cache.contains_key(&asset) {
-            let h = match vfs::open(disc, &asset) {
+    let load_hmd = |cache: &mut HashMap<String, Option<(hmd::Hmd, Vec<hmd::Vec3>)>>,
+                    asset: &str| {
+        if !cache.contains_key(asset) {
+            let h = match vfs::open(disc, asset) {
                 Ok(bytes) => match hmd::read(&bytes) {
                     Ok(h) => {
                         let verts = h.model_vertices();
@@ -863,13 +933,17 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
                 },
                 Err(_) => None,
             };
-            cache.insert(asset.clone(), h);
+            cache.insert(asset.to_string(), h);
         }
-        let Some((h, verts)) = cache[&asset].as_ref() else {
-            continue;
-        };
-        let xf = crate::map::xform(part);
-        let (obj_kickable, obj_cam_collidable, obj_look_penetrate) = object_flags(&part.model);
+    };
+    let push_hmd = |hits: &mut Vec<Hit>,
+                    h: &hmd::Hmd,
+                    verts: &[hmd::Vec3],
+                    xf: &acvd_formats::flver::Xform,
+                    flags: (bool, bool, bool),
+                    prop_id: u32,
+                    only_when_broken: bool| {
+        let (obj_kickable, obj_cam_collidable, obj_look_penetrate) = flags;
         for tri in &h.triangles {
             let [a, b, c] = tri.verts.map(|i| mirror(xf.apply(verts[i as usize])));
             let mat = h
@@ -888,7 +962,41 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los && !obj_look_penetrate,
                 blocks_bullet: (mask & 0x7c) == 0,
+                prop_id,
+                only_when_broken,
             });
+        }
+    };
+    for (part_idx, part) in parts.iter().enumerate() {
+        let Some(binder) = crate::map::binder(map, part) else {
+            continue;
+        };
+        let prop_id = if part.kind == crate::map::KIND_OBJECT {
+            let broken_flv = format!("{binder}|{}_b.flv", part.model);
+            let is_destr = *destructible_cache
+                .entry(broken_flv.clone())
+                .or_insert_with(|| vfs::open(disc, &broken_flv).is_ok());
+            if is_destr {
+                (part_idx + 1) as u32
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let asset = format!("{binder}|{}_h.hmd", part.model);
+        load_hmd(&mut cache, &asset);
+        let xf = crate::map::xform(part);
+        let flags = object_flags(&part.model);
+        if let Some((h, verts)) = cache[&asset].as_ref() {
+            push_hmd(&mut hits, h, verts, &xf, flags, prop_id, false);
+        }
+        if prop_id != 0 {
+            let broken_asset = format!("{binder}|{}_b_h.hmd", part.model);
+            load_hmd(&mut cache, &broken_asset);
+            if let Some((h, verts)) = cache[&broken_asset].as_ref() {
+                push_hmd(&mut hits, h, verts, &xf, flags, prop_id, true);
+            }
         }
     }
     Ok(Collision::with_hits(Vec::new(), hits))
@@ -959,6 +1067,8 @@ mod tests {
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los,
                 blocks_bullet: (mask & 0x7c) == 0,
+                prop_id: 0,
+                only_when_broken: false,
             }
         };
         let concrete_wall = Collision::with_hits(
@@ -1006,7 +1116,7 @@ mod tests {
         let mut best_t = 1.0_f32;
         let mut best: Option<(f32, Vec3, Vec3)> = None;
         for h in &c.hits {
-            if !h.matches(filter) {
+            if !h.is_active(&c.prop_broken) || !h.matches(filter) {
                 continue;
             }
             if let Some((t, n)) = segment_hits_tri(origin, delta, h.a, h.b, h.c, best_t) {
@@ -1032,6 +1142,8 @@ mod tests {
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los,
                 blocks_bullet: (mask & 0x7c) == 0,
+                prop_id: 0,
+                only_when_broken: false,
             };
             [
                 tri([-10.0, 0.0, z], [10.0, 0.0, z], [-10.0, 20.0, z]),
@@ -1127,5 +1239,46 @@ mod tests {
                 .is_some(),
             "downward ray from m4000 start should hit ground"
         );
+    }
+
+    #[test]
+    fn destructible_prop_break_swaps_collision_triangles() {
+        let mut intact = Hit::solid(
+            Vec3::new(-5.0, 0.0, -10.0),
+            Vec3::new(5.0, 0.0, -10.0),
+            Vec3::new(0.0, 10.0, -10.0),
+        );
+        intact.prop_id = 7;
+        intact.only_when_broken = false;
+
+        let mut broken = Hit::solid(
+            Vec3::new(-5.0, 0.0, -15.0),
+            Vec3::new(5.0, 0.0, -15.0),
+            Vec3::new(0.0, 3.0, -15.0),
+        );
+        broken.prop_id = 7;
+        broken.only_when_broken = true;
+
+        let mut c = Collision::with_hits(Vec::new(), vec![intact, broken]);
+        // Intact: ray at y = 5 hits intact wall at z = -10 and reports prop_id = 7.
+        let hit = c
+            .raycast_with_prop(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.0, 5.0, -20.0), RayFilter::Bullet)
+            .expect("should hit intact prop");
+        assert_eq!(hit.3, Some(7));
+        assert!((hit.1.z - (-10.0)).abs() < 1e-3);
+
+        // Break prop 7: intact wall disappears, broken rubble at z = -15 (y <= 3) becomes active.
+        c.break_prop(7);
+        assert!(c.is_prop_broken(7));
+        assert!(
+            c.raycast_with_prop(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.0, 5.0, -20.0), RayFilter::Bullet)
+                .is_none(),
+            "upper ray should pass through after break"
+        );
+        let rubble = c
+            .raycast_with_prop(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 1.0, -20.0), RayFilter::Bullet)
+            .expect("lower ray should hit broken _b_h.hmd rubble");
+        assert_eq!(rubble.3, Some(7));
+        assert!((rubble.1.z - (-15.0)).abs() < 1e-3);
     }
 }

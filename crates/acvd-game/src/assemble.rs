@@ -256,6 +256,30 @@ pub fn place_of(places: &[(&str, RootPlace)], root: Option<&str>) -> RootPlace {
     .unwrap_or(RootPlace::IDENTITY)
 }
 
+/// Computes the deployed world-space `RootPlace` for an Overed Weapon's secondary root `"60"`
+/// re-attached onto arm dummy `60` with orient flag `0` (`acattachinfo` record 1:
+/// `(2, 60, 12, 0, "60")`). Returns `None` if the OW has no root `"60"` or the arms have no
+/// dummy `60`.
+pub fn ow_deployed_place(
+    ow: &Placement,
+    arms: &Placement,
+    arms_stored: &Stored,
+) -> Option<RootPlace> {
+    let root60 = ow.model.root("60")?;
+    if arms.model.socket(60).is_none() && !arms_stored.frames.iter().any(|f| f.id == 60) {
+        return None;
+    }
+    let mount = Mount {
+        root: root60.name,
+        origin: root60.origin,
+        parent: 0,
+        socket: SocketRef::Dummy(60),
+        orient: Some(0),
+        follow: None,
+    };
+    Some(mount_place(&mount, arms, arms_stored, &[]))
+}
+
 fn mount_place(
     mount: &Mount,
     parent_model: &Placement,

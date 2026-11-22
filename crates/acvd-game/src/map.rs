@@ -8,15 +8,23 @@
 
 use std::collections::{HashMap, HashSet};
 
+use acvd_data::find;
+use acvd_data::generated::ac_unit::PARAM_ACOBJECTPARAM_BIN;
+use acvd_data::generated::sfx::PARAM_SFXSESETPARAM_BIN;
+use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{bnd3, flver, msb, nav};
+use acvd_formats::{bnd3, env as fmt_env, flver, msb, nav};
 use acvd_render::{LoadedMesh, Packs};
 use anyhow::Result;
 use bevy::prelude::*;
 
+use crate::collision::Collision;
+use crate::sfx;
+use crate::sound;
+
 /// Map part kinds that have a visual model and a hit model.
 const KIND_PIECE: u32 = 0;
-const KIND_OBJECT: u32 = 1;
+pub(crate) const KIND_OBJECT: u32 = 1;
 
 pub fn folder(map: &str) -> String {
     format!("model/map/{map}")
@@ -55,6 +63,122 @@ pub fn xform(part: &msb::Part) -> flver::Xform {
 pub struct Start {
     pub position: Vec3,
     pub yaw: f32,
+}
+
+/// Water-return respawn points (`POINT_PARAM_ST` kind `50`, `msb::POINT_WATER_RETURN`) and
+/// water surface height (`env::Scene.water_height` from `model/map/ch_env/{map}_env.msb`
+/// type-101 sub-block 0 `+0x08`, 360 `0x827ffa80`, overridden by `--water <y>`).
+#[derive(Resource, Clone, Debug, Default)]
+pub struct WaterReturnPoints {
+    pub points: Vec<Start>,
+    pub water_height: Option<f32>,
+}
+
+impl WaterReturnPoints {
+    pub fn from_points(points: &[msb::Point], water_height: Option<f32>) -> Self {
+        let pts = points
+            .iter()
+            .filter(|p| p.kind == msb::POINT_WATER_RETURN)
+            .map(|p| {
+                let [x, y, z] = p.translation;
+                Start {
+                    position: Vec3::new(-x, y, z),
+                    yaw: -p.rotation_deg[1].to_radians(),
+                }
+            })
+            .collect();
+        Self {
+            points: pts,
+            water_height,
+        }
+    }
+
+    /// Loads kind-50 water-return points from `{map}_{layout}.msb` and `{map}_map.msb`, plus
+    /// `water_height` from `model/map/ch_env/{map}_env.msb` (or `water_override` if set).
+    pub fn load(
+        disc: &Disc,
+        map: &str,
+        layout: Option<&str>,
+        water_override: Option<f32>,
+    ) -> Result<Self> {
+        let mut sources = Vec::new();
+        if let Some(l) = layout {
+            sources.push(format!("{}/{map}_{l}.msb", folder(map)));
+        }
+        sources.push(terrain_msb(disc, map));
+        let mut all_points = Vec::new();
+        for path in sources.into_iter().filter(|p| disc.exists(p)) {
+            let pts = msb::points(&vfs::open(disc, &path)?)?;
+            all_points.extend(
+                pts.into_iter()
+                    .filter(|p| p.kind == msb::POINT_WATER_RETURN),
+            );
+        }
+        let water_height = water_override.or_else(|| {
+            let env_path = format!("model/map/ch_env/{map}_env.msb");
+            vfs::open(disc, &env_path)
+                .ok()
+                .and_then(|d| fmt_env::read(&d).ok())
+                .and_then(|e| e.scene)
+                .map(|s| s.water_height)
+        });
+        Ok(Self::from_points(&all_points, water_height))
+    }
+
+    /// Returns the water-return point closest to `pos` in XZ, or `fallback` if none exist.
+    pub fn nearest(&self, pos: Vec3, fallback: Start) -> Start {
+        self.points
+            .iter()
+            .copied()
+            .min_by(|a, b| {
+                let da = Vec2::new(a.position.x - pos.x, a.position.z - pos.z).length_squared();
+                let db = Vec2::new(b.position.x - pos.x, b.position.z - pos.z).length_squared();
+                da.total_cmp(&db)
+            })
+            .unwrap_or(fallback)
+    }
+}
+
+/// Destructible map object (`KIND_OBJECT` whose binder ships `{model}_b.flv`, 360 `0x82c02498`,
+/// `DestroyModel` `0x82c84a60`).
+#[derive(Component, Debug)]
+pub struct DestructibleProp {
+    /// Matches `collision::Hit::prop_id` (`part_idx + 1`).
+    pub prop_id: u32,
+    pub model: String,
+    /// World-space bounding sphere center and radius (for AOE / melee / kick hits).
+    pub center: Vec3,
+    pub radius: f32,
+    /// Remaining HP before breaking into `_b.flv` / `_b_h.hmd`.
+    pub hp: f32,
+    #[allow(dead_code)]
+    pub max_hp: f32,
+    /// Nonzero `AcObjectParam.damage_id` (e.g. explosive fuel tanks `89110..89113`).
+    #[allow(dead_code)]
+    pub damage_id: i32,
+    pub full: Entity,
+    pub low: Option<Entity>,
+    pub broken_mesh: Entity,
+    pub broken: bool,
+    /// Set on the lethal hit; consumed by [`step_destructibles`].
+    pub just_broken: bool,
+}
+
+impl DestructibleProp {
+    /// Applies `damage` to this prop; returns `true` on the hit that breaks it.
+    pub fn apply_damage(&mut self, damage: f32) -> bool {
+        if self.broken || damage <= 0.0 {
+            return false;
+        }
+        self.hp = (self.hp - damage).max(0.0);
+        if self.hp <= 0.0 {
+            self.broken = true;
+            self.just_broken = true;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// One MSB `POINT_PARAM_ST` area box (kinds `100` operation / `101` warning / `102` caution,
@@ -419,7 +543,8 @@ pub fn spawn(
     };
     let mut drawn = 0;
     let mut low_parts = 0;
-    for part in &parts {
+    let mut destructible_parts = 0;
+    for (part_idx, part) in parts.iter().enumerate() {
         let Some(binder) = binder(map, part) else {
             continue;
         };
@@ -453,12 +578,29 @@ pub fn spawn(
         } else {
             None
         };
+        let broken_file = format!("{}_b.flv", part.model);
+        let broken = if part.kind == KIND_OBJECT
+            && binder_has(&mut members, disc, &binder, &broken_file)
+        {
+            load_model(
+                &mut models,
+                &mut textures,
+                meshes,
+                materials,
+                images,
+                disc,
+                &format!("{binder}|{broken_file}"),
+            )
+        } else {
+            None
+        };
         drawn += 1;
         let xf = bevy_transform(&xform(part));
         let (min, max) = mesh_bounds(&list);
         let (center, radius) = sphere(&xf, min, max);
         let mut full = Entity::PLACEHOLDER;
         let mut low_entity = None;
+        let mut broken_entity = None;
         let parent = commands
             .spawn((
                 MapPart,
@@ -472,6 +614,9 @@ pub fn spawn(
             if let Some(low) = &low {
                 low_entity = Some(spawn_lod(c, low, Visibility::Hidden));
             }
+            if let Some(broken) = &broken {
+                broken_entity = Some(spawn_lod(c, broken, Visibility::Hidden));
+            }
         });
         commands.entity(parent).insert(MapLod {
             center,
@@ -479,11 +624,39 @@ pub fn spawn(
             full,
             low: low_entity,
         });
+        if let Some(broken_mesh) = broken_entity {
+            destructible_parts += 1;
+            let obj_id = part
+                .model
+                .strip_prefix('o')
+                .or_else(|| part.model.strip_prefix('O'))
+                .and_then(|s| s.parse::<u32>().ok());
+            let damage_id = obj_id
+                .and_then(|id| find(PARAM_ACOBJECTPARAM_BIN, id))
+                .map_or(0, |r| r.data.damage_id);
+            let max_hp = if damage_id > 0 { 800.0 } else { 500.0 };
+            commands.entity(parent).insert(DestructibleProp {
+                prop_id: (part_idx + 1) as u32,
+                model: part.model.clone(),
+                center,
+                radius: radius.max(2.0),
+                hp: max_hp,
+                max_hp,
+                damage_id,
+                full,
+                low: low_entity,
+                broken_mesh,
+                broken: false,
+                just_broken: false,
+            });
+        }
     }
     if textures.missing > 0 {
         warn!("map {map}: {} textures missing", textures.missing);
     }
-    info!("map {map}: {drawn} parts, {low_parts} with an _l1 mesh");
+    info!(
+        "map {map}: {drawn} parts, {low_parts} with an _l1 mesh, {destructible_parts} destructible (_b.flv)"
+    );
     Ok(drawn)
 }
 
@@ -583,14 +756,17 @@ fn spawn_lod(
 /// reading hid 481 of 550 parts, the small objects, and left the ground under the AC.
 pub fn lod(
     camera: Query<&Transform, With<Camera3d>>,
-    parts: Query<&MapLod>,
+    parts: Query<(&MapLod, Option<&DestructibleProp>)>,
     mut vis: Query<&mut Visibility>,
     mut logged: Local<bool>,
 ) {
     let Ok(camera) = camera.single() else { return };
     let eye = camera.translation;
     let (mut n_full, mut n_low) = (0, 0);
-    for part in &parts {
+    for (part, prop) in &parts {
+        if prop.is_some_and(|p| p.broken) {
+            continue;
+        }
         let metric = lod_metric(eye.distance(part.center), part.radius);
         let full = metric < 0.1 || part.low.is_none();
         set_vis(&mut vis, part.full, full);
@@ -608,6 +784,51 @@ pub fn lod(
     if !*logged {
         info!("map lod: {n_full} full, {n_low} _l1");
         *logged = true;
+    }
+}
+
+/// Handles newly broken destructible map objects (`DestructibleProp::just_broken`): flips their
+/// visual meshes (`full`/`low` -> `broken_mesh` `_b.flv`), swaps collision `_h.hmd` -> `_b_h.hmd`
+/// via `Collision::break_prop`, and spawns explosion FFX + destruction SFX (`DestroyModel`
+/// `0x82c84a60`).
+pub fn step_destructibles(
+    mut commands: Commands,
+    mut collision: ResMut<Collision>,
+    mut props: Query<&mut DestructibleProp>,
+    mut vis: Query<&mut Visibility>,
+    mut cues: ResMut<sound::Cues>,
+    mut audio_sources: ResMut<Assets<AudioSource>>,
+) {
+    for mut prop in &mut props {
+        if !prop.just_broken {
+            continue;
+        }
+        prop.just_broken = false;
+        collision.break_prop(prop.prop_id);
+        set_vis(&mut vis, prop.full, false);
+        if let Some(low) = prop.low {
+            set_vis(&mut vis, low, false);
+        }
+        set_vis(&mut vis, prop.broken_mesh, true);
+
+        let sfx_id = find(PARAM_SFXSESETPARAM_BIN, 502)
+            .map(|r| r.data.sfx_id as i32)
+            .filter(|&id| id > 0)
+            .unwrap_or(502);
+        commands.spawn((
+            sfx::Sfx::new(sfx_id),
+            Transform::from_translation(prop.center),
+        ));
+        if let Some(se) = find(PARAM_ACSOUNDPARAM_BIN, 0)
+            .filter(|r| r.data.se_destroy > 0)
+            .map(|r| format!("c{:08}", r.data.se_destroy))
+        {
+            sound::cue(&mut commands, &mut cues, &mut audio_sources, &se);
+        }
+        info!(
+            "destructible prop {} (id {}) broken at ({:.1}, {:.1}, {:.1})",
+            prop.model, prop.prop_id, prop.center.x, prop.center.y, prop.center.z
+        );
     }
 }
 
@@ -794,5 +1015,55 @@ mod tests {
         assert!(p.x <= 804.0 + 700.0 - 0.99, "clamped x = {}", p.x);
         assert_eq!(v.x, 0.0, "outward velocity zeroed");
         assert_eq!(v.z, 0.5, "tangential velocity preserved");
+    }
+
+    #[test]
+    fn water_return_points_load_from_m4000_and_pick_nearest() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let wr = WaterReturnPoints::load(&disc, "m4000", Some("actest"), None).unwrap();
+        assert_eq!(wr.water_height, Some(3.0));
+        assert!(
+            !wr.points.is_empty(),
+            "m4000 should expose POINT_WATER_RETURN (kind 50) points"
+        );
+        let fallback = Start {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+        };
+        let first = wr.points[0];
+        let picked = wr.nearest(first.position + Vec3::new(0.5, -10.0, 0.5), fallback);
+        assert!((picked.position - first.position).length() < 1e-3);
+    }
+
+    #[test]
+    fn destructible_prop_apply_damage_breaks_once() {
+        let mut prop = DestructibleProp {
+            prop_id: 42,
+            model: "o2022".into(),
+            center: Vec3::new(10.0, 5.0, 20.0),
+            radius: 4.0,
+            hp: 500.0,
+            max_hp: 500.0,
+            damage_id: 89112,
+            full: Entity::PLACEHOLDER,
+            low: None,
+            broken_mesh: Entity::PLACEHOLDER,
+            broken: false,
+            just_broken: false,
+        };
+        assert_eq!(prop.max_hp, 500.0);
+        assert_eq!(prop.damage_id, 89112);
+        assert!(!prop.apply_damage(200.0));
+        assert!(!prop.broken && !prop.just_broken);
+        assert!((prop.hp - 300.0).abs() < 1e-4);
+        assert!(prop.apply_damage(400.0));
+        assert!(prop.broken && prop.just_broken && prop.hp == 0.0);
+        // Subsequent hits do not re-trigger break.
+        assert!(!prop.apply_damage(500.0));
     }
 }
