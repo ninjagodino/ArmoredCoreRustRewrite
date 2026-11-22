@@ -9,6 +9,7 @@
 //! Joints are solved in FLVER axes and mirrored on X into Bevy's, like the meshes.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use acvd_data::generated::ac_unit::{
     AcanimHokanparamSt, PARAM_ACMOTION_BIN, PARAM_MOTIONCOLLATE_BIN,
@@ -168,7 +169,7 @@ pub enum TaeFired {
 /// subtree; `AC_MOTIONINFO` `upper_priority` / `b_apply_lower == 0`).
 pub struct UpperLayer {
     pub anim_id: u16,
-    pub clip: ani::Anim,
+    pub clip: Arc<ani::Anim>,
     pub frame: f32,
     pub looping: bool,
     pub speed: f32,
@@ -320,6 +321,18 @@ fn parse_anim_id(entry: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// Parses `<prefix>_<id:03>.ani` strictly (matching `Motion::play`'s entry format).
+fn parse_prefixed_anim_id(prefix: &str, entry: &str) -> Option<u16> {
+    let rest = entry
+        .strip_prefix(prefix)?
+        .strip_prefix('_')?
+        .strip_suffix(".ani")?;
+    if rest.len() < 3 || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<u16>().ok()
+}
+
 /// The motion set playing on the shown AC.
 #[derive(Resource)]
 pub struct Motion {
@@ -329,7 +342,7 @@ pub struct Motion {
     pub prefix: &'static str,
     pub clips: Vec<&'static Asset>,
     pub index: usize,
-    pub clip: ani::Anim,
+    pub clip: Arc<ani::Anim>,
     /// `AcMotioninfo.anim_id` of the currently playing lower-body clip (used for TAE lookup).
     pub current_anim_id: u16,
     pub frame: f32,
@@ -380,15 +393,16 @@ pub struct Motion {
     pub sound_param_id: u32,
     /// TAE events fired during the most recent `pose::animate` tick.
     pub tae_events: Vec<TaeFired>,
-    cache: HashMap<usize, ani::Anim>,
-    ow_cache: HashMap<u16, ani::Anim>,
+    clip_by_id: HashMap<u16, usize>,
+    ow_clip_by_id: HashMap<u16, &'static Asset>,
+    cache: HashMap<usize, Arc<ani::Anim>>,
+    ow_cache: HashMap<u16, Arc<ani::Anim>>,
 }
 
 impl Motion {
     pub fn name(&self) -> &'static str {
         if self.playing_ow_clip {
-            let entry = format!("{}_{:03}.ani", self.prefix, self.current_anim_id);
-            if let Some(a) = self.ow_equip_clips.iter().find(|a| a.entry == entry) {
+            if let Some(a) = self.ow_clip_by_id.get(&self.current_anim_id) {
                 return a.entry;
             }
         }
@@ -397,11 +411,7 @@ impl Motion {
 
     /// True if the `motion_ow_equip` bank is loaded and contains clip `anim_id`.
     pub fn has_ow_clip(&self, anim_id: u16) -> bool {
-        if self.ow_equip_clips.is_empty() {
-            return false;
-        }
-        let entry = format!("{}_{anim_id:03}.ani", self.prefix);
-        self.ow_equip_clips.iter().any(|a| a.entry == entry)
+        self.ow_clip_by_id.contains_key(&anim_id)
     }
 
     /// Switches between `motion_ow_disarm` and `motion_ow_equip` (`0x8284e9d8`).
@@ -409,18 +419,21 @@ impl Motion {
         self.ow_bank_active = active && !self.ow_equip_clips.is_empty();
     }
 
-    fn load_ow_clip(&mut self, disc: &Disc, anim_id: u16) -> Result<ani::Anim> {
+    fn load_ow_clip(&mut self, disc: &Disc, anim_id: u16) -> Result<Arc<ani::Anim>> {
         if let Some(c) = self.ow_cache.get(&anim_id) {
-            return Ok(c.clone());
+            return Ok(Arc::clone(c));
         }
-        let entry = format!("{}_{anim_id:03}.ani", self.prefix);
         let asset = self
-            .ow_equip_clips
-            .iter()
-            .find(|a| a.entry == entry)
+            .ow_clip_by_id
+            .get(&anim_id)
             .copied()
-            .with_context(|| format!("motion_ow_equip has no {entry}"))?;
-        let clip = ani::read(&vfs::open(disc, &asset.path())?)?;
+            .with_context(|| {
+                format!(
+                    "motion_ow_equip has no {}_{anim_id:03}.ani",
+                    self.prefix
+                )
+            })?;
+        let clip = Arc::new(ani::read(&vfs::open(disc, &asset.path())?)?);
         anyhow::ensure!(
             clip.bones.len() == self.skeleton.bones.len(),
             "{} has {} bones, the skeleton {}",
@@ -428,31 +441,31 @@ impl Motion {
             clip.bones.len(),
             self.skeleton.bones.len()
         );
-        self.ow_cache.insert(anim_id, clip.clone());
+        self.ow_cache.insert(anim_id, Arc::clone(&clip));
+        Ok(clip)
+    }
+
+    fn load_clip(&mut self, disc: &Disc, index: usize) -> Result<Arc<ani::Anim>> {
+        if let Some(c) = self.cache.get(&index) {
+            return Ok(Arc::clone(c));
+        }
+        let asset = self.clips.get(index).context("no such clip")?;
+        let clip = Arc::new(ani::read(&vfs::open(disc, &asset.path())?)?);
+        anyhow::ensure!(
+            clip.bones.len() == self.skeleton.bones.len(),
+            "{} has {} bones, the skeleton {}",
+            asset.entry,
+            clip.bones.len(),
+            self.skeleton.bones.len()
+        );
+        self.cache.insert(index, Arc::clone(&clip));
         Ok(clip)
     }
 
     /// Loads clip `index`; clips whose bone count differs from the skeleton's are refused.
     pub fn select(&mut self, disc: &Disc, index: usize) -> Result<()> {
-        let clip = match self.cache.remove(&index) {
-            Some(clip) => clip,
-            None => {
-                let asset = self.clips.get(index).context("no such clip")?;
-                let clip = ani::read(&vfs::open(disc, &asset.path())?)?;
-                anyhow::ensure!(
-                    clip.bones.len() == self.skeleton.bones.len(),
-                    "{} has {} bones, the skeleton {}",
-                    asset.entry,
-                    clip.bones.len(),
-                    self.skeleton.bones.len()
-                );
-                clip
-            }
-        };
-        let old = std::mem::replace(&mut self.clip, clip);
-        if !self.playing_ow_clip {
-            self.cache.insert(self.index, old);
-        }
+        let clip = self.load_clip(disc, index)?;
+        self.clip = clip;
         self.playing_ow_clip = false;
         self.current_anim_id = self
             .clips
@@ -483,11 +496,7 @@ impl Motion {
     ) -> Result<()> {
         if (self.ow_bank_active || anim_id >= 200) && self.has_ow_clip(anim_id) {
             if !self.playing_ow_clip || self.current_anim_id != anim_id {
-                let clip = self.load_ow_clip(disc, anim_id)?;
-                let old = std::mem::replace(&mut self.clip, clip);
-                if !self.playing_ow_clip {
-                    self.cache.insert(self.index, old);
-                }
+                self.clip = self.load_ow_clip(disc, anim_id)?;
                 self.playing_ow_clip = true;
                 self.current_anim_id = anim_id;
                 self.frame = 0.0;
@@ -504,12 +513,10 @@ impl Motion {
             (self.looping, self.speed, self.playing) = (looping, speed, true);
             return Ok(());
         }
-        let entry = format!("{}_{anim_id:03}.ani", self.prefix);
-        let index = self
-            .clips
-            .iter()
-            .position(|a| a.entry == entry)
-            .with_context(|| format!("{} has no {entry}", self.set))?;
+        let index = *self
+            .clip_by_id
+            .get(&anim_id)
+            .with_context(|| format!("{} has no {}_{anim_id:03}.ani", self.set, self.prefix))?;
         if self.playing_ow_clip || index != self.index {
             self.select(disc, index)?;
             self.fade.secs = fade;
@@ -544,28 +551,11 @@ impl Motion {
         let clip = if (self.ow_bank_active || anim_id >= 200) && self.has_ow_clip(anim_id) {
             self.load_ow_clip(disc, anim_id)?
         } else {
-            let entry = format!("{}_{anim_id:03}.ani", self.prefix);
-            let index = self
-                .clips
-                .iter()
-                .position(|a| a.entry == entry)
-                .with_context(|| format!("{} has no {entry}", self.set))?;
-            match self.cache.get(&index) {
-                Some(c) => c.clone(),
-                None => {
-                    let asset = self.clips.get(index).context("no such clip")?;
-                    let c = ani::read(&vfs::open(disc, &asset.path())?)?;
-                    anyhow::ensure!(
-                        c.bones.len() == self.skeleton.bones.len(),
-                        "{} has {} bones, the skeleton {}",
-                        asset.entry,
-                        c.bones.len(),
-                        self.skeleton.bones.len()
-                    );
-                    self.cache.insert(index, c.clone());
-                    c
-                }
-            }
+            let index = *self
+                .clip_by_id
+                .get(&anim_id)
+                .with_context(|| format!("{} has no {}_{anim_id:03}.ani", self.set, self.prefix))?;
+            self.load_clip(disc, index)?
         };
         let gen = self
             .upper
@@ -739,19 +729,27 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
     };
     let skeleton = ani::read(&vfs::open(disc, &format!("{}|{}", m.set, m.skeleton))?)
         .with_context(|| format!("{}|{}", m.set, m.skeleton))?;
-    let mut clips: Vec<&'static Asset> = acvd_data::generated::assets::ALL
+    let mut clips: Vec<&'static Asset> = acvd_data::assets_in(m.set)
         .iter()
-        .flat_map(|g| g.iter())
-        .filter(|a| a.binder == m.set && a.ext == ".ani")
+        .copied()
+        .filter(|a| a.ext == ".ani")
         .collect();
     clips.sort_by_key(|a| a.entry);
     let index = clips
         .iter()
         .position(|a| a.entry == m.skeleton)
         .unwrap_or(0);
-    let clip = skeleton.clone();
+    let clip = Arc::new(skeleton.clone());
     let prefix = m.skeleton.split('_').next().unwrap_or_default();
     let current_anim_id = parse_anim_id(m.skeleton);
+    let mut clip_by_id = HashMap::with_capacity(clips.len());
+    for (i, a) in clips.iter().enumerate() {
+        if let Some(id) = parse_prefixed_anim_id(prefix, a.entry) {
+            clip_by_id.entry(id).or_insert(i);
+        }
+    }
+    let mut cache = HashMap::new();
+    cache.insert(index, Arc::clone(&clip));
 
     // Load legs TAE timeline (`tae/ac/motion_ow_disarm/own{:06}.tae`) from MotionCollateSt.
     let legs_motion_id = acvd_data::part_field(leg_part as i64, 3, "legs_motion_id") as u8;
@@ -797,10 +795,10 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
         Some(r) => {
             let name = r.data.ow_equip_ac_motion_name;
             let binder = format!("model/ac/motion/motion_ow_equip/{name}/{name}_a.bnd.dcx");
-            let mut ow_clips: Vec<&'static Asset> = acvd_data::generated::assets::ALL
+            let mut ow_clips: Vec<&'static Asset> = acvd_data::assets_in(&binder)
                 .iter()
-                .flat_map(|g| g.iter())
-                .filter(|a| a.binder == binder && a.ext == ".ani")
+                .copied()
+                .filter(|a| a.ext == ".ani")
                 .collect();
             ow_clips.sort_by_key(|a| a.entry);
             let ow_tae_path = format!("tae/ac/motion_ow_equip/own{:06}.tae", r.data.motion_ow_equip);
@@ -816,6 +814,13 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
         }
         None => (None, Vec::new(), None),
     };
+
+    let mut ow_clip_by_id = HashMap::with_capacity(ow_equip_clips.len());
+    for &a in &ow_equip_clips {
+        if let Some(id) = parse_prefixed_anim_id(prefix, a.entry) {
+            ow_clip_by_id.entry(id).or_insert(a);
+        }
+    }
 
     Ok(Some(Motion {
         set: m.set,
@@ -847,7 +852,9 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
         tae_events: Vec::new(),
         center_shift: Vec3::ZERO,
         center_ready: false,
-        cache: HashMap::new(),
+        clip_by_id,
+        ow_clip_by_id,
+        cache,
         ow_cache: HashMap::new(),
     }))
 }

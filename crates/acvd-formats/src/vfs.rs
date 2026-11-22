@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
@@ -104,6 +104,88 @@ struct X360 {
     bundled: HashMap<String, (u64, bnd3::Entry)>,
     /// Every named file: lowercase disc path to the path as named.
     names: BTreeMap<String, String>,
+    /// Bounded LRU cache of decompressed, header-parsed BND3 binders.
+    binders: Mutex<BinderCache>,
+}
+
+/// Memory budget for cached decompressed binders in [`Disc`].
+const BINDER_CACHE_BYTES: usize = 192 * 1024 * 1024;
+
+struct CachedBinder {
+    bytes: Vec<u8>,
+    entries: Vec<bnd3::Entry>,
+    /// First entry index for each entry name (preserves `entries.iter().find(...)` order).
+    by_name: HashMap<String, usize>,
+}
+
+impl CachedBinder {
+    fn parse(bytes: Vec<u8>) -> Result<Self> {
+        let b = bnd3::read(&bytes)?;
+        let mut by_name = HashMap::with_capacity(b.entries.len());
+        for (i, e) in b.entries.iter().enumerate() {
+            if let Some(ref name) = e.name {
+                by_name.entry(name.clone()).or_insert(i);
+            }
+        }
+        Ok(Self {
+            bytes,
+            entries: b.entries,
+            by_name,
+        })
+    }
+
+    fn entry(&self, name: &str) -> Result<Vec<u8>> {
+        let found = match name.strip_prefix('#').and_then(|n| n.parse::<usize>().ok()) {
+            Some(i) => self.entries.get(i),
+            None => self.by_name.get(name).and_then(|&i| self.entries.get(i)),
+        };
+        let e = found.with_context(|| format!("no entry `{name}`"))?;
+        undcx(e.contents(&self.bytes)?.into_owned())
+    }
+}
+
+#[derive(Default)]
+struct BinderCache {
+    entries: HashMap<String, (u64, Arc<CachedBinder>)>,
+    tick: u64,
+    total_bytes: usize,
+}
+
+impl BinderCache {
+    fn get(&mut self, k: &str) -> Option<Arc<CachedBinder>> {
+        let (last_used, binder) = self.entries.get_mut(k)?;
+        self.tick += 1;
+        *last_used = self.tick;
+        Some(Arc::clone(binder))
+    }
+
+    fn insert(&mut self, k: String, binder: Arc<CachedBinder>) {
+        let size = binder.bytes.len();
+        if size > BINDER_CACHE_BYTES {
+            return;
+        }
+        if let Some((last_used, _)) = self.entries.get_mut(&k) {
+            self.tick += 1;
+            *last_used = self.tick;
+            return;
+        }
+        while self.total_bytes + size > BINDER_CACHE_BYTES && !self.entries.is_empty() {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some((_, evicted)) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.bytes.len());
+            }
+        }
+        self.tick += 1;
+        self.total_bytes += size;
+        self.entries.insert(k, (self.tick, binder));
+    }
 }
 
 /// Lowercase, `/`-separated, no leading slash.
@@ -172,11 +254,46 @@ impl Disc {
     pub fn asset(&self, asset: &str) -> Result<Vec<u8>> {
         let mut parts = asset.split(SEPARATOR);
         let file = parts.next().unwrap_or_default();
-        let mut data = undcx(self.read(file)?).with_context(|| format!("expanding {file}"))?;
-        for name in parts {
-            data = entry(&data, name).with_context(|| format!("opening `{name}` in {asset}"))?;
+        let Some(first_entry) = parts.next() else {
+            return undcx(self.read(file)?).with_context(|| format!("expanding {file}"));
+        };
+        let mut prefix = key(file);
+        let mut binder = self.open_binder(&prefix, || {
+            undcx(self.read(file)?).with_context(|| format!("expanding {file}"))
+        })?;
+        let mut next_name = first_entry;
+        for following in parts {
+            prefix.push(SEPARATOR);
+            prefix.push_str(next_name);
+            let parent = binder;
+            let entry_name = next_name;
+            binder = self.open_binder(&prefix, || {
+                parent
+                    .entry(entry_name)
+                    .with_context(|| format!("opening `{entry_name}` in {asset}"))
+            })?;
+            next_name = following;
         }
-        Ok(data)
+        binder
+            .entry(next_name)
+            .with_context(|| format!("opening `{next_name}` in {asset}"))
+    }
+
+    fn open_binder(
+        &self,
+        cache_key: &str,
+        load: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<Arc<CachedBinder>> {
+        if let Some(hit) = self.0.binders.lock().unwrap().get(cache_key) {
+            return Ok(hit);
+        }
+        let parsed = Arc::new(CachedBinder::parse(load()?)?);
+        self.0
+            .binders
+            .lock()
+            .unwrap()
+            .insert(cache_key.to_owned(), Arc::clone(&parsed));
+        Ok(parsed)
     }
 
     /// Every named file path on the disc (disc-relative, `/`-separated), sorted.
@@ -245,6 +362,7 @@ impl X360 {
             layers,
             bundled: HashMap::new(),
             names,
+            binders: Mutex::new(BinderCache::default()),
         };
         x.index_bundles()?;
         Ok(x)
@@ -440,6 +558,12 @@ mod tests {
             .asset("model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv")
             .unwrap();
         assert!(flv.starts_with(b"FLVER\0"));
+        // Repeated lookup hits the bounded binder cache and returns identical bytes.
+        let flv_cached = disc
+            .asset("model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv")
+            .unwrap();
+        assert_eq!(flv, flv_cached);
+        assert_eq!(disc.0.binders.lock().unwrap().entries.len(), 1);
     }
 
     #[test]

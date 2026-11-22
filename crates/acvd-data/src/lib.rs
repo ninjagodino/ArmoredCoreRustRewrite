@@ -1,6 +1,9 @@
 //! Game data generated from the sheets by `acvd-sheets gen`, one strut per sheet row.
 //! `src/generated` is derived from the owned disc and is never committed.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Row<T: 'static> {
     pub id: u32,
@@ -134,7 +137,15 @@ impl AcPart {
 
 /// The catalogue record for part `id` in `category`.
 pub fn ac_part(category: u8, id: u16) -> Option<&'static AcPart> {
-    generated::assembly::AC_PARTS.iter().find(|p| p.category == category && p.id == id)
+    static INDEX: OnceLock<HashMap<(u8, u16), &'static AcPart>> = OnceLock::new();
+    let map = INDEX.get_or_init(|| {
+        let mut m = HashMap::with_capacity(generated::assembly::AC_PARTS.len());
+        for p in generated::assembly::AC_PARTS {
+            m.entry((p.category, p.id)).or_insert(p);
+        }
+        m
+    });
+    map.get(&(category, id)).copied()
 }
 
 /// Field `name` of part `id` in `category`; 0 for an empty slot (id 0 or below), as the
@@ -194,7 +205,15 @@ pub struct AcState {
 }
 
 pub fn ac_state(state: &str, direction: Option<u8>) -> Option<&'static AcState> {
-    generated::assembly::AC_STATES.iter().find(|s| s.state == state && s.direction == direction)
+    static INDEX: OnceLock<HashMap<(&'static str, Option<u8>), &'static AcState>> = OnceLock::new();
+    let map = INDEX.get_or_init(|| {
+        let mut m = HashMap::with_capacity(generated::assembly::AC_STATES.len());
+        for s in generated::assembly::AC_STATES {
+            m.entry((s.state, s.direction)).or_insert(s);
+        }
+        m
+    });
+    map.get(&(state, direction)).copied()
 }
 
 /// A tuning binary `system/paramlist.xml` lists, with its debug-menu labels.
@@ -221,22 +240,72 @@ pub fn tuning(name: &str, index: usize) -> Option<f64> {
 
 /// The model at asset path `path`.
 pub fn model(path: &str) -> Option<&'static ModelRef> {
-    generated::models::ALL.iter().flat_map(|g| g.iter()).find(|m| m.path == path)
+    static INDEX: OnceLock<HashMap<&'static str, &'static ModelRef>> = OnceLock::new();
+    let map = INDEX.get_or_init(|| {
+        let mut m = HashMap::new();
+        for model in generated::models::ALL.iter().flat_map(|g| g.iter()) {
+            m.entry(model.path).or_insert(model);
+        }
+        m
+    });
+    map.get(path).copied()
 }
 
 /// Every model whose entry name (after the last `|`) equals `name`, ASCII case-insensitive.
 pub fn models_named(name: &str) -> impl Iterator<Item = &'static ModelRef> + '_ {
-    generated::models::ALL.iter().flat_map(|g| g.iter()).filter(move |m| m.path.rsplit('|').next().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+    static INDEX: OnceLock<HashMap<String, Vec<&'static ModelRef>>> = OnceLock::new();
+    let map = INDEX.get_or_init(|| {
+        let mut m: HashMap<String, Vec<&'static ModelRef>> = HashMap::new();
+        for model in generated::models::ALL.iter().flat_map(|g| g.iter()) {
+            if let Some(entry) = model.path.rsplit('|').next() {
+                m.entry(entry.to_ascii_lowercase()).or_default().push(model);
+            }
+        }
+        m
+    });
+    let key = name.to_ascii_lowercase();
+    map.get(&key).map(Vec::as_slice).unwrap_or(&[]).iter().copied()
 }
 
 /// Every texture whose name equals `name` (ASCII case-insensitive), in disc order.
 pub fn textures_named(name: &str) -> impl Iterator<Item = &'static TextureRef> + '_ {
-    generated::textures::ALL.iter().flat_map(|g| g.iter()).filter(move |t| t.name.eq_ignore_ascii_case(name))
+    static INDEX: OnceLock<HashMap<String, Vec<&'static TextureRef>>> = OnceLock::new();
+    let map = INDEX.get_or_init(|| {
+        let mut m: HashMap<String, Vec<&'static TextureRef>> = HashMap::new();
+        for tex in generated::textures::ALL.iter().flat_map(|g| g.iter()) {
+            m.entry(tex.name.to_ascii_lowercase()).or_default().push(tex);
+        }
+        m
+    });
+    let key = name.to_ascii_lowercase();
+    map.get(&key).map(Vec::as_slice).unwrap_or(&[]).iter().copied()
 }
 
 /// Every binder entry whose name equals `name` (ASCII case-insensitive), in disc order.
 pub fn assets_named(name: &str) -> impl Iterator<Item = &'static Asset> + '_ {
-    generated::assets::ALL.iter().flat_map(|g| g.iter()).filter(move |a| a.name.eq_ignore_ascii_case(name))
+    static INDEX: OnceLock<HashMap<String, Vec<&'static Asset>>> = OnceLock::new();
+    let map = INDEX.get_or_init(|| {
+        let mut m: HashMap<String, Vec<&'static Asset>> = HashMap::new();
+        for asset in generated::assets::ALL.iter().flat_map(|g| g.iter()) {
+            m.entry(asset.name.to_ascii_lowercase()).or_default().push(asset);
+        }
+        m
+    });
+    let key = name.to_ascii_lowercase();
+    map.get(&key).map(Vec::as_slice).unwrap_or(&[]).iter().copied()
+}
+
+/// Every entry inside `binder` (exact asset binder path), in disc order.
+pub fn assets_in(binder: &str) -> &'static [&'static Asset] {
+    static INDEX: OnceLock<HashMap<&'static str, Vec<&'static Asset>>> = OnceLock::new();
+    let map = INDEX.get_or_init(|| {
+        let mut m: HashMap<&'static str, Vec<&'static Asset>> = HashMap::new();
+        for asset in generated::assets::ALL.iter().flat_map(|g| g.iter()) {
+            m.entry(asset.binder).or_default().push(asset);
+        }
+        m
+    });
+    map.get(binder).map(Vec::as_slice).unwrap_or(&[])
 }
 
 pub mod generated;
