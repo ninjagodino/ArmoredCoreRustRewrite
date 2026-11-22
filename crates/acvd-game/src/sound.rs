@@ -196,6 +196,7 @@ struct Heard {
     glide: bool,
     quick_boosts: u32,
     wall_jumps: u32,
+    kicks: u32,
     sustain: Vec<Entity>,
 }
 
@@ -214,11 +215,15 @@ fn motion(
         stop(&mut commands, &mut heard.sustain);
         heard.moving = false;
         heard.airborne = pilot.airborne;
-        (heard.glide, heard.quick_boosts, heard.wall_jumps) =
-            (pilot.glide, pilot.quick_boosts, pilot.wall_jumps);
+        (heard.glide, heard.quick_boosts, heard.wall_jumps, heard.kicks) = (
+            pilot.glide,
+            pilot.quick_boosts,
+            pilot.wall_jumps,
+            pilot.kicks_started,
+        );
         return;
     }
-    if pilot.quick_boosts != heard.quick_boosts {
+    if pilot.quick_boosts != heard.quick_boosts || pilot.kicks_started != heard.kicks {
         for cue in QUICK_BOOST {
             cues.play(&mut commands, &mut assets, cue, false);
         }
@@ -227,10 +232,14 @@ fn motion(
     if pilot.glide && !heard.glide {
         cues.play(&mut commands, &mut assets, GLIDE_ON, false);
     }
-    (heard.glide, heard.quick_boosts, heard.wall_jumps) =
-        (pilot.glide, pilot.quick_boosts, pilot.wall_jumps);
+    (heard.glide, heard.quick_boosts, heard.wall_jumps, heard.kicks) = (
+        pilot.glide,
+        pilot.quick_boosts,
+        pilot.wall_jumps,
+        pilot.kicks_started,
+    );
     let flat = Vec2::new(pilot.velocity.x, pilot.velocity.z);
-    let moving = pilot.boost && flat.length() > BOOST_MOVING;
+    let moving = (pilot.boost || pilot.in_kick() || pilot.in_blade_dash()) && flat.length() > BOOST_MOVING;
     if moving && !heard.moving {
         cues.play(&mut commands, &mut assets, BOOST_ON, false);
     }
@@ -242,11 +251,16 @@ fn motion(
     heard.moving = moving;
 
     // Rising edge of airborne with upward speed: a jump. A ledge fall leaves `vy` ≤ 0, and a
-    // grounded High Boost adds its own small hop while playing `QUICK_BOOST`.
+    // grounded High Boost / Kick / Blade lunge adds its own vertical lift.
     // `se_jump` is +0xA of `AC_SOUNDPARAM_ST` (`FUN_82899168`, category 1 `c%08d`). Row 0
     // stands in for the AC's own row; every row stores the same id.
     let jump = wall_jumped
-        || (pilot.airborne && !heard.airborne && pilot.velocity.y > 0.0 && !pilot.in_quick_boost());
+        || (pilot.airborne
+            && !heard.airborne
+            && pilot.velocity.y > 0.0
+            && !pilot.in_quick_boost()
+            && !pilot.in_kick()
+            && !pilot.in_blade());
     heard.airborne = pilot.airborne;
     if jump {
         if let Some(row) = acvd_data::find(PARAM_ACSOUNDPARAM_BIN, 0).filter(|r| r.data.se_jump > 0)

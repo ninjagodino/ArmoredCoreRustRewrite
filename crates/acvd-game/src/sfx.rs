@@ -2217,16 +2217,25 @@ pub fn boosters(
     let stick = pilot.command;
     let glide = pilot.glide && pilot.boost;
     let wj_accel = pilot.in_wall_jump_accel();
+    let kicking = pilot.in_kick();
+    let blade_dash = pilot.in_blade_dash();
     let glide_scale = if wj_accel {
         pilot.ctrl.wall_jump_sfx_scale
+    } else if kicking {
+        pilot.ctrl.kick_sfx_scale
+    } else if blade_dash {
+        GLIDE_SFX_SCALE
     } else {
         stick.length().clamp(0.0, GLIDE_SFX_SCALE)
     };
     let moving = stick.length() > SIDE_STICK || pilot.velocity.with_y(0.0).length() > BOOST_MOVING;
     // Ground boost only while the boost-move slot runs. Air boost passes f2 = 1, so the main
     // flame stays lit with the stick neutral. Glide passes the clamped stick as both;
-    // AcMove_wallJump (`0x82824560`) lights mode 4 at `wall_jump_sfx_scale` (0.7).
+    // AcMove_wallJump (`0x82824560`) lights mode 4 at `wall_jump_sfx_scale` (0.7);
+    // AcMove_boostChargeKick (`0x82823740`) lights mode 3 at `kick_sfx_scale` (0.7).
     let active = wj_accel
+        || kicking
+        || blade_dash
         || pilot.boost && (glide && glide_scale > 0.0 || !glide && (pilot.airborne || moving));
     for (e, mut p) in &mut points {
         let want = booster_plays(p.id, stick, glide, active, glide_scale, row);

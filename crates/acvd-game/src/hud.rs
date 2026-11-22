@@ -602,8 +602,12 @@ fn reading(
             )
         }),
         Readout::LeftArm | Readout::RightArm => gun(arms, which).map(|g| {
-            let f = fraction(g.remaining as f32, g.magazine as f32);
-            (g.remaining as u32, f, g.magazine > 0 && f < tuning(324))
+            if g.kind == Kind::Blade && g.magazine == 0 {
+                (0, 1.0, false)
+            } else {
+                let f = fraction(g.remaining as f32, g.magazine as f32);
+                (g.remaining as u32, f, g.magazine > 0 && f < tuning(324))
+            }
         }),
         Readout::Shoulder => arms
             .map(|a| a.shoulder)

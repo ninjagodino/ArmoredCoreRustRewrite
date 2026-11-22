@@ -26,10 +26,10 @@
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::bullet::{
-    BULLET_BULLETENERGY_BIN, BULLET_BULLETMISSILE_BIN, BULLET_BULLETRIGID_BIN,
-    PARAM_BULLETHITSEPARAM_BIN, PARAM_BULLETHITSFXPARAM_BIN,
-    PARAM_ENEMY_BULLET_ENEMYBULLETENERGY_BIN, PARAM_ENEMY_BULLET_ENEMYBULLETMISSILE_BIN,
-    PARAM_ENEMY_BULLET_ENEMYBULLETRIGID_BIN,
+    BULLET_BULLETBLADE_BIN, BULLET_BULLETENERGY_BIN, BULLET_BULLETEXPLOSION_BIN,
+    BULLET_BULLETMISSILE_BIN, BULLET_BULLETRIGID_BIN, PARAM_BULLETHITSEPARAM_BIN,
+    PARAM_BULLETHITSFXPARAM_BIN, PARAM_ENEMY_BULLET_ENEMYBULLETENERGY_BIN,
+    PARAM_ENEMY_BULLET_ENEMYBULLETMISSILE_BIN, PARAM_ENEMY_BULLET_ENEMYBULLETRIGID_BIN,
 };
 use acvd_data::generated::sfx::{PARAM_ACWEAPONSFXPARAM_BIN, PARAM_ENEMYWEAPONSFXPARAM_BIN};
 use acvd_data::generated::sound::{
@@ -46,8 +46,8 @@ use bevy::prelude::*;
 
 use crate::assemble::Placement;
 use crate::collision::{Collision, RAY_HALF};
-use crate::control::{Held, Pilot, Piloting};
-use crate::damage::{self, DamageType, PlayerHealth};
+use crate::control::{BladeLaunch, BladePhase, Held, Pilot, Piloting};
+use crate::damage::{self, DamageType, PlayerHealth, SpeedWeightScale};
 use crate::hud::Status;
 use crate::pose::{self, Driven, Motion};
 use crate::sfx::{EffectPoint, Sfx};
@@ -205,6 +205,27 @@ pub struct MissileFlight {
     pub proximity_fuse_range: f32,
 }
 
+/// Melee blade parameters from `bullet/bulletblade.bin` (`BulletBladeSt`, `0x828a4928`) and
+/// `acvparts.bin` (`0x8247f170`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BladeSpec {
+    /// Blade reach / hit length in m (`BulletBladeSt.hit_radius`).
+    pub hit_radius: f32,
+    /// Blade capsule thickness radius in m (`BulletBladeSt.blade_radius`).
+    pub blade_radius: f32,
+    /// Max targets struck per swing (`BulletBladeSt.damage_hit_count_chara`).
+    pub max_hits: u8,
+    /// Multi-target cleave power multiplier (`BulletBladeSt.decay_power`).
+    pub decay_power: f32,
+    /// Multi-target cleave recoil multiplier (`BulletBladeSt.decay_recoil`).
+    pub decay_recoil: f32,
+    /// True for KE physical blades & CE heat piles (`0x8247f170`: `damage_type != TE`), which
+    /// scale power & recoil by speed × weight (`0x828a43e8`). False for TE laser blades.
+    pub physical: bool,
+    /// True when `magazine == 0` (infinite swings: laser blades & physical blades; Heat Piles use ammo).
+    pub infinite_ammo: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Gun {
     pub remaining: u16,
@@ -218,6 +239,7 @@ pub struct Gun {
     pub kind: Kind,
     pub flight: Flight,
     pub missile_flight: Option<MissileFlight>,
+    pub blade: Option<BladeSpec>,
     /// True when `sub +0x00 == 1` (`0x82478850`): enables multi-lock missile acquisition.
     pub is_missile: bool,
     /// Weapon's own max simultaneous missile locks (`0x82478cd0`: `burst_count` if `lock_use_burst != 0`, else `lock_once.max(1)`).
@@ -283,6 +305,7 @@ pub enum Kind {
     Rigid,
     Energy,
     Missile,
+    Blade,
     Skip,
 }
 
@@ -941,11 +964,12 @@ pub fn fire(
     // arm with its bay weapon instead of shooting. The clip keeps the block after release.
     // Scan Mode (`AC + 0xdb0 != 0`, `0x828b51e0` -> `0x82879d58(_, 0)`, `manual.fmg` 20407):
     // weapon fire is disabled while in Scan Mode (R2 becomes Target Scan).
+    // Kick / Blade active (`AcActRestrictionParamSt` rows 2, 3, 9: `b_shoot == 0`): block fire.
     let shifting = body.shift.is_some()
         || keys.pressed(KeyCode::KeyR)
         || held.0.contains(&KeyCode::KeyR)
         || pads.iter().any(|pad| pad.pressed(GamepadButton::North));
-    if shifting || pilot.scan_mode {
+    if shifting || pilot.scan_mode || pilot.in_kick() || pilot.in_blade() {
         want = [false, false];
         want_shoulder = false;
     }
@@ -969,6 +993,58 @@ pub fn fire(
     for (i, gun) in arms.hands.iter_mut().enumerate() {
         gun.cooldown = (gun.cooldown - dt * TICK_RATE).max(0.0);
         let hand = if i == 0 { Hand::Right } else { Hand::Left };
+        if gun.kind == Kind::Blade {
+            let Some(blade) = gun.blade else { continue };
+            let has_ammo = blade.infinite_ammo || gun.remaining > 0;
+            if want[i]
+                && has_ammo
+                && gun.cooldown <= 0.0
+                && !pilot.in_blade()
+                && !pilot.in_kick()
+                && pilot.en >= gun.en_drain
+            {
+                let target = fcs
+                    .as_deref()
+                    .and_then(|f| f.locked.as_ref())
+                    .map(|l| (l.entity, l.world_pos));
+                let launch = BladeLaunch {
+                    hand_idx: i,
+                    physical: blade.physical,
+                    target,
+                    hit_radius: blade.hit_radius,
+                    blade_radius: blade.blade_radius,
+                    max_hits: blade.max_hits,
+                    decay_power: blade.decay_power,
+                    decay_recoil: blade.decay_recoil,
+                    damage_type: gun.damage_type,
+                    damage_power: gun.damage_power,
+                    damage_recoil: gun.damage_recoil,
+                    trail_fx: gun.fx.bullet,
+                    hit_low_fx: gun.fx.hit_low,
+                    hit_hi_fx: gun.fx.hit_hi,
+                    hit_low_se: gun.hit_se.low,
+                    hit_hi_se: gun.hit_se.hi,
+                };
+                if pilot.start_blade(launch) {
+                    let _ = pilot.try_drain_en(gun.en_drain);
+                    if !blade.infinite_ammo {
+                        gun.remaining = gun.remaining.saturating_sub(1);
+                    }
+                    gun.cooldown = gun.reload_time.max(1.0);
+                    if let Some(status) = status.as_deref_mut() {
+                        status.en = pilot.en;
+                        status.en_max = pilot.en_max;
+                    }
+                    sound::shot(
+                        &mut commands,
+                        &mut speaker.cues,
+                        &mut speaker.sources,
+                        gun.shoot,
+                    );
+                }
+            }
+            continue;
+        }
         let can = gun.kind != Kind::Skip
             && gun.remaining > 0
             && gun.cooldown <= 0.0
@@ -1746,6 +1822,230 @@ pub fn tick_player_health(
     }
 }
 
+/// Sweeps active Boost Charge Kick (`KickState`, `BULLET_BULLETEXPLOSION_BIN` row 4100
+/// `init_radius = 7.0 m`, `0x8286ac40` speed×weight scaling, hit VFX/SE row `99000`) and
+/// active Melee Blade swings (`BladeState`, `BULLET_BULLETBLADE_BIN`, `0x828a4928` → `0x828a43e8`)
+/// against living `TargetHealth` spheres.
+#[allow(clippy::too_many_arguments)]
+pub fn step_melee(
+    piloting: Res<Piloting>,
+    mut speaker: Speaker,
+    mut commands: Commands,
+    mut acs: Query<(&mut Pilot, &Transform, Option<&PlayerHealth>)>,
+    hardpoints: Query<(&Hardpoint, &GlobalTransform)>,
+    mut targets: Query<
+        (Entity, &Target, &mut TargetHealth, &mut Transform),
+        Without<Pilot>,
+    >,
+) {
+    if !piloting.0 {
+        return;
+    }
+    let Ok((mut pilot, ac_tf, player_health)) = acs.single_mut() else {
+        return;
+    };
+    if player_health.is_some_and(|h| h.destroyed) {
+        return;
+    }
+
+    let cur_pos = ac_tf.translation;
+    let prev_pos = pilot.prev_position;
+    let horiz_kmh = pilot.horiz_speed_kmh();
+    let total_weight = pilot.ctrl.total_weight;
+
+    // Keep blade homing target position fresh while target is alive.
+    if let Some(blade) = pilot.blade.as_mut() {
+        if let Some((tent, _)) = blade.launch.target {
+            if let Ok((_, _, health, tf)) = targets.get(tent) {
+                if !health.destroyed {
+                    blade.target_pos = Some(tf.translation + Vec3::Y * health.center_offset_y());
+                } else {
+                    blade.target_pos = None;
+                }
+            }
+        }
+    }
+
+    // 1. Boost Charge Kick hit sweep (`BULLET_BULLETEXPLOSION_BIN` row 4100 = 7.0 m sphere,
+    //    `PARAM_BULLETHITSFXPARAM_BIN` / `PARAM_BULLETHITSEPARAM_BIN` row 99000).
+    if let Some(kick) = pilot.kick {
+        if !kick.hit_applied {
+            let kick_radius = find(BULLET_BULLETEXPLOSION_BIN, 4100)
+                .map_or(7.0, |r| r.data.init_radius.max(3.0));
+            let offset = Vec3::Y * 4.0 + kick.dir * 2.5;
+            let a = prev_pos + offset;
+            let b = cur_pos + offset;
+
+            let mut best: Option<(f32, Entity, Vec3)> = None;
+            for (entity, _, health, tf) in &targets {
+                if health.destroyed {
+                    continue;
+                }
+                for sphere in &health.spheres {
+                    let center = tf.translation + Vec3::Y * sphere.offset_y;
+                    if let Some((t, hit_pos, _)) =
+                        damage::swept_sphere_hits_sphere(a, b, kick_radius, center, sphere.radius)
+                    {
+                        if best.is_none_or(|(bt, _, _)| t < bt) {
+                            best = Some((t, entity, hit_pos));
+                        }
+                    }
+                }
+            }
+
+            if let Some((_, entity, hit_pos)) = best {
+                let (power, recoil) = SpeedWeightScale::kick().scale(
+                    pilot.ctrl.kick_power,
+                    pilot.ctrl.kick_recoil,
+                    horiz_kmh,
+                    total_weight,
+                );
+                if let Ok((_, target, mut health, mut tf)) = targets.get_mut(entity) {
+                    let (res, lethal) = health.apply_hit(DamageType::Ke, power, recoil);
+                    health.record_hit_from(cur_pos);
+                    if !lethal {
+                        // Knockback along kick direction (`NewAcBehavior +0x524`).
+                        tf.translation += kick.dir * 5.0;
+                    }
+                    let (kick_fx, kick_se) = fx_and_hit_se_for(99000);
+                    let ffx = if res.effective {
+                        kick_fx.hit_hi
+                    } else {
+                        kick_fx.hit_low
+                    };
+                    if ffx > 0 {
+                        commands.spawn((Sfx::new(ffx), Transform::from_translation(hit_pos)));
+                    }
+                    let se = if res.effective {
+                        kick_se.hi
+                    } else {
+                        kick_se.low
+                    };
+                    if se > 0 {
+                        sound::shot(&mut commands, &mut speaker.cues, &mut speaker.sources, se);
+                    }
+                    info!(
+                        "BOOST KICK {} ({}) at {:.1} km/h: {} {:.0} dmg (recoil {:.0}, AP {:.0}/{:.0}){}{}",
+                        target.name,
+                        target.model,
+                        horiz_kmh,
+                        if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                        res.damage,
+                        res.recoil,
+                        health.ap,
+                        health.ap_max,
+                        if health.is_staggered() { " STAGGER" } else { "" },
+                        if lethal { " DESTROYED" } else { "" },
+                    );
+                }
+                pilot.on_kick_contact();
+                return;
+            }
+        }
+    }
+
+    // 2. Melee Blade active swing sweep (`BladePhase::Swing`, `BULLET_BULLETBLADE_BIN`, `0x828a4928`).
+    if let Some(mut blade) = pilot.blade.take() {
+        if blade.phase == BladePhase::Swing {
+            let hand = if blade.launch.hand_idx == 0 {
+                Hand::Right
+            } else {
+                Hand::Left
+            };
+            let forward = (Quat::from_rotation_y(pilot.yaw) * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
+            let origin = hardpoints
+                .iter()
+                .find(|(h, _)| h.hand == hand)
+                .map_or(cur_pos + Vec3::Y * 4.5 + forward * 2.0, |(_, t)| t.translation());
+
+            // Spawn blade trail / laser beam FFX once on entering Swing (e.g. FFX 4104).
+            if !blade.trail_spawned {
+                blade.trail_spawned = true;
+                if blade.launch.trail_fx > 0 {
+                    commands.spawn((
+                        Sfx::new(blade.launch.trail_fx),
+                        Transform::from_translation(origin).looking_to(forward, Vec3::Y),
+                    ));
+                }
+            }
+
+            let reach = blade.launch.hit_radius.clamp(6.0, 35.0);
+            let sweep_r = blade.launch.blade_radius.max(2.0);
+            let tip = origin + forward * reach;
+            let max_hits = blade.launch.max_hits.max(1) as usize;
+
+            for (entity, target, mut health, tf) in &mut targets {
+                if blade.hit_entities.len() >= max_hits {
+                    break;
+                }
+                if health.destroyed || blade.hit_entities.contains(&entity) {
+                    continue;
+                }
+                let mut hit_pos = None;
+                for sphere in &health.spheres {
+                    let center = tf.translation + Vec3::Y * sphere.offset_y;
+                    if let Some((_, p, _)) =
+                        damage::swept_sphere_hits_sphere(origin, tip, sweep_r, center, sphere.radius)
+                    {
+                        hit_pos = Some(p);
+                        break;
+                    }
+                }
+                let Some(hit_pos) = hit_pos else { continue };
+
+                let (mut power, mut recoil) = if blade.launch.physical {
+                    SpeedWeightScale::physical_blade().scale(
+                        blade.launch.damage_power,
+                        blade.launch.damage_recoil,
+                        horiz_kmh,
+                        total_weight,
+                    )
+                } else {
+                    (blade.launch.damage_power, blade.launch.damage_recoil)
+                };
+                if !blade.hit_entities.is_empty() {
+                    power *= blade.launch.decay_power.clamp(0.0, 1.0);
+                    recoil *= blade.launch.decay_recoil.clamp(0.0, 1.0);
+                }
+                let (res, lethal) = health.apply_hit(blade.launch.damage_type, power, recoil);
+                health.record_hit_from(cur_pos);
+                let ffx = if res.effective {
+                    blade.launch.hit_hi_fx
+                } else {
+                    blade.launch.hit_low_fx
+                };
+                if ffx > 0 {
+                    commands.spawn((Sfx::new(ffx), Transform::from_translation(hit_pos)));
+                }
+                let se = if res.effective {
+                    blade.launch.hit_hi_se
+                } else {
+                    blade.launch.hit_low_se
+                };
+                if se > 0 {
+                    sound::shot(&mut commands, &mut speaker.cues, &mut speaker.sources, se);
+                }
+                blade.hit_entities.push(entity);
+                pilot.blade_hits += 1;
+                info!(
+                    "BLADE {} ({}) ({}): {} {:.0} dmg (recoil {:.0}, AP {:.0}/{:.0}){}{}",
+                    target.name,
+                    target.model,
+                    if blade.launch.physical { "physical/pile" } else { "laser" },
+                    if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                    res.damage,
+                    res.recoil,
+                    health.ap,
+                    health.ap_max,
+                    if health.is_staggered() { " STAGGER" } else { "" },
+                    if lethal { " DESTROYED" } else { "" },
+                );
+            }
+        }
+        pilot.blade = Some(blade);
+    }
+}
+
 pub(crate) fn silent() -> Gun {
     Gun {
         remaining: 0,
@@ -1757,6 +2057,7 @@ pub(crate) fn silent() -> Gun {
         kind: Kind::Skip,
         flight: Flight::default(),
         missile_flight: None,
+        blade: None,
         is_missile: false,
         weapon_lock_max: 0,
         burst_count: 1,
@@ -1784,10 +2085,12 @@ fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
     let magazine = part_field(id, category, "magazine").max(0.0) as u16;
     let init_speed = part_field(id, category, "init_speed");
     let bullet_id = part_field(id, category, "bullet_id") as u32;
-    let (kind, flight, missile_flight, speed) = flight(bullet_id, init_speed);
+    let damage_type = DamageType::from_raw(part_field(id, category, "damage_type") as u8);
+    let (kind, flight, missile_flight, blade, speed) =
+        flight_or_blade(bullet_id, init_speed, damage_type, magazine);
     let hit_id = part_field(id, category, "hit_id") as u32;
     let (fx, hit_se) = fx_and_hit_se_for(hit_id);
-    let is_missile = part_field(id, category, "is_missile") != 0.0;
+    let is_missile = part_field(id, category, "is_missile") == 1.0;
     let base_burst = (part_field(id, category, "burst_count") as u8).max(1);
     let burst_count = if category == 12 {
         base_burst.saturating_mul(arms_mount.max(1))
@@ -1816,11 +2119,12 @@ fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
         kind,
         flight,
         missile_flight,
+        blade,
         is_missile,
         weapon_lock_max,
         burst_count,
         burst_interval: part_field(id, category, "burst_interval"),
-        damage_type: DamageType::from_raw(part_field(id, category, "damage_type") as u8),
+        damage_type,
         damage_power: part_field(id, category, "damage_power"),
         damage_recoil: part_field(id, category, "damage_recoil"),
         en_drain: part_field(id, category, "en_drain"),
@@ -1878,6 +2182,7 @@ fn enemy_gun_from_record(data: &[u8]) -> Gun {
         kind,
         flight,
         missile_flight,
+        blade: None,
         is_missile,
         weapon_lock_max: if is_missile { 1 } else { 0 },
         burst_count,
@@ -2044,6 +2349,31 @@ fn fx_and_hit_se_for(hit_id: u32) -> (Fx, HitSe) {
         delete_fx: row.delete_sfx_id.into(),
     };
     (fx, hit_se)
+}
+
+fn flight_or_blade(
+    id: u32,
+    init_speed: f32,
+    damage_type: DamageType,
+    magazine: u16,
+) -> (Kind, Flight, Option<MissileFlight>, Option<BladeSpec>, f32) {
+    if let Some(row) = find(BULLET_BULLETBLADE_BIN, id) {
+        let d = &row.data;
+        let spec = BladeSpec {
+            hit_radius: d.hit_radius,
+            blade_radius: d.blade_radius,
+            max_hits: d.damage_hit_count_chara.max(1),
+            decay_power: d.decay_power,
+            decay_recoil: d.decay_recoil,
+            // `0x8247f170`: physical blade / heat pile speed×weight scaling applies when
+            // `damage_type != 1 (TE)`.
+            physical: damage_type != DamageType::Te,
+            infinite_ammo: magazine == 0,
+        };
+        return (Kind::Blade, Flight::default(), None, Some(spec), 0.0);
+    }
+    let (kind, fl, mf, spd) = flight(id, init_speed);
+    (kind, fl, mf, None, spd)
 }
 
 fn flight(id: u32, init_speed: f32) -> (Kind, Flight, Option<MissileFlight>, f32) {
@@ -3185,5 +3515,105 @@ mod tests {
             min_dist < 5.0,
             "homing missile should intercept target (min_dist = {min_dist})"
         );
+    }
+
+    #[test]
+    fn melee_blades_and_heat_piles_load_from_bulletblade_bin() {
+        // Laser blade 350 (design 5011 hanger_l): TE, infinite ammo, EN drain, FFX 4104, hit_radius 25.
+        let lb350 = gun(350);
+        assert_eq!(lb350.kind, Kind::Blade);
+        assert!(!lb350.is_missile);
+        assert_eq!(lb350.damage_type, DamageType::Te);
+        assert_eq!(lb350.magazine, 0);
+        assert!(lb350.en_drain > 2000.0);
+        assert!(lb350.damage_power > 8000.0);
+        assert_eq!(lb350.fx.bullet, 4104);
+        assert_eq!(lb350.shoot, 6);
+        let spec350 = lb350.blade.expect("laser blade spec");
+        assert!(!spec350.physical, "TE laser blade does not use speedxweight scaling (0x8247f170)");
+        assert!(spec350.infinite_ammo);
+        assert_eq!(spec350.hit_radius, 25.0);
+        assert_eq!(spec350.blade_radius, 2.0);
+        assert_eq!(spec350.max_hits, 3);
+
+        // Laser blade 360 (starter design 5001 hanger_l): TE, infinite ammo, bullet 10063.
+        let lb360 = gun(360);
+        assert_eq!(lb360.kind, Kind::Blade);
+        assert_eq!(lb360.blade.unwrap().hit_radius, 22.0);
+
+        // Heat Pile 150 (design 6006 armwep_r): CE, finite ammo (12), 0 EN drain, physical scaling.
+        let pile150 = gun(150);
+        assert_eq!(pile150.kind, Kind::Blade);
+        assert_eq!(pile150.damage_type, DamageType::Ce);
+        assert_eq!(pile150.magazine, 12);
+        assert_eq!(pile150.en_drain, 0.0);
+        assert!(pile150.damage_power > 18000.0);
+        assert!(pile150.damage_recoil > 2000.0);
+        assert_eq!(pile150.shoot, 3);
+        let spec150 = pile150.blade.expect("heat pile spec");
+        assert!(spec150.physical, "CE heat pile uses physical speedxweight scaling (0x8247f170)");
+        assert!(!spec150.infinite_ammo);
+        assert_eq!(spec150.hit_radius, 10.0);
+        assert_eq!(spec150.blade_radius, 3.0);
+
+        // Physical Blade 2810 (design 6304 hanger): KE, infinite ammo, 0 EN drain, physical scaling.
+        let phys2810 = gun(2810);
+        assert_eq!(phys2810.kind, Kind::Blade);
+        assert_eq!(phys2810.damage_type, DamageType::Ke);
+        assert_eq!(phys2810.magazine, 0);
+        assert_eq!(phys2810.en_drain, 0.0);
+        assert_eq!(phys2810.shoot, 80);
+        let spec2810 = phys2810.blade.expect("physical blade spec");
+        assert!(spec2810.physical);
+        assert!(spec2810.infinite_ammo);
+        assert_eq!(spec2810.hit_radius, 10.0);
+        assert_eq!(spec2810.blade_radius, 4.0);
+
+        // Kick hit VFX/SE row 99000 and hit sphere row 4100 resolve cleanly from disc tables.
+        let (kfx, kse) = fx_and_hit_se_for(99000);
+        assert_eq!(kfx.hit_hi, 135);
+        assert_eq!(kse.hi, 9202);
+        assert_eq!(kse.low, 9027);
+        assert_eq!(find(BULLET_BULLETEXPLOSION_BIN, 4100).unwrap().data.init_radius, 7.0);
+    }
+
+    #[test]
+    fn kick_and_blade_hits_stagger_and_destroy_targets() {
+        // Test Boost Charge Kick against tank e1020 (AP 1200) and DEF-MT e0210 (AP 3600).
+        let design5001 = acvd_data::find(
+            acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN,
+            5001,
+        )
+        .unwrap()
+        .data;
+        let ctrl = acvd_data::generated::ctrl::AcCtrlParam::calculate(&design5001);
+        let (k_pwr, k_rec) =
+            SpeedWeightScale::kick().scale(ctrl.kick_power, ctrl.kick_recoil, 120.0, ctrl.total_weight);
+
+        let mut tank = TargetHealth::from_enemy("e1020");
+        let (res, lethal) = tank.apply_hit(DamageType::Ke, k_pwr, k_rec);
+        assert!(res.effective && lethal && tank.destroyed, "120 km/h kick must one-shot tank");
+
+        let mut mt = TargetHealth::from_enemy("e0210");
+        let (res_mt, _) = mt.apply_hit(DamageType::Ke, k_pwr, k_rec);
+        assert!(res_mt.effective && mt.is_staggered(), "kick recoil must stagger DEF-MT");
+
+        // Test Heat Pile 150 at 130 km/h against DEF-MT e0210 -> one-shot destruction.
+        let pile = gun(150);
+        let (p_pwr, p_rec) = SpeedWeightScale::physical_blade().scale(
+            pile.damage_power,
+            pile.damage_recoil,
+            130.0,
+            ctrl.total_weight,
+        );
+        let mut mt2 = TargetHealth::from_enemy("e0210");
+        let (res_p, lethal_p) = mt2.apply_hit(pile.damage_type, p_pwr, p_rec);
+        assert!(res_p.effective && lethal_p && mt2.destroyed, "Heat Pile must destroy DEF-MT");
+
+        // Test Laser Blade 350 fixed TE damage against tank e1020 -> one-shot destruction.
+        let lb = gun(350);
+        let mut tank2 = TargetHealth::from_enemy("e1020");
+        let (res_l, lethal_l) = tank2.apply_hit(lb.damage_type, lb.damage_power, lb.damage_recoil);
+        assert!(res_l.effective && lethal_l && tank2.destroyed, "Laser Blade must destroy tank");
     }
 }

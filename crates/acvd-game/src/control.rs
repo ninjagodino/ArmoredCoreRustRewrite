@@ -17,7 +17,7 @@ use acvd_data::generated::camera::{
     PARAM_ACCAMERAOFFSETPARAM_BIN,
 };
 use acvd_data::generated::ctrl::AcCtrlParam;
-use acvd_data::generated::tuning::AC_ANIM_PARAM;
+use acvd_data::generated::tuning::{AC_ANIM_PARAM, NEW_AC_BEHAVIOR};
 use acvd_data::{find, Row};
 use acvd_render::app::Orbit;
 use bevy::prelude::*;
@@ -129,6 +129,90 @@ struct QbThrust {
     dir: Vec3,
     hop: bool,
 }
+
+/// Active Boost Charge Kick state (`KickState` vtable `0x820928d0`, ctor `0x8283f8a8`, update
+/// `0x82844570` → `0x8283e1f0` / `0x828433a0`, `AcMove_boostChargeKick` `0x82823740`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KickState {
+    /// Elapsed ticks since entering Phase 1 (`0..=kick_accel_frames + kick_after_frames`).
+    pub timer: f32,
+    /// Horizontal forward unit direction at kick launch.
+    pub dir: Vec3,
+    /// True once the single kick hit (`BulletExplosionSt` 4100 `damage_hit_count = 1`) has landed.
+    pub hit_applied: bool,
+}
+
+/// Active melee blade phase (`BladeState`, phase table `0x83714024`:
+/// `[0x828ae9e0, 0x828af000, 0x828af1c8]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BladePhase {
+    /// Phase 0 (`0x828ae9e0`): wind-up charge (`blade_charge_frames` / `phys_blade_charge_frames` = 5 ticks).
+    Charge,
+    /// Phase 1 (`0x828af000`): homing lunge toward FCS-locked target (`AcMove_bladeDash` `0x828248f8`).
+    Dash,
+    /// Phase 2 (`0x828af1c8` first `blade_swing_frames` = 12 ticks): active swing & hit window.
+    Swing,
+    /// Phase 2 tail (`0x828af30c..0x828af350`, up to `blade_recovery_frames` = 30 ticks): braking recovery.
+    Recovery,
+}
+
+/// Parameters passed to `Pilot::start_blade` when triggering a melee blade weapon.
+#[derive(Clone, Copy, Debug)]
+pub struct BladeLaunch {
+    /// `0` = right arm, `1` = left arm.
+    pub hand_idx: usize,
+    /// `0x8247f170`: true for KE physical blades & CE heat piles; false for TE laser blades.
+    pub physical: bool,
+    /// FCS-locked target entity & world position (if any).
+    pub target: Option<(Entity, Vec3)>,
+    /// Weapon hit reach (`BulletBladeSt.hit_radius`, m).
+    pub hit_radius: f32,
+    /// Weapon blade capsule thickness (`BulletBladeSt.blade_radius`, m).
+    pub blade_radius: f32,
+    /// Max targets damaged per swing (`BulletBladeSt.damage_hit_count_chara`).
+    pub max_hits: u8,
+    /// Multi-hit power decay (`BulletBladeSt.decay_power`).
+    pub decay_power: f32,
+    /// Multi-hit recoil decay (`BulletBladeSt.decay_recoil`).
+    pub decay_recoil: f32,
+    /// Weapon damage attribute (`0` KE, `1` TE, `6` CE).
+    pub damage_type: crate::damage::DamageType,
+    /// Base weapon power (`acvparts.bin +0x18c`).
+    pub damage_power: f32,
+    /// Base weapon impact recoil (`acvparts.bin +0x190`).
+    pub damage_recoil: f32,
+    /// Blade trail FFX id (`acweaponsfxparam.bullet_sfx_id`, e.g. `4104` for laser blades).
+    pub trail_fx: i32,
+    /// Hit FFX ids (`bullethitsfxparam.dry_ac_low_damage` / `ac_hi_damage`).
+    pub hit_low_fx: i32,
+    pub hit_hi_fx: i32,
+    /// Hit sound cue ids (`bullethitseparam.dry_ac_low_damage` / `ac_hi_damage`).
+    pub hit_low_se: i16,
+    pub hit_hi_se: i16,
+}
+
+/// Live melee blade attack state on `Pilot`.
+#[derive(Clone, Debug)]
+pub(crate) struct BladeAction {
+    pub launch: BladeLaunch,
+    pub phase: BladePhase,
+    /// Ticks elapsed in the current phase (`Charge`, `Dash`, or `Swing+Recovery`).
+    pub timer: f32,
+    /// Maximum ticks for `BladePhase::Dash` (`0x828ad510`).
+    pub max_dash_ticks: f32,
+    /// Entry horizontal speed in m/tick (`0x828ad328`).
+    pub entry_speed_tick: f32,
+    /// Live target position (updated each frame while target lives).
+    pub target_pos: Option<Vec3>,
+    /// Whether the attack started airborne (picks air vs ground `acmotion` rows).
+    pub air_start: bool,
+    /// Whether the attack uses the airborne downward-thrust clip (`NewAcBehavior +0x2e2` = 35°).
+    pub downward: bool,
+    /// True once the blade trail FFX has been spawned on entering `Swing`.
+    pub trail_spawned: bool,
+    /// Targets already struck during this swing (caps per-target hits at 1, total at `max_hits`).
+    pub hit_entities: Vec<Entity>,
+}
 /// Whether input drives the AC (`P` toggles) instead of browsing clips.
 #[derive(Resource)]
 pub struct Piloting(pub bool);
@@ -180,6 +264,12 @@ pub struct Pilot {
     pub quick_dir: Vec3,
     /// Wall kicks launched so far (`WallJumpState` Phase 0 -> Phase 1, `0x828438c0`).
     pub wall_jumps: u32,
+    /// Boost Charge Kicks started and landed (`KickState` `0x820928d0`).
+    pub kicks_started: u32,
+    pub kicks_landed: u32,
+    /// Melee blade swings started and target hits landed (`BladeState` `0x83714024`).
+    pub blade_swings: u32,
+    pub blade_hits: u32,
     /// Active High Boost / Boost Charge state (`0x8200d378`), and re-fire cooldown ticks
     /// (`action_ctrl +0x110`, `0x8283ed98`).
     qb: Option<QbPhase>,
@@ -190,6 +280,12 @@ pub struct Pilot {
     wj: Option<WallJumpPhase>,
     wj_lockout: f32,
     wall_jump_queued: bool,
+    /// Active Boost Charge Kick state (`KickState` `0x820928d0`, `0x8283fdb0`).
+    pub(crate) kick: Option<KickState>,
+    /// Active melee blade state (`BladeState` `0x83714024`).
+    pub(crate) blade: Option<BladeAction>,
+    /// World position before the last movement frame (for swept melee collision).
+    pub(crate) prev_position: Vec3,
     /// The body-relative eighth of a high boost whose clip starts on the next state pick.
     quick_pending: Option<u8>,
     /// Ticks of take-off acceleration left.
@@ -402,7 +498,9 @@ fn camera_action(state: &str, boost: bool, airborne: bool) -> u32 {
         "turn_left" | "turn_right" => 3,
         "land" => 9,
         "glide_start" | "glide" | "glide_air_in" | "glide_air" => 0x1a,
+        "kick" => 0x2a,
         "wall_jump_prep" | "wall_jump" => 0x2b,
+        s if s.starts_with("blade_") || s.starts_with("phys_blade_") => 0x2c,
         "quick_boost" => 0x32,
         _ => 8,
     };
@@ -883,6 +981,102 @@ impl Pilot {
         matches!(self.wj, Some(WallJumpPhase::Accel { .. }))
     }
 
+    /// Whether a Boost Charge Kick (`KickState`, `0x820928d0`) is active.
+    pub fn in_kick(&self) -> bool {
+        self.kick.is_some()
+    }
+
+    /// Whether a melee blade attack (`BladeState`, `0x83714024`) is active.
+    pub fn in_blade(&self) -> bool {
+        self.blade.is_some()
+    }
+
+    /// Whether a melee blade attack is actively lunging or swinging (lights boosters).
+    pub fn in_blade_dash(&self) -> bool {
+        matches!(
+            self.blade.as_ref().map(|b| b.phase),
+            Some(BladePhase::Dash | BladePhase::Swing)
+        )
+    }
+
+    /// Current horizontal speed in km/h (used by `SpeedWeightScale` `0x828a2e50`).
+    pub fn horiz_speed_kmh(&self) -> f32 {
+        Vec2::new(self.velocity.x, self.velocity.z).length() * TICK_TO_KMH
+    }
+
+    /// Starts Boost Charge Kick (`AcActCtrl_startKick` `0x8283fdb0` → `0x8281f278` EN check/drain
+    /// of `qb_en_drain` = `BST__HI_EN * 0.7`, `KickState` `0x8283f8a8`).
+    pub fn start_kick(&mut self) -> bool {
+        if self.kick.is_some() || self.blade.is_some() || self.wj.is_some() {
+            return false;
+        }
+        if !self.try_drain_en(self.ctrl.qb_en_drain) {
+            return false;
+        }
+        let dir = Quat::from_rotation_y(self.yaw + self.cam.yaw_off) * FORWARD;
+        let dir = Vec3::new(dir.x, 0.0, dir.z).normalize_or(FORWARD);
+        self.qb = None;
+        self.glide = false;
+        self.kicks_started += 1;
+        // Carry at least kick_max_tick forward so a standalone kick or low-speed entry immediately
+        // reaches charging speed, while preserving higher High Boost / Glide Boost entry speed.
+        let horiz = Vec2::new(self.velocity.x, self.velocity.z);
+        let speed = horiz.length().max(self.ctrl.kick_max_tick);
+        self.velocity.x = dir.x * speed;
+        self.velocity.z = dir.z * speed;
+        self.kick = Some(KickState {
+            timer: 0.0,
+            dir,
+            hit_applied: false,
+        });
+        true
+    }
+
+    /// Stops and rebounds the AC when Boost Charge Kick strikes a target (`0x828433b8` → `0x8283cef8`).
+    pub fn on_kick_contact(&mut self) {
+        if let Some(kick) = self.kick.take() {
+            self.kicks_landed += 1;
+            self.velocity.x = -kick.dir.x * (self.ctrl.walk_max_tick * 0.5);
+            self.velocity.z = -kick.dir.z * (self.ctrl.walk_max_tick * 0.5);
+        }
+    }
+
+    /// Starts a melee blade attack (`BladeState` `0x83714024`, `0x8283ec20` → `0x828ad698`).
+    pub fn start_blade(&mut self, launch: BladeLaunch) -> bool {
+        if self.blade.is_some() || self.kick.is_some() || self.wj.is_some() {
+            return false;
+        }
+        self.qb = None;
+        self.glide = false;
+        let entry_speed_tick = Vec2::new(self.velocity.x, self.velocity.z).length();
+        // `0x828ad510`: dash duration = `blade_homing_time_speed_coef * entry_speed * 0.01 + blade_dash_max_frames / 60`
+        // (with a responsive homing window when FCS-locked onto a target outside instant-swing range).
+        let speed_bonus_ticks =
+            NEW_AC_BEHAVIOR.blade_homing_time_speed_coef * (entry_speed_tick * TICK_TO_KMH) * 0.01 * TICK_RATE;
+        let max_dash_ticks = if launch.target.is_some() {
+            (NEW_AC_BEHAVIOR.blade_dash_max_frames + speed_bonus_ticks).clamp(18.0, 45.0)
+        } else {
+            NEW_AC_BEHAVIOR.blade_dash_max_frames
+        };
+        let target_pos = launch.target.map(|(_, pos)| pos);
+        let downward = self.airborne
+            && self.cam.pitch.to_degrees() <= -f32::from(NEW_AC_BEHAVIOR.blade_down_angle_deg);
+        self.blade_swings += 1;
+        self.blade = Some(BladeAction {
+            launch,
+            phase: BladePhase::Charge,
+            timer: 0.0,
+            max_dash_ticks,
+            entry_speed_tick,
+            target_pos,
+            air_start: self.airborne,
+            downward,
+            trail_spawned: false,
+            hit_entities: Vec::new(),
+        });
+        true
+    }
+
     /// A standing AC moving by `ctrl`, with the default follow camera for its legs' motion set.
     pub fn new(ctrl: AcCtrlParam, legs_motion_id: u8) -> Self {
         let en_max = ctrl.en_capacity.max(0.0);
@@ -901,11 +1095,18 @@ impl Pilot {
             second_stage_qb: false,
             quick_dir: FORWARD,
             wall_jumps: 0,
+            kicks_started: 0,
+            kicks_landed: 0,
+            blade_swings: 0,
+            blade_hits: 0,
             qb: None,
             qb_cooldown: 0.0,
             wj: None,
             wj_lockout: 0.0,
             wall_jump_queued: false,
+            kick: None,
+            blade: None,
+            prev_position: Vec3::ZERO,
             quick_pending: None,
             takeoff: 0.0,
             jump_queued: false,
@@ -976,6 +1177,7 @@ struct Input {
     glide: bool,
     quick_boost: bool,
     qb_held: bool,
+    kick: bool,
 }
 
 fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamepad>) -> Input {
@@ -995,6 +1197,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
     let mut glide = keys.just_pressed(KeyCode::ControlLeft) || held.contains(&KeyCode::ControlLeft);
     let mut quick_boost = keys.just_pressed(KeyCode::KeyV) || held.contains(&KeyCode::KeyV);
     let mut qb_held = down(KeyCode::KeyV);
+    let kick = keys.just_pressed(KeyCode::KeyK) || held.contains(&KeyCode::KeyK);
     for pad in pads {
         let left = pad.left_stick();
         if left.length() > 0.2 {
@@ -1022,6 +1225,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
         glide,
         quick_boost,
         qb_held,
+        kick,
     }
 }
 
@@ -1063,7 +1267,7 @@ fn charge_curve(x: f32, start: f32, base: f32, center: f32, width: f32, over: f3
 /// Drains `qb_en_drain` (`BST__HI_EN * 0.7`, Lua param 57) via `0x828b2648` -> `0x82830910` and
 /// blocks launch when EN is insufficient (Xenia probe `private/xenia/en_drain2.jsonl`).
 fn start_quick_boost(p: &mut Pilot) -> bool {
-    if p.qb.is_some() || p.qb_cooldown >= 1.0 {
+    if p.qb.is_some() || p.kick.is_some() || p.blade.is_some() || p.qb_cooldown >= 1.0 {
         return false;
     }
     if !p.try_drain_en(p.ctrl.qb_en_drain) {
@@ -1194,7 +1398,12 @@ fn step_qb(p: &mut Pilot, input: &Input, moving: bool) -> Option<QbThrust> {
             weight,
             dir,
         } => {
-            // `0x8237bcb0` + `0x8283fdb0`: Glide Boost cancels an active Phase 2 burst.
+            // `0x8237bf28` -> `0x8237bcb0` -> `0x8283fdb0`: holding High Boost (`□ + HOLD`,
+            // manual 20301/20401) into Phase 2 launches Boost Charge Kick (`KickState`).
+            if input.qb_held && p.start_kick() {
+                return None;
+            }
+            // Glide Boost cancels an active Phase 2 burst.
             if input.glide && p.boost && moving && !p.airborne && p.en >= p.ctrl.glide_en_tick {
                 p.qb = None;
                 p.glide = true;
@@ -1428,6 +1637,189 @@ fn step_wall_jump(p: &mut Pilot, input: &Input, facing: Quat) -> Option<WallJump
     }
 }
 
+/// Steps `KickState` (`360 0x820928d0`: `0x82844570` → `0x828433a0`, `AcMove_boostChargeKick`
+/// `0x82823740`) by one 60 Hz tick. Returns `(horizontal, skip_gravity)` when active.
+fn step_kick(p: &mut Pilot, horizontal: Vec2) -> Option<(Vec2, bool)> {
+    let mut kick = p.kick?;
+    let c = p.ctrl;
+    let total = c.kick_accel_frames + c.kick_after_frames;
+    kick.timer += 1.0;
+    if kick.timer > total {
+        p.kick = None;
+        return None;
+    }
+    p.kick = Some(kick);
+
+    let dir2 = Vec2::new(kick.dir.x, kick.dir.z).normalize_or(Vec2::NEG_Y);
+    let next_h = if kick.timer <= c.kick_accel_frames {
+        integrate(
+            horizontal,
+            dir2 * c.kick_accel_tick,
+            c.kick_max_tick,
+            c.over_max_decel_tick,
+        )
+    } else {
+        // Carry kick momentum through the 35-tick follow-through without ground braking
+        // (`+0x1c0 = 0` in `0x828435b4`), decaying gently if above `kick_max_tick`.
+        let cur = horizontal.length();
+        if cur > c.kick_max_tick {
+            horizontal.normalize_or(dir2) * (cur * (1.0 - c.over_max_decel_tick)).max(c.kick_max_tick)
+        } else {
+            dir2 * cur.max(c.kick_max_tick * 0.85)
+        }
+    };
+
+    // Vertical thrust (`0x82823788..0x82823964`): downward dive when pitched down
+    // (`NewAcBehavior +0x538` = 3.0 m/s per tick / 60), else slight lift capped at `qb_hop_max_tick`.
+    let pitch = p.cam.pitch;
+    if pitch < 0.0 {
+        let down_rad = NEW_AC_BEHAVIOR.kick_down_angle_deg.to_radians();
+        let ignore_rad = NEW_AC_BEHAVIOR.kick_ignore_fall_angle_deg.to_radians();
+        let denom = (-std::f32::consts::FRAC_PI_2 - ignore_rad).min(-0.1);
+        let norm = (pitch.clamp(down_rad, 0.0) / denom).clamp(0.0, 1.0);
+        p.velocity.y -= c.kick_down_accel_tick * norm;
+    } else {
+        p.velocity.y = (p.velocity.y + c.kick_accel_tick).min(c.qb_hop_max_tick);
+    }
+    Some((next_h, true))
+}
+
+/// Steps `BladeState` (`360 0x83714024`: Phase 0 `0x828ae9e0`, Phase 1 `0x828af000`,
+/// Phase 2 `0x828af1c8`, `AcMove_bladeDash` `0x828248f8`) by one 60 Hz tick.
+/// Returns `(horizontal, skip_gravity)` when active.
+fn step_blade(
+    p: &mut Pilot,
+    position: Vec3,
+    horizontal: Vec2,
+    brake: f32,
+    drag: f32,
+) -> Option<(Vec2, bool)> {
+    let mut b = p.blade.take()?;
+    let c = p.ctrl;
+    b.timer += 1.0;
+
+    // Steer AC facing toward the FCS-locked target during Charge, Dash, and Swing (`0x828ad710`).
+    if !matches!(b.phase, BladePhase::Recovery) {
+        if let Some(tpos) = b.target_pos {
+            let to = Vec2::new(tpos.x - position.x, tpos.z - position.z);
+            if to.length_squared() > 1e-4 {
+                // FORWARD is -Z (`sin(-yaw) = x`, `-cos(-yaw) = z` -> `yaw = atan2(-dx, -dz)`).
+                let target_yaw = (-to.x).atan2(-to.y);
+                let mut diff = (target_yaw - p.yaw + std::f32::consts::PI)
+                    .rem_euclid(std::f32::consts::TAU)
+                    - std::f32::consts::PI;
+                let max_step = (c.turn_rate * 2.5) / TICK_RATE;
+                diff = diff.clamp(-max_step, max_step);
+                p.yaw += diff;
+            }
+        }
+    }
+
+    let forward = Quat::from_rotation_y(p.yaw) * FORWARD;
+    let forward_h = Vec2::new(forward.x, forward.z).normalize_or(Vec2::NEG_Y);
+    let dist_to_target = b
+        .target_pos
+        .map(|t| (t - position).with_y(0.0).length());
+
+    let (next_h, skip_gravity) = match b.phase {
+        BladePhase::Charge => {
+            let charge_ticks = if b.launch.physical {
+                NEW_AC_BEHAVIOR.phys_blade_charge_frames
+            } else {
+                NEW_AC_BEHAVIOR.blade_charge_frames
+            };
+            let h = if p.airborne {
+                horizontal * (1.0 - drag).clamp(0.0, 1.0)
+            } else {
+                approach(horizontal, Vec2::ZERO, brake)
+            };
+            if b.timer >= charge_ticks {
+                b.timer = 0.0;
+                let instant_dist = NEW_AC_BEHAVIOR.blade_instant_swing_dist;
+                if b.max_dash_ticks > 0.0
+                    && dist_to_target.is_some_and(|d| d > instant_dist)
+                {
+                    b.phase = BladePhase::Dash;
+                } else {
+                    b.phase = BladePhase::Swing;
+                }
+            }
+            (h, false)
+        }
+        BladePhase::Dash | BladePhase::Swing => {
+            let dir_h = b
+                .target_pos
+                .map(|t| Vec2::new(t.x - position.x, t.z - position.z).normalize_or(forward_h))
+                .unwrap_or(forward_h);
+            // `0x828ad328`: entry speed ratio between `blade_min_speed_kmh` (20) and `blade_max_speed_kmh` (150),
+            // combined with `0x828aeb68` distance scale (`min(1, dist / 50 m)`).
+            let entry_kmh = b.entry_speed_tick * TICK_TO_KMH;
+            let min_s = f32::from(NEW_AC_BEHAVIOR.blade_min_speed_kmh);
+            let max_s = f32::from(NEW_AC_BEHAVIOR.blade_max_speed_kmh).max(min_s + 1.0);
+            let spd_rate = ((entry_kmh - min_s) / (max_s - min_s))
+                .clamp(NEW_AC_BEHAVIOR.blade_min_accel_rate, 1.0)
+                .max(0.4);
+            let dist_rate = dist_to_target
+                .map(|d| (d / NEW_AC_BEHAVIOR.blade_homing_full_dist.max(1.0)).clamp(0.4, 1.0))
+                .unwrap_or(1.0);
+            let accel = dir_h * (c.blade_accel_tick * spd_rate * dist_rate);
+            let h = integrate(horizontal, accel, c.blade_max_tick, c.over_max_decel_tick);
+
+            // Vertical homing toward locked target (`AcMove_bladeDash` `0x82824a04..0x82824a24`).
+            let mut hover = false;
+            if let Some(tpos) = b.target_pos {
+                let dy = tpos.y - (position.y + 4.0);
+                if dy > 1.0 {
+                    p.airborne = true;
+                    p.velocity.y =
+                        (p.velocity.y + c.quick_boost_v_acc_tick).min(c.blade_rise_max_tick);
+                    hover = true;
+                } else if dy < -1.0 && p.airborne {
+                    p.velocity.y = (p.velocity.y - c.quick_boost_v_acc_tick).max(-c.blade_rise_max_tick);
+                    hover = true;
+                } else if p.airborne {
+                    p.velocity.y *= 0.85;
+                    hover = true;
+                }
+            }
+
+            if b.phase == BladePhase::Dash {
+                let instant_dist = NEW_AC_BEHAVIOR.blade_instant_swing_dist;
+                if b.timer >= NEW_AC_BEHAVIOR.blade_dash_min_frames
+                    && (dist_to_target.is_none_or(|d| d <= instant_dist)
+                        || b.timer >= b.max_dash_ticks)
+                {
+                    b.phase = BladePhase::Swing;
+                    b.timer = 0.0;
+                }
+            } else {
+                let swing_ticks = f32::from(NEW_AC_BEHAVIOR.blade_swing_frames).max(1.0);
+                if b.timer >= swing_ticks {
+                    b.phase = BladePhase::Recovery;
+                }
+            }
+            (h, hover)
+        }
+        BladePhase::Recovery => {
+            // `0x828af30c..0x828af350`: brake until `blade_recovery_frames` (30 ticks) elapse.
+            let h = if p.airborne {
+                horizontal * (1.0 - drag).clamp(0.0, 1.0)
+            } else {
+                approach(horizontal, Vec2::ZERO, brake)
+            };
+            let total_ticks = f32::from(NEW_AC_BEHAVIOR.blade_recovery_frames)
+                .max(f32::from(NEW_AC_BEHAVIOR.blade_swing_frames));
+            if b.timer >= total_ticks {
+                return Some((h, false));
+            }
+            (h, false)
+        }
+    };
+
+    p.blade = Some(b);
+    Some((next_h, skip_gravity))
+}
+
 /// One 60 Hz tick of generator output minus passive part EN drain (`360 0x828bef18` at
 /// `0x828bf6cc..0x828bf74c`: `0x8287edd8` -> `0x8287eef0` -> `0x82830910(passive=1)` ->
 /// `0x8287ef40` -> `0x828307c8`; Xenia probes `private/xenia/en_drain{,2}.jsonl`).
@@ -1471,7 +1863,7 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     let speed = horizontal.length();
     let moving = wish != Vec2::ZERO;
     // A glide starts on the ground (`pilot`) but carries on over a drop.
-    p.glide &= p.boost && moving && p.qb.is_none() && p.wj.is_none();
+    p.glide &= p.boost && moving && p.qb.is_none() && p.wj.is_none() && p.kick.is_none() && p.blade.is_none();
     let brake = if speed >= c.brake_switch_tick {
         c.hispeed_brake_tick
     } else {
@@ -1483,6 +1875,11 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         c.air_drag_tick
     };
 
+    // Glide Boost -> Boost Charge Kick (`0x82840ee0` -> `0x8283fdb0`), or direct Kick key.
+    if (p.glide && input.qb_held) || input.kick {
+        p.start_kick();
+    }
+
     // Wall kick trigger (`0x82841520` -> `0x82841338`): airborne, not in jump take-off (state 3),
     // lockout (`action_ctrl +0x114`) < 1 tick, and `WallJumpHitChecker` (`0x828aa500`) hits a wall.
     if p.wall_jump_queued {
@@ -1490,6 +1887,8 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         if p.airborne
             && p.wj.is_none()
             && p.qb.is_none()
+            && p.kick.is_none()
+            && p.blade.is_none()
             && p.takeoff <= 0.0
             && p.wj_lockout < 1.0
         {
@@ -1511,16 +1910,37 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         }
     }
 
-    let qb_thrust = step_qb(p, input, moving);
-    let wj_thrust = if qb_thrust.is_none() {
+    let qb_thrust = if p.kick.is_none() && p.blade.is_none() {
+        step_qb(p, input, moving)
+    } else {
+        None
+    };
+    let kick_step = if qb_thrust.is_none() && p.blade.is_none() {
+        step_kick(p, horizontal)
+    } else {
+        None
+    };
+    let blade_step = if qb_thrust.is_none() && kick_step.is_none() {
+        step_blade(p, *position, horizontal, brake, drag)
+    } else {
+        None
+    };
+    let wj_thrust = if qb_thrust.is_none() && kick_step.is_none() && blade_step.is_none() {
         step_wall_jump(p, input, facing)
     } else {
         None
     };
     let mut qb_hopped = false;
     let mut wj_accelerated = false;
+    let mut melee_skip_gravity = false;
 
-    if let Some(qb) = qb_thrust {
+    if let Some((kh, skip_g)) = kick_step {
+        horizontal = kh;
+        melee_skip_gravity = skip_g;
+    } else if let Some((bh, skip_g)) = blade_step {
+        horizontal = bh;
+        melee_skip_gravity = skip_g;
+    } else if let Some(qb) = qb_thrust {
         // `0x82824078` with `+0x1c0 == 1` (no normal move action): ground brake or air drag runs
         // before `0x82822ea0` adds the High Boost acceleration (`+0x118 * scale`) and clamps to
         // `0x82822af0` case 4 (`lerp(quick_boost_min_tick, quick_boost_max_tick, weight)`).
@@ -1626,7 +2046,7 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     } else {
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     }
-    if p.jump_queued && !p.airborne && p.qb.is_none() && p.wj.is_none() {
+    if p.jump_queued && !p.airborne && p.qb.is_none() && p.wj.is_none() && p.kick.is_none() && p.blade.is_none() {
         (p.airborne, p.takeoff, p.boost, p.glide) = (true, c.jump_frames, true, false);
         // `0x8283d4b8`: entering Jump (state 3) sets `action_ctrl +0x114` to
         // `NewAcBehavior +0x4ae` (10 ticks), preventing immediate wall kick off the ground.
@@ -1634,7 +2054,7 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
     }
     p.jump_queued = false;
 
-    if p.airborne && !qb_hopped && !wj_accelerated {
+    if p.airborne && !qb_hopped && !wj_accelerated && !melee_skip_gravity {
         if p.takeoff > 0.0 {
             p.velocity.y += c.jump_accel_tick * p.takeoff.min(1.0);
             p.takeoff = (p.takeoff - 1.0).max(0.0);
@@ -1692,6 +2112,38 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
     let moving = input.stick != Vec2::ZERO;
     let dir = moving.then(|| direction(input.stick));
     let current = p.state.unwrap_or(("idle", None));
+    // Boost Charge Kick (`KickState` `0x820928d0`, `0x828433a0` -> `0x828845e8`): row 243, anim 90.
+    if p.kick.is_some() {
+        return ("kick", None);
+    }
+    // Melee Blade (`BladeState` `0x83714024`): laser blade rows 100-113, physical/pile rows 293-306.
+    if let Some(b) = &p.blade {
+        let right = b.launch.hand_idx == 0;
+        let phys = b.launch.physical;
+        let clip = match (phys, b.air_start, b.downward, b.phase, right) {
+            (false, true, true, BladePhase::Swing | BladePhase::Recovery, true) => "blade_down_r",
+            (false, true, true, BladePhase::Swing | BladePhase::Recovery, false) => "blade_down_l",
+            (false, true, _, BladePhase::Charge | BladePhase::Dash, true) => "blade_air_charge_r",
+            (false, true, _, BladePhase::Charge | BladePhase::Dash, false) => "blade_air_charge_l",
+            (false, true, _, BladePhase::Swing | BladePhase::Recovery, true) => "blade_air_swing_r",
+            (false, true, _, BladePhase::Swing | BladePhase::Recovery, false) => "blade_air_swing_l",
+            (false, false, _, BladePhase::Charge | BladePhase::Dash, true) => "blade_charge_r",
+            (false, false, _, BladePhase::Charge | BladePhase::Dash, false) => "blade_charge_l",
+            (false, false, _, BladePhase::Swing | BladePhase::Recovery, true) => "blade_swing_r",
+            (false, false, _, BladePhase::Swing | BladePhase::Recovery, false) => "blade_swing_l",
+            (true, true, true, BladePhase::Swing | BladePhase::Recovery, true) => "phys_blade_down_r",
+            (true, true, true, BladePhase::Swing | BladePhase::Recovery, false) => "phys_blade_down_l",
+            (true, true, _, BladePhase::Charge | BladePhase::Dash, true) => "phys_blade_air_charge_r",
+            (true, true, _, BladePhase::Charge | BladePhase::Dash, false) => "phys_blade_air_charge_l",
+            (true, true, _, BladePhase::Swing | BladePhase::Recovery, true) => "phys_blade_air_swing_r",
+            (true, true, _, BladePhase::Swing | BladePhase::Recovery, false) => "phys_blade_air_swing_l",
+            (true, false, _, BladePhase::Charge | BladePhase::Dash, true) => "phys_blade_charge_r",
+            (true, false, _, BladePhase::Charge | BladePhase::Dash, false) => "phys_blade_charge_l",
+            (true, false, _, BladePhase::Swing | BladePhase::Recovery, true) => "phys_blade_swing_r",
+            (true, false, _, BladePhase::Swing | BladePhase::Recovery, false) => "phys_blade_swing_l",
+        };
+        return (clip, None);
+    }
     // Wall Jump (`WallJumpState` 0x82092a20): Phase 0 plays `wall_jump_prep` (rows 231/233/235/237,
     // `0x82884da8`), Phase 1/2 plays `wall_jump` (rows 232/234/236/238, `0x82884688`).
     if let Some(wj) = p.wj {
@@ -1866,16 +2318,17 @@ pub fn pilot(
     }
     p.boost |= held.0.contains(&KeyCode::ShiftLeft);
     p.command = input.stick;
-    if p.qb.is_none() && p.wj.is_none() {
+    if p.qb.is_none() && p.wj.is_none() && p.kick.is_none() && p.blade.is_none() {
         p.glide |= input.glide && p.boost && !p.airborne && p.en >= p.ctrl.glide_en_tick;
         p.jump_queued |= input.jump && !p.airborne;
         p.wall_jump_queued |= input.jump && p.airborne;
     }
     // Re-fire is gated by `HighBoostState` ending (`0x8200d378` slot `+0x50` = `0x8241a6b8`) and
     // `action_ctrl +0x110` (`qb_reload_ticks`, `0x8283ed98`), not the animation clip length.
-    if input.quick_boost {
+    if input.quick_boost && !p.glide {
         start_quick_boost(&mut p);
     }
+    p.prev_position = transform.translation;
     let yaw = p.yaw;
     p.accumulator = (p.accumulator + time.delta_secs()).min(10.0 / TICK_RATE);
     while p.accumulator >= 1.0 / TICK_RATE {
@@ -2548,6 +3001,140 @@ mod tests {
         assert!(
             p.velocity.y <= 0.0,
             "wall kick skips accel when EN < trijump_en_tick"
+        );
+    }
+
+    #[test]
+    fn boost_charge_kick_triggers_from_hold_drains_en_and_rebounds() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        assert!(ctrl.kick_power > 4000.0 && ctrl.kick_recoil > 1500.0);
+        assert_eq!(ctrl.kick_accel_frames, 3.0);
+        assert_eq!(ctrl.kick_after_frames, 35.0);
+
+        let ground = Collision::with_hits(
+            vec![crate::collision::Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            Vec::new(),
+        );
+        // 1. Holding V (□ + HOLD) through High Boost Phase 1 -> Phase 2 launches KickState.
+        let mut p = Pilot::new(ctrl, 0);
+        let mut pos = Vec3::ZERO;
+        let en_start = p.en;
+        assert!(start_quick_boost(&mut p));
+        let hold_v = Input {
+            stick: Vec2::Y,
+            qb_held: true,
+            ..Input::default()
+        };
+        let mut entered_kick = false;
+        for _ in 0..40 {
+            step(&mut p, &hold_v, &mut pos, &ground);
+            if p.in_kick() {
+                entered_kick = true;
+                break;
+            }
+        }
+        assert!(entered_kick, "holding High Boost into Phase 2 must launch KickState");
+        assert_eq!(p.kicks_started, 1);
+        assert!(p.en < en_start - ctrl.qb_en_drain, "kick must drain qb_en_drain");
+        let kick_speed = p.horiz_speed_kmh();
+        assert!(
+            kick_speed >= ctrl.kick_max_speed * 0.9,
+            "kick speed {kick_speed} km/h should be >= 90% kick_max_speed {}",
+            ctrl.kick_max_speed
+        );
+
+        // Contact rebounds & stops KickState cleanly (`0x828433b8`).
+        p.on_kick_contact();
+        assert!(!p.in_kick());
+        assert_eq!(p.kicks_landed, 1);
+
+        // 2. Insufficient EN blocks KickState (`0x8281f278`).
+        p.en = ctrl.qb_en_drain * 0.5;
+        assert!(!p.start_kick(), "KickState blocked when EN < qb_en_drain");
+
+        // 3. Downward pitch dive (`NewAcBehavior +0x538`, `0x82823938`) adds downward vy.
+        p.en = p.en_max;
+        p.airborne = true;
+        pos = Vec3::new(0.0, 50.0, 0.0);
+        p.velocity = Vec3::ZERO;
+        p.cam.pitch = -0.7; // looking down
+        assert!(p.start_kick());
+        step(&mut p, &Input::default(), &mut pos, &Collision::default());
+        assert!(p.velocity.y < 0.0, "downward pitch kick must dive downward");
+    }
+
+    #[test]
+    fn blade_homing_lunge_and_swing_phases() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        let ground = Collision::with_hits(
+            vec![crate::collision::Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            Vec::new(),
+        );
+        let mut p = Pilot::new(ctrl, 0);
+        let mut pos = Vec3::ZERO;
+        // Locked target 25 m ahead along -Z (beyond 12 m instant-swing distance).
+        let target_pos = Vec3::new(0.0, 3.0, -25.0);
+        let launch = BladeLaunch {
+            hand_idx: 1,
+            physical: false,
+            target: Some((Entity::PLACEHOLDER, target_pos)),
+            hit_radius: 22.0,
+            blade_radius: 2.0,
+            max_hits: 3,
+            decay_power: 0.5,
+            decay_recoil: 0.5,
+            damage_type: crate::damage::DamageType::Te,
+            damage_power: 8107.0,
+            damage_recoil: 0.0,
+            trail_fx: 4104,
+            hit_low_fx: 746,
+            hit_hi_fx: 746,
+            hit_low_se: 9501,
+            hit_hi_se: 9501,
+        };
+        assert!(p.start_blade(launch));
+        assert!(p.in_blade());
+        assert_eq!(p.blade.as_ref().unwrap().phase, BladePhase::Charge);
+
+        let mut saw_dash = false;
+        let mut saw_swing = false;
+        let mut saw_recovery = false;
+        for _ in 0..120 {
+            step(&mut p, &Input::default(), &mut pos, &ground);
+            match p.blade.as_ref().map(|b| b.phase) {
+                Some(BladePhase::Dash) => saw_dash = true,
+                Some(BladePhase::Swing) => saw_swing = true,
+                Some(BladePhase::Recovery) => saw_recovery = true,
+                Some(BladePhase::Charge) => {}
+                None => break,
+            }
+        }
+        assert!(saw_dash, "locked target 25 m away must trigger BladePhase::Dash");
+        assert!(saw_swing, "blade dash must transition into BladePhase::Swing");
+        assert!(saw_recovery, "blade swing must transition into BladePhase::Recovery");
+        assert!(!p.in_blade(), "blade attack must finish cleanly after recovery");
+        assert!(
+            pos.z < -8.0,
+            "homing blade dash should close significant distance toward target (z={})",
+            pos.z
         );
     }
 }

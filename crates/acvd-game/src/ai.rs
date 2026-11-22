@@ -784,7 +784,9 @@ impl EnemyAi {
                     WeaponRole::Sub => 1,
                     WeaponRole::Shoulder => 2,
                 };
-                if !allow_roles[role_idx] || slot.gun.kind == Kind::Skip || slot.gun.remaining == 0
+                if !allow_roles[role_idx]
+                    || matches!(slot.gun.kind, Kind::Skip | Kind::Blade)
+                    || slot.gun.remaining == 0
                 {
                     continue;
                 }

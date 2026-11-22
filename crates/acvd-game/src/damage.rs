@@ -25,6 +25,7 @@
 use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
 use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::generated::enemy::{EnemyBasicSt, EnemyGraphicsSt};
+use acvd_data::generated::tuning::DAMAGE;
 use acvd_data::part_field;
 use bevy::prelude::*;
 
@@ -252,6 +253,84 @@ pub fn enemy_hit_spheres(gfx: &EnemyGraphicsSt) -> Vec<HitSphere> {
             radius: r,
         }]
     }
+}
+
+/// Speed × weight melee damage scaling parameters (`0x828a3470` → `0x828a33a8` →
+/// `0x828a2e50` / `0x828a20d8` / `0x828a2078` / `0x828a20a8`).
+///
+/// - Boost Charge Kick (`0x8286ac40`): `param/damage.bin` fields 11–15 (`+0x2c..+0x3c`):
+///   `ref_speed = 100 km/h`, `ref_weight = 5000`, `max_speed = 10`, `max_weight = 10`, `min_rate = 0.4`.
+/// - Physical blade & Heat Pile (`0x828a43e8`, gated by `0x8247f170` = `damage_type != TE`):
+///   `param/damage.bin` fields 16–20 (`+0x40..+0x50`):
+///   `ref_speed = 130 km/h`, `ref_weight = 3500`, `max_speed = 10`, `max_weight = 1.5`, `min_rate = 0.6`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpeedWeightScale {
+    pub ref_speed_kmh: f32,
+    pub ref_weight: f32,
+    pub max_speed_factor: f32,
+    pub max_weight_factor: f32,
+    pub min_power_rate: f32,
+}
+
+impl SpeedWeightScale {
+    /// Boost Charge Kick scaling (`param/damage.bin` fields 11–15, `0x8286ac40`).
+    pub fn kick() -> Self {
+        Self {
+            ref_speed_kmh: DAMAGE.kick_ref_speed_kmh,
+            ref_weight: DAMAGE.kick_ref_weight,
+            max_speed_factor: DAMAGE.kick_max_speed_factor,
+            max_weight_factor: DAMAGE.kick_max_weight_factor,
+            min_power_rate: DAMAGE.kick_min_power_rate,
+        }
+    }
+
+    /// Physical blade & Heat Pile scaling (`param/damage.bin` fields 16–20, `0x828a43e8`).
+    pub fn physical_blade() -> Self {
+        Self {
+            ref_speed_kmh: DAMAGE.blade_ref_speed_kmh,
+            ref_weight: DAMAGE.blade_ref_weight,
+            max_speed_factor: DAMAGE.blade_max_speed_factor,
+            max_weight_factor: DAMAGE.blade_max_weight_factor,
+            min_power_rate: DAMAGE.blade_min_power_rate,
+        }
+    }
+
+    /// Evaluates `(scaled_power, scaled_recoil)` from horizontal AC speed (km/h) and total build
+    /// weight (`0x828a33a8` → `0x828a2e50`, `0x828a20d8`, `0x828a2078`, `0x828a20a8`).
+    pub fn scale(
+        self,
+        base_power: f32,
+        base_recoil: f32,
+        horiz_speed_kmh: f32,
+        total_weight: f32,
+    ) -> (f32, f32) {
+        let speed_f = if self.ref_speed_kmh > 0.0 {
+            (horiz_speed_kmh / self.ref_speed_kmh).clamp(0.0, self.max_speed_factor)
+        } else {
+            1.0
+        };
+        let weight_f = if self.ref_weight > 0.0 {
+            (total_weight / self.ref_weight).clamp(0.0, self.max_weight_factor)
+        } else {
+            1.0
+        };
+        let mult = (speed_f * weight_f).max(self.min_power_rate);
+        (base_power * mult, base_recoil * mult)
+    }
+}
+
+/// Tests a swept sphere (capsule from `a` to `b` with radius `sweep_radius`) against a target
+/// sphere `(center, target_radius)`. Returns `(t, hit_point, outward_normal)`.
+pub fn swept_sphere_hits_sphere(
+    a: Vec3,
+    b: Vec3,
+    sweep_radius: f32,
+    center: Vec3,
+    target_radius: f32,
+) -> Option<(f32, Vec3, Vec3)> {
+    let (t, _center_at_hit, normal) = segment_hits_sphere(a, b, center, sweep_radius + target_radius)?;
+    let hit_point = center + normal * target_radius;
+    Some((t, hit_point, normal))
 }
 
 /// Tests directed segment `a -> b` against a sphere `(center, radius)`.
@@ -599,5 +678,57 @@ mod tests {
         assert!(ph.tick(2.0), "respawn triggers after PLAYER_RESPAWN_SECS");
         ph.reset();
         assert!(!ph.destroyed && ph.ap_u32() == 34695 && !ph.is_staggered());
+    }
+
+    #[test]
+    fn speed_weight_scaling_matches_360_kick_and_blade_params() {
+        let kick = SpeedWeightScale::kick();
+        assert_eq!(kick.ref_speed_kmh, 100.0);
+        assert_eq!(kick.ref_weight, 5000.0);
+        assert!((kick.min_power_rate - 0.4).abs() < 1e-6);
+
+        // At 0 km/h, floor at min_power_rate = 0.4.
+        let (p0, r0) = kick.scale(7000.0, 2500.0, 0.0, 6000.0);
+        assert!((p0 - 2800.0).abs() < 1e-3);
+        assert!((r0 - 1000.0).abs() < 1e-3);
+
+        // At 150 km/h and 6000 weight: 1.5 * 1.2 = 1.8x.
+        let (p1, r1) = kick.scale(7000.0, 2500.0, 150.0, 6000.0);
+        assert!((p1 - 7000.0 * 1.8).abs() < 1e-2);
+        assert!((r1 - 2500.0 * 1.8).abs() < 1e-2);
+
+        // Physical blade / Heat Pile (`0x828a43e8`): ref 130 km/h, weight 3500, max_weight 1.5, floor 0.6.
+        let blade = SpeedWeightScale::physical_blade();
+        assert_eq!(blade.ref_speed_kmh, 130.0);
+        assert_eq!(blade.ref_weight, 3500.0);
+        assert!((blade.max_weight_factor - 1.5).abs() < 1e-6);
+        assert!((blade.min_power_rate - 0.6).abs() < 1e-6);
+
+        // Heavy AC (weight 9000 -> weight_factor clamped at 1.5) at 130 km/h -> 1.0 * 1.5 = 1.5x.
+        let (bp, br) = blade.scale(6248.0, 1589.0, 130.0, 9000.0);
+        assert!((bp - 6248.0 * 1.5).abs() < 1e-2);
+        assert!((br - 1589.0 * 1.5).abs() < 1e-2);
+
+        // Standstill physical blade floors at 0.6x.
+        let (bp0, _) = blade.scale(6248.0, 1589.0, 0.0, 6000.0);
+        assert!((bp0 - 6248.0 * 0.6).abs() < 1e-2);
+
+        // Swept sphere hit detection: radius 7 m kick sphere passing within 9 m of a radius 3 m target hits.
+        let hit = swept_sphere_hits_sphere(
+            Vec3::new(0.0, 4.0, 15.0),
+            Vec3::new(0.0, 4.0, -5.0),
+            7.0,
+            Vec3::new(8.0, 4.0, 0.0),
+            3.0,
+        );
+        assert!(hit.is_some());
+        let miss = swept_sphere_hits_sphere(
+            Vec3::new(0.0, 4.0, 15.0),
+            Vec3::new(0.0, 4.0, -5.0),
+            7.0,
+            Vec3::new(12.0, 4.0, 0.0),
+            3.0,
+        );
+        assert!(miss.is_none());
     }
 }

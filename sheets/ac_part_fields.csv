@@ -151,3 +151,5 @@ category,offset,type,name,evidence
 13,244,i16,init_speed,"Scr_GetACVParam(13, int16 0) (i16 at record+0xf4): recon launch speed in m/s (sticky 100/120/180, follow 30, hover 20)"
 13,276,u8,max_simultaneous,"0x8247b340 -> 0x824758e0(recon, 0) (u8 at record+0x114, default 1 if 0): max simultaneously active recon units (sticky 3/5, follow 1, hover 5/8), stored at recon_ctrl +0xe4 by 0x828bca28 (0x828bcbf0) and +0x12c by 0x82a0d698"
 13,278,u8,reload_ticks,"0x824780a8 -> 0x824758e0(recon, 2) (u8 at record+0x116): recon deployment cooldown in 60 Hz ticks (40 sticky/follow, 20 hover), multiplied by 0x82004408 (1/60) into recon_ctrl +0xe8 by 0x828bca28 (0x828bcc10..0x828bcc38)"
+3,268,i16,kick_power,"Scr_GetACVParam(3, int16 12) (AcCtrlParamCalc.lua line 272 Scr_SetParam 60 -> AcCtrlParam +0xf4; 360 0x8286ac40 reads +0xf4 x 0x8286a0c8 as base Boost Charge Kick attack power: 5521-9652 across legs)"
+3,270,i16,kick_recoil,"Scr_GetACVParam(3, int16 13) (AcCtrlParamCalc.lua line 271 Scr_SetParam 59 -> AcCtrlParam +0xf0; 360 0x8286ac40 reads +0xf0 x 0x8286a0c8 as base Boost Charge Kick impact recoil: 1989-3256 across legs)"

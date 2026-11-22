@@ -5,9 +5,9 @@
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
 //! [--water <y>]`
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump,
-//! V high boost (quick boost), Ctrl glide boost while boosting on the ground
+//! V high boost (quick boost) / hold V (or K, gamepad □ + HOLD) Boost Charge Kick, Ctrl glide boost while boosting on the ground
 //! (air clips once it leaves the ground);
-//! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left,
+//! F / left mouse / R2 fire the right arm weapon (guns or melee blades/piles), C / right mouse / L2 the left,
 //! G / X / Tab / R1 fire the shoulder weapon / locked missile salvo (see `weapons`).
 //! Z / Select / R3 toggles Scan Mode (`AC + 0xdb0`, `scan`): reduces passive EN drain for faster
 //! recharge, disables weapon fire, switches the HUD lock sight to `ACV_ScanModeLockSight`, and
@@ -303,6 +303,7 @@ fn main() {
             (
                 bay::shift,
                 weapons::fire,
+                weapons::step_melee,
                 ai::update,
                 weapons::step_projectiles,
                 weapons::step_missiles,
@@ -367,6 +368,7 @@ fn key(name: &str) -> Option<KeyCode> {
         "space" => KeyCode::Space,
         "ctrl" => KeyCode::ControlLeft,
         "v" => KeyCode::KeyV,
+        "k" => KeyCode::KeyK,
         "f" | "fire" => KeyCode::KeyF,
         "c" => KeyCode::KeyC,
         "g" | "shoulder" => KeyCode::KeyG,
