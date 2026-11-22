@@ -308,7 +308,11 @@ fn main() {
     }))
     .add_plugins((blur::BlurPlugin, paint::PaintPlugin, acvd_render::menu::MenuPlugin))
     .add_plugins(sfx::SfxPlugin { disc: disc.clone() })
-    .add_plugins(sound::SoundPlugin { disc: disc.clone() })
+    .add_plugins(sound::SoundPlugin {
+        disc: disc.clone(),
+        map: map.clone().filter(|_| !plane && !hits),
+        play_bgm: shot.is_none(),
+    })
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(enemy_parts)

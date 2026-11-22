@@ -102,6 +102,78 @@ pub fn is_fsb(data: &[u8]) -> bool {
     data.starts_with(MAGIC)
 }
 
+/// Reads only the FSB4 header and a single sample's payload from `disc`, avoiding loading
+/// multi-hundred-megabyte stream banks (`sound/bgm.fsb`, `sound/se_stream.fsb`) into memory.
+pub fn read_sample(disc: &crate::vfs::Disc, file: &str, index: usize) -> Result<Sample> {
+    let head = disc.read_range(file, 0, HEADER)?;
+    ensure!(is_fsb(&head), "{file}: not an FSB4 bank");
+    let count = lu32(&head, 4)? as usize;
+    ensure!(
+        index < count,
+        "{file}: sample index {index} out of range ({count})"
+    );
+    let header_bytes = lu32(&head, 8)? as usize;
+    let data_bytes = lu32(&head, 12)? as usize;
+    let version = lu32(&head, 16)?;
+    ensure!(
+        version == VERSION,
+        "FSB4 version {version:#x}, want {VERSION:#x}"
+    );
+    let big_endian_pcm = lu32(&head, 20)? & BANK_BIG_ENDIAN_PCM != 0;
+    let table = disc.read_range(file, HEADER as u64, header_bytes)?;
+    ensure!(table.len() == header_bytes, "{file}: truncated sample table");
+
+    let data_at = HEADER + header_bytes;
+    let mut at = 0usize;
+    let mut cursor = data_at;
+    for i in 0..=index {
+        ensure!(
+            at + 2 <= table.len(),
+            "sample {i} header runs past the header block"
+        );
+        let size = u16::from_le_bytes(table[at..at + 2].try_into().unwrap()) as usize;
+        ensure!(
+            size >= BASIC_SAMPLE && at + size <= table.len(),
+            "sample {i} header ({size:#x} at {at:#x}) runs past the header block"
+        );
+        let compressed = u32::from_le_bytes(table[at + 36..at + 40].try_into().unwrap()) as usize;
+        let end = cursor
+            .checked_add(compressed)
+            .filter(|e| *e <= data_at + data_bytes);
+        let Some(end) = end else {
+            bail!("sample {i} payload {compressed:#x} at {cursor:#x} runs past the data block");
+        };
+        if i == index {
+            let name = cstr(&table[at + 2..at + 32]);
+            let length = u32::from_le_bytes(table[at + 32..at + 36].try_into().unwrap());
+            let loop_start = u32::from_le_bytes(table[at + 40..at + 44].try_into().unwrap());
+            let loop_end = u32::from_le_bytes(table[at + 44..at + 48].try_into().unwrap());
+            let mode = u32::from_le_bytes(table[at + 48..at + 52].try_into().unwrap());
+            let frequency = u32::from_le_bytes(table[at + 52..at + 56].try_into().unwrap());
+            let channels = u16::from_le_bytes(table[at + 62..at + 64].try_into().unwrap());
+            let data = disc.read_range(file, cursor as u64, compressed)?;
+            ensure!(
+                data.len() == compressed,
+                "{file}#{index} ({name}): truncated payload"
+            );
+            return Ok(Sample {
+                name,
+                length,
+                loop_start,
+                loop_end,
+                mode,
+                frequency,
+                channels,
+                big_endian_pcm,
+                data,
+            });
+        }
+        at += size;
+        cursor = end;
+    }
+    unreachable!()
+}
+
 pub fn read(data: &[u8]) -> Result<Bank> {
     ensure!(is_fsb(data), "not an FSB4 bank");
     let count = lu32(data, 4)?;

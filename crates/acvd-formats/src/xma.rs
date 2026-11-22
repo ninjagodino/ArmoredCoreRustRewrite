@@ -21,8 +21,8 @@
 //! half a frame. Callers trim to the bank's sample count.
 //!
 //! Only 1- and 2-channel streams exist in XMA, so the WMA Pro paths for groups of more than
-//! two channels and the LFE channel are left out. The IMDCT is computed directly from a
-//! cosine table per block size (blocks are at most 512 coefficients).
+//! two channels and the LFE channel are left out. The half-length IMDCT runs via a radix-2
+//! complex FFT of length `N / 2` (64, 128, or 256 points).
 
 use std::sync::OnceLock;
 
@@ -136,16 +136,22 @@ impl<'a> Bits<'a> {
         Self { data, pos: 0, len }
     }
 
+    #[inline]
     fn peek(&self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
-        let byte = self.pos / 8;
+        let byte = self.pos >> 3;
+        let bit = (self.pos & 7) as u32;
+        if let Some(chunk) = self.data.get(byte..byte + 8) {
+            let v = u64::from_be_bytes(chunk.try_into().unwrap());
+            return ((v << bit) >> (64 - n)) as u32;
+        }
         let mut v = 0u64;
         for i in 0..5 {
             v = (v << 8) | *self.data.get(byte + i).unwrap_or(&0) as u64;
         }
-        let shift = 40 - (self.pos % 8) as u32 - n;
+        let shift = 40 - bit - n;
         ((v >> shift) & ((1u64 << n) - 1)) as u32
     }
 
@@ -201,26 +207,48 @@ impl BitBuf {
     }
 }
 
+/// Fast-path lookup width for [`Vlc::read`]: codes of `<= 9` bits resolve in a single table
+/// lookup; longer codes fall back to binary search on `codes`.
+const VLC_FAST_BITS: u32 = 9;
+const VLC_FAST_SIZE: usize = 1 << VLC_FAST_BITS;
+
 /// Canonical Huffman table from code lengths in symbol-list order (FFmpeg
 /// `ff_vlc_init_from_lengths`): codes count up from 0, left-aligned in 32 bits.
 struct Vlc {
+    fast: [(i32, u8); VLC_FAST_SIZE],
     codes: Vec<(u32, u8, i32)>,
 }
 
 impl Vlc {
     fn new(entries: impl IntoIterator<Item = (u8, i32)>, offset: i32) -> Self {
         let mut codes = Vec::new();
+        let mut fast = [(0i32, 0u8); VLC_FAST_SIZE];
         let mut code = 0u64;
         for (len, sym) in entries {
-            codes.push((code as u32, len, sym + offset));
+            let sym = sym + offset;
+            let c = code as u32;
+            codes.push((c, len, sym));
+            if len as u32 <= VLC_FAST_BITS {
+                let start = (c >> (32 - VLC_FAST_BITS)) as usize;
+                let count = 1usize << (VLC_FAST_BITS - len as u32);
+                for slot in &mut fast[start..start + count] {
+                    *slot = (sym, len);
+                }
+            }
             code += 1u64 << (32 - len);
         }
-        Self { codes }
+        Self { fast, codes }
     }
 
     /// The symbol, or -1 for a code not in the table (nothing consumed).
+    #[inline]
     fn read(&self, gb: &mut Bits) -> i32 {
         let v = gb.peek(32);
+        let (sym, len) = self.fast[(v >> (32 - VLC_FAST_BITS)) as usize];
+        if len != 0 {
+            gb.skip(len as usize);
+            return sym;
+        }
         let i = self.codes.partition_point(|c| c.0 <= v);
         if i == 0 {
             return -1;
@@ -243,8 +271,90 @@ struct Tables {
     vec1: Vlc,
     /// Sine windows of 128, 256, 512 samples.
     windows: [Vec<f32>; BLOCK_SIZES],
-    /// IMDCT cosine tables (scale included) for 128, 256, 512 coefficients.
-    imdct: [Vec<f32>; BLOCK_SIZES],
+    /// FFT-based half-length IMDCT plans (scale included) for 128, 256, 512 coefficients.
+    imdct: [ImdctPlan; BLOCK_SIZES],
+}
+
+struct ImdctPlan {
+    n: usize,
+    pre: Vec<(f32, f32)>,
+    post: Vec<(f32, f32)>,
+    bitrev: Vec<usize>,
+    fft_tw: Vec<Vec<(f32, f32)>>,
+}
+
+impl ImdctPlan {
+    /// FFmpeg's half-length inverse MDCT (`av_tx` MDCT, scale `-1 / (N/2) / 2^15`):
+    /// `out[j] = scale * sum_k X[k] cos(pi / (4N) * (2j + 2N + 1) * (2k + 1))`.
+    /// Reduced via DCT-IV to a single `N/2`-point complex radix-2 FFT.
+    fn new(n: usize) -> Self {
+        let m = n / 2;
+        let bits = log2(m);
+        let scale = -1.0 / (m as f64) / 32768.0;
+        let mut pre = Vec::with_capacity(m);
+        let mut post = Vec::with_capacity(m);
+        for k in 0..m {
+            let angle = std::f64::consts::PI * (k as f64 + 0.125) / n as f64;
+            let (s, c) = angle.sin_cos();
+            pre.push((c as f32, (-s) as f32));
+            post.push(((scale * c) as f32, (scale * -s) as f32));
+        }
+        let bitrev = (0..m)
+            .map(|k| k.reverse_bits() >> (usize::BITS as usize - bits))
+            .collect();
+        let fft_tw = (0..bits)
+            .map(|stage| {
+                let half = 1 << stage;
+                (0..half)
+                    .map(|j| {
+                        let angle = -std::f64::consts::PI * j as f64 / half as f64;
+                        let (s, c) = angle.sin_cos();
+                        (c as f32, s as f32)
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            n,
+            pre,
+            post,
+            bitrev,
+            fft_tw,
+        }
+    }
+
+    fn run(&self, src: &[f32], dst: &mut [f32]) {
+        let m = self.n / 2;
+        let mut buf = [(0.0f32, 0.0f32); FRAME / 2];
+        let z = &mut buf[..m];
+        for k in 0..m {
+            let re = src[self.n - 1 - 2 * k];
+            let im = -src[2 * k];
+            let (tr, ti) = self.pre[k];
+            z[self.bitrev[k]] = (re * tr - im * ti, re * ti + im * tr);
+        }
+        for (stage, tws) in self.fft_tw.iter().enumerate() {
+            let half = 1 << stage;
+            let step = half << 1;
+            for base in (0..m).step_by(step) {
+                for j in 0..half {
+                    let (wr, wi) = tws[j];
+                    let (ur, ui) = z[base + j];
+                    let (vr, vi) = z[base + j + half];
+                    let tr = vr * wr - vi * wi;
+                    let ti = vr * wi + vi * wr;
+                    z[base + j] = (ur + tr, ui + ti);
+                    z[base + j + half] = (ur - tr, ui - ti);
+                }
+            }
+        }
+        for k in 0..m {
+            let (zr, zi) = z[k];
+            let (tr, ti) = self.post[k];
+            dst[2 * k] = zr * tr - zi * ti;
+            dst[self.n - 1 - 2 * k] = zr * ti + zi * tr;
+        }
+    }
 }
 
 fn tables() -> &'static Tables {
@@ -286,23 +396,7 @@ fn tables() -> &'static Tables {
                     })
                     .collect()
             }),
-            imdct: std::array::from_fn(|i| {
-                // FFmpeg's half-length inverse MDCT (`av_tx` MDCT, scale 1 / (N/2) / 2^15):
-                // out[n] = -scale * sum_k X[k] cos(pi / (4N) * (2n + 2N + 1) * (2k + 1)).
-                let n = block(i);
-                let scale = -1.0 / (n as f64 / 2.0) / 32768.0;
-                let period = 8 * n;
-                let mut t = vec![0f32; n * n];
-                for j in 0..n {
-                    for k in 0..n {
-                        let phase = ((2 * j + 2 * n + 1) * (2 * k + 1)) % period;
-                        t[j * n + k] = (scale
-                            * (std::f64::consts::PI * phase as f64 / (4.0 * n as f64)).cos())
-                            as f32;
-                    }
-                }
-                t
-            }),
+            imdct: std::array::from_fn(|i| ImdctPlan::new(block(i))),
         }
     })
 }
@@ -766,7 +860,7 @@ impl Stream {
         if transmit {
             self.inverse_channel_transform();
             let size = log2(subframe_len) - log2(MIN_SUBFRAME);
-            let cos = &t.imdct[size];
+            let plan = &t.imdct[size];
             for i in 0..cur {
                 let c = self.channel_indexes[i];
                 let ch = &mut self.channel[c];
@@ -781,11 +875,7 @@ impl Stream {
                     }
                 }
                 let n = subframe_len;
-                let src = &self.tmp[..n];
-                for j in 0..n {
-                    let row = &cos[j * n..j * n + n];
-                    ch.out[ch.coeffs + j] = row.iter().zip(src).map(|(a, b)| a * b).sum();
-                }
+                plan.run(&self.tmp[..n], &mut ch.out[ch.coeffs..ch.coeffs + n]);
             }
         }
 
@@ -1934,23 +2024,27 @@ mod tests {
     #[test]
     fn imdct_matches_definition() {
         let t = tables();
-        let n = 128;
-        let mut x = vec![0f32; n];
-        x[3] = 1.0;
-        let out: Vec<f32> = (0..n)
-            .map(|j| {
-                t.imdct[0][j * n..j * n + n]
-                    .iter()
-                    .zip(&x)
-                    .map(|(a, b)| a * b)
-                    .sum()
-            })
-            .collect();
-        let scale = -1.0 / 64.0 / 32768.0;
-        for (j, v) in out.iter().enumerate() {
-            let want =
-                scale * (std::f64::consts::PI / n as f64 * (j as f64 + n as f64 + 0.5) * 3.5).cos();
-            assert!((*v as f64 - want).abs() < 1e-9, "{j}: {v} vs {want}");
+        for (idx, n) in [128usize, 256, 512].into_iter().enumerate() {
+            let x: Vec<f32> = (0..n)
+                .map(|k| ((k * 37 + 13) % 97) as f32 - 48.0)
+                .collect();
+            let mut out = vec![0f32; n];
+            t.imdct[idx].run(&x, &mut out);
+            let scale = -1.0 / (n as f64 / 2.0) / 32768.0;
+            for (j, &v) in out.iter().enumerate() {
+                let want: f64 = (0..n)
+                    .map(|k| {
+                        let phase = (2 * j + 2 * n + 1) * (2 * k + 1);
+                        x[k] as f64
+                            * (std::f64::consts::PI * phase as f64 / (4.0 * n as f64)).cos()
+                    })
+                    .sum::<f64>()
+                    * scale;
+                assert!(
+                    (v as f64 - want).abs() < 1e-6,
+                    "n={n} j={j}: {v} vs {want}"
+                );
+            }
         }
     }
 }

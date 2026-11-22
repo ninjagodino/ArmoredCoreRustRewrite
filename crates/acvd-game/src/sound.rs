@@ -9,12 +9,12 @@
 //! at full volume.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_formats::vfs::Disc;
-use acvd_formats::{fev, fsb};
-use bevy::audio::{AudioPlayer, AudioSource, PlaybackSettings};
+use acvd_formats::{env, fev, fsb};
+use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings, Volume};
 use bevy::prelude::*;
 
 use crate::control::{Pilot, Piloting};
@@ -178,14 +178,145 @@ pub fn cue(commands: &mut Commands, cues: &mut Cues, assets: &mut Assets<AudioSo
     }
 }
 
+/// Default BGM volume (keeps SFX clearly audible over music).
+const BGM_VOLUME: f32 = 0.35;
+
 pub struct SoundPlugin {
     pub disc: Disc,
+    /// Map id (e.g. `"m4000"`) whose `ch_env/{map}_env.msb` selects the BGM track, if any.
+    pub map: Option<String>,
+    /// False in headless `--shot` runs to skip spawning a background BGM decode thread.
+    pub play_bgm: bool,
 }
 
 impl Plugin for SoundPlugin {
     fn build(&self, app: &mut App) {
+        let bgm = if self.play_bgm {
+            BgmState::spawn_decode(&self.disc, self.map.as_deref())
+        } else {
+            BgmState::default()
+        };
         app.insert_resource(Cues::load(&self.disc))
-            .add_systems(Update, motion.after(crate::weapons::fire));
+            .insert_resource(bgm)
+            .add_systems(Update, (motion.after(crate::weapons::fire), bgm_update));
+    }
+}
+
+#[derive(Component)]
+struct BgmPlayer;
+
+#[derive(Resource, Default)]
+struct BgmState {
+    rx: Option<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    muted: bool,
+}
+
+/// Resolves the BGM wave for `map` from `ch_env/{map}_env.msb` (`EVENT_BGM`, 360 `0x82800128`)
+/// and `sound/acv2_bgm_bgm.fev` (falling back to the map's 3-digit arena/mission track or
+/// `acv2_bgm_menu_bgm_menu.fev` `grg` when no map is loaded).
+fn resolve_bgm_wave(disc: &Disc, map: Option<&str>) -> Option<(String, fev::Wave)> {
+    if let Some(map_id) = map {
+        if let Ok(project) = disc
+            .read("sound/acv2_bgm_bgm.fev")
+            .and_then(|b| fev::read(&b))
+        {
+            let mut candidates = Vec::new();
+            let env_path = format!("model/map/ch_env/{map_id}_env.msb");
+            if let Ok(e) = disc.read(&env_path).and_then(|b| env::read(&b)) {
+                if let Some(bgm) = e.bgm.filter(|b| b.id > 0) {
+                    candidates.push(format!("{:03}", bgm.id));
+                }
+            }
+            if let Some(digits) = map_id.strip_prefix('m').and_then(|s| s.get(..3)) {
+                candidates.push(digits.to_string());
+            }
+            candidates.push("400".to_string());
+            for cue in candidates {
+                if let Some(wave) = project.waves(&cue).into_iter().next().cloned() {
+                    return Some((cue, wave));
+                }
+            }
+        }
+    }
+    let menu = disc
+        .read("sound/acv2_bgm_menu_bgm_menu.fev")
+        .and_then(|b| fev::read(&b))
+        .ok()?;
+    menu.waves("grg")
+        .into_iter()
+        .next()
+        .cloned()
+        .map(|w| ("grg".to_string(), w))
+}
+
+impl BgmState {
+    fn spawn_decode(disc: &Disc, map: Option<&str>) -> Self {
+        let Some((cue, wave)) = resolve_bgm_wave(disc, map) else {
+            return Self::default();
+        };
+        let disc = disc.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let file = format!("sound/{}.fsb", wave.bank);
+            let sample = match fsb::read_sample(&disc, &file, wave.index as usize) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("sound: bgm {cue} ({file}#{}): {err:#}", wave.index);
+                    return;
+                }
+            };
+            let pcm = match sample.decode() {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("sound: bgm {cue} decode: {err:#}");
+                    return;
+                }
+            };
+            let wav = wav_pcm(&pcm.to_i16(), pcm.channels, sample.frequency);
+            let _ = tx.send(wav);
+        });
+        Self {
+            rx: Some(Mutex::new(rx)),
+            muted: false,
+        }
+    }
+}
+
+fn bgm_update(
+    mut commands: Commands,
+    mut assets: ResMut<Assets<AudioSource>>,
+    mut bgm: ResMut<BgmState>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut sinks: Query<&mut AudioSink, With<BgmPlayer>>,
+) {
+    if let Some(rx) = bgm.rx.as_ref() {
+        let received = rx.lock().ok().and_then(|r| r.try_recv().ok());
+        if let Some(wav) = received {
+            bgm.rx = None;
+            let handle = assets.add(AudioSource {
+                bytes: Arc::<[u8]>::from(wav),
+            });
+            let volume = if bgm.muted {
+                Volume::Linear(0.0)
+            } else {
+                Volume::Linear(BGM_VOLUME)
+            };
+            commands.spawn((
+                AudioPlayer(handle),
+                PlaybackSettings::LOOP.with_volume(volume),
+                BgmPlayer,
+            ));
+        }
+    }
+    if keys.just_pressed(KeyCode::F9) {
+        bgm.muted = !bgm.muted;
+        for mut sink in &mut sinks {
+            sink.set_volume(if bgm.muted {
+                Volume::Linear(0.0)
+            } else {
+                Volume::Linear(BGM_VOLUME)
+            });
+        }
     }
 }
 
@@ -378,5 +509,25 @@ mod tests {
                 "{cue} decoded to silence"
             );
         }
+    }
+
+    #[test]
+    fn bgm_resolves_and_range_reads_x360() {
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        let Ok(disc) = Disc::open(&iso) else { return };
+        let (cue, wave) = resolve_bgm_wave(&disc, Some("m4000")).expect("m4000 bgm");
+        assert_eq!(wave.bank, "bgm", "m4000 cue {cue}");
+        let sample = fsb::read_sample(&disc, "sound/bgm.fsb", wave.index as usize).unwrap();
+        assert!(sample.xma());
+        assert_eq!(sample.channels, 2);
+        assert!(sample.length > 44_100 * 30, "expected full-length BGM track");
+
+        let (garage_cue, garage_wave) = resolve_bgm_wave(&disc, None).expect("garage bgm");
+        assert_eq!(garage_cue, "grg");
+        assert_eq!(garage_wave.bank, "bgm_menu");
+        let gsample =
+            fsb::read_sample(&disc, "sound/bgm_menu.fsb", garage_wave.index as usize).unwrap();
+        assert!(gsample.xma());
+        assert_eq!(gsample.channels, 2);
     }
 }

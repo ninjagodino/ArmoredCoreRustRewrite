@@ -284,10 +284,13 @@ in order:
   the WMA Pro audio could reuse `acvd-formats::xma`'s WMA Pro core.
 - **Mission events** (EVD), **AI** (decompiled Lua in `private/lua360` from the ISO, with the
   `LogAI` state names; no sheet yet).
-- **XMA decode speed**: `xmacheck` takes 33 s for `bgm` and 50 s for `se_stream` (release). Fine
-  for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **Fast FFT-Based XMA IMDCT & Async BGM Streaming** (`acvd-formats::xma`, `fsb`, `vfs`, `env`, `acvd-game::sound`, `main`):
+  - **FFT IMDCT + Fast VLC/Bitreader (`crates/acvd-formats/src/xma.rs`)**: replaced the `O(N²)` cosine matrix IMDCT with an `N/2`-point complex radix-2 FFT via DCT-IV (`ImdctPlan`, 64/128/256-point stack-allocated FFT), added a 9-bit (512-entry) fast lookup table in `Vlc::read`, and added a `u64::from_be_bytes` fast path in `Bits::peek`. Full `bgm.fsb` (26 full-length stereo tracks) decode in `xmacheck` dropped from **33 s → 10.9 s** (3.0× faster, ~0.42 s per full track, 0 frame errors, identical peak `1.105`).
+  - **Single-Sample FSB Range Reads (`vfs::Disc::read_range`, `fsb::read_sample`)**: reads only the FSB4 header (~3 KB) and the requested sample's compressed payload (~4 MB) instead of loading the entire 122 MB `sound/bgm.fsb` into memory.
+  - **Async Map/Garage BGM (`env::Bgm`, `acvd-game::sound`)**: parsed `EVENT_BGM` (type 400, 360 `0x82800128`) in `acvd-formats::env`, resolved map BGM cues via `sound/acv2_bgm_bgm.fev` (with garage fallback `grg` in `sound/acv2_bgm_menu_bgm_menu.fev`), decoded on a background thread with zero startup stall, and added `F9` mute toggle (skipped under `--shot`).
 
 - **VFS Binder Cache, Indexed Data Lookups & `Arc<ani::Anim>` Clip Cache** (`acvd-formats::vfs`, `acvd-data`, `acvd-game::pose`):
   - **Bounded LRU Binder Cache (`crates/acvd-formats/src/vfs.rs`)**: added a 192 MiB `BinderCache` inside `Disc` (`X360`) that caches decompressed, BND3-parsed containers with an O(1) `by_name` entry map across all `|` nesting levels, avoiding repeated ISO reads, DCX decompression, and header parsing during map/collision load and first-use animation/SFX transitions.

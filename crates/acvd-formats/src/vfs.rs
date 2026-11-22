@@ -244,9 +244,29 @@ impl Disc {
 
     /// The first `n` bytes of one disc file (all of it when shorter).
     pub fn head(&self, file: &str, n: usize) -> Result<Vec<u8>> {
+        self.read_range(file, 0, n)
+    }
+
+    /// Up to `len` bytes of one disc file starting at `offset` (no DCX expansion).
+    /// Avoids loading huge banks (like `sound/bgm.fsb`) when only one slice is needed.
+    pub fn read_range(&self, file: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         match self.0.locate(file) {
-            Some(Loc::Image(at, size)) => self.0.image.read_at(at, n.min(size as usize)),
-            _ => Ok(self.0.read(file)?.into_iter().take(n).collect()),
+            Some(Loc::Image(at, size)) => {
+                if offset >= size {
+                    return Ok(Vec::new());
+                }
+                let avail = (size - offset).min(len as u64) as usize;
+                self.0
+                    .image
+                    .read_at(at + offset, avail)
+                    .with_context(|| format!("reading {file}@{offset:#x}"))
+            }
+            _ => {
+                let bytes = self.0.read(file)?;
+                let start = (offset as usize).min(bytes.len());
+                let end = start.saturating_add(len).min(bytes.len());
+                Ok(bytes[start..end].to_vec())
+            }
         }
     }
 

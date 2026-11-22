@@ -159,11 +159,20 @@ pub struct Scene {
     pub tonemap: ToneMap,
 }
 
+/// Type-400 BGM event data (`0x82800128`: `+0x00` → `r31+0x50`, `+0x04` → `+0x90`, `+0x08` → `+0x94`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Bgm {
+    pub id: u32,
+    pub param_a: u32,
+    pub param_b: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Env {
     pub events: Vec<Event>,
     pub lights: Vec<LightSet>,
     pub scene: Option<Scene>,
+    pub bgm: Option<Bgm>,
 }
 
 impl Env {
@@ -211,6 +220,7 @@ pub fn read(data: &[u8]) -> Result<Env> {
         events: Vec::new(),
         lights: Vec::new(),
         scene: None,
+        bgm: None,
     };
     for off in msb::section(data, "EVENT_PARAM_ST")? {
         let name_rel = r.u32(off)? as usize;
@@ -261,6 +271,13 @@ pub fn read(data: &[u8]) -> Result<Env> {
                     water_height: r.f32(sub + 8)?,
                     sky_scale: Some(r.f32(sub + 0x1c)?).filter(|&s| s > 0.0).unwrap_or(1.0),
                     tonemap,
+                });
+            }
+            EVENT_BGM if env.bgm.is_none() && e.data + 12 <= data.len() => {
+                env.bgm = Some(Bgm {
+                    id: r.u32(e.data)?,
+                    param_a: r.u32(e.data + 4)?,
+                    param_b: r.u32(e.data + 8)?,
                 });
             }
             _ => {}
