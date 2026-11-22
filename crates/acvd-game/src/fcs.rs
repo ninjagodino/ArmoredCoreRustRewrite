@@ -380,7 +380,7 @@ pub fn update(
     let Ok((pilot, arms, ac_tf, mut fcs)) = acs.single_mut() else {
         return;
     };
-    if pilot.scan_mode {
+    if pilot.scan_mode || pilot.ow_lockout {
         fcs.locked = None;
         fcs.missile_locks.clear();
         fcs.missile_lock_timer = 0.0;

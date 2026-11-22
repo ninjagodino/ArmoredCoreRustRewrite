@@ -5,8 +5,9 @@
 //! `0x8288cea0`: flags 0/1 build a basis on the socket forward against world +Y (`0x8288c0b8`),
 //! flags 2/3 against world +Z (`0x8288bef8`). Flag 4 (a hanger weapon on its rack) builds the
 //! same kind of basis through `0x8288a058`: local -Z, the barrel, lies along the socket
-//! forward, and world +Y fills the remaining axis (`0x827ce358`). Flag 5 negates that forward
-//! and is not applied to shoulder weapons.
+//! forward, and world +Y fills the remaining axis (`0x827ce358`). Flag 5 (Overed Weapon on
+//! core dummy 50, record 25 `(1,50,12,5,"50")`) negates `forward` before calling `0x8288a058`,
+//! so local +Z lies along the socket forward.
 
 use acvd_data::{ac_part, Joint, ModelRef, Slot, SocketRef};
 use acvd_render::{RootPlace, SocketFrame};
@@ -93,7 +94,7 @@ pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
             problem(format!("no {} model {:04}", s.prefix, part.model_id));
             continue;
         };
-        let roots: Vec<&Joint> = if s.roots.is_empty() {
+        let mut roots: Vec<&Joint> = if s.roots.is_empty() {
             model.roots.iter().collect()
         } else {
             s.roots.iter().filter_map(|r| model.root(r)).collect()
@@ -101,6 +102,17 @@ pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
         if roots.is_empty() || roots.len() < s.roots.len() {
             problem(format!("{} lacks a root bone of {:?}", model.path, s.roots));
             continue;
+        }
+        // Overed weapons (`category == 11`) always anchor root `"50"` onto core dummy 50
+        // (`acattachinfo` record 25), and models with a secondary blade/cannon arm root `"60"`
+        // (`ow0110`, `ow0310`, `ow0610`, `ow6010`) ride `"50"` while stowed (`acattachinfo`
+        // record 0: `(12,60,12,1,"60")`). Append any remaining roots as followers of `roots[0]`.
+        if s.category == 11 {
+            for extra in model.roots {
+                if !roots.iter().any(|r| r.name == extra.name) {
+                    roots.push(extra);
+                }
+            }
         }
         let Some(parent_name) = s.parent else {
             placed.push((s.name, out.placements.len()));
@@ -257,6 +269,9 @@ fn mount_place(
             .find(|(n, _)| Some(*n) == mount.follow)
             .map(|(_, p)| *p)
     };
+    if mount.follow.is_some() {
+        return follow().unwrap_or(RootPlace::IDENTITY);
+    }
     let (at, forward, carrier) = match mount.socket {
         SocketRef::Dummy(id) => match parent.frames.iter().find(|f| f.id == id) {
             Some(f) => (f.position, f.forward, placed(&parent.places, &f.root)),
@@ -326,6 +341,8 @@ pub fn orient_basis(flag: u8, forward: [f32; 3]) -> [[f32; 3]; 3] {
     let f = unit(forward);
     match flag {
         4 => rack_basis(f),
+        // `0x8288cea0`: flag 5 negates `forward` and calls `0x8288a058` (same basis as flag 4).
+        5 => rack_basis(neg(f)),
         0 | 1 => {
             let x = if flag & 1 == 1 { f } else { neg(f) };
             let y = if f[1].abs() >= 1.0 - 1.0e-4 {
@@ -522,5 +539,61 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 5, "expected weapon-arm designs on disc, checked {checked}");
+    }
+
+    #[test]
+    fn flag5_negates_flag4_forward() {
+        let f = [0.0, 0.25, 0.9682];
+        let b4 = orient_basis(4, neg(f));
+        let b5 = orient_basis(5, f);
+        for k in 0..3 {
+            close(b4[k], b5[k]);
+        }
+    }
+
+    #[test]
+    fn overed_weapons_assemble_cleanly_on_preset_designs() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+
+        let mut checked = 0;
+        for row in AC_ASSEMBLY_DESIGN_ST_FILES.iter().flat_map(|(_, r)| r.iter()) {
+            if row.data.back_r == 0 {
+                continue;
+            }
+            let built = assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &row.data);
+            assert!(
+                built.problems.is_empty(),
+                "OW design {} ({}) had assembly problems: {:?}",
+                row.id,
+                row.name,
+                built.problems
+            );
+            let ow = built
+                .placements
+                .iter()
+                .find(|p| p.column == "back_r")
+                .unwrap_or_else(|| panic!("OW design {} missing back_r placement", row.id));
+            assert_eq!(ow.category, 11);
+            assert_eq!(ow.part, row.data.back_r as u16);
+            let m50 = ow
+                .mounts
+                .iter()
+                .find(|m| m.root == "50")
+                .expect("OW root 50 mount");
+            assert_eq!(m50.socket, SocketRef::Dummy(50));
+            assert_eq!(m50.orient, Some(5));
+            assert_eq!(m50.follow, None);
+            if matches!(ow.part, 110 | 310 | 610 | 6010) {
+                let m60 = ow
+                    .mounts
+                    .iter()
+                    .find(|m| m.root == "60")
+                    .expect("OW secondary root 60 follower");
+                assert_eq!(m60.follow, Some("50"));
+            }
+            checked += 1;
+        }
+        assert!(checked >= 4, "expected OW preset designs (9002/9003/9004/9999), checked {checked}");
     }
 }

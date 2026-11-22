@@ -17,6 +17,13 @@
 //! Hold R (△ / gamepad North) and press that fire button to bay-shift: the hand weapon trades
 //! places with the one on the rack (see `bay`). A ready-position weapon is purged instead,
 //! because it cannot sit on the bay.
+//! If the design equips an Overed Weapon (`back_r`, category 11: designs `9002`, `9003`, `9004`,
+//! `9999`), hold U (or hold R / △ without pressing fire for 1 s) to arm it and purge the left-arm
+//! weapon, then hold F / left mouse / R2 to charge and release at full charge to fire (auto-purges
+//! into EN/FCS lockout when the limit gauge drains).
+//! Hand weapons support full-auto, simultaneous multi-pellet spread (shotguns/pulse guns),
+//! sequential multi-round bursts (burst rifles/handguns), and hold-to-charge / release-to-fire
+//! (laser rifles, rail cannons, laser cannons).
 //! A ready-position weapon (cannon, autocannon, and the other classes with `ready_position`)
 //! plays its deploy clip while fire is held and does not shoot until that clip ends; releasing
 //! fire plays the stow, and that side's arm plays its deploy clip over the walk. A ready weapon
@@ -327,6 +334,7 @@ fn main() {
             (
                 bay::shift,
                 weapons::fire,
+                weapons::step_overed_weapon,
                 weapons::step_melee,
                 ai::update,
                 targets::animate_enemies,
@@ -353,6 +361,7 @@ fn main() {
             hud::scan_hud,
             hud::recon_hud,
             hud::stagger_hud,
+            hud::ow_hud,
             hud::area_warning_hud,
         )
             .chain()
@@ -402,6 +411,7 @@ fn key(name: &str) -> Option<KeyCode> {
         "x" => KeyCode::KeyX,
         "tab" => KeyCode::Tab,
         "r" => KeyCode::KeyR,
+        "u" | "ow" => KeyCode::KeyU,
         "z" | "scan" => KeyCode::KeyZ,
         "b" | "recon" => KeyCode::KeyB,
         "up" => KeyCode::ArrowUp,
@@ -735,6 +745,11 @@ fn show(
                 commands.entity(root).insert(h);
             }
         }
+        if part.placement.column == "back_r" {
+            if let Some(root) = root {
+                commands.entity(root).insert(weapons::OwHardpoint);
+            }
+        }
         if part.placement.column == "arms" {
             let is_wa =
                 acvd_data::part_field(part.placement.part as i64, 2, "is_weapon_arm") != 0.0;
@@ -881,6 +896,9 @@ fn show(
                 ) {
                     mesh_entity.insert(bay::WeaponMesh { root });
                 }
+            }
+            if part.placement.column == "back_r" {
+                mesh_entity.insert(weapons::OwMesh);
             }
         }
     }

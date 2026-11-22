@@ -37,7 +37,7 @@ use bevy::window::PrimaryWindow;
 use crate::damage::PlayerHealth;
 use crate::fcs::Fcs;
 use crate::scan::{ReconUnit, ScanState, MAX_RECON_SLOTS};
-use crate::weapons::{Armament, Gun, Kind};
+use crate::weapons::{Armament, Gun, Kind, OwPhase};
 
 const LAYOUT: &str = "lang/en/menu/sortie.drb.dcx";
 const SCREEN: Vec2 = Vec2::new(1280.0, 720.0);
@@ -170,6 +170,12 @@ pub struct Status {
     pub en: f32,
     /// Generator energy capacity (`0x829d0b30` status `+0x14`, from `AC + 0x214` `+0x08`).
     pub en_max: f32,
+    /// Live Overed Weapon phase (`0x82885c40..0x828865f8`).
+    pub ow_phase: OwPhase,
+    /// Overed Weapon charge gauge fraction in `0..=1` (`0x82885f10`).
+    pub ow_charge: f32,
+    /// Overed Weapon limit gauge fraction in `0..=1` (`0x82885fa8`).
+    pub ow_limit: f32,
 }
 
 impl Status {
@@ -192,6 +198,9 @@ impl Status {
             ap_max,
             en: en_max,
             en_max,
+            ow_phase: OwPhase::Disarmed,
+            ow_charge: 0.0,
+            ow_limit: 0.0,
         }
     }
 
@@ -249,6 +258,14 @@ pub struct ScanEnemyParamHud;
 /// Marker on `ACV_FE_Normal::Stagger` (`ErrorLog_Stagger`, dialog 208, rect `[158, 126, 346, 196]`).
 #[derive(Component)]
 pub struct StaggerHud;
+
+/// Marker on Overed Weapon lock-sight dialogs (`ACV_OWLockSight` / `ACV_OWLockSightCenter`, `0x829d4e40`).
+#[derive(Component)]
+pub struct OwSightHud;
+
+/// Marker on Overed Weapon overload / error-log dialog (`ACV_OW_ErrorLog`, `0x825aefe0`).
+#[derive(Component)]
+pub struct OwErrorHud;
 
 /// Marker on `FE_EspialMachineInfo` (anchored at `ACV_FE_Normal::EspialMachineInfo`: recon ammo).
 #[derive(Component)]
@@ -435,6 +452,22 @@ pub fn layout(
         commands
             .entity(root)
             .insert((StaggerHud, Visibility::Hidden));
+    }
+    // Overed Weapon HUD dialogs (`0x829d4e40` `ACV_OWLockSight` / `ACV_OWLockSightCenter` centered
+    // at screen center, and `0x825aefe0` `ACV_OW_ErrorLog` at screen corner).
+    for name in ["ACV_OWLockSight", "ACV_OWLockSightCenter"] {
+        if let Some(dlg) = dialog(name) {
+            let root = menu::spawn(&mut commands, &hud.layout, dlg, size / 2.0, scale);
+            commands
+                .entity(root)
+                .insert((OwSightHud, Visibility::Hidden));
+        }
+    }
+    if let Some(dlg) = dialog("ACV_OW_ErrorLog") {
+        let root = menu::spawn(&mut commands, &hud.layout, dlg, corner, scale);
+        commands
+            .entity(root)
+            .insert((OwErrorHud, Visibility::Hidden));
     }
     // World-projected Recon markers (`ACV_MapScan_EspialMachine*`, `ACV_MapScan_ReconInfo*`)
     // and recon-detected enemy markers (`ACV_MapScan_SubTargetS`).
@@ -946,6 +979,88 @@ pub fn stagger_hud(
         } else {
             Visibility::Hidden
         });
+    }
+}
+
+/// Shows Overed Weapon HUD dialogs (`ACV_OWLockSight` / `ACV_OWLockSightCenter` `0x829d4e40`,
+/// `ACV_OW_ErrorLog` `0x825aefe0`) and updates OW charge/limit gauges while an OW is active or
+/// in post-purge lockout.
+#[allow(clippy::type_complexity)]
+pub fn ow_hud(
+    status: Query<&Status>,
+    mut sight: Query<(Entity, &mut Visibility), (With<OwSightHud>, Without<OwErrorHud>)>,
+    mut err: Query<(Entity, &mut Visibility), (With<OwErrorHud>, Without<OwSightHud>)>,
+    children: Query<&Children>,
+    mut gauges: Query<(&MenuObject, &mut MenuGauge)>,
+    mut texts: Query<(&MenuObject, &mut MenuText)>,
+    mut sub_vis: Query<(&MenuObject, &mut Visibility), (Without<OwSightHud>, Without<OwErrorHud>)>,
+) {
+    let st = status.single().ok();
+    let active = st.is_some_and(|s| {
+        matches!(
+            s.ow_phase,
+            OwPhase::Arming
+                | OwPhase::Armed
+                | OwPhase::Charging
+                | OwPhase::Charged
+                | OwPhase::Attacking
+        )
+    });
+    let show_err = active || st.is_some_and(|s| s.ow_phase == OwPhase::Lockout);
+    for (root, mut vis) in &mut sight {
+        vis.set_if_neq(if active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
+        if active {
+            if let Some(s) = st {
+                for child in children.iter_descendants(root) {
+                    if let Ok((obj, mut g)) = gauges.get_mut(child) {
+                        let name = obj.0.to_lowercase();
+                        g.fill = if name.contains("charge") {
+                            s.ow_charge
+                        } else {
+                            s.ow_limit
+                        };
+                    }
+                    if let Ok((obj, mut v)) = sub_vis.get_mut(child) {
+                        if matches!(
+                            obj.0.as_str(),
+                            "Hit" | "Ineffective" | "Danger" | "Booster"
+                                | "Status_Hit" | "Status_Ineffective" | "Status_Danger" | "Status_Booster"
+                        ) {
+                            v.set_if_neq(Visibility::Hidden);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (root, mut vis) in &mut err {
+        vis.set_if_neq(if show_err {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
+        if show_err {
+            if let Some(s) = st {
+                let limit_pct = format!("{:06.2}%", s.ow_limit * 100.0);
+                for child in children.iter_descendants(root) {
+                    if let Ok((_, mut g)) = gauges.get_mut(child) {
+                        g.fill = s.ow_limit;
+                    }
+                    if let Ok((obj, mut t)) = texts.get_mut(child) {
+                        let name = obj.0.to_lowercase();
+                        if name.contains("limit") || t.text.contains('%') || t.text.contains("000.00") {
+                            if t.text != limit_pct {
+                                t.text = limit_pct.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1774,6 +1889,9 @@ mod tests {
             ap_max: 30000,
             en: 58630.0,
             en_max: 58630.0,
+            ow_phase: OwPhase::Disarmed,
+            ow_charge: 0.0,
+            ow_limit: 0.0,
         };
         let (digits, fill, low) = reading(Readout::Energy, Some(&s), None).unwrap();
         assert_eq!(digits, 10000);

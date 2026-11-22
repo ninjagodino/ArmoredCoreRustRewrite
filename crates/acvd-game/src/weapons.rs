@@ -28,11 +28,12 @@ use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::bullet::{
     BULLET_BULLETARISE_BIN, BULLET_BULLETBLADE_BIN, BULLET_BULLETENERGY_BIN,
     BULLET_BULLETEXPLOSION_BIN, BULLET_BULLETMISSILE_BIN, BULLET_BULLETRIGID_BIN,
-    PARAM_BULLETHITSEPARAM_BIN, PARAM_BULLETHITSFXPARAM_BIN,
+    BULLET_BULLETSTATUSERROR_BIN, PARAM_BULLETHITSEPARAM_BIN, PARAM_BULLETHITSFXPARAM_BIN,
     PARAM_ENEMY_BULLET_ENEMYBULLETENERGY_BIN, PARAM_ENEMY_BULLET_ENEMYBULLETMISSILE_BIN,
     PARAM_ENEMY_BULLET_ENEMYBULLETRIGID_BIN,
 };
 use acvd_data::generated::ctrl::AcCtrlParam;
+use acvd_data::generated::tuning::NEW_AC_BEHAVIOR;
 use acvd_data::generated::sfx::{PARAM_ACWEAPONSFXPARAM_BIN, PARAM_ENEMYWEAPONSFXPARAM_BIN};
 use acvd_data::generated::sound::{
     PARAM_ACSOUNDPARAM_BIN, PARAM_ACWEAPONSOUNDPARAM_BIN, PARAM_ENEMYWEAPONSOUNDPARAM_BIN,
@@ -87,7 +88,8 @@ pub enum Hand {
     Left,
 }
 
-/// The two hand weapons, two bay weapons, and shoulder unit of the shown design.
+/// The two hand weapons, two bay weapons, shoulder unit, and optional Overed Weapon (`back_r`)
+/// of the shown design.
 /// `hands` / `bays` are `[right, left]`. When `weapon_arm` is true (`acvparts` cat-2 byte
 /// `+0x13c == 1`, `0x824793c8`), `hands[0]` holds the unified built-in weapon-arm record
 /// (`0x82479668` -> `0x8247e090`) and `hands[1]` / `bays` / `shoulder` are silent.
@@ -96,6 +98,9 @@ pub struct Armament {
     pub hands: [Gun; 2],
     pub bays: [Gun; 2],
     pub shoulder: Gun,
+    /// Equipped Overed Weapon (`AC_ASSEMBLY_DESIGN_ST.back_r`, category 11, slot 12) and its
+    /// live 360 state machine (`0x82885c40..0x82886948`).
+    pub overed: Option<OveredWeaponState>,
     /// True when the equipped arms are weapon arms (`0x824793c8`).
     pub weapon_arm: bool,
     /// Queued shoulder salvo rounds (`Some(target)` for locked missiles, `None` for dumbfire/rockets).
@@ -111,6 +116,397 @@ pub struct Armament {
     /// Counter within the current weapon-arm salvo for alternating right/left barrel muzzles.
     pub arm_salvo_index: u32,
 }
+
+/// Hand-weapon firing mode derived from `acvparts.bin` category-10 sub-record fields
+/// (`0x823c7260`, `0x82475b00` / `0x8247d6e0` `charge_time` at `+0x3e`, `0x82475c98` `fire_mode`
+/// at `+0x03`, `burst_count` at `+0x1d`, `burst_wait` at `+0x20`, `burst_interval` at `+0x22`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FireMode {
+    /// Continuous automatic fire while trigger is held (rifles, gatlings, autocannons, etc.).
+    #[default]
+    Auto,
+    /// Simultaneous multi-pellet cone spread per shot (shotguns, pulse guns/cannons, scatter cannons).
+    PelletSpread,
+    /// Multi-round sequential burst per trigger pull (burst rifles kind 6 `710..6520`, burst handguns).
+    Burst,
+    /// Hold trigger to charge up to `charge_time` ticks (`sub +0x3e`), release to fire
+    /// (all 26 charge weapons: kind 11 laser rifles, kind 17 rail cannons, kind 22 laser cannons).
+    Charge,
+}
+
+/// Result of stepping one weapon's trigger state for a frame (`Gun::step_trigger`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TriggerAction {
+    None,
+    /// Rising edge of a charge hold (plays `acweaponsoundparam.charge`).
+    StartCharge,
+    /// Fire `pellets` projectile(s) with damage/speed multiplier `power_scale`.
+    Fire { power_scale: f32, pellets: usize },
+}
+
+/// Secondary AoE explosion blast spawned on projectile/missile impact (`BULLET_ARISE_ST` ->
+/// `BULLET_EXPLOSION_ST` / `BULLET_STATUS_ERROR_ST`; e.g. Huge Cannon `99615` 50 m,
+/// Multiple Pulse `99815` 30 m TE sphere, Giga Missile `101010` 100 m mega-blast).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImpactBlast {
+    pub radius: f32,
+    pub damage_type: DamageType,
+    pub damage_power: f32,
+    pub damage_recoil: f32,
+    pub hit_fx: i32,
+    pub hit_se: i16,
+}
+
+/// Static specification of an equipped Overed Weapon (`param/acvparts.bin` category 11, slot 12,
+/// initialized by 360 `0x82858948` -> `0x82886418` -> `0x82885bf0`).
+#[derive(Clone, Copy, Debug)]
+pub struct OveredWeaponSpec {
+    pub part_id: u16,
+    /// Category-11 `+0x1a0`: `1` Grind Blade, `3` Mass Blade, `6` Huge Cannon,
+    /// `8` Multiple Pulse, `10` Giga Missile, `60` Mega Blade.
+    pub ow_type: u32,
+    pub gun: Gun,
+    /// Secondary AoE blast from category-11 `+0x144` (`arise_id`).
+    pub blast: Option<ImpactBlast>,
+    /// Target EN required for full charge (`AcCtrlParam::ow_charge_en`, `OwCtrl +0x08`).
+    pub charge_en: f32,
+    /// Generator OW EN/s output while active (`AcCtrlParam::ow_en_output`, `0x82868798` -> `0x8287ef68`).
+    pub ow_en_output: f32,
+    /// Post-fire reload cooldown in seconds (`AcCtrlParam::ow_reload`, `OwCtrl +0x0c`).
+    pub ow_reload_secs: f32,
+    /// Post-purge EN & FCS lockout duration in seconds (`cat-11 +0x28`, `OwCtrl +0x04`).
+    pub lockout_secs: f32,
+    /// Limit gauge passive drain per second (`owCalorificBaseVal * 60`, `OwCtrl +0x20`).
+    pub calorific_per_sec: f32,
+    /// Charge heat divisor (`heatValue_OwCharge = 500`, `OwCtrl +0x24` in `0x82885e08`).
+    pub charge_heat_base: f32,
+    /// Initial limit gauge capacity (`cat-11 +0xfe`, default `9000` in `0x82885bf0`, `OwCtrl +0x28`).
+    pub limit_capacity: f32,
+    /// AP self-damage per overload tick (`AcCtrlParam::ow_overload_dmg`, `0x828861d0`).
+    pub overload_dmg: f32,
+    /// Random self-damage interval bounds in seconds (`OwCtrl +0x14`/`+0x18`, `0x828861d0`).
+    pub dmgtime_min: f32,
+    pub dmgtime_max: f32,
+    /// Activation hold duration in seconds (`NewAcBehavior` field 309 `ow_mode_hold_frames / 60`).
+    pub activate_hold_secs: f32,
+}
+
+impl OveredWeaponSpec {
+    pub fn is_melee(&self) -> bool {
+        matches!(self.ow_type, 1 | 3 | 60)
+    }
+
+    pub fn from_design(design: &AcAssemblyDesignSt, ctrl: &AcCtrlParam) -> Option<Self> {
+        let id = design.back_r as i64;
+        if id <= 0 {
+            return None;
+        }
+        let ow_type = part_field(id, 11, "ow_type") as u32;
+        let gun = ow_gun(id);
+        let arise_id = part_field(id, 11, "arise_id") as u32;
+        let blast = impact_blast_from_arise(arise_id);
+        let raw_cap = part_field(id, 11, "limit_capacity");
+        let limit_capacity = if raw_cap > 0.0 { raw_cap } else { 9000.0 };
+        let lockout_secs = part_field(id, 11, "lockout_secs").max(1.0);
+        let charge_en = ctrl.ow_charge_en.max(1.0);
+        let ow_en_output = if ctrl.ow_en_output > 0.0 {
+            ctrl.ow_en_output
+        } else {
+            ctrl.en_output.max(10000.0)
+        };
+        Some(Self {
+            part_id: design.back_r as u16,
+            ow_type,
+            gun,
+            blast,
+            charge_en,
+            ow_en_output,
+            ow_reload_secs: ctrl.ow_reload.max(0.5),
+            lockout_secs,
+            calorific_per_sec: (ctrl.ow_calorific_base * TICK_RATE).max(60.0),
+            charge_heat_base: ctrl.ow_charge_heat_base.max(1.0),
+            limit_capacity,
+            overload_dmg: ctrl.ow_overload_dmg.max(0.0),
+            dmgtime_min: ctrl.ow_dmgtime_min.max(0.5),
+            dmgtime_max: ctrl.ow_dmgtime_max.max(ctrl.ow_dmgtime_min.max(0.5)),
+            activate_hold_secs: (NEW_AC_BEHAVIOR.ow_mode_hold_frames / TICK_RATE).max(0.25),
+        })
+    }
+}
+
+/// 360 `OwCtrl` phase (`OwCtrl +0x44`, switched in `0x828865f8`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OwPhase {
+    /// Phase 0: stowed on the core back pack; hold activate button to arm.
+    #[default]
+    Disarmed,
+    /// Phase 1: deploying OW & purging/stowing the left-arm weapon.
+    Arming,
+    /// Phase 4: armed & overloading (`0x82885c40 == 1`); hold fire to charge.
+    Armed,
+    /// Phases 5/6: accumulating `charge_en` at `ow_en_output` (`0x82886468`).
+    Charging,
+    /// Phase 7: full charge reached (`0x82885d28`); release fire to unleash OW attack (`0x82886528`).
+    Charged,
+    /// Phase 9: executing OW attack & recoil/dash window (`0x828865f8` case 9).
+    Attacking,
+    /// Phases 2/3 + overload state 2 (`0x828861d0`): auto-purged, EN depleted & FCS disabled for `lockout_secs`.
+    Lockout,
+    /// Overload state 3 (`0x828861d0`): lockout expired, OW spent for the rest of the sortie.
+    Spent,
+}
+
+/// Discrete event emitted by `OveredWeaponState::step`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwEvent {
+    Armed,
+    ChargeComplete,
+    Fired,
+    Purged,
+    LockoutEnded,
+}
+
+/// Per-frame output of `OveredWeaponState::step`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OwStepResult {
+    pub event: Option<OwEvent>,
+    /// Unmitigated overload AP self-damage triggered this step (`0x828861d0` slot `+0x44`).
+    pub overload_damage: f32,
+}
+
+/// Live Overed Weapon controller matching 360 `OwCtrl` (`0x82885c40..0x82886948`).
+#[derive(Clone, Copy, Debug)]
+pub struct OveredWeaponState {
+    pub spec: OveredWeaponSpec,
+    pub phase: OwPhase,
+    /// Seconds the activation button has been continuously held while `Disarmed`.
+    pub activate_hold: f32,
+    /// Remaining seconds in `Arming` or `Attacking`.
+    pub phase_timer: f32,
+    /// Accumulated charge EN (`OwCtrl +0x34`, `0..=spec.charge_en`).
+    pub charge_en_cur: f32,
+    /// Remaining reload cooldown after an attack (`OwCtrl +0x38`, `0x82886150`).
+    pub reload_remaining: f32,
+    /// Remaining limit gauge pool (`OwCtrl +0x3c`, `0..=spec.limit_capacity`, `0x828860a0`).
+    pub limit_remaining: f32,
+    /// Remaining seconds until the next overload AP self-damage tick (`OwCtrl +0x4c`, `0x828861d0`).
+    pub dmg_timer: f32,
+    /// Elapsed seconds in post-purge `Lockout` (`OwCtrl +0x50`, `0x828861d0` state 2).
+    pub lockout_elapsed: f32,
+    /// 360 LCG PRNG state (`OwCtrl +0x40`, `0x41c64e6d * s + 0x3039` in `0x828861d0`).
+    rng_state: u32,
+    /// Number of OW attacks fired this sortie.
+    pub attacks_fired: u32,
+}
+
+impl OveredWeaponState {
+    pub fn new(spec: OveredWeaponSpec) -> Self {
+        Self {
+            limit_remaining: spec.limit_capacity,
+            spec,
+            phase: OwPhase::Disarmed,
+            activate_hold: 0.0,
+            phase_timer: 0.0,
+            charge_en_cur: 0.0,
+            reload_remaining: 0.0,
+            dmg_timer: 0.0,
+            lockout_elapsed: 0.0,
+            rng_state: 1,
+            attacks_fired: 0,
+        }
+    }
+
+    /// True while OW mode is active (`0x82885c40`: phases 1/4/5/6/7/9).
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.phase,
+            OwPhase::Arming
+                | OwPhase::Armed
+                | OwPhase::Charging
+                | OwPhase::Charged
+                | OwPhase::Attacking
+        )
+    }
+
+    /// True when normal hand/shoulder fire is suppressed in favor of OW controls.
+    pub fn blocks_normal_fire(&self) -> bool {
+        self.is_active()
+    }
+
+    /// Charge gauge fraction in `0..=1` (`0x82885f10`).
+    pub fn charge_fraction(&self) -> f32 {
+        if self.spec.charge_en > 0.0 {
+            (self.charge_en_cur / self.spec.charge_en).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Limit gauge fraction in `0..=1` (`0x82885fa8`).
+    pub fn limit_fraction(&self) -> f32 {
+        if self.spec.limit_capacity > 0.0 {
+            (self.limit_remaining / self.spec.limit_capacity).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// 360 LCG roll (`0x828861d0`: `seed = seed * 0x41c64e6d + 0x3039`, `((seed >> 16) & 0x7fff) / 32767.0`).
+    fn roll_dmg_interval(&mut self) -> f32 {
+        self.rng_state = self.rng_state.wrapping_mul(0x41c6_4e6d).wrapping_add(0x3039);
+        let u = ((self.rng_state >> 16) & 0x7fff) as f32 / 32767.0;
+        self.spec.dmgtime_min + (self.spec.dmgtime_max - self.spec.dmgtime_min) * u
+    }
+
+    /// `0x82885da8`: decays charge EN by `0.8` (`0x83713e4c`) per 60 Hz frame, zeroing below `10.0` (`0x83713e48`).
+    fn decay_charge(&mut self, dt: f32) {
+        let frames = (dt * TICK_RATE).max(0.0);
+        self.charge_en_cur *= 0.8_f32.powf(frames);
+        if self.charge_en_cur < 10.0 {
+            self.charge_en_cur = 0.0;
+        }
+    }
+
+    /// Steps the OW state machine by `dt` seconds (`0x828868c0` -> `0x82886050`, `0x82886150`,
+    /// `0x828865f8`, `0x828861d0`).
+    pub fn step(&mut self, dt: f32, activate_held: bool, fire_held: bool) -> OwStepResult {
+        let mut out = OwStepResult::default();
+        if dt <= 0.0 {
+            return out;
+        }
+
+        // `0x82886150`: tick reload cooldown while not in Attacking (phase 9).
+        if self.phase != OwPhase::Attacking && self.reload_remaining > 0.0 {
+            self.reload_remaining = (self.reload_remaining - dt).max(0.0);
+        }
+
+        match self.phase {
+            OwPhase::Disarmed => {
+                if activate_held {
+                    self.activate_hold += dt;
+                    if self.activate_hold >= self.spec.activate_hold_secs {
+                        self.activate_hold = 0.0;
+                        self.phase = OwPhase::Arming;
+                        self.phase_timer = 0.45;
+                        self.dmg_timer = self.roll_dmg_interval();
+                    }
+                } else {
+                    self.activate_hold = 0.0;
+                }
+                self.decay_charge(dt);
+            }
+            OwPhase::Arming => {
+                self.phase_timer -= dt;
+                self.decay_charge(dt);
+                if self.phase_timer <= 0.0 {
+                    self.phase = OwPhase::Armed;
+                    out.event = Some(OwEvent::Armed);
+                }
+            }
+            OwPhase::Armed => {
+                if self.limit_remaining <= 0.0 {
+                    self.phase = OwPhase::Lockout;
+                    self.lockout_elapsed = 0.0;
+                    self.charge_en_cur = 0.0;
+                    out.event = Some(OwEvent::Purged);
+                } else if fire_held && self.reload_remaining <= 0.0 {
+                    // `0x828865f8` case 5 -> 6 immediately calls `0x82886468` on the same tick.
+                    self.phase = OwPhase::Charging;
+                    let en_step = self.spec.ow_en_output * dt;
+                    let extra_heat = en_step / self.spec.charge_heat_base;
+                    self.limit_remaining = (self.limit_remaining - extra_heat).max(0.0);
+                    self.charge_en_cur = (self.charge_en_cur + en_step).min(self.spec.charge_en);
+                    if self.charge_en_cur >= self.spec.charge_en {
+                        self.phase = OwPhase::Charged;
+                        out.event = Some(OwEvent::ChargeComplete);
+                    }
+                } else {
+                    self.decay_charge(dt);
+                }
+            }
+            OwPhase::Charging => {
+                // `0x82886468` + `0x82885e08`: charge accumulates by `ow_en_output * dt`,
+                // draining extra limit gauge `en_step / charge_heat_base` (`(ow_en_output/60 / 500) * 60 * dt`).
+                let en_step = self.spec.ow_en_output * dt;
+                let extra_heat = en_step / self.spec.charge_heat_base;
+                self.limit_remaining = (self.limit_remaining - extra_heat).max(0.0);
+                if fire_held && self.limit_remaining > 0.0 && self.reload_remaining <= 0.0 {
+                    self.charge_en_cur = (self.charge_en_cur + en_step).min(self.spec.charge_en);
+                    if self.charge_en_cur >= self.spec.charge_en {
+                        self.phase = OwPhase::Charged;
+                        out.event = Some(OwEvent::ChargeComplete);
+                    }
+                } else {
+                    // `0x828860f0`: early release or limit exhausted cancels charge.
+                    self.decay_charge(dt);
+                    self.phase = OwPhase::Armed;
+                }
+            }
+            OwPhase::Charged => {
+                // `0x82886528`: continues charge heat drain; releasing trigger fires OW!
+                let en_step = self.spec.ow_en_output * dt;
+                let extra_heat = en_step / self.spec.charge_heat_base;
+                self.limit_remaining = (self.limit_remaining - extra_heat).max(0.0);
+                if self.limit_remaining <= 0.0 {
+                    self.decay_charge(dt);
+                    self.phase = OwPhase::Armed;
+                } else if !fire_held {
+                    // Trigger released at full charge -> unleash OW attack (`0x82886594..0x828865c4`)!
+                    self.charge_en_cur = 0.0;
+                    self.reload_remaining = self.spec.ow_reload_secs;
+                    self.phase = OwPhase::Attacking;
+                    self.phase_timer =
+                        (NEW_AC_BEHAVIOR.ow_attack_dash_frames as f32 / TICK_RATE).max(0.35);
+                    self.attacks_fired += 1;
+                    out.event = Some(OwEvent::Fired);
+                }
+            }
+            OwPhase::Attacking => {
+                self.phase_timer -= dt;
+                if self.phase_timer <= 0.0 {
+                    // Single-use ranged/massive OWs (`Huge Cannon`, `Giga Missile`) or depleted
+                    // limit gauge purge right after the attack finishes; multi-hit/blade OWs
+                    // can swing again while limit remains!
+                    if matches!(self.spec.ow_type, 6 | 10) {
+                        self.limit_remaining = 0.0;
+                    }
+                    self.phase = OwPhase::Armed;
+                }
+            }
+            OwPhase::Lockout => {
+                // `0x828861d0` state 2: count up to `lockout_secs` (`OwCtrl +0x04`).
+                self.lockout_elapsed += dt;
+                if self.lockout_elapsed >= self.spec.lockout_secs {
+                    self.phase = OwPhase::Spent;
+                    out.event = Some(OwEvent::LockoutEnded);
+                }
+            }
+            OwPhase::Spent => {}
+        }
+
+        // `0x828861d0` state 1: while OW mode is active, drain limit gauge by `calorific_per_sec * dt`
+        // and roll overload AP self-damage ticks in `[dmgtime_min, dmgtime_max]`.
+        if self.is_active() {
+            self.limit_remaining =
+                (self.limit_remaining - self.spec.calorific_per_sec * dt).max(0.0);
+            if self.dmg_timer <= 0.0 {
+                out.overload_damage = self.spec.overload_dmg;
+                self.dmg_timer = self.roll_dmg_interval();
+            }
+            self.dmg_timer = (self.dmg_timer - dt).max(0.0);
+        }
+
+        out
+    }
+}
+
+/// Root joint of an equipped Overed Weapon (`back_r`, root `"50"`).
+#[derive(Component)]
+pub struct OwHardpoint;
+
+/// Skinned mesh belonging to an equipped Overed Weapon (`back_r`), hidden on auto-purge.
+#[derive(Component)]
+pub struct OwMesh;
 
 /// A bay shift in progress. While this exists the fire buttons do not shoot: they already
 /// started the exchange (`sheets/ac_states.csv` `bay_shift_*` / `bay_purge_*`).
@@ -299,6 +695,22 @@ pub struct Gun {
     pub sniper: bool,
     /// Weapon reload stability interpolation factor (`sub +0x2c`, `0x82478b90`, used by `0x8286adf8`).
     pub reload_stab_factor: f32,
+    /// Firing mode (`Auto`, `PelletSpread`, `Burst`, or `Charge`).
+    pub fire_mode: FireMode,
+    /// Charge hold duration in 60 Hz ticks (`sub +0x3e`, `0x8247d6e0` -> `0x8247ea28`; 0 = non-charge).
+    pub charge_time: f32,
+    /// Live charge accumulation in 60 Hz ticks (`0..=charge_time`).
+    pub charge_ticks: f32,
+    /// Charge sound cue id (`acweaponsoundparam.charge`; `<= 0` silent).
+    pub charge_se: i16,
+    /// Per-round sequential burst delay in 60 Hz ticks (`sub +0x20`, burst rifles `710..6520`).
+    pub burst_wait: f32,
+    /// Remaining rounds queued in the current sequential burst.
+    pub burst_remaining: u8,
+    /// Remaining 60 Hz ticks before the next sequential burst round fires.
+    pub burst_timer: f32,
+    /// Previous-frame trigger state for charge release edge detection.
+    pub trigger_held: bool,
 }
 
 /// Exact 360 arm firing-stability & attack-balance reload multiplier (`0x8286adf8`, called by
@@ -344,6 +756,104 @@ impl Gun {
     pub fn damage_at(&self, dist: f32) -> (f32, f32) {
         let mult = self.decay.multiplier(dist);
         (self.damage_power * mult, self.damage_recoil * mult)
+    }
+
+    /// Charge progress fraction in `0..=1` for charge weapons (`sub +0x3e > 0`).
+    pub fn charge_fraction(&self) -> f32 {
+        if self.charge_time > 0.0 {
+            (self.charge_ticks / self.charge_time).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Steps this hand weapon's firing mode (`Auto`, `PelletSpread`, `Burst`, `Charge`) by
+    /// `frames` (60 Hz ticks) and returns whether to start charging or fire this frame.
+    pub fn step_trigger(
+        &mut self,
+        want: bool,
+        can: bool,
+        stance_ready: bool,
+        frames: f32,
+    ) -> TriggerAction {
+        let was_held = self.trigger_held;
+        self.trigger_held = want;
+        match self.fire_mode {
+            FireMode::Auto => {
+                if want && can && stance_ready {
+                    TriggerAction::Fire {
+                        power_scale: 1.0,
+                        pellets: 1,
+                    }
+                } else {
+                    TriggerAction::None
+                }
+            }
+            FireMode::PelletSpread => {
+                if want && can && stance_ready {
+                    TriggerAction::Fire {
+                        power_scale: 1.0,
+                        pellets: self.burst_count.max(1) as usize,
+                    }
+                } else {
+                    TriggerAction::None
+                }
+            }
+            FireMode::Burst => {
+                // Active sequential burst finishes even if the trigger is released mid-burst.
+                if self.burst_remaining > 0 {
+                    self.burst_timer = (self.burst_timer - frames).max(0.0);
+                    if self.burst_timer <= 0.0 && self.remaining > 0 {
+                        self.burst_remaining -= 1;
+                        let step_delay = self.burst_wait.max(self.burst_interval).max(2.0);
+                        self.burst_timer = step_delay;
+                        return TriggerAction::Fire {
+                            power_scale: 1.0,
+                            pellets: 1,
+                        };
+                    }
+                    return TriggerAction::None;
+                }
+                if want && can && stance_ready {
+                    let count = self.burst_count.max(1).min(self.remaining as u8);
+                    if count > 1 {
+                        self.burst_remaining = count - 1;
+                        self.burst_timer = self.burst_wait.max(self.burst_interval).max(2.0);
+                    }
+                    TriggerAction::Fire {
+                        power_scale: 1.0,
+                        pellets: 1,
+                    }
+                } else {
+                    TriggerAction::None
+                }
+            }
+            FireMode::Charge => {
+                // `0x82475b00` / `0x8247d6e0` -> `0x8247ea28`: hold to charge up to `charge_time`,
+                // release to fire (partial charge scales 0.5..1.0, full charge = 1.0).
+                if want && can && stance_ready {
+                    let started = self.charge_ticks <= 0.0;
+                    self.charge_ticks = (self.charge_ticks + frames).min(self.charge_time.max(1.0));
+                    if started {
+                        TriggerAction::StartCharge
+                    } else {
+                        TriggerAction::None
+                    }
+                } else if !want && was_held && self.charge_ticks > 0.0 && can {
+                    let frac = self.charge_fraction();
+                    self.charge_ticks = 0.0;
+                    TriggerAction::Fire {
+                        power_scale: 0.5 + 0.5 * frac,
+                        pellets: 1,
+                    }
+                } else {
+                    if !want || !can {
+                        self.charge_ticks = 0.0;
+                    }
+                    TriggerAction::None
+                }
+            }
+        }
     }
 }
 
@@ -555,6 +1065,7 @@ pub struct Projectile {
     hit_low: i32,
     hit_hi: i32,
     hit_se: HitSe,
+    pub blast: Option<ImpactBlast>,
 }
 
 impl Projectile {
@@ -581,7 +1092,20 @@ impl Projectile {
             hit_low: gun.fx.hit_low,
             hit_hi: gun.fx.hit_hi,
             hit_se: gun.hit_se,
+            blast: None,
         }
+    }
+
+    pub fn with_power_scale(mut self, scale: f32) -> Self {
+        let s = scale.clamp(0.1, 2.0);
+        self.damage_power *= s;
+        self.damage_recoil *= s;
+        self
+    }
+
+    pub fn with_blast(mut self, blast: Option<ImpactBlast>) -> Self {
+        self.blast = blast;
+        self
     }
 
     /// Steps bullet velocity and returns the world displacement `delta` for `dt` seconds,
@@ -669,6 +1193,7 @@ pub struct Missile {
     pub hit_se: HitSe,
     /// Recursion depth for sub-munition splitting (`0` for parent, `1` for spawned children).
     pub split_depth: u8,
+    pub blast: Option<ImpactBlast>,
 }
 
 /// One sub-munition spawned when a split missile executes `close_act_id == 8` (`0x828de0c8`).
@@ -729,7 +1254,13 @@ impl Missile {
             after_accel_fx: gun.fx.after_accel,
             hit_se: gun.hit_se,
             split_depth: 0,
+            blast: None,
         }
+    }
+
+    pub fn with_blast(mut self, blast: Option<ImpactBlast>) -> Self {
+        self.blast = blast;
+        self
     }
 
     /// Returns `Some(split)` when `close_act_id == 8` triggers (`0x828eaac0`):
@@ -864,6 +1395,7 @@ impl Missile {
                             after_accel_fx: child_fx.after_accel,
                             hit_se: child_hit_se,
                             split_depth: self.split_depth + 1,
+                            blast: None,
                         }),
                     ));
                 }
@@ -892,6 +1424,7 @@ impl Missile {
                                 hit_low: child_fx.hit_low,
                                 hit_hi: child_fx.hit_hi,
                                 hit_se: child_hit_se,
+                                blast: None,
                             },
                             kind,
                             bullet_fx: child_fx.bullet,
@@ -1012,6 +1545,7 @@ pub(crate) struct Tracers {
 impl Armament {
     pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
         let ctrl = AcCtrlParam::calculate(design);
+        let overed = OveredWeaponSpec::from_design(design, &ctrl).map(OveredWeaponState::new);
         let weapon_arm = part_field(design.arms as i64, 2, "is_weapon_arm") != 0.0;
         if weapon_arm {
             // `0x824793c8` -> `0x82479668` -> `0x8247e090`: weapon arms embed a single unified
@@ -1023,6 +1557,7 @@ impl Armament {
                 hands: [wa, silent()],
                 bays: [silent(), silent()],
                 shoulder: silent(),
+                overed,
                 weapon_arm: true,
                 salvo: Vec::new(),
                 salvo_timer: 0.0,
@@ -1045,6 +1580,7 @@ impl Armament {
             hands,
             bays,
             shoulder,
+            overed,
             weapon_arm: false,
             salvo: Vec::new(),
             salvo_timer: 0.0,
@@ -1289,7 +1825,11 @@ pub fn fire(
         || keys.pressed(KeyCode::KeyR)
         || held.0.contains(&KeyCode::KeyR)
         || pads.iter().any(|pad| pad.pressed(GamepadButton::North));
-    if shifting || pilot.scan_mode || pilot.in_kick() || pilot.in_blade() {
+    let ow_blocks = arms
+        .overed
+        .as_ref()
+        .is_some_and(OveredWeaponState::blocks_normal_fire);
+    if shifting || pilot.scan_mode || pilot.in_kick() || pilot.in_blade() || ow_blocks {
         want = [false, false];
         want_shoulder = false;
     }
@@ -1704,38 +2244,59 @@ pub fn fire(
         let stance_ready = !gun.stance
             || body.motion.is_none()
             || body.anims.as_ref().is_none_or(|a| a.sniper.allows(hand));
-        let fired = if let Some(anims) = body.anims.as_mut() {
-            let (fired, deploy) = match anims
+        // Weapon deploy / fire clip playback. For charge weapons, deploy holds while charging.
+        let clip_ready = if let Some(anims) = body.anims.as_mut() {
+            let (clip_ok, deploy) = match anims
                 .rigs
                 .iter_mut()
                 .find(|r| r.hand == hand && !r.bay && !r.retired)
             {
                 Some(rig) => {
-                    let fired = rig.playback.tick(want[i], can, frames);
+                    let clip_ok = rig.playback.tick(want[i], can, frames);
                     let deploy = rig.playback.deploys();
                     rig.apply(&mut posed);
-                    (fired, deploy)
+                    (clip_ok, deploy)
                 }
                 None => (want[i] && can, false),
             };
-            let fired = fired && stance_ready;
             if deploy {
                 if let Some(arm) = anims.arms.iter_mut().find(|r| r.hand == hand) {
                     arm.playback.tick(want[i], false, frames);
                     arm.apply(&mut posed);
                 }
             }
-            fired
-        } else {
-            want[i] && can && stance_ready
-        };
-        if fired {
-            if let Some(anims) = body.anims.as_mut() {
-                anims.kick(hand, gun.sniper);
+            if gun.fire_mode == FireMode::Charge || gun.fire_mode == FireMode::Burst {
+                stance_ready
+            } else {
+                clip_ok && stance_ready
             }
-        }
-        if !fired || !pilot.try_drain_en(gun.en_drain) {
+        } else {
+            stance_ready
+        };
+        let action = gun.step_trigger(want[i], can, clip_ready, frames);
+        let (power_scale, pellets) = match action {
+            TriggerAction::None => continue,
+            TriggerAction::StartCharge => {
+                if gun.charge_se > 0 {
+                    sound::shot(
+                        &mut commands,
+                        &mut speaker.cues,
+                        &mut speaker.sources,
+                        gun.charge_se,
+                    );
+                }
+                continue;
+            }
+            TriggerAction::Fire {
+                power_scale,
+                pellets,
+            } => (power_scale, pellets),
+        };
+        if !pilot.try_drain_en(gun.en_drain) {
             continue;
+        }
+        if let Some(anims) = body.anims.as_mut() {
+            anims.kick(hand, gun.sniper);
         }
         if let Some(status) = status.as_deref_mut() {
             status.en = pilot.en;
@@ -1750,7 +2311,10 @@ pub fn fire(
             .as_deref()
             .map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
         gun.remaining = gun.remaining.saturating_sub(1);
-        gun.cooldown = gun.reload_time.max(1.0);
+        // Sequential bursts set full `reload_time` after the final round in the burst.
+        if gun.burst_remaining == 0 {
+            gun.cooldown = gun.reload_time.max(1.0);
+        }
         sound::shot(
             &mut commands,
             &mut speaker.cues,
@@ -1781,20 +2345,34 @@ pub fn fire(
                 )),
             };
         }
-        let shot = (
-            Transform::from_translation(origin).looking_to(hand_aim, Vec3::Y),
-            Projectile::from_gun(gun, hand_aim),
-        );
-        if gun.fx.bullet > 0 {
-            commands
-                .spawn((shot, Visibility::default()))
-                .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
-        } else {
-            let material = match gun.kind {
-                Kind::Energy => assets.energy.clone(),
-                _ => assets.rigid.clone(),
+        let pellets = pellets.max(1);
+        let right_axis = hand_aim.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up_axis = right_axis.cross(hand_aim).normalize_or(Vec3::Y);
+        for p in 0..pellets {
+            let shot_aim = if pellets > 1 {
+                let az = std::f32::consts::TAU * (p as f32) / (pellets as f32);
+                let ring = if p == 0 && pellets >= 6 { 0.0 } else { 0.04 };
+                (hand_aim + (right_axis * az.cos() + up_axis * az.sin()) * ring)
+                    .normalize_or(hand_aim)
+            } else {
+                hand_aim
             };
-            commands.spawn((Mesh3d(assets.mesh.clone()), MeshMaterial3d(material), shot));
+            let proj = Projectile::from_gun(gun, shot_aim).with_power_scale(power_scale);
+            let shot = (
+                Transform::from_translation(origin).looking_to(shot_aim, Vec3::Y),
+                proj,
+            );
+            if gun.fx.bullet > 0 {
+                commands
+                    .spawn((shot, Visibility::default()))
+                    .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+            } else {
+                let material = match gun.kind {
+                    Kind::Energy => assets.energy.clone(),
+                    _ => assets.rigid.clone(),
+                };
+                commands.spawn((Mesh3d(assets.mesh.clone()), MeshMaterial3d(material), shot));
+            }
         }
     }
 
@@ -1967,6 +2545,363 @@ pub fn fire(
     }
 }
 
+/// Applies a secondary AoE explosion blast (`ImpactBlast` from `BULLET_ARISE_ST` ->
+/// `BULLET_EXPLOSION_ST` / `BULLET_STATUS_ERROR_ST`) to all living targets within `blast.radius`.
+fn apply_impact_blast(
+    blast: ImpactBlast,
+    center: Vec3,
+    direct_entity: Option<Entity>,
+    commands: &mut Commands,
+    speaker: &mut Speaker,
+    targets: &mut Query<
+        (Entity, &Target, &mut TargetHealth, &Transform),
+        (Without<Projectile>, Without<PlayerHealth>),
+    >,
+) {
+    if blast.hit_fx > 0 {
+        commands.spawn((Sfx::new(blast.hit_fx), Transform::from_translation(center)));
+    }
+    if blast.hit_se > 0 {
+        sound::cue(
+            commands,
+            &mut speaker.cues,
+            &mut speaker.sources,
+            &format!("w{:08}", blast.hit_se),
+        );
+    }
+    let r2 = blast.radius * blast.radius;
+    for (t_ent, target, mut health, t_tf) in targets.iter_mut() {
+        if health.destroyed || Some(t_ent) == direct_entity {
+            continue;
+        }
+        let tpos = t_tf.translation + Vec3::Y * 4.0;
+        if tpos.distance_squared(center) <= r2 {
+            let (res, lethal) =
+                health.apply_hit(blast.damage_type, blast.damage_power, blast.damage_recoil);
+            health.record_hit_from(center);
+            info!(
+                "OW blast hit {} ({}) -{:.0} AP ({:.0}/{:.0}){}",
+                target.name,
+                target.model,
+                res.damage,
+                health.ap,
+                health.ap_max,
+                if lethal { " DESTROYED" } else { "" },
+            );
+        }
+    }
+}
+
+/// Same secondary AoE explosion helper for missile impacts (`Without<Missile>` query filter).
+fn apply_missile_impact_blast(
+    blast: ImpactBlast,
+    center: Vec3,
+    direct_entity: Option<Entity>,
+    commands: &mut Commands,
+    speaker: &mut Speaker,
+    targets: &mut Query<
+        (Entity, &Target, &mut TargetHealth, &Transform),
+        (Without<Missile>, Without<PlayerHealth>),
+    >,
+) {
+    if blast.hit_fx > 0 {
+        commands.spawn((Sfx::new(blast.hit_fx), Transform::from_translation(center)));
+    }
+    if blast.hit_se > 0 {
+        sound::cue(
+            commands,
+            &mut speaker.cues,
+            &mut speaker.sources,
+            &format!("w{:08}", blast.hit_se),
+        );
+    }
+    let r2 = blast.radius * blast.radius;
+    for (t_ent, target, mut health, t_tf) in targets.iter_mut() {
+        if health.destroyed || Some(t_ent) == direct_entity {
+            continue;
+        }
+        let tpos = t_tf.translation + Vec3::Y * 4.0;
+        if tpos.distance_squared(center) <= r2 {
+            let (res, lethal) =
+                health.apply_hit(blast.damage_type, blast.damage_power, blast.damage_recoil);
+            health.record_hit_from(center);
+            info!(
+                "OW missile blast hit {} ({}) -{:.0} AP ({:.0}/{:.0}){}",
+                target.name,
+                target.model,
+                res.damage,
+                health.ap,
+                health.ap_max,
+                if lethal { " DESTROYED" } else { "" },
+            );
+        }
+    }
+}
+
+/// Drives an equipped Overed Weapon (`AC_ASSEMBLY_DESIGN_ST.back_r`, category 11, slot 12)
+/// through its 360 state machine (`0x82885c40..0x82886948`):
+/// - Hold `U` (or hold `R` / `△` with no fire button held for `ow_mode_hold_frames` = 60 ticks,
+///   `manual.fmg` 20405) to arm OW and purge/stow the left-arm weapon.
+/// - Hold `F` / LMB / `R2` to charge `charge_en` at `ow_en_output`; release at full charge to fire.
+/// - Drains limit gauge and applies periodic overload AP self-damage (`ow_overload_dmg`,
+///   `ow_dmgtime_min..max`) while armed; auto-purges OW meshes and enters `lockout_secs` EN/FCS
+///   lockout when limit hits zero (`0x828861d0`).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn step_overed_weapon(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    held: Res<Held>,
+    piloting: Res<Piloting>,
+    assets: Res<Tracers>,
+    pads: Query<&Gamepad>,
+    mut speaker: Speaker,
+    mut commands: Commands,
+    mut acs: Query<(
+        &mut Pilot,
+        &mut Armament,
+        &Transform,
+        Option<&mut PlayerHealth>,
+        Option<&mut Status>,
+        Option<&crate::fcs::Fcs>,
+    )>,
+    ow_hp: Query<&GlobalTransform, With<OwHardpoint>>,
+    mut ow_meshes: Query<&mut Visibility, (With<OwMesh>, Without<crate::bay::WeaponMesh>)>,
+    mut wep_meshes: Query<(&crate::bay::WeaponMesh, &mut Visibility), Without<OwMesh>>,
+    loadout: Option<Res<crate::bay::Loadout>>,
+    points: Query<(&EffectPoint, &GlobalTransform)>,
+) {
+    if !piloting.0 {
+        return;
+    }
+    let dt = time.delta_secs();
+    let Ok((mut pilot, mut arms, ac_tf, mut player_health, mut status, fcs)) = acs.single_mut()
+    else {
+        return;
+    };
+    if player_health.as_ref().is_some_and(|h| h.destroyed) {
+        pilot.ow_active = false;
+        pilot.ow_lockout = false;
+        return;
+    }
+    let Some(mut ow) = arms.overed else {
+        pilot.ow_active = false;
+        pilot.ow_lockout = false;
+        if let Some(s) = status.as_deref_mut() {
+            s.ow_phase = OwPhase::Disarmed;
+            s.ow_charge = 0.0;
+            s.ow_limit = 0.0;
+        }
+        return;
+    };
+
+    let down = |k: KeyCode| keys.pressed(k) || held.0.contains(&k);
+    let mut fire_held = down(KeyCode::KeyF) || mouse.pressed(MouseButton::Left);
+    let mut left_fire = down(KeyCode::KeyC) || mouse.pressed(MouseButton::Right);
+    let mut tri_held = down(KeyCode::KeyR);
+    for pad in &pads {
+        fire_held |= pad.pressed(GamepadButton::RightTrigger2);
+        left_fire |= pad.pressed(GamepadButton::LeftTrigger2);
+        tri_held |= pad.pressed(GamepadButton::North);
+    }
+    // `manual.fmg` 20405: hold `△` (or dedicated `U` key) without pressing fire buttons to arm OW.
+    let activate_held = !pilot.scan_mode
+        && (down(KeyCode::KeyU) || (tri_held && !fire_held && !left_fire));
+    let trigger_for_ow = !pilot.scan_mode && fire_held;
+
+    let res = ow.step(dt, activate_held, trigger_for_ow);
+
+    pilot.ow_active = ow.is_active();
+    pilot.ow_lockout = ow.phase == OwPhase::Lockout;
+
+    if res.overload_damage > 0.0 {
+        if let Some(health) = player_health.as_deref_mut() {
+            let (hit, _) = health.apply_hit(DamageType::Unmitigated, res.overload_damage, 0.0);
+            if let Some(s) = status.as_deref_mut() {
+                s.ap = health.ap_u32();
+            }
+            info!(
+                "OW overload self-damage -{:.0} AP ({:.0}/{:.0})",
+                hit.damage, health.ap, health.ap_max
+            );
+        }
+    }
+
+    if let Some(event) = res.event {
+        match event {
+            OwEvent::Armed => {
+                // Purge/stow left-arm weapon so the left arm can interface with the Overed Weapon.
+                arms.hands[1] = silent();
+                if let Some(l) = loadout.as_deref() {
+                    if let Some(left_root) = l.slots[1].as_ref().and_then(|m| m.weapon) {
+                        for (wm, mut vis) in &mut wep_meshes {
+                            if wm.root == left_root {
+                                *vis = Visibility::Hidden;
+                            }
+                        }
+                    }
+                }
+                sound::cue(&mut commands, &mut speaker.cues, &mut speaker.sources, "b00000000");
+                info!(
+                    "OW {} (type {}) ARMED: limit {:.0}, charge_en {:.0}, ow_en_out {:.0}/s",
+                    ow.spec.part_id,
+                    ow.spec.ow_type,
+                    ow.spec.limit_capacity,
+                    ow.spec.charge_en,
+                    ow.spec.ow_en_output
+                );
+            }
+            OwEvent::ChargeComplete => {
+                sound::cue(&mut commands, &mut speaker.cues, &mut speaker.sources, "c00000024");
+                info!("OW {} CHARGE COMPLETE — release trigger to unleash!", ow.spec.part_id);
+            }
+            OwEvent::Fired => {
+                let aim = pilot.aim_direction();
+                let ow_muzzle = points
+                    .iter()
+                    .find(|(p, _)| p.column == "back_r" && (101..=112).contains(&p.id))
+                    .map(|(_, gt)| gt.translation())
+                    .or_else(|| ow_hp.iter().next().map(GlobalTransform::translation))
+                    .unwrap_or(ac_tf.translation + Vec3::Y * 5.0);
+                let gun = &ow.spec.gun;
+                if gun.shoot > 0 {
+                    sound::shot(&mut commands, &mut speaker.cues, &mut speaker.sources, gun.shoot);
+                }
+                if gun.fx.muzzle > 0 {
+                    commands.spawn((
+                        Sfx::new(gun.fx.muzzle),
+                        Transform::from_translation(ow_muzzle)
+                            .looking_to(-aim, Vec3::Y)
+                            .with_scale(Vec3::splat(MUZZLE_SCALE * 2.0)),
+                    ));
+                }
+                let locked = fcs.and_then(|f| f.locked.as_ref());
+                let fire_aim = locked
+                    .map(|l| (l.world_pos - ow_muzzle).normalize_or_zero())
+                    .filter(|&d| d != Vec3::ZERO)
+                    .unwrap_or(aim);
+
+                if ow.spec.is_melee() {
+                    // Grind Blade (1), Mass Blade (3), Mega Blade (60): OW dash lunge + giant melee sweep.
+                    pilot.start_ow_dash(fire_aim);
+                    if let Some(blade) = gun.blade {
+                        let launch = BladeLaunch {
+                            hand_idx: 0,
+                            physical: blade.physical,
+                            target: locked.map(|l| (l.entity, l.world_pos)),
+                            hit_radius: blade.hit_radius,
+                            blade_radius: blade.blade_radius,
+                            max_hits: blade.max_hits,
+                            decay_power: blade.decay_power,
+                            decay_recoil: blade.decay_recoil,
+                            damage_type: gun.damage_type,
+                            damage_power: gun.damage_power,
+                            damage_recoil: gun.damage_recoil,
+                            trail_fx: gun.fx.bullet,
+                            hit_low_fx: gun.fx.hit_low,
+                            hit_hi_fx: gun.fx.hit_hi,
+                            hit_low_se: gun.hit_se.low,
+                            hit_hi_se: gun.hit_se.hi,
+                        };
+                        pilot.start_blade(launch);
+                    }
+                } else if ow.spec.ow_type == 10 || gun.kind == Kind::Missile {
+                    // Giga Missile (1010, bullet 59010 + 100 m mega-blast 101010 -> 70010).
+                    let target_ent = locked.map(|l| l.entity);
+                    let launch_dir = (fire_aim + Vec3::Y * 0.25).normalize_or(fire_aim);
+                    let missile =
+                        Missile::from_gun(gun, launch_dir, target_ent).with_blast(ow.spec.blast);
+                    let tf = Transform::from_translation(ow_muzzle).looking_to(launch_dir, Vec3::Y);
+                    if gun.fx.bullet > 0 {
+                        commands
+                            .spawn((
+                                tf,
+                                missile,
+                                Visibility::default(),
+                                Mesh3d(assets.mesh.clone()),
+                                MeshMaterial3d(assets.missile.clone()),
+                            ))
+                            .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+                    } else {
+                        commands.spawn((
+                            Mesh3d(assets.mesh.clone()),
+                            MeshMaterial3d(assets.missile.clone()),
+                            tf,
+                            missile,
+                        ));
+                    }
+                } else if ow.spec.ow_type == 8 {
+                    // Multiple Pulse (810, 扇キャノン): 7-beam fan volley with TE sphere blast (99815 -> 69810).
+                    let right = fire_aim.cross(Vec3::Y).normalize_or(Vec3::X);
+                    for k in -3..=3_i32 {
+                        let yaw_off = (k as f32) * 5.0_f32.to_radians();
+                        let dir = (fire_aim * yaw_off.cos() + right * yaw_off.sin())
+                            .normalize_or(fire_aim);
+                        let proj = Projectile::from_gun(gun, dir).with_blast(ow.spec.blast);
+                        let tf = Transform::from_translation(ow_muzzle).looking_to(dir, Vec3::Y);
+                        if gun.fx.bullet > 0 {
+                            commands
+                                .spawn((tf, proj, Visibility::default()))
+                                .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+                        } else {
+                            commands.spawn((
+                                Mesh3d(assets.mesh.clone()),
+                                MeshMaterial3d(assets.energy.clone()),
+                                tf,
+                                proj,
+                            ));
+                        }
+                    }
+                } else {
+                    // Huge Cannon (610, bullet 10050, 1800 m/s + 50 m nuclear blast 99615).
+                    let proj = Projectile::from_gun(gun, fire_aim).with_blast(ow.spec.blast);
+                    let tf = Transform::from_translation(ow_muzzle).looking_to(fire_aim, Vec3::Y);
+                    if gun.fx.bullet > 0 {
+                        commands
+                            .spawn((tf, proj, Visibility::default()))
+                            .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+                    } else {
+                        commands.spawn((
+                            Mesh3d(assets.mesh.clone()),
+                            MeshMaterial3d(assets.rigid.clone()),
+                            tf,
+                            proj,
+                        ));
+                    }
+                }
+                info!(
+                    "OW {} (type {}) FIRED (power {:.0}, recoil {:.0})",
+                    ow.spec.part_id, ow.spec.ow_type, gun.damage_power, gun.damage_recoil
+                );
+            }
+            OwEvent::Purged => {
+                // Auto-purge OW meshes (`0x828865f8` case 2 -> 3) and enter post-OW EN/FCS lockout.
+                for mut vis in &mut ow_meshes {
+                    *vis = Visibility::Hidden;
+                }
+                pilot.en = 0.0;
+                sound::cue(&mut commands, &mut speaker.cues, &mut speaker.sources, "c00000024");
+                info!(
+                    "OW {} AUTO-PURGED — entering {:.0}s EN/FCS lockout",
+                    ow.spec.part_id, ow.spec.lockout_secs
+                );
+            }
+            OwEvent::LockoutEnded => {
+                info!("OW {} lockout ended — EN/FCS systems restored", ow.spec.part_id);
+            }
+        }
+    }
+
+    if let Some(s) = status.as_deref_mut() {
+        s.en = pilot.en;
+        s.en_max = pilot.en_max;
+        s.ow_phase = ow.phase;
+        s.ow_charge = ow.charge_fraction();
+        s.ow_limit = ow.limit_fraction();
+    }
+    arms.overed = Some(ow);
+}
+
 /// Steps in-flight projectiles against target hit spheres (for `Owner::Player`), the player AC's
 /// hit spheres (for `Owner::Enemy`), and map ground collision, applying the 360 damage formula
 /// (`0x827d0b50`) and spawning hit VFX/SFX.
@@ -2065,6 +3000,16 @@ pub fn step_projectiles(
                                 if lethal { " DESTROYED" } else { "" },
                             );
                         }
+                        if let Some(blast) = shot.blast {
+                            apply_impact_blast(
+                                blast,
+                                pos,
+                                Some(t_entity),
+                                &mut commands,
+                                &mut speaker,
+                                &mut targets,
+                            );
+                        }
                         commands.entity(e).despawn();
                         continue;
                     }
@@ -2153,6 +3098,11 @@ pub fn step_projectiles(
                     &mut speaker.sources,
                     &format!("w{:08}", shot.hit_se.low),
                 );
+            }
+            if shot.owner == Owner::Player {
+                if let Some(blast) = shot.blast {
+                    apply_impact_blast(blast, at, None, &mut commands, &mut speaker, &mut targets);
+                }
             }
             commands.entity(e).despawn();
             continue;
@@ -2377,6 +3327,16 @@ pub fn step_missiles(
                                 if lethal { " DESTROYED" } else { "" },
                             );
                         }
+                        if let Some(blast) = missile.blast {
+                            apply_missile_impact_blast(
+                                blast,
+                                pos,
+                                Some(t_entity),
+                                &mut commands,
+                                &mut speaker,
+                                &mut targets,
+                            );
+                        }
                         commands.entity(e).despawn();
                         continue;
                     }
@@ -2480,6 +3440,18 @@ pub fn step_missiles(
                     &mut speaker.sources,
                     &format!("w{:08}", missile.hit_se.low),
                 );
+            }
+            if missile.owner == Owner::Player {
+                if let Some(blast) = missile.blast {
+                    apply_missile_impact_blast(
+                        blast,
+                        at,
+                        None,
+                        &mut commands,
+                        &mut speaker,
+                        &mut targets,
+                    );
+                }
             }
             commands.entity(e).despawn();
             continue;
@@ -2802,6 +3774,14 @@ pub(crate) fn silent() -> Gun {
         stance: false,
         sniper: false,
         reload_stab_factor: 1.0,
+        fire_mode: FireMode::Auto,
+        charge_time: 0.0,
+        charge_ticks: 0.0,
+        charge_se: 0,
+        burst_wait: 0.0,
+        burst_remaining: 0,
+        burst_timer: 0.0,
+        trigger_held: false,
     }
 }
 
@@ -2839,6 +3819,38 @@ fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
     } else {
         0
     };
+    let charge_time = if category == 10 {
+        part_field(id, 10, "charge_time").max(0.0)
+    } else {
+        0.0
+    };
+    let burst_wait = if category == 10 {
+        part_field(id, 10, "burst_wait").max(0.0)
+    } else {
+        0.0
+    };
+    let burst_interval = part_field(id, category, "burst_interval").max(0.0);
+    let fire_mode = if category == 10 && charge_time > 0.0 {
+        // `0x82475b00` / `0x8247d6e0`: charge-to-fire weapon (laser rifles, rail/laser cannons).
+        FireMode::Charge
+    } else if category == 10
+        && burst_count > 1
+        && !is_missile
+        && (burst_wait > 0.0 || burst_interval > 0.0)
+    {
+        // Multi-round sequential burst (`0x82475c98` / `sub +0x20` / `sub +0x22`: burst rifles, burst handguns).
+        FireMode::Burst
+    } else if category == 10 && burst_count > 1 && !is_missile {
+        // Simultaneous multi-pellet cone spread (shotguns, pulse guns/cannons, scatter cannons).
+        FireMode::PelletSpread
+    } else {
+        FireMode::Auto
+    };
+    let reload_stab_factor = if category == 11 {
+        1.0
+    } else {
+        part_field(id, category, "reload_stab_factor")
+    };
     Gun {
         remaining: magazine,
         magazine,
@@ -2853,7 +3865,7 @@ fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
         is_missile,
         weapon_lock_max,
         burst_count,
-        burst_interval: part_field(id, category, "burst_interval"),
+        burst_interval,
         damage_type,
         damage_power: part_field(id, category, "damage_power"),
         damage_recoil: part_field(id, category, "damage_recoil"),
@@ -2869,7 +3881,15 @@ fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
         hit_se,
         stance: category == 10 && part_field(id, 10, "ready_position") != 0.0,
         sniper: category == 10 && part_field(id, 10, "weapon_kind") == 5.0,
-        reload_stab_factor: part_field(id, category, "reload_stab_factor"),
+        reload_stab_factor,
+        fire_mode,
+        charge_time,
+        charge_ticks: 0.0,
+        charge_se: charge_of_hit(hit_id),
+        burst_wait,
+        burst_remaining: 0,
+        burst_timer: 0.0,
+        trigger_held: false,
     }
 }
 
@@ -2877,8 +3897,43 @@ fn gun(id: i64) -> Gun {
     gun_from_category(id, 10, 1)
 }
 
+fn ow_gun(id: i64) -> Gun {
+    gun_from_category(id, 11, 1)
+}
+
 fn shoulder_gun(id: i64, arms_mount: u8) -> Gun {
     gun_from_category(id, 12, arms_mount)
+}
+
+/// Resolves an OW secondary blast row (`BULLET_BULLETARISE_BIN` -> `BULLET_BULLETEXPLOSION_BIN` or
+/// `BULLET_BULLETSTATUSERROR_BIN`, e.g. Huge Cannon `99615` 50 m, Multiple Pulse `99815` 30 m,
+/// Giga Missile `101010` 100 m).
+fn impact_blast_from_arise(arise_id: u32) -> Option<ImpactBlast> {
+    if arise_id == 0 {
+        return None;
+    }
+    let arise = &find(BULLET_BULLETARISE_BIN, arise_id)?.data;
+    let radius = find(BULLET_BULLETEXPLOSION_BIN, arise.bullet_id)
+        .map(|r| r.data.max_radius.max(r.data.init_radius))
+        .or_else(|| find(BULLET_BULLETSTATUSERROR_BIN, arise.bullet_id).map(|r| r.data.hit_radius))
+        .unwrap_or(0.0);
+    if radius <= 0.0 {
+        return None;
+    }
+    let sfx_id = u32::try_from(arise.sfx_type).unwrap_or(0);
+    let (fx, hit_se) = if sfx_id > 0 {
+        fx_and_hit_se_for(sfx_id)
+    } else {
+        (Fx::default(), HitSe::default())
+    };
+    Some(ImpactBlast {
+        radius,
+        damage_type: DamageType::from_raw(arise.damage_type),
+        damage_power: arise.damage_power,
+        damage_recoil: arise.damage_recoil,
+        hit_fx: if fx.hit > 0 { fx.hit } else { fx.bullet },
+        hit_se: if hit_se.hi > 0 { hit_se.hi } else { hit_se.low },
+    })
 }
 
 /// Decodes one category-10 enemy weapon record from `param/enemy/parts/acvenemyparts.bin`
@@ -2934,6 +3989,14 @@ fn enemy_gun_from_record(data: &[u8]) -> Gun {
         stance: false,
         sniper: false,
         reload_stab_factor: 1.0,
+        fire_mode: FireMode::Auto,
+        charge_time: 0.0,
+        charge_ticks: 0.0,
+        charge_se: 0,
+        burst_wait: 0.0,
+        burst_remaining: 0,
+        burst_timer: 0.0,
+        trigger_held: false,
     }
 }
 
@@ -3061,6 +4124,13 @@ fn shoot_of_hit(hit_id: u32) -> i16 {
     find(PARAM_ACWEAPONSOUNDPARAM_BIN, hit_id)
         .map(|r| r.data.shoot)
         .unwrap_or(DEFAULT_SHOOT)
+}
+
+fn charge_of_hit(hit_id: u32) -> i16 {
+    find(PARAM_ACWEAPONSOUNDPARAM_BIN, hit_id)
+        .map(|r| r.data.charge)
+        .filter(|&c| c > 0)
+        .unwrap_or(0)
 }
 
 fn fx_and_hit_se_for(hit_id: u32) -> (Fx, HitSe) {
@@ -4665,5 +5735,243 @@ mod tests {
         assert_eq!(a7210.hands[0].kind, Kind::Missile);
         assert!(a7210.hands[0].is_missile);
         assert_eq!(a7210.hands[0].magazine, 160);
+    }
+
+    #[test]
+    fn ac_ctrl_param_ow_formulas_match_lua() {
+        let get = |id: u32| {
+            acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+                .iter()
+                .flat_map(|(_, r)| r.iter())
+                .find(|r| r.id == id)
+                .unwrap()
+                .data
+        };
+        for id in [9002_u32, 9003, 9999] {
+            let d = get(id);
+            let c = AcCtrlParam::calculate(&d);
+            // AcCtrlParamCalc.lua lines 253-283:
+            assert!((c.ow_cooltime_lv2 - c.ow_mode_time * 0.5).abs() < 1.0e-4);
+            assert!((c.ow_cooltime_lv1 - c.ow_cooltime_lv2 * 0.6).abs() < 1.0e-4);
+            assert!(c.ow_overload_dmg > 0.0, "design {id} ow_overload_dmg");
+            assert!(c.ow_dmgtime_min > 0.0 && c.ow_dmgtime_max > c.ow_dmgtime_min);
+            assert!(c.ow_charge_en > 100_000.0, "design {id} charge_en");
+            assert!(c.ow_en_output > 10_000.0, "design {id} ow_en_output");
+            assert_eq!(c.ow_reload, 3.0);
+            assert_eq!(c.ow_calorific_base, 5.0);
+            assert_eq!(c.ow_charge_heat_base, 500.0);
+            assert!(c.ow_attack_accel_tick > 0.0 && c.ow_attack_max_tick > 0.0);
+        }
+        // Grind Blade (9003, back_r=110) has attack_speed_scale = 1.8 vs Huge Cannon (9002, back_r=610) = 1.0.
+        let mut grind = get(9002);
+        let c_cannon = AcCtrlParam::calculate(&grind);
+        grind.back_r = 110;
+        let c_grind = AcCtrlParam::calculate(&grind);
+        assert!(
+            (c_grind.ow_attack_max_tick / c_cannon.ow_attack_max_tick - 1.8).abs() < 0.05,
+            "Grind Blade 1.8x attack speed scale (0x82477400)"
+        );
+    }
+
+    #[test]
+    fn all_six_overed_weapons_resolve_specs_and_unmitigated_damage() {
+        let mut base = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, r)| r.iter())
+            .find(|r| r.id == 9002)
+            .unwrap()
+            .data;
+        let cases = [
+            (110_u16, 1_u32, Kind::Blade, true, false),
+            (310, 3, Kind::Blade, true, false),
+            (610, 6, Kind::Rigid, false, true),
+            (810, 8, Kind::Energy, false, true),
+            (1010, 10, Kind::Missile, false, true),
+            (6010, 60, Kind::Blade, true, false),
+        ];
+        for (part_id, ow_type, kind, melee, has_blast) in cases {
+            base.back_r = part_id as i16;
+            let arm = Armament::from_design(&base);
+            let ow = arm.overed.expect("equipped OW");
+            assert_eq!(ow.spec.part_id, part_id);
+            assert_eq!(ow.spec.ow_type, ow_type);
+            assert_eq!(ow.spec.gun.kind, kind);
+            assert_eq!(ow.spec.is_melee(), melee);
+            assert_eq!(ow.spec.gun.damage_type, DamageType::Unmitigated);
+            assert!(ow.spec.gun.damage_power >= 60_000.0);
+            assert_eq!(ow.spec.blast.is_some(), has_blast, "OW {part_id} blast");
+        }
+    }
+
+    #[test]
+    fn overed_weapon_state_machine_lifecycle() {
+        let d = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, r)| r.iter())
+            .find(|r| r.id == 9002)
+            .unwrap()
+            .data;
+        let mut ow = Armament::from_design(&d).overed.expect("design 9002 OW");
+        assert_eq!(ow.phase, OwPhase::Disarmed);
+
+        // 1. Short tap does not arm OW; continuous hold for >= activate_hold_secs arms it.
+        ow.step(0.3, true, false);
+        assert_eq!(ow.phase, OwPhase::Disarmed);
+        ow.step(0.1, false, false);
+        assert_eq!(ow.activate_hold, 0.0);
+        for _ in 0..40 {
+            ow.step(0.05, true, false);
+        }
+        assert_eq!(ow.phase, OwPhase::Armed);
+        assert!(ow.is_active());
+        assert!(ow.limit_remaining < ow.spec.limit_capacity);
+
+        // 2. Early trigger release decays charge back to 0 without firing.
+        ow.step(0.5, false, true);
+        assert_eq!(ow.phase, OwPhase::Charging);
+        assert!(ow.charge_en_cur > 0.0);
+        ow.step(0.05, false, false);
+        assert_eq!(ow.phase, OwPhase::Armed);
+        for _ in 0..40 {
+            ow.step(0.05, false, false);
+        }
+        assert_eq!(ow.charge_en_cur, 0.0);
+
+        // 3. Full charge + overload self-damage ticks + release-to-fire -> Attacking -> Purged -> Lockout -> Spent.
+        let mut saw_overload = false;
+        let mut saw_charged = false;
+        for _ in 0..400 {
+            let r = ow.step(0.1, false, true);
+            if r.overload_damage > 0.0 {
+                saw_overload = true;
+            }
+            if r.event == Some(OwEvent::ChargeComplete) || ow.phase == OwPhase::Charged {
+                saw_charged = true;
+                break;
+            }
+        }
+        assert!(saw_charged, "OW must reach Charged phase");
+        // Release trigger to fire Huge Cannon!
+        let fire_res = ow.step(0.05, false, false);
+        assert_eq!(fire_res.event, Some(OwEvent::Fired));
+        assert_eq!(ow.phase, OwPhase::Attacking);
+        assert_eq!(ow.attacks_fired, 1);
+
+        // Let attack finish -> Huge Cannon auto-purges -> enters Lockout -> eventually Spent.
+        let mut saw_purge = false;
+        for _ in 0..40 {
+            let r = ow.step(0.05, false, false);
+            if r.overload_damage > 0.0 {
+                saw_overload = true;
+            }
+            if r.event == Some(OwEvent::Purged) {
+                saw_purge = true;
+                break;
+            }
+        }
+        assert!(saw_purge, "Huge Cannon must auto-purge after firing");
+        assert_eq!(ow.phase, OwPhase::Lockout);
+        assert!(!ow.is_active());
+
+        // Advance past lockout_secs -> Spent.
+        let mut ended = false;
+        for _ in 0..100 {
+            if ow.step(0.5, false, false).event == Some(OwEvent::LockoutEnded) {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended && ow.phase == OwPhase::Spent);
+        // Verify overload self-damage fires on a fresh armed OW over 20 s.
+        if !saw_overload {
+            let mut ow2 = Armament::from_design(&d).overed.unwrap();
+            for _ in 0..40 {
+                ow2.step(0.05, true, false);
+            }
+            let mut dmg_total = 0.0;
+            for _ in 0..200 {
+                dmg_total += ow2.step(0.1, false, false).overload_damage;
+            }
+            assert!(dmg_total > 0.0, "armed OW must deal periodic overload AP self-damage");
+        }
+    }
+
+    #[test]
+    fn hand_weapon_firing_modes_cover_auto_pellet_burst_and_charge() {
+        // Auto: rifle 1611.
+        let mut rifle = gun(1611);
+        assert_eq!(rifle.fire_mode, FireMode::Auto);
+        assert_eq!(
+            rifle.step_trigger(true, true, true, 1.0),
+            TriggerAction::Fire {
+                power_scale: 1.0,
+                pellets: 1,
+            }
+        );
+
+        // PelletSpread: shotgun 1011 (12 simultaneous pellets).
+        let mut shotgun = gun(1011);
+        assert_eq!(shotgun.fire_mode, FireMode::PelletSpread);
+        assert_eq!(shotgun.burst_count, 12);
+        assert_eq!(
+            shotgun.step_trigger(true, true, true, 1.0),
+            TriggerAction::Fire {
+                power_scale: 1.0,
+                pellets: 12,
+            }
+        );
+
+        // Burst: burst rifle 710 (5 sequential rounds spaced by burst_wait = 5 ticks).
+        let mut burst = gun(710);
+        assert_eq!(burst.fire_mode, FireMode::Burst);
+        assert_eq!(burst.burst_count, 5);
+        assert_eq!(burst.burst_wait, 5.0);
+        let mut fired = 0;
+        if matches!(
+            burst.step_trigger(true, true, true, 1.0),
+            TriggerAction::Fire { pellets: 1, .. }
+        ) {
+            fired += 1;
+        }
+        // Release trigger immediately; remaining 4 burst rounds still fire on schedule.
+        for _ in 0..25 {
+            if matches!(
+                burst.step_trigger(false, false, true, 1.0),
+                TriggerAction::Fire { pellets: 1, .. }
+            ) {
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 5, "burst rifle must fire all 5 sequential rounds");
+
+        // Charge: laser rifle 1411 (charge_time = 109 ticks), rail cannon 2510 (63), laser cannon 2110 (246).
+        let mut laser = gun(1411);
+        assert_eq!(laser.fire_mode, FireMode::Charge);
+        assert_eq!(laser.charge_time, 109.0);
+        assert_eq!(gun(2510).fire_mode, FireMode::Charge);
+        assert_eq!(gun(2110).fire_mode, FireMode::Charge);
+
+        // Hold to start charge, charge halfway, release -> partial power (0.5..1.0).
+        assert_eq!(laser.step_trigger(true, true, true, 1.0), TriggerAction::StartCharge);
+        assert_eq!(laser.step_trigger(true, true, true, 53.5), TriggerAction::None);
+        match laser.step_trigger(false, true, true, 1.0) {
+            TriggerAction::Fire { power_scale, pellets } => {
+                assert_eq!(pellets, 1);
+                assert!(power_scale > 0.7 && power_scale < 0.8, "half charge scale {power_scale}");
+            }
+            other => panic!("expected partial-charge fire on release, got {other:?}"),
+        }
+
+        // Full charge -> release fires at full 1.0 power.
+        assert_eq!(laser.step_trigger(true, true, true, 1.0), TriggerAction::StartCharge);
+        assert_eq!(laser.step_trigger(true, true, true, 120.0), TriggerAction::None);
+        assert_eq!(laser.charge_fraction(), 1.0);
+        assert_eq!(
+            laser.step_trigger(false, true, true, 1.0),
+            TriggerAction::Fire {
+                power_scale: 1.0,
+                pellets: 1,
+            }
+        );
     }
 }

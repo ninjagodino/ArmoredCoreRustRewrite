@@ -254,6 +254,16 @@ pub struct Pilot {
     /// True while Scan Mode is active (`AC + 0xdb0 != 0`, `0x828b41a0`). Switches passive EN
     /// drain to `scan_passive_en_drain_tick` (`0x8286a558` / `0x828bef18`) and locks out firing.
     pub scan_mode: bool,
+    /// True while an Overed Weapon is armed/charging/attacking (`0x82885c40 != 0`): switches
+    /// generator EN output to `ow_en_output` (`0x82868798` -> `0x8287ef68`).
+    pub ow_active: bool,
+    /// True during post-OW purge lockout (`0x828861d0` state 2, `manual.fmg` 20814): drains EN
+    /// and disables FCS lock-on for `lockout_secs`.
+    pub ow_lockout: bool,
+    /// Remaining 60 Hz ticks of an OW attack movement lunge (`NewAcBehavior` field 235 = 30 ticks,
+    /// `0x82869d40` -> `AcMove +0x124/+0x128`).
+    ow_dash_ticks: f32,
+    ow_dash_dir: Vec3,
     /// Current map area band (`POINT_PARAM_ST` kinds `100`–`102`, `manual.fmg` 20500).
     pub area_zone: crate::map::AreaZone,
     /// Move stick this frame, x right and y forward in the facing the integrator uses.
@@ -1079,6 +1089,23 @@ impl Pilot {
         true
     }
 
+    /// Launches an Overed Weapon attack dash burst (`0x82869d40` -> `AcMove +0x124/+0x128`,
+    /// `NewAcBehavior` field 234 `ow_attack_accel_mult` = 1.5, field 235 `ow_attack_dash_frames` = 30).
+    pub fn start_ow_dash(&mut self, dir: Vec3) {
+        let horiz = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
+        let dir = if horiz != Vec3::ZERO {
+            horiz
+        } else {
+            Quat::from_rotation_y(self.yaw) * FORWARD
+        };
+        let frames = (acvd_data::generated::tuning::NEW_AC_BEHAVIOR.ow_attack_dash_frames as f32)
+            .max(1.0);
+        self.ow_dash_ticks = frames;
+        self.ow_dash_dir = dir;
+        self.qb = None;
+        self.glide = false;
+    }
+
     /// A standing AC moving by `ctrl`, with the default follow camera for its legs' motion set.
     pub fn new(ctrl: AcCtrlParam, legs_motion_id: u8) -> Self {
         let en_max = ctrl.en_capacity.max(0.0);
@@ -1092,6 +1119,10 @@ impl Pilot {
             glide: false,
             airborne: false,
             scan_mode: false,
+            ow_active: false,
+            ow_lockout: false,
+            ow_dash_ticks: 0.0,
+            ow_dash_dir: FORWARD,
             area_zone: crate::map::AreaZone::Inside,
             command: Vec2::ZERO,
             quick_boosts: 0,
@@ -1830,12 +1861,24 @@ fn step_blade(
 /// (`scan_passive_en_drain_tick`, `0x8286a558` + `NewAcBehavior` fields 319-331) for faster EN
 /// recharge. Runs every tick with no recovery delay and the same rate on ground and in air.
 fn step_en(p: &mut Pilot) {
+    if p.ow_lockout {
+        // Post-OW purge lockout (`0x828861d0` state 2, `manual.fmg` 20814): EN stays depleted.
+        p.en = 0.0;
+        return;
+    }
     let drain = if p.scan_mode {
         p.ctrl.scan_passive_en_drain_tick
     } else {
         p.ctrl.passive_en_drain_tick
     };
-    let net = p.ctrl.en_output_tick - drain;
+    // While OW is active (`0x82885c40 != 0`), generator output uses `gene.ow_en_output`
+    // (`0x82868798` -> `0x82855ad8` -> `0x8287ef68`).
+    let output_tick = if p.ow_active && p.ctrl.ow_en_output > 0.0 {
+        p.ctrl.ow_en_output / TICK_RATE
+    } else {
+        p.ctrl.en_output_tick
+    };
+    let net = output_tick - drain;
     p.en = (p.en + net).clamp(0.0, p.en_max);
 }
 
@@ -2075,6 +2118,18 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
             };
         }
         p.velocity.y = p.velocity.y.max(-c.fall_max_tick);
+    }
+    if p.ow_dash_ticks > 0.0 {
+        p.ow_dash_ticks = (p.ow_dash_ticks - 1.0).max(0.0);
+        let dir2 = Vec2::new(p.ow_dash_dir.x, p.ow_dash_dir.z).normalize_or_zero();
+        let mult = acvd_data::generated::tuning::NEW_AC_BEHAVIOR
+            .ow_attack_accel_mult
+            .max(1.0);
+        let accel = c.ow_attack_accel_tick.max(c.quick_boost_acc_tick) * mult;
+        let max_spd = c.ow_attack_max_tick.max(c.quick_boost_max_tick);
+        if dir2 != Vec2::ZERO && max_spd > 0.0 {
+            horizontal = integrate(horizontal, dir2 * accel, max_spd, c.over_max_decel_tick);
+        }
     }
     p.velocity = Vec3::new(horizontal.x, p.velocity.y, horizontal.y);
     let before_y = position.y;
