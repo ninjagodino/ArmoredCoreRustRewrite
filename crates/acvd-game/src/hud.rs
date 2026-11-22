@@ -836,6 +836,102 @@ pub fn readouts(
     }
 }
 
+/// Marker for the `LIMIT OF AREA` / `OUTSIDE OF AREA` warning banner (`manual.fmg` 20500,
+/// `AreaOverLine` `0x825b3678`).
+#[derive(Component)]
+pub struct AreaWarningHud;
+
+#[derive(Component)]
+pub struct AreaWarningText;
+
+/// Shows `LIMIT OF AREA` (amber/orange) or `OUTSIDE OF AREA` (red) when the AC leaves the
+/// map caution/warning/operation bounds (`POINT_PARAM_ST` kinds `100`–`102`).
+pub fn area_warning_hud(
+    time: Res<Time>,
+    pilots: Query<&crate::control::Pilot>,
+    mut commands: Commands,
+    mut banner: Query<(&mut Visibility, &mut BackgroundColor), With<AreaWarningHud>>,
+    mut label: Query<(&mut Text, &mut TextColor), With<AreaWarningText>>,
+) {
+    use crate::map::AreaZone;
+    let zone = pilots.single().map_or(AreaZone::Inside, |p| p.area_zone);
+    if banner.is_empty() {
+        commands
+            .spawn((
+                AreaWarningHud,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(88.0),
+                    left: Val::Percent(50.0),
+                    margin: UiRect::left(px(-150.0)),
+                    width: px(300.0),
+                    padding: UiRect::axes(px(14.0), px(6.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.18, 0.06, 0.02, 0.82)),
+                Visibility::Hidden,
+            ))
+            .with_children(|c| {
+                c.spawn((
+                    AreaWarningText,
+                    Text::new("LIMIT OF AREA"),
+                    TextFont {
+                        font_size: FontSize::Px(20.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.72, 0.15)),
+                ));
+            });
+        return;
+    }
+
+    let pulse = ((time.elapsed_secs() * 8.0).sin() * 0.5 + 0.5).clamp(0.25, 1.0);
+    let (show, msg, fg, bg) = match zone {
+        AreaZone::Inside => (
+            false,
+            "",
+            Color::WHITE,
+            Color::srgba(0.0, 0.0, 0.0, 0.0),
+        ),
+        AreaZone::Caution => (
+            true,
+            "LIMIT OF AREA",
+            Color::srgba(1.0, 0.78, 0.2, pulse),
+            Color::srgba(0.22, 0.12, 0.02, 0.78 * pulse),
+        ),
+        AreaZone::Warning => (
+            true,
+            "LIMIT OF AREA",
+            Color::srgba(1.0, 0.42, 0.12, pulse),
+            Color::srgba(0.32, 0.08, 0.02, 0.85 * pulse),
+        ),
+        AreaZone::Outside => (
+            true,
+            "OUTSIDE OF AREA",
+            Color::srgba(1.0, 0.18, 0.15, pulse),
+            Color::srgba(0.4, 0.03, 0.03, 0.9 * pulse),
+        ),
+    };
+    for (mut vis, mut bg_col) in &mut banner {
+        vis.set_if_neq(if show {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
+        *bg_col = BackgroundColor(bg);
+    }
+    if show {
+        for (mut text, mut color) in &mut label {
+            if text.0 != msg {
+                text.0 = msg.to_string();
+            }
+            *color = TextColor(fg);
+        }
+    }
+}
+
 /// Shows `ACV_FE_Normal::Stagger` (`ErrorLog_Stagger`, dialog 208) while the player AC is
 /// staggered (`PlayerHealth::is_staggered()`).
 pub fn stagger_hud(

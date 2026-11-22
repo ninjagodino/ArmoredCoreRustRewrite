@@ -254,6 +254,8 @@ pub struct Pilot {
     /// True while Scan Mode is active (`AC + 0xdb0 != 0`, `0x828b41a0`). Switches passive EN
     /// drain to `scan_passive_en_drain_tick` (`0x8286a558` / `0x828bef18`) and locks out firing.
     pub scan_mode: bool,
+    /// Current map area band (`POINT_PARAM_ST` kinds `100`–`102`, `manual.fmg` 20500).
+    pub area_zone: crate::map::AreaZone,
     /// Move stick this frame, x right and y forward in the facing the integrator uses.
     /// The booster effect dispatcher (`0x828932a0`) reads this vector.
     pub command: Vec2,
@@ -1090,6 +1092,7 @@ impl Pilot {
             glide: false,
             airborne: false,
             scan_mode: false,
+            area_zone: crate::map::AreaZone::Inside,
             command: Vec2::ZERO,
             quick_boosts: 0,
             second_stage_qb: false,
@@ -2241,6 +2244,7 @@ pub fn pilot(
     mut piloting: ResMut<Piloting>,
     garage: Res<crate::Garage>,
     collision: Res<Collision>,
+    area_bounds: Option<Res<crate::map::AreaBounds>>,
     motion: Option<ResMut<Motion>>,
     mut acs: Query<(&mut Pilot, &mut Transform, &GlobalTransform, Option<&mut Status>)>,
     mut cams: Query<(&mut Orbit, &mut Transform, &mut Projection, &mut ZoomBlur), Without<Pilot>>,
@@ -2348,6 +2352,11 @@ pub fn pilot(
         let velocity = p.velocity;
         p.cam.blur_tick(velocity);
     }
+    p.area_zone = area_bounds
+        .as_deref()
+        .map_or(crate::map::AreaZone::Inside, |b| {
+            b.enforce(&mut transform.translation, &mut p.velocity)
+        });
     if let Some(status) = status.as_deref_mut() {
         status.en = p.en;
         status.en_max = p.en_max;
@@ -2717,20 +2726,16 @@ mod tests {
                 layer: Layer::Ground,
             }],
             vec![
-                Hit {
-                    a: Vec3::new(0.0, 0.0, -50.0),
-                    b: Vec3::new(0.0, 40.0, -50.0),
-                    c: Vec3::new(0.0, 0.0, 50.0),
-                    layer: Layer::Ground,
-                    wall_kickable: true,
-                },
-                Hit {
-                    a: Vec3::new(0.0, 40.0, -50.0),
-                    b: Vec3::new(0.0, 40.0, 50.0),
-                    c: Vec3::new(0.0, 0.0, 50.0),
-                    layer: Layer::Ground,
-                    wall_kickable: true,
-                },
+                Hit::solid(
+                    Vec3::new(0.0, 0.0, -50.0),
+                    Vec3::new(0.0, 40.0, -50.0),
+                    Vec3::new(0.0, 0.0, 50.0),
+                ),
+                Hit::solid(
+                    Vec3::new(0.0, 40.0, -50.0),
+                    Vec3::new(0.0, 40.0, 50.0),
+                    Vec3::new(0.0, 0.0, 50.0),
+                ),
             ],
         );
 

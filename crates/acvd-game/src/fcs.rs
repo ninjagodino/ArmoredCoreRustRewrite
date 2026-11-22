@@ -10,7 +10,9 @@
 //!   datum-local `z > 0` lies inside the inner cone when
 //!   `(x / (z * tan(sight_x)))^2 + (y / (z * tan(sight_y)))^2 <= 1.0`. An outer hysteresis cone
 //!   adds `2.0°` (`DAT_820b005c` in `0x829d8758`) to keep an existing lock from flickering at the
-//!   edge. Terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`) is not raycast yet.
+//!   edge. Terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20` → `0x829c5e30`, filter
+//!   `0x80100006` + `0x829c5c00` `AcObjectParam.camera_collidable`) is raycast against the map
+//!   collision BVH (`Collision::has_los(..., RayFilter::FcsLos)`).
 //! - **Secondary lock-on timer** (`0x82857688` → `0x829debe8` → `0x829de560`): per hand,
 //!   `lock_time = weapon.missile_lock_time * AcCtrlParam::lock_effective_rate / 60.0` seconds.
 //!   Once `elapsed >= lock_time`, secondary lock is complete.
@@ -25,6 +27,7 @@ use std::collections::HashMap;
 use acvd_data::generated::ctrl::AcCtrlParam;
 use bevy::prelude::*;
 
+use crate::collision::{Collision, RayFilter};
 use crate::control::{Pilot, Piloting};
 use crate::targets::{Target, TargetHealth};
 use crate::weapons::{Armament, Kind};
@@ -355,10 +358,17 @@ pub fn predict_lead_point(
     target_pos + target_vel * t.clamp(0.0, MAX_LEAD_TIME)
 }
 
+/// Terrain line-of-sight test for FCS lock-on (`LockCheckRay` `0x829c5f20` mode 1, filter
+/// `0x80100006` + `0x829c5c00` `camera_collidable`).
+pub fn target_has_los(collision: &Collision, ac_pos: Vec3, target_pos: Vec3) -> bool {
+    collision.has_los(ac_pos, target_pos, RayFilter::FcsLos)
+}
+
 /// Per-frame FCS target selection and secondary lock-on timer update.
 pub fn update(
     time: Res<Time>,
     piloting: Res<Piloting>,
+    collision: Res<Collision>,
     mut prev_pos: Local<HashMap<Entity, Vec3>>,
     mut acs: Query<(&Pilot, &Armament, &Transform, &mut Fcs)>,
     targets: Query<(Entity, &Target, &TargetHealth, &Transform)>,
@@ -413,6 +423,9 @@ pub fn update(
         );
         let in_missile_locks = fcs.missile_locks.contains(&entity);
         let score = if let Some(ell) = inner {
+            if !target_has_los(&collision, ac_pos, center) {
+                continue;
+            }
             inner_candidates.push((entity, ell));
             valid_targets.insert(entity, center);
             // Slight bias toward keeping the current locked target to prevent edge flicker.
@@ -433,6 +446,9 @@ pub fn update(
                 spec.datum_back,
             ) {
                 Some(ell) => {
+                    if !target_has_los(&collision, ac_pos, center) {
+                        continue;
+                    }
                     valid_targets.insert(entity, center);
                     if Some(entity) == cur_entity {
                         1.0 + ell
@@ -678,5 +694,43 @@ mod tests {
         step_missile_locks(&mut locks, &mut timer, &inner2, &valid, 5, step, true, 0.01);
         assert_eq!(locks.iter().filter(|&&e| e == e2).count(), 0);
         assert_eq!(locks.len(), 3);
+    }
+
+    #[test]
+    fn lock_check_ray_blocks_fcs_lock_behind_wall() {
+        use crate::collision::Hit;
+        let wall = Collision::with_hits(
+            Vec::new(),
+            vec![
+                Hit::solid(
+                    Vec3::new(-20.0, 0.0, -50.0),
+                    Vec3::new(20.0, 0.0, -50.0),
+                    Vec3::new(-20.0, 30.0, -50.0),
+                ),
+                Hit::solid(
+                    Vec3::new(20.0, 0.0, -50.0),
+                    Vec3::new(20.0, 30.0, -50.0),
+                    Vec3::new(-20.0, 30.0, -50.0),
+                ),
+            ],
+        );
+        let ac_pos = Vec3::new(0.0, 4.5, 0.0);
+        // Target in front of wall (-30 m): clear LOS.
+        assert!(target_has_los(&wall, ac_pos, Vec3::new(0.0, 4.5, -30.0)));
+        // Target behind wall (-80 m): occluded by `LockCheckRay`.
+        assert!(!target_has_los(&wall, ac_pos, Vec3::new(0.0, 4.5, -80.0)));
+
+        // Also test against actual `m4000` geometry if disc is present:
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        if let Ok(disc) = acvd_formats::vfs::Disc::open(&acvd_formats::vfs::default_disc(&root)) {
+            let m4000 = crate::collision::load_map(&disc, "m4000").expect("m4000 collision");
+            let origin = Vec3::new(324.65, 33.5, 649.5);
+            // Straight down through the floor (to y = -10) is occluded by m4000 ground.
+            assert!(!target_has_los(&m4000, origin, Vec3::new(324.65, -10.0, 649.5)));
+            // Short open-air sightline 5 m above start is clear.
+            assert!(target_has_los(&m4000, origin, origin + Vec3::Y * 5.0));
+        }
     }
 }

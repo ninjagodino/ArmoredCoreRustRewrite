@@ -19,7 +19,7 @@ use acvd_data::generated::enemy::{
 use bevy::audio::AudioSource;
 use bevy::prelude::*;
 
-use crate::collision::{Collision, RAY_HALF};
+use crate::collision::{Collision, RayFilter, RAY_HALF};
 use crate::control::{Pilot, Piloting};
 use crate::damage::PlayerHealth;
 use crate::sound::Cues;
@@ -444,12 +444,16 @@ impl EnemyAi {
     }
 
     /// Steps AI perception, movement intent, facing turn, and weapon firing for `dt` seconds.
+    /// `has_los` is the result of `Collision::has_los(..., RayFilter::AiLos)` (`LockCheckRay`
+    /// mode 2 `0x829c5cd0` -> `0x829aacb8` `!b_look_line_penetrate`).
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         pos: Vec3,
         player_pos: Vec3,
         player_vel: Vec3,
         player_alive: bool,
+        has_los: bool,
         health: &TargetHealth,
         dt: f32,
     ) -> AiStepOutput {
@@ -496,8 +500,9 @@ impl EnemyAi {
         };
         let desired_player_yaw = yaw_from_dir(dir_xz).unwrap_or(self.yaw);
 
-        // Perception (`Targetting_CatchUpWithConeInSide` + `IsLastHitRemember`).
-        let in_sight = dist_3d <= self.visible_dist && angle_to_player <= self.visible_half_angle_rad;
+        // Perception (`Targetting_CatchUpWithConeInSide` + `LockCheckRay` + `IsLastHitRemember`).
+        let in_sight =
+            has_los && dist_3d <= self.visible_dist && angle_to_player <= self.visible_half_angle_rad;
         let in_hearing = dist_3d <= self.hearing_dist;
         let hit_alert = health.last_hit_timer > 0.0;
         let max_keep_dist = self.visible_dist.max(self.hearing_dist) * 1.35;
@@ -762,9 +767,14 @@ impl EnemyAi {
         let accel_blend = (dt * 4.0).min(1.0);
         self.velocity = self.velocity.lerp(desired_vel, accel_blend);
 
-        // Evaluate weapon firing (`GetMuzzleOuterAngle` + range + reload/burst timers).
+        // Evaluate weapon firing (`GetMuzzleOuterAngle` + range + terrain LOS + reload/burst timers).
         let mut shots = Vec::new();
-        if self.engaged {
+        if !has_los {
+            for slot in &mut self.weapons {
+                slot.burst_left = 0;
+            }
+        }
+        if self.engaged && has_los {
             let new_forward = Quat::from_rotation_y(self.yaw) * FORWARD;
             let outer_angle_deg = if dir_xz != Vec3::ZERO {
                 new_forward
@@ -872,11 +882,17 @@ pub fn update(
         if health.destroyed {
             continue;
         }
+        let has_los = collision.has_los(
+            tf.translation + Vec3::Y * ai.muzzle_height,
+            player_pos + Vec3::Y * PLAYER_AIM_Y,
+            RayFilter::AiLos,
+        );
         let out = ai.step(
             tf.translation,
             player_pos,
             player_vel,
             player_alive,
+            has_los,
             health,
             dt,
         );
@@ -1005,6 +1021,7 @@ mod tests {
                 Vec3::new(0.0, 0.0, -120.0),
                 Vec3::ZERO,
                 true,
+                true,
                 &hp,
                 1.0 / 30.0,
             );
@@ -1030,6 +1047,7 @@ mod tests {
                 Vec3::ZERO,
                 Vec3::new(0.0, 0.0, -40.0),
                 Vec3::ZERO,
+                true,
                 true,
                 &hp,
                 1.0 / 30.0,
@@ -1071,6 +1089,7 @@ mod tests {
                     Vec3::new(0.0, 0.0, -120.0),
                     Vec3::ZERO,
                     true,
+                    true,
                     &hp,
                     1.0 / 30.0,
                 );
@@ -1083,5 +1102,78 @@ mod tests {
             assert!(moved, "test AC {design_id} should move/strafe");
             assert!(fired >= 1, "test AC {design_id} should fire at player");
         }
+    }
+
+    #[test]
+    fn enemy_ai_holds_fire_when_los_occluded_by_wall() {
+        use crate::collision::Hit;
+        let Some(parts) = load_enemy_parts() else {
+            return;
+        };
+        // Solid building wall at z = -60 m between tank (z = 0) and player (z = -120 m).
+        let wall = Collision::with_hits(
+            Vec::new(),
+            vec![
+                Hit::solid(
+                    Vec3::new(-30.0, 0.0, -60.0),
+                    Vec3::new(30.0, 0.0, -60.0),
+                    Vec3::new(-30.0, 30.0, -60.0),
+                ),
+                Hit::solid(
+                    Vec3::new(30.0, 0.0, -60.0),
+                    Vec3::new(30.0, 30.0, -60.0),
+                    Vec3::new(-30.0, 30.0, -60.0),
+                ),
+            ],
+        );
+        let mut tank = EnemyAi::for_enemy("e1020", Vec3::ZERO, 0.0, &parts);
+        let hp = TargetHealth::from_enemy("e1020");
+        let player_pos = Vec3::new(0.0, 0.0, -120.0);
+        let occluded_los = wall.has_los(
+            Vec3::Y * tank.muzzle_height,
+            player_pos + Vec3::Y * PLAYER_AIM_Y,
+            RayFilter::AiLos,
+        );
+        assert!(!occluded_los, "wall must block AI LOS");
+
+        // Even if already alerted (engaged), enemy must NOT fire through the wall.
+        tank.engaged = true;
+        let mut blocked_shots = 0usize;
+        for _ in 0..60 {
+            let out = tank.step(
+                Vec3::ZERO,
+                player_pos,
+                Vec3::ZERO,
+                true,
+                occluded_los,
+                &hp,
+                1.0 / 30.0,
+            );
+            blocked_shots += out.shots.len();
+        }
+        assert_eq!(blocked_shots, 0, "occluded enemy must not fire through walls");
+
+        // Stepping out from behind cover (x = 70 m -> crosses z = -60 at x = 35 m > 30 m) restores LOS.
+        let exposed_pos = Vec3::new(70.0, 0.0, -120.0);
+        let clear_los = wall.has_los(
+            Vec3::Y * tank.muzzle_height,
+            exposed_pos + Vec3::Y * PLAYER_AIM_Y,
+            RayFilter::AiLos,
+        );
+        assert!(clear_los, "stepping past wall restores AI LOS");
+        let mut clear_shots = 0usize;
+        for _ in 0..90 {
+            let out = tank.step(
+                Vec3::ZERO,
+                exposed_pos,
+                Vec3::ZERO,
+                true,
+                clear_los,
+                &hp,
+                1.0 / 30.0,
+            );
+            clear_shots += out.shots.len();
+        }
+        assert!(clear_shots >= 1, "enemy should fire once LOS is clear");
     }
 }

@@ -57,6 +57,215 @@ pub struct Start {
     pub yaw: f32,
 }
 
+/// One MSB `POINT_PARAM_ST` area box (kinds `100` operation / `101` warning / `102` caution,
+/// `shape == 5`, `m4000_actest.msb`), already mirrored on X into Bevy coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct AreaBox {
+    /// Center X/Z and bottom Y in Bevy world metres (`translation`, X mirrored).
+    pub origin: Vec3,
+    /// Half-width along local X (`width * 0.5`).
+    pub half_x: f32,
+    /// Half-depth along local Z (`depth * 0.5`).
+    pub half_z: f32,
+    /// Height above `origin.y` (`height`).
+    pub height: f32,
+    /// Yaw in Bevy radians (`-rotation_deg[1].to_radians()`).
+    pub yaw: f32,
+}
+
+impl AreaBox {
+    pub fn from_point(p: &msb::Point) -> Option<Self> {
+        let msb::PointShape::Box {
+            width,
+            depth,
+            height,
+        } = p.shape_data
+        else {
+            return None;
+        };
+        let [x, y, z] = p.translation;
+        Some(Self {
+            origin: Vec3::new(-x, y, z),
+            half_x: (width * 0.5).max(1.0),
+            half_z: (depth * 0.5).max(1.0),
+            height: height.max(1.0),
+            yaw: -p.rotation_deg[1].to_radians(),
+        })
+    }
+
+    fn to_local(&self, pos: Vec3) -> Vec3 {
+        let rel = pos - self.origin;
+        if self.yaw.abs() < 1e-6 {
+            rel
+        } else {
+            Quat::from_rotation_y(-self.yaw) * rel
+        }
+    }
+
+    fn from_local(&self, local: Vec3) -> Vec3 {
+        let rot = if self.yaw.abs() < 1e-6 {
+            local
+        } else {
+            Quat::from_rotation_y(self.yaw) * local
+        };
+        self.origin + rot
+    }
+
+    /// True if `pos` lies inside this area box (`|lx| <= half_x`, `|lz| <= half_z`, `0 <= ly <= height`).
+    pub fn contains(&self, pos: Vec3) -> bool {
+        let l = self.to_local(pos);
+        l.x.abs() <= self.half_x && l.z.abs() <= self.half_z && l.y >= 0.0 && l.y <= self.height
+    }
+
+    /// Clamps `pos` inside this box (with optional inward `margin`) and zeroes any outward
+    /// velocity component in `vel`. Returns `true` if `pos` was clamped.
+    pub fn clamp(&self, pos: &mut Vec3, vel: &mut Vec3, margin: f32) -> bool {
+        let hx = (self.half_x - margin).max(1.0);
+        let hz = (self.half_z - margin).max(1.0);
+        let h = (self.height - margin).max(1.0);
+        let mut l = self.to_local(*pos);
+        let mut lv = if self.yaw.abs() < 1e-6 {
+            *vel
+        } else {
+            Quat::from_rotation_y(-self.yaw) * *vel
+        };
+        let mut clamped = false;
+        if l.x < -hx {
+            l.x = -hx;
+            if lv.x < 0.0 {
+                lv.x = 0.0;
+            }
+            clamped = true;
+        } else if l.x > hx {
+            l.x = hx;
+            if lv.x > 0.0 {
+                lv.x = 0.0;
+            }
+            clamped = true;
+        }
+        if l.z < -hz {
+            l.z = -hz;
+            if lv.z < 0.0 {
+                lv.z = 0.0;
+            }
+            clamped = true;
+        } else if l.z > hz {
+            l.z = hz;
+            if lv.z > 0.0 {
+                lv.z = 0.0;
+            }
+            clamped = true;
+        }
+        if l.y > h {
+            l.y = h;
+            if lv.y > 0.0 {
+                lv.y = 0.0;
+            }
+            clamped = true;
+        }
+        if clamped {
+            *pos = self.from_local(l);
+            *vel = if self.yaw.abs() < 1e-6 {
+                lv
+            } else {
+                Quat::from_rotation_y(self.yaw) * lv
+            };
+        }
+        clamped
+    }
+}
+
+/// Which map area band the AC currently occupies (`POINT_PARAM_ST` kinds `100`–`102`,
+/// `manual.fmg` 20500 `LIMIT OF AREA` / `OUTSIDE OF AREA`, `AreaOverLine` `0x825b3678`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AreaZone {
+    /// Inside the inner caution area (`kind == 102`) or no area bounds defined.
+    #[default]
+    Inside,
+    /// Outside caution area (`102`), inside warning area (`101`): `LIMIT OF AREA`.
+    Caution,
+    /// Outside warning area (`101`), inside operation area (`100`): `LIMIT OF AREA` (urgent).
+    Warning,
+    /// At or outside the operation area (`100`): `OUTSIDE OF AREA` (clamped).
+    Outside,
+}
+
+/// Map operation / warning / caution area boxes from `{map}_{layout}.msb` (`POINT_PARAM_ST`
+/// kinds `100`, `101`, `102`).
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct AreaBounds {
+    pub operation: Option<AreaBox>,
+    pub warning: Option<AreaBox>,
+    pub caution: Option<AreaBox>,
+}
+
+impl AreaBounds {
+    pub fn from_points(points: &[msb::Point]) -> Self {
+        let find = |kind: u32| {
+            points
+                .iter()
+                .find(|p| p.kind == kind)
+                .and_then(AreaBox::from_point)
+        };
+        Self {
+            operation: find(msb::POINT_OPERATION_AREA),
+            warning: find(msb::POINT_WARNING_AREA),
+            caution: find(msb::POINT_CAUTION_AREA),
+        }
+    }
+
+    /// Loads area bounds (`POINT` kinds `100`–`102`) from `{map}_{layout}.msb`, falling back to
+    /// the terrain MSB.
+    pub fn load(disc: &Disc, map: &str, layout: Option<&str>) -> Result<Self> {
+        let mut sources = Vec::new();
+        if let Some(l) = layout {
+            sources.push(format!("{}/{map}_{l}.msb", folder(map)));
+        }
+        sources.push(terrain_msb(disc, map));
+        for path in sources.into_iter().filter(|p| disc.exists(p)) {
+            let pts = msb::points(&vfs::open(disc, &path)?)?;
+            let bounds = Self::from_points(&pts);
+            if bounds.operation.is_some() || bounds.warning.is_some() || bounds.caution.is_some() {
+                return Ok(bounds);
+            }
+        }
+        Ok(Self::default())
+    }
+
+    /// Classifies `pos` into `Inside`, `Caution`, `Warning`, or `Outside`.
+    pub fn zone(&self, pos: Vec3) -> AreaZone {
+        if let Some(op) = self.operation {
+            if !op.contains(pos) {
+                return AreaZone::Outside;
+            }
+        }
+        if let Some(warn) = self.warning {
+            if !warn.contains(pos) {
+                return AreaZone::Warning;
+            }
+        }
+        if let Some(caut) = self.caution {
+            if !caut.contains(pos) {
+                return AreaZone::Caution;
+            }
+        }
+        AreaZone::Inside
+    }
+
+    /// Clamps `pos` and outward velocity `vel` inside the operation area (`kind == 100`) and
+    /// returns the resulting [`AreaZone`] (`AreaZone::Outside` when clamped at the boundary).
+    pub fn enforce(&self, pos: &mut Vec3, vel: &mut Vec3) -> AreaZone {
+        let clamped = self
+            .operation
+            .is_some_and(|op| op.clamp(pos, vel, 1.0));
+        if clamped {
+            AreaZone::Outside
+        } else {
+            self.zone(*pos)
+        }
+    }
+}
+
 /// Start point index 0 (`msb::POINT_START`) of `{map}_{layout}.msb`, else of the terrain MSB.
 /// MSB axes mirror X into Bevy, which also negates a yaw.
 pub fn start(disc: &Disc, map: &str, layout: Option<&str>) -> Result<Option<Start>> {
@@ -447,5 +656,39 @@ mod tests {
         assert!(near < 0.1, "{near}");
         assert!((0.4..2.0).contains(&far), "{far}");
         assert!(lod_metric(10_000.0, 128.0) > 15.0);
+    }
+
+    #[test]
+    fn actest_area_bounds_parse_and_classify_zones() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let bounds = AreaBounds::load(&disc, "m4000", Some("actest")).unwrap();
+        let op = bounds.operation.expect("m4000 operation area (kind 100)");
+        let warn = bounds.warning.expect("m4000 warning area (kind 101)");
+        let caut = bounds.caution.expect("m4000 caution area (kind 102)");
+        assert_eq!(op.origin, Vec3::new(804.0, -15.0, 609.35));
+        assert_eq!((op.half_x, op.half_z, op.height), (700.0, 450.0, 225.0));
+        assert_eq!((warn.half_x, warn.half_z, warn.height), (675.0, 425.0, 175.0));
+        assert_eq!((caut.half_x, caut.half_z, caut.height), (650.0, 400.0, 125.0));
+
+        // AC start point (324.65, 29.0, 649.5) is safely inside all three boxes.
+        let s = start(&disc, "m4000", Some("actest")).unwrap().unwrap();
+        assert_eq!(bounds.zone(s.position), AreaZone::Inside);
+
+        // Moving past caution (+660 m from center X=804 -> x=1464) triggers Caution (`LIMIT OF AREA`).
+        assert_eq!(bounds.zone(Vec3::new(1464.0, 30.0, 609.35)), AreaZone::Caution);
+        // Moving past warning (+685 m -> x=1489) triggers Warning (`LIMIT OF AREA`).
+        assert_eq!(bounds.zone(Vec3::new(1489.0, 30.0, 609.35)), AreaZone::Warning);
+        // Moving past operation (+720 m -> x=1524) is Outside and gets cleanly clamped back in.
+        let mut p = Vec3::new(1524.0, 30.0, 609.35);
+        let mut v = Vec3::new(2.0, 0.0, 0.5);
+        assert_eq!(bounds.enforce(&mut p, &mut v), AreaZone::Outside);
+        assert!(p.x <= 804.0 + 700.0 - 0.99, "clamped x = {}", p.x);
+        assert_eq!(v.x, 0.0, "outward velocity zeroed");
+        assert_eq!(v.z, 0.5, "tangential velocity preserved");
     }
 }

@@ -24,8 +24,31 @@ pub const MAGIC: u32 = 0x0098_9A6A;
 /// Section version of the `ch_env/*_env.msb` files (`crate::env`).
 pub const MAGIC_ENV: u32 = 0x0098_9A6C;
 
+/// `POINT_PARAM_ST` kind of a water return point (水没復帰).
+pub const POINT_WATER_RETURN: u32 = 50;
+/// `POINT_PARAM_ST` kind of the outer operation area (作戦領域).
+pub const POINT_OPERATION_AREA: u32 = 100;
+/// `POINT_PARAM_ST` kind of the warning area (警告領域).
+pub const POINT_WARNING_AREA: u32 = 101;
+/// `POINT_PARAM_ST` kind of the caution area (注意領域).
+pub const POINT_CAUTION_AREA: u32 = 102;
 /// `POINT_PARAM_ST` kind of a start position.
 pub const POINT_START: u32 = 200;
+
+/// Decoded shape payload at `POINT_PARAM_ST +0x38` (`m4000_actest.msb`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum PointShape {
+    /// Shape 0/1: dimensionless point.
+    Point,
+    /// Shape 2: sphere (`f32 radius`).
+    Sphere { radius: f32 },
+    /// Shape 4: cylinder (`f32 radius`, `f32 height`).
+    Cylinder { radius: f32, height: f32 },
+    /// Shape 5: box (`f32 width` X, `f32 depth` Z, `f32 height` Y).
+    Box { width: f32, depth: f32, height: f32 },
+    /// Any other shape kind.
+    Other(u32),
+}
 
 /// `MODEL_PARAM_ST` record (`0x8280d4c8`) and its `+0x14` draw sub-record (`0x829a5e60`) /
 /// `+0x18` AC sub-record (`0x82b91348` → `0x82b91470`).
@@ -84,6 +107,8 @@ pub struct Point {
     /// Index among the points of the same kind.
     pub kind_index: u32,
     pub shape: u32,
+    /// Shape dimensions decoded from `POINT_PARAM_ST +0x38` sub-record.
+    pub shape_data: PointShape,
     pub translation: [f32; 3],
     pub rotation_deg: [f32; 3],
 }
@@ -284,13 +309,36 @@ pub fn points(data: &[u8]) -> Result<Vec<Point>> {
                 name_rel < 0x400,
                 "MSB point at {off:#x} name offset {name_rel:#x}"
             );
+            let shape = r.u32(off + 0x10)?;
+            let shape_rel = if off + 0x3C <= data.len() {
+                r.u32(off + 0x38)? as usize
+            } else {
+                0
+            };
+            let shape_data = match shape {
+                0 | 1 => PointShape::Point,
+                2 if shape_rel > 0 && off + shape_rel + 4 <= data.len() => PointShape::Sphere {
+                    radius: r.f32(off + shape_rel)?,
+                },
+                4 if shape_rel > 0 && off + shape_rel + 8 <= data.len() => PointShape::Cylinder {
+                    radius: r.f32(off + shape_rel)?,
+                    height: r.f32(off + shape_rel + 4)?,
+                },
+                5 if shape_rel > 0 && off + shape_rel + 12 <= data.len() => PointShape::Box {
+                    width: r.f32(off + shape_rel)?,
+                    depth: r.f32(off + shape_rel + 4)?,
+                    height: r.f32(off + shape_rel + 8)?,
+                },
+                other => PointShape::Other(other),
+            };
             Ok(Point {
                 name: r
                     .cstr_sjis(off + name_rel)
                     .with_context(|| format!("MSB point at {off:#x}"))?,
                 kind: r.u32(off + 8)?,
                 kind_index: r.u32(off + 0x0C)?,
-                shape: r.u32(off + 0x10)?,
+                shape,
+                shape_data,
                 translation: vec3(&r, off + 0x14)?,
                 rotation_deg: vec3(&r, off + 0x20)?,
             })
@@ -366,13 +414,57 @@ mod tests {
             return;
         };
         let data = crate::vfs::open(&disc, "model/map/m4000/m4000_actest.msb").unwrap();
-        let start = points(&data)
-            .unwrap()
-            .into_iter()
+        let actest_points = points(&data).unwrap();
+        let start = actest_points
+            .iter()
             .find(|p| p.kind == POINT_START && p.kind_index == 0)
             .unwrap();
         assert_eq!(start.translation, [-324.65, 29.0, 649.5]);
         assert_eq!(start.rotation_deg[1], 90.0);
+        assert_eq!(
+            start.shape_data,
+            PointShape::Cylinder {
+                radius: 10.0,
+                height: 10.0
+            }
+        );
+        let op_area = actest_points
+            .iter()
+            .find(|p| p.kind == POINT_OPERATION_AREA)
+            .unwrap();
+        assert_eq!(op_area.translation, [-804.0, -15.0, 609.35]);
+        assert_eq!(
+            op_area.shape_data,
+            PointShape::Box {
+                width: 1400.0,
+                depth: 900.0,
+                height: 225.0
+            }
+        );
+        let warn_area = actest_points
+            .iter()
+            .find(|p| p.kind == POINT_WARNING_AREA)
+            .unwrap();
+        assert_eq!(
+            warn_area.shape_data,
+            PointShape::Box {
+                width: 1350.0,
+                depth: 850.0,
+                height: 175.0
+            }
+        );
+        let caution_area = actest_points
+            .iter()
+            .find(|p| p.kind == POINT_CAUTION_AREA)
+            .unwrap();
+        assert_eq!(
+            caution_area.shape_data,
+            PointShape::Box {
+                width: 1300.0,
+                depth: 800.0,
+                height: 125.0
+            }
+        );
         let layer_list = layers(&data).unwrap();
         let layer_names: Vec<&str> = layer_list.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(

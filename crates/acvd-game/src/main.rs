@@ -222,6 +222,13 @@ fn main() {
         position: Vec3::ZERO,
         yaw: 0.0,
     });
+    let area_bounds = match map.as_deref().filter(|_| !plane) {
+        Some(id) => map::AreaBounds::load(&disc, id, layout.as_deref()).unwrap_or_else(|e| {
+            eprintln!("map {id} area bounds: {e:#}");
+            map::AreaBounds::default()
+        }),
+        None => map::AreaBounds::default(),
+    };
     if let Some(y) = water {
         collision.planes.push(Plane {
             y,
@@ -273,6 +280,7 @@ fn main() {
     })
     .insert_resource(StartYaw(yaw))
     .insert_resource(start)
+    .insert_resource(area_bounds)
     .insert_resource(Scene {
         map: map.filter(|_| !plane && !hits),
         layout: layout.filter(|_| !plane),
@@ -327,6 +335,7 @@ fn main() {
             hud::scan_hud,
             hud::recon_hud,
             hud::stagger_hud,
+            hud::area_warning_hud,
         )
             .chain()
             .after(weapons::tick_player_health),

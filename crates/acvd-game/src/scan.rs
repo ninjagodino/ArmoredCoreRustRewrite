@@ -30,7 +30,7 @@ use acvd_data::{find, part_field};
 use acvd_render::Packs;
 use bevy::prelude::*;
 
-use crate::collision::Collision;
+use crate::collision::{Collision, RayFilter};
 use crate::control::{Held, Pilot, Piloting};
 use crate::fcs;
 use crate::targets::{Target, TargetHealth};
@@ -308,14 +308,10 @@ impl ReconUnit {
                     // `BulletReconSt.gravity` is in m/s per 60 Hz tick (same scale as rigid bullets).
                     self.velocity.y -= self.gravity * TICK_RATE * dt;
                     let next = *pos + self.velocity * dt;
-                    if let Some(ground_y) = collision.ground_below(next + Vec3::Y * 1.0) {
-                        if next.y <= ground_y + 0.15 {
-                            *pos = Vec3::new(next.x, ground_y + 0.15, next.z);
-                            self.velocity = Vec3::ZERO;
-                            self.stuck = true;
-                        } else {
-                            *pos = next;
-                        }
+                    if let Some((_, hit, normal)) = collision.raycast(*pos, next, RayFilter::Bullet) {
+                        *pos = hit + normal * 0.15;
+                        self.velocity = Vec3::ZERO;
+                        self.stuck = true;
                     } else {
                         *pos = next;
                     }

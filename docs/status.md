@@ -22,10 +22,9 @@ Rough priority order; reorder freely.
 "AC test scene"). Gameplay should match the 360 build; menus may stay partial. Tasks toward it,
 in order:
 
-- **Map look**: lighting / fog / sky / tone map / per-draw light-set ids are in (see below);
+- **Map look**: lighting / fog / sky / tone map / per-draw light-set ids and area bounds (POINT kinds 100-102) are in (see below);
   still open: broken models (`_b.flv` / `_b_h.hmd`), the `movie` texture (a runtime video
-  surface), the area bounds (POINT kinds 100-102: operation / warning / caution area) and the
-  water return point (kind 50).
+  surface), and the water return point (kind 50).
   - Done: `acvd-formats::env` reads `ch_env/*_env.msb` (MSB chain at version 0x00989A6C,
     EVENT_PARAM_ST only); `sheets/map_env.csv` has every field, the shader constants built from
     it (0x82c2bc48 lights, 0x82c2b4d8 fog, 0x82bd2268 gamma) and the Flver_ColDif pixel-shader
@@ -279,6 +278,13 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **3D Terrain Raycasting (FCS `LockCheckRay` LOS, Projectile/Missile Wall Hits, AI Sightlines) & Map Area Bounds** (`acvd-formats::msb`, `acvd-game::collision`, `fcs`, `weapons`, `scan`, `ai`, `map`, `control`, `hud`, `main`, `sheets/hmd.csv`, `sheets/systems.csv`):
+  - **360 HMD collision filter & `LockCheckRay` (`ACV2.pe`, `sheets/hmd.csv`)**: traced HMD material mask table `0x8371d460` (`0x82b9db78` → `0x82b9dc38` → `0x82c52498`: `0x00` solid terrain, `0x02` `water`/`ashore`, `0x04` wire, `0x08` `camera`, `0x10` `enehit`, `0x20` `plyerhit`, `0x60` `ackickrhit`), `LockCheckRay` (`0x829c5f20` → `0x829c5e30` → `0x82b9df28`, filter `0x80100006`; mode 1 `0x829c5c00` for FCS `0x829d8d58` skips map objects with `AcObjectParam.camera_collidable == 0` `0x829aabc8`; mode 2 `0x829c5cd0` for AI also skips `AcObjectParam.b_look_line_penetrate != 0` `0x829aacb8`), and bullet/missile raycast (`0x828eea28` → `0x82b9df28`, filter `0x00100004`, solid terrain + water).
+  - **Accelerated 3D BVH raycast (`collision.rs`)**: flat binary BVH built once at map load over all 42,384 `m4000` HMD triangles, exposing `Collision::raycast(origin, end, filter)` and early-out `Collision::has_los(origin, end, filter)` with `RayFilter::{FcsLos, AiLos, Bullet, Ground}` and zero per-ray heap allocation; verified exact equivalence vs brute force on synthetic scenes and `m4000`.
+  - **FCS LOS, Projectile/Missile/Recon wall hits, AI LOS**: `fcs::update` gates Combat Mode primary and multi-lock missile targets on `LockCheckRay` (`RayFilter::FcsLos`) while Scan Mode + Recon-detected targets remain marked through cover (`scan.rs`); `weapons::step_projectiles`, `weapons::step_missiles`, and sticky `scan::ReconUnit::step` raycast `prev -> next` (`RayFilter::Bullet`) so shots/missiles detonate on buildings/walls with surface-normal-oriented impact FFX + hit SE; `ai::update` gates enemy/test-AC visual detection and weapon firing on `RayFilter::AiLos` (cancelling mid-burst when occluded).
+  - **Map Area Bounds (`POINT_PARAM_ST` kinds `100`–`102`)**: `acvd-formats::msb` decodes `+0x38` `PointShape` payloads (sphere/cylinder/box; `m4000_actest.msb` boxes at `(-804, -15, 609.35)`: Operation `100` `[1400, 900, 225]`, Warning `101` `[1350, 850, 175]`, Caution `102` `[1300, 800, 125]`). `map::AreaBounds` + `control::pilot` cleanly clamp the AC inside the operation area (zeroing outward velocity) and `hud::area_warning_hud` displays pulsing `LIMIT OF AREA` / `OUTSIDE OF AREA` warnings (`manual.fmg` 20500, `AreaOverLine` `0x825b3678`).
+  - Verified visually on `m4000` (`private/shots/raycast_wall_hit.png`: rifle shots impacting buildings with orange explosion/sparks) and with workspace unit tests (`acvd-formats` 57, `acvd-game` 90, `acvd-sheets all` 0 errors, `acvd-index audit` 0 mismatches).
 
 - **Boost Charge Kick & Melee Blades** (`acvd-game::damage`, `control`, `weapons`, `hud`, `sfx`, `sound`, `ai`, `main`, `sheets/tuning_fields.csv`, `sheets/ac_part_fields.csv`, `sheets/ac_ctrl_calc.csv`, `sheets/ac_states.csv`):
   - **Boost Charge Kick** (`KickState` vtable `0x820928d0`, ctor `0x8283f8a8`, update `0x82844570` → `0x8283e1f0` / `0x828433a0`; `AcMove_boostChargeKick` `0x82823740`):

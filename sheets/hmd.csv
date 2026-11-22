@@ -22,3 +22,6 @@ node_aabb,node+0x08,f32x3 min + f32x3 max,local space
 tri_vert,tri+0x00,u16x3,vertex = value>>1; low bit kept (27150 set bits across m3100)
 tri_unk,tri+0x06,u16,unique count close to nt; not a vertex index
 tri_material,tri+0x08,u16,0 or 1 on two-material files; indexes the name table (sand/concrete/iron/clay/plyerhit/ackickrhit/camera.tga)
+material_mask_table,0x8371d460,27 x 0x10 bytes,"360 HMD material table (0x82b9db78 -> 0x82b9dc38 -> 0x82c52498): +0x08 mask byte = 0x00 solid (stone/glass/concrete/ice/sand/iron/clay/snow/virtual/building/spark/bottomwater/bog/dmgfloor), 0x02 water/ashore, 0x04 wire (entry 9), 0x08 camera, 0x10 enehit, 0x20 plyerhit, 0x60 ackickrhit"
+ray_filter_fcs_los,0x829c5e30,u32 0x80100006,"LockCheckRay (0x829c5f20 -> 0x829c5e30 -> 0x82b9df28): solid terrain (mask 0x00), excludes water (0x02) and wire (0x04); mode 1 (0x829c5c00, FCS 0x829d8d58) skips map objects with AcObjectParam.camera_collidable == 0 (0x829aabc8); mode 2 (0x829c5cd0, AI sightlines) also skips AcObjectParam.b_look_line_penetrate != 0 (0x829aacb8)"
+ray_filter_bullet,0x828eea28,u32 0x00100004,"Bullet/missile raycast (0x828eea28 -> 0x82b9df28): solid terrain and water, excludes wire (0x04) and invisible camera/enehit/plyerhit/ackickrhit (0x08|0x10|0x20|0x40)"

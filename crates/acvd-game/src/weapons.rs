@@ -45,7 +45,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use crate::assemble::Placement;
-use crate::collision::{Collision, RAY_HALF};
+use crate::collision::{Collision, RayFilter, RAY_HALF};
 use crate::control::{BladeLaunch, BladePhase, Held, Pilot, Piloting};
 use crate::damage::{self, DamageType, PlayerHealth, SpeedWeightScale};
 use crate::hud::Status;
@@ -1348,17 +1348,7 @@ pub fn step_projectiles(
         let prev = transform.translation;
         let next = prev + delta;
 
-        let ground = collision
-            .ground_below(prev)
-            .filter(|&g| delta.y < 0.0 && next.y <= g)
-            .map(|g| {
-                let t = if delta.y.abs() > 1e-6 {
-                    ((g - prev.y) / delta.y).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                (t, Vec3::new(prev.x + delta.x * t, g, prev.z + delta.z * t))
-            });
+        let terrain = collision.raycast(prev, next, RayFilter::Bullet);
 
         match shot.owner {
             Owner::Player => {
@@ -1380,7 +1370,7 @@ pub fn step_projectiles(
                     }
                 }
                 if let Some((t_hit, pos, normal, t_entity)) = best_target {
-                    if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                    if terrain.is_none_or(|(t_g, _, _)| t_hit <= t_g) {
                         if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
                             let (power, recoil) = shot.effective_damage();
                             let (res, lethal) = health.apply_hit(shot.damage_type, power, recoil);
@@ -1445,7 +1435,7 @@ pub fn step_projectiles(
                             }
                         }
                         if let Some((t_hit, pos, normal)) = best {
-                            if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                            if terrain.is_none_or(|(t_g, _, _)| t_hit <= t_g) {
                                 let (power, recoil) = shot.effective_damage();
                                 let (res, lethal) =
                                     health.apply_hit(shot.damage_type, power, recoil);
@@ -1497,13 +1487,21 @@ pub fn step_projectiles(
             }
         }
 
-        if let Some((_, at)) = ground {
+        if let Some((_, at, normal)) = terrain {
             if shot.hit > 0 {
                 commands.spawn((
                     Sfx::new(shot.hit),
                     Transform::from_translation(at)
-                        .with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
+                        .with_rotation(Quat::from_rotation_arc(Vec3::Z, normal)),
                 ));
+            }
+            if shot.hit_se.low > 0 {
+                sound::cue(
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    &format!("w{:08}", shot.hit_se.low),
+                );
             }
             commands.entity(e).despawn();
             continue;
@@ -1572,17 +1570,7 @@ pub fn step_missiles(
             .proximity_fuse_range
             .max(missile.flight.hit_radius.min(2.0));
 
-        let ground = collision
-            .ground_below(prev)
-            .filter(|&g| delta.y < 0.0 && next.y <= g)
-            .map(|g| {
-                let t = if delta.y.abs() > 1e-6 {
-                    ((g - prev.y) / delta.y).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                (t, Vec3::new(prev.x + delta.x * t, g, prev.z + delta.z * t))
-            });
+        let terrain = collision.raycast(prev, next, RayFilter::Bullet);
 
         match missile.owner {
             Owner::Player => {
@@ -1603,7 +1591,7 @@ pub fn step_missiles(
                     }
                 }
                 if let Some((t_hit, pos, normal, t_entity)) = best_target {
-                    if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                    if terrain.is_none_or(|(t_g, _, _)| t_hit <= t_g) {
                         if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
                             let (power, recoil) = missile.effective_damage();
                             let (res, lethal) =
@@ -1679,7 +1667,7 @@ pub fn step_missiles(
                             }
                         }
                         if let Some((t_hit, pos, normal)) = best {
-                            if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                            if terrain.is_none_or(|(t_g, _, _)| t_hit <= t_g) {
                                 let (power, recoil) = missile.effective_damage();
                                 let (res, lethal) =
                                     health.apply_hit(missile.damage_type, power, recoil);
@@ -1739,7 +1727,7 @@ pub fn step_missiles(
             }
         }
 
-        if let Some((_, at)) = ground {
+        if let Some((_, at, normal)) = terrain {
             let ffx = if missile.hit > 0 {
                 missile.hit
             } else {
@@ -1749,8 +1737,16 @@ pub fn step_missiles(
                 commands.spawn((
                     Sfx::new(ffx),
                     Transform::from_translation(at)
-                        .with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
+                        .with_rotation(Quat::from_rotation_arc(Vec3::Z, normal)),
                 ));
+            }
+            if missile.hit_se.low > 0 {
+                sound::cue(
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    &format!("w{:08}", missile.hit_se.low),
+                );
             }
             commands.entity(e).despawn();
             continue;
@@ -3615,5 +3611,44 @@ mod tests {
         let mut tank2 = TargetHealth::from_enemy("e1020");
         let (res_l, lethal_l) = tank2.apply_hit(lb.damage_type, lb.damage_power, lb.damage_recoil);
         assert!(res_l.effective && lethal_l && tank2.destroyed, "Laser Blade must destroy tank");
+    }
+
+    #[test]
+    fn projectile_raycast_impacts_vertical_wall() {
+        use crate::collision::Hit;
+        // Vertical concrete wall at z = -30 m, 20 m tall.
+        let wall = Collision::with_hits(
+            Vec::new(),
+            vec![
+                Hit::solid(
+                    Vec3::new(-20.0, 0.0, -30.0),
+                    Vec3::new(20.0, 0.0, -30.0),
+                    Vec3::new(-20.0, 20.0, -30.0),
+                ),
+                Hit::solid(
+                    Vec3::new(20.0, 0.0, -30.0),
+                    Vec3::new(20.0, 20.0, -30.0),
+                    Vec3::new(-20.0, 20.0, -30.0),
+                ),
+            ],
+        );
+        let rifle = gun(1720);
+        let mut shot = Projectile::from_gun(&rifle, Vec3::NEG_Z);
+        let mut pos = Vec3::new(0.0, 5.0, 0.0);
+        let mut hit = None;
+        for _ in 0..120 {
+            let Some(delta) = shot.step(1.0 / 60.0) else {
+                break;
+            };
+            let next = pos + delta;
+            if let Some((_, at, normal)) = wall.raycast(pos, next, RayFilter::Bullet) {
+                hit = Some((at, normal));
+                break;
+            }
+            pos = next;
+        }
+        let (at, normal) = hit.expect("projectile must impact vertical wall instead of clipping");
+        assert!((at.z - (-30.0)).abs() < 1e-3, "impact at {at}");
+        assert!((normal - Vec3::Z).length() < 1e-3, "wall normal {normal}");
     }
 }
