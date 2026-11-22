@@ -390,10 +390,13 @@ pub(crate) fn apply_env_file(
             return None;
         }
     };
-    if let Some(s) = env.scene {
+    if let Some(s) = env.scene.as_ref() {
         commands.insert_resource(ClearColor(Color::srgb_u8(
             s.clear[0], s.clear[1], s.clear[2],
         )));
+        crate::lens_flare::set_active(commands, s.lens_flare.clone());
+    } else {
+        crate::lens_flare::clear_active(commands);
     }
     if let Some(ac) = env.light(SET_AC) {
         for (i, (mut light, mut xf)) in lights.iter_mut().enumerate().take(2) {
@@ -411,7 +414,11 @@ pub(crate) fn apply_env_file(
             ..default()
         });
     }
-    let bloom = env.scene.map(|s| s.tonemap.bloom).and_then(bevy_bloom);
+    let bloom = env
+        .scene
+        .as_ref()
+        .map(|s| s.tonemap.bloom)
+        .and_then(bevy_bloom);
     for camera in cameras {
         let mut cam = commands.entity(camera);
         cam.insert((Hdr, Tonemapping::None));
@@ -464,6 +471,7 @@ pub(crate) fn load_map_env(
 /// Removes active sortie map-env relighting state (e.g. when returning to the 3D garage).
 pub(crate) fn clear_map_env(commands: &mut Commands) {
     commands.remove_resource::<MapEnv>();
+    crate::lens_flare::clear_active(commands);
 }
 
 fn load(
@@ -517,7 +525,7 @@ fn relight(
             .as_ref()
             .map(|p| p.model.clone())
             .unwrap_or_default();
-        let tm = tonemap_vec(env.env.scene.map(|s| s.tonemap).unwrap_or_default());
+        let tm = tonemap_vec(env.env.scene.as_ref().map(|s| s.tonemap).unwrap_or_default());
         if model.starts_with('o') {
             let sky = env
                 .skies
@@ -546,7 +554,7 @@ fn relight(
                     .remove::<MeshMaterial3d<StandardMaterial>>()
                     .insert(MeshMaterial3d(sky));
                 if msb_part.as_ref().is_some_and(|p| p.follow_camera_xz) {
-                    let scale = env.env.scene.map_or(1.0, |s| s.sky_scale);
+                    let scale = env.env.scene.as_ref().map_or(1.0, |s| s.sky_scale);
                     commands.entity(part).insert(SkyDome {
                         y: part_xf.translation.y,
                         scale,

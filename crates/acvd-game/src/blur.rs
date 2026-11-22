@@ -12,7 +12,9 @@ use bevy::shader::ShaderRef;
 /// it by the source texture's width).
 const FRAME_WIDTH: f32 = 1280.0;
 
-/// Zoom-blur parameters for one camera, as 360 0x82c97ff8 / 0x82c98368 hand them to the shaders.
+/// Speed blur + crepuscular god-ray parameters for one camera (`ZoomBlur` 360 `0x82c97ff8` /
+/// `0x82c98368` and `LensFlareGodRay` 360 `0x82c9f9f0`), combined into a single
+/// `FullscreenMaterial` pass so Bevy 0.19's shared fullscreen bind group never collides.
 #[derive(Component, ExtractComponent, Clone, Copy, ShaderType, Default)]
 pub struct ZoomBlur {
     /// Tap spacing in UV per unit of distance from the centre: BlurOffset x intensity / width.
@@ -23,6 +25,9 @@ pub struct ZoomBlur {
     thin: f32,
     /// BlurNoEffectSizeX / Y: the centre rectangle that is copied unblurred, as a share of the screen.
     no_effect: Vec2,
+    /// Crepuscular god-ray radial blur + merge (`LensFlareGodRay*PS`, updated each frame in
+    /// `PostUpdate` by `lens_flare::update_lens_flare`).
+    pub god_ray: crate::lens_flare::GodRayFilter,
 }
 
 impl ZoomBlur {
@@ -32,6 +37,7 @@ impl ZoomBlur {
             alpha: f32::from(alpha) / 255.0,
             thin,
             no_effect,
+            god_ray: crate::lens_flare::GodRayFilter::default(),
         }
     }
 }

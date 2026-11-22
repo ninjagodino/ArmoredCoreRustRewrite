@@ -1379,6 +1379,10 @@ impl Pilot {
             * Quat::from_rotation_x(self.cam.pitch)
             * FORWARD
     }
+
+    pub fn set_pitch(&mut self, pitch: f32) {
+        self.cam.pitch = pitch;
+    }
 }
 
 /// Mouselook (M): camera yaw / pitch radians per pixel of mouse motion.

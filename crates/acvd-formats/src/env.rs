@@ -142,8 +142,141 @@ impl Default for ToneMap {
     }
 }
 
-/// The type-101 scene record's sub-blocks (`0x827ffa80`).
+/// One of the 4 primary glare/streak sprite slots in type-101 sub-block 3 (`+0x34..+0x44`,
+/// unpacked by `0x827fc664..0x827fc820` into `m_LensFlare + 0x4b4`, drawn by `0x82c9f5b0`).
 #[derive(Debug, Clone, Copy, Serialize)]
+pub struct FlareGlare {
+    /// `+0x00`: texture index in `lensflare.tpf` (`lf00`..`lf10`), `< 0` disables the slot.
+    pub tex_id: i32,
+    /// `+0x04`: `u8` alpha scaled by `1/255`.
+    pub alpha: f32,
+    /// `+0x08`: sprite size multiplier.
+    pub scale: f32,
+    /// `+0x0c`: nonzero scales size by the flare visibility factor (`r26+0xa0`).
+    pub scale_by_vis: bool,
+    /// `+0x0d`: nonzero rotates the sprite toward screen centre (`atan2`).
+    pub rotate: bool,
+    /// `+0x0e`: mode/blend flag (`r31-0x08`).
+    pub mode: u8,
+}
+
+/// One of the 18 axis-aligned ghost sprite slots in type-101 sub-block 3 (`+0x44..+0x8c`,
+/// unpacked by `0x827fc824..0x827fcc34` into `m_LensFlare + 0x17c`, drawn by `0x82ca0370`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct FlareGhost {
+    /// `+0x00`: texture index in `lensflare.tpf` (`lf00`..`lf10`), `< 0` disables the slot.
+    pub tex_id: i32,
+    /// `+0x04`: `u8` alpha scaled by `1/255`.
+    pub alpha: f32,
+    /// `+0x08`: sprite size multiplier.
+    pub scale: f32,
+    /// `+0x0c`: position along the sun-to-mirrored-opposite axis (`0.0` = sun, `0.5` = centre,
+    /// `1.0` = opposite point across screen centre).
+    pub axis_pos: f32,
+    /// `+0x10`: nonzero rotates the sprite toward screen centre (`atan2`).
+    pub rotate: bool,
+    /// `+0x11`: nonzero selects the secondary visibility scale (`r30+0xa4` vs `+0xa0`).
+    pub alt_scale: bool,
+}
+
+/// Crepuscular god-ray radial blur parameters from type-101 sub-block 3 (`+0x8c`, unpacked by
+/// `0x827fcc38..0x827fcd38` into `m_LensFlare + 0x564`, executed by `0x82c9f9f0`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct GodRay {
+    /// `+0x00`: emitter texture index (`0xffff` / `< 0` disables god rays).
+    pub tex_id: i16,
+    /// `+0x04`: emitter sprite size scale (`r30+0x0c`).
+    pub emitter_scale: f32,
+    /// `+0x08`: emitter depth bias / z param (`r30+0x24`).
+    pub emitter_depth_bias: f32,
+    /// `+0x0c..+0x0f`: emitter sprite RGBA tint (0..255).
+    pub emitter_color: [u8; 4],
+    /// `+0x10..+0x1c`: radial-blur PS `c29` (`density, weight, decay, exposure`).
+    pub blur_params: [f32; 4],
+    /// `+0x20`: merge pass intensity multiplier (`c28.x = merge_intensity * visibility`).
+    pub merge_intensity: f32,
+    /// `+0x24`: sample-count selector (`0` = 12 taps, `1` = 16 taps, `2` = 20 taps).
+    pub sample_mode: u8,
+    /// `+0x26`: merge shader selector (`0` = Add, `1` = Modulate, `2` = Transparent).
+    pub merge_mode: u8,
+    /// `+0x28..+0x2b`: merge tint RGBA (0..255; `.rgb / 255` uploaded to `c28.yzw`).
+    pub merge_color: [u8; 4],
+}
+
+impl Default for GodRay {
+    fn default() -> Self {
+        Self {
+            tex_id: -1,
+            emitter_scale: 1.0,
+            emitter_depth_bias: 0.0,
+            emitter_color: [0; 4],
+            blur_params: [0.0; 4],
+            merge_intensity: 0.0,
+            sample_mode: 0,
+            merge_mode: 0,
+            merge_color: [0; 4],
+        }
+    }
+}
+
+/// Dirty-lens dust overlay (`lfdust`) from type-101 sub-block 3 (`+0x90`, unpacked by
+/// `0x827fcd3c..0x827fcde8` into `m_LensFlare + 0x5dc`, drawn by `0x82ca1510`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct LensDust {
+    /// `+0x00`, `+0x04`: top-left screen offset in 720p pixels (default `0, 0`).
+    pub pos: [f32; 2],
+    /// `+0x08`, `+0x0c`: quad size in 720p pixels (default `512, 512`).
+    pub size: [f32; 2],
+    /// `+0x10..+0x13`: RGBA tint (0..255; default `[255, 255, 255, 0]`).
+    pub color: [u8; 4],
+}
+
+impl Default for LensDust {
+    fn default() -> Self {
+        Self {
+            pos: [0.0, 0.0],
+            size: [512.0, 512.0],
+            color: [255, 255, 255, 0],
+        }
+    }
+}
+
+/// Lens-flare, god-ray, and lens-dust block from type-101 sub-block 3 (`data + u32_be(data + 0xc)`,
+/// unpacked by `0x827fc548` -> `0x82800350` into `m_LensFlare` at `0x83a8b220`).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct LensFlare {
+    /// `+0x00`: nonzero enables the lens-flare / god-ray / dust pipeline.
+    pub enabled: bool,
+    /// `+0x04`, `+0x08`: sun/flare pitch and yaw in degrees (converted to radians by `0x827fc620`).
+    pub angles_deg: [f32; 2],
+    /// `+0x0c..+0x18`: primary glare RGBA (0..255 floats in file, divided by 255).
+    pub glare_color: [f32; 4],
+    /// `+0x1c..+0x28`: ghost chain RGBA (0..255 floats in file, divided by 255).
+    pub ghost_color: [f32; 4],
+    /// `+0x2c`: glare alpha flicker amplitude (`r26+0x48`).
+    pub glare_flicker: f32,
+    /// `+0x30`: ghost alpha flicker amplitude (`r30+0x4c`).
+    pub ghost_flicker: f32,
+    /// `+0x34..+0x44`: up to 4 primary glare/streak slots.
+    pub glares: Vec<FlareGlare>,
+    /// `+0x44..+0x8c`: up to 18 ghost chain slots.
+    pub ghosts: Vec<FlareGhost>,
+    /// `+0x8c`: god-ray radial-blur configuration.
+    pub god_ray: GodRay,
+    /// `+0x90`: dirty-lens dust overlay configuration.
+    pub dust: LensDust,
+}
+
+impl LensFlare {
+    /// Unit vector toward the flare source in game axes: `(-cos p * sin y, sin p, -cos p * cos y)`.
+    pub fn direction(&self) -> [f32; 3] {
+        let [p, y] = self.angles_deg.map(|a| a.to_radians());
+        [-p.cos() * y.sin(), p.sin(), -p.cos() * y.cos()]
+    }
+}
+
+/// The type-101 scene record's sub-blocks (`0x827ffa80`).
+#[derive(Debug, Clone, Serialize)]
 pub struct Scene {
     /// Bytes 0..3 of the first sub-block, RGB 0-255.
     pub clear: [u8; 3],
@@ -157,6 +290,8 @@ pub struct Scene {
     pub sky_scale: f32,
     /// Second sub-block (`data + 8`), tone-map parameters.
     pub tonemap: ToneMap,
+    /// Third sub-block (`data + 0xc`), lens-flare, god-ray, and lens-dust parameters.
+    pub lens_flare: LensFlare,
 }
 
 /// Type-400 BGM event data (`0x82800128`: `+0x00` → `r31+0x50`, `+0x04` → `+0x90`, `+0x08` → `+0x94`).
@@ -213,6 +348,118 @@ fn light(r: &Be, name: String, d: usize) -> Result<LightSet> {
     })
 }
 
+fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
+    if s3 + 0x94 > len {
+        return Ok(LensFlare::default());
+    }
+    let enabled = r.u32(s3)? != 0;
+    if !enabled {
+        return Ok(LensFlare::default());
+    }
+    const INV255: f32 = 1.0 / 255.0;
+    let angles_deg = [r.f32(s3 + 4)?, r.f32(s3 + 8)?];
+    let glare_color = [
+        r.f32(s3 + 0x0c)? * INV255,
+        r.f32(s3 + 0x10)? * INV255,
+        r.f32(s3 + 0x14)? * INV255,
+        r.f32(s3 + 0x18)? * INV255,
+    ];
+    let ghost_color = [
+        r.f32(s3 + 0x1c)? * INV255,
+        r.f32(s3 + 0x20)? * INV255,
+        r.f32(s3 + 0x24)? * INV255,
+        r.f32(s3 + 0x28)? * INV255,
+    ];
+    let glare_flicker = r.f32(s3 + 0x2c)?;
+    let ghost_flicker = r.f32(s3 + 0x30)?;
+
+    let mut glares = Vec::new();
+    for i in 0..4 {
+        let rel = r.u32(s3 + 0x34 + i * 4)? as usize;
+        if rel > 0 && s3 + rel + 0x10 <= len {
+            let p = s3 + rel;
+            let tex_id = r.i32(p)?;
+            if tex_id >= 0 {
+                glares.push(FlareGlare {
+                    tex_id,
+                    alpha: r.u8(p + 4)? as f32 * INV255,
+                    scale: r.f32(p + 8)?,
+                    scale_by_vis: r.u8(p + 0x0c)? != 0,
+                    rotate: r.u8(p + 0x0d)? != 0,
+                    mode: r.u8(p + 0x0e)?,
+                });
+            }
+        }
+    }
+
+    let mut ghosts = Vec::new();
+    for i in 0..18 {
+        let rel = r.u32(s3 + 0x44 + i * 4)? as usize;
+        if rel > 0 && s3 + rel + 0x12 <= len {
+            let p = s3 + rel;
+            let tex_id = r.i32(p)?;
+            if tex_id >= 0 {
+                ghosts.push(FlareGhost {
+                    tex_id,
+                    alpha: r.u8(p + 4)? as f32 * INV255,
+                    scale: r.f32(p + 8)?,
+                    axis_pos: r.f32(p + 0x0c)?,
+                    rotate: r.u8(p + 0x10)? != 0,
+                    alt_scale: r.u8(p + 0x11)? != 0,
+                });
+            }
+        }
+    }
+
+    let gr_rel = r.u32(s3 + 0x8c)? as usize;
+    let god_ray = if gr_rel > 0 && s3 + gr_rel + 0x2c <= len {
+        let p = s3 + gr_rel;
+        GodRay {
+            tex_id: r.u32(p)? as i16,
+            emitter_scale: r.f32(p + 4)?,
+            emitter_depth_bias: r.f32(p + 8)?,
+            emitter_color: [r.u8(p + 0x0c)?, r.u8(p + 0x0d)?, r.u8(p + 0x0e)?, r.u8(p + 0x0f)?],
+            blur_params: [
+                r.f32(p + 0x10)?,
+                r.f32(p + 0x14)?,
+                r.f32(p + 0x18)?,
+                r.f32(p + 0x1c)?,
+            ],
+            merge_intensity: r.f32(p + 0x20)?,
+            sample_mode: r.u16(p + 0x24)? as u8,
+            merge_mode: r.u16(p + 0x26)? as u8,
+            merge_color: [r.u8(p + 0x28)?, r.u8(p + 0x29)?, r.u8(p + 0x2a)?, r.u8(p + 0x2b)?],
+        }
+    } else {
+        GodRay::default()
+    };
+
+    let dust_rel = r.u32(s3 + 0x90)? as usize;
+    let dust = if dust_rel > 0 && s3 + dust_rel + 0x14 <= len {
+        let p = s3 + dust_rel;
+        LensDust {
+            pos: [r.f32(p)?, r.f32(p + 4)?],
+            size: [r.f32(p + 8)?, r.f32(p + 0x0c)?],
+            color: [r.u8(p + 0x10)?, r.u8(p + 0x11)?, r.u8(p + 0x12)?, r.u8(p + 0x13)?],
+        }
+    } else {
+        LensDust::default()
+    };
+
+    Ok(LensFlare {
+        enabled,
+        angles_deg,
+        glare_color,
+        ghost_color,
+        glare_flicker,
+        ghost_flicker,
+        glares,
+        ghosts,
+        god_ray,
+        dust,
+    })
+}
+
 pub fn read(data: &[u8]) -> Result<Env> {
     let r = Be(data);
     ensure!(r.u32(0)? == msb::MAGIC_ENV, "not an env MSB");
@@ -265,12 +512,19 @@ pub fn read(data: &[u8]) -> Result<Env> {
                 } else {
                     ToneMap::default()
                 };
+                let sub3_rel = r.u32(e.data + 0x0c)? as usize;
+                let lens_flare = if sub3_rel > 0 {
+                    lens_flare(&r, e.data + sub3_rel, data.len())?
+                } else {
+                    LensFlare::default()
+                };
                 env.scene = Some(Scene {
                     clear: [r.u8(sub)?, r.u8(sub + 1)?, r.u8(sub + 2)?],
                     far: r.f32(sub + 4)?,
                     water_height: r.f32(sub + 8)?,
                     sky_scale: Some(r.f32(sub + 0x1c)?).filter(|&s| s > 0.0).unwrap_or(1.0),
                     tonemap,
+                    lens_flare,
                 });
             }
             EVENT_BGM if env.bgm.is_none() && e.data + 12 <= data.len() => {
@@ -332,7 +586,7 @@ mod tests {
         );
         assert!(near(mountain.fog.height_color[3], 0.14));
 
-        let scene = env.scene.unwrap();
+        let scene = env.scene.as_ref().unwrap();
         assert_eq!(scene.clear, [0x25, 0x32, 0x31]);
         assert_eq!(scene.far, 15000.0);
         assert_eq!(scene.water_height, 3.0);
@@ -351,5 +605,64 @@ mod tests {
                 && near(scene.tonemap.bloom.blur_scale[1], 1.0)
         );
         assert!(scene.tonemap.bloom.color.iter().all(|&c| near(c, 1.0)));
+
+        let lf = &scene.lens_flare;
+        assert!(lf.enabled);
+        assert!(near(lf.angles_deg[0], 43.0) && near(lf.angles_deg[1], -160.0));
+        assert_eq!(lf.glares.len(), 4);
+        assert_eq!(lf.ghosts.len(), 6);
+        assert_eq!(lf.god_ray.tex_id, -1);
+        assert!(near(lf.god_ray.blur_params[0], 0.3));
+        assert!(near(lf.god_ray.blur_params[1], 0.98));
+        assert!(near(lf.god_ray.blur_params[2], 0.98));
+        assert!(near(lf.god_ray.blur_params[3], 1.0));
+        assert!(near(lf.dust.pos[0], -80.0) && near(lf.dust.pos[1], 98.0));
+        assert!(near(lf.dust.size[0], 752.0) && near(lf.dust.size[1], 672.0));
+        assert_eq!(lf.dust.color, [255, 255, 155, 255]);
+    }
+
+    #[test]
+    fn lensflare_assets_and_god_rays_from_disc() {
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
+        let tpf_bytes =
+            crate::vfs::open(&disc, "model/filter/lensflare/lensflare_t.bnd|lensflare.tpf")
+                .unwrap();
+        let tpf = crate::tpf::read(&tpf_bytes).unwrap();
+        let names: Vec<&str> = tpf.textures.iter().map(|t| t.name.as_str()).collect();
+        println!("lensflare.tpf ({} textures):", tpf.textures.len());
+        for t in &tpf.textures {
+            println!("  {} ({}x{}, fmt={:#x})", t.name, t.width, t.height, t.format);
+        }
+        for i in 0..=10 {
+            let expected = format!("lf{i:02}");
+            assert!(
+                names.iter().any(|n| n.eq_ignore_ascii_case(&expected)),
+                "missing {expected} in {names:?}"
+            );
+        }
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case("lfdust")));
+
+        // Scan all ch_env/*_env.msb files to verify lens_flare / god_ray parsing across maps.
+        let mut godray_maps = 0;
+        for path in disc.list("model/map/ch_env") {
+            if !path.ends_with("_env.msb") {
+                continue;
+            }
+            if let Ok(bytes) = crate::vfs::open(&disc, &path) {
+                if let Ok(env) = read(&bytes) {
+                    if let Some(sc) = &env.scene {
+                        if sc.lens_flare.enabled && sc.lens_flare.god_ray.tex_id >= 0 {
+                            godray_maps += 1;
+                            if godray_maps <= 5 {
+                                println!("god_ray map {path}: {:?}", sc.lens_flare.god_ray);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("total maps with active god_ray: {godray_maps}");
     }
 }

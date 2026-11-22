@@ -60,6 +60,7 @@ mod fcs;
 mod garage;
 mod hanger;
 mod hud;
+mod lens_flare;
 mod map;
 mod paint;
 mod pose;
@@ -128,6 +129,13 @@ struct Hud {
 #[derive(Resource)]
 struct StartYaw(f32);
 
+/// Optional explicit gameplay camera overrides (`--yaw` / `--pitch` in radians).
+#[derive(Resource, Default, Clone, Copy)]
+struct StartAim {
+    yaw: Option<f32>,
+    pitch: Option<f32>,
+}
+
 /// The map whose models are drawn (`None`: draw the hit meshes or the floor plane).
 #[derive(Resource)]
 struct Scene {
@@ -145,7 +153,8 @@ fn in_sortie(mode: Res<garage::Mode>) -> bool {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut wanted, mut disc, mut shot, mut flat, mut yaw) = (None, None, None, false, None);
+    let (mut wanted, mut disc, mut shot, mut flat, mut yaw, mut pitch, mut pos_override) =
+        (None, None, None, false, None, None, None::<Vec3>);
     let (mut clip, mut frame, mut held, mut wait) = (None, None, Vec::new(), 0.0);
     let (mut map, mut plane, mut water) = (Some("m4000".to_string()), false, None);
     let (mut layout, mut hits) = (Some("actest".to_string()), false);
@@ -164,6 +173,18 @@ fn main() {
                     .next()
                     .and_then(|d| d.parse::<f32>().ok())
                     .map(f32::to_radians)
+            }
+            "--pitch" => {
+                pitch = args
+                    .next()
+                    .and_then(|d| d.parse::<f32>().ok())
+                    .map(f32::to_radians)
+            }
+            "--pos" => {
+                pos_override = args.next().and_then(|s| {
+                    let v: Vec<f32> = s.split(',').filter_map(|p| p.parse().ok()).collect();
+                    (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
+                });
             }
             "--clip" => clip = args.next(),
             "--frame" => frame = args.next().and_then(|f| f.parse::<f32>().ok()),
@@ -216,35 +237,40 @@ fn main() {
     };
     let piloting = !start_garage && clip.is_none() && frame.is_none();
     // Piloting starts behind the AC, the browser in front of it.
+    let start_aim = StartAim { yaw, pitch };
     let yaw = yaw.unwrap_or(if piloting { 0.25 } else { 2.6 });
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
     let disc =
         Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
-    let (collision, start, area_bounds, map_nav, water_return) = if initial_mode == garage::Mode::Sortie {
-        load_sortie_data(&disc, map.as_deref(), layout.as_deref(), plane, water)
-    } else {
-        (
-            Collision::with_hits(
-                vec![Plane {
-                    y: 0.0,
-                    layer: Layer::Ground,
-                }],
-                Vec::new(),
-            ),
-            map::Start {
-                position: Vec3::ZERO,
-                yaw: 0.0,
-            },
-            map::AreaBounds::default(),
-            map::MapNav::default(),
-            map::WaterReturnPoints {
-                points: Vec::new(),
-                water_height: water,
-            },
-        )
-    };
+    let (collision, mut start, area_bounds, map_nav, water_return) =
+        if initial_mode == garage::Mode::Sortie {
+            load_sortie_data(&disc, map.as_deref(), layout.as_deref(), plane, water)
+        } else {
+            (
+                Collision::with_hits(
+                    vec![Plane {
+                        y: 0.0,
+                        layer: Layer::Ground,
+                    }],
+                    Vec::new(),
+                ),
+                map::Start {
+                    position: Vec3::ZERO,
+                    yaw: 0.0,
+                },
+                map::AreaBounds::default(),
+                map::MapNav::default(),
+                map::WaterReturnPoints {
+                    points: Vec::new(),
+                    water_height: water,
+                },
+            )
+        };
+    if let Some(p) = pos_override {
+        start.position = p;
+    }
     let designs: Vec<&'static Row<AcAssemblyDesignSt>> = AC_ASSEMBLY_DESIGN_ST_FILES
         .iter()
         .flat_map(|(_, rows)| rows.iter())
@@ -318,6 +344,7 @@ fn main() {
         play_bgm: shot.is_none(),
     })
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
+    .add_plugins(lens_flare::LensFlarePlugin { disc: disc.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(enemy_parts)
     .insert_resource(initial_mode)
@@ -338,6 +365,7 @@ fn main() {
         status: String::new(),
     })
     .insert_resource(StartYaw(yaw))
+    .insert_resource(start_aim)
     .insert_resource(start)
     .insert_resource(area_bounds)
     .insert_resource(map_nav)
@@ -1045,6 +1073,7 @@ fn show(
     hud: Option<Res<Hud>>,
     collision: Res<Collision>,
     start: Res<map::Start>,
+    start_aim: Res<StartAim>,
     shot: Option<ResMut<Shot>>,
 ) {
     let meshes = &mut *assets.meshes;
@@ -1433,7 +1462,16 @@ fn show(
     let fcs = fcs::Fcs::from_ctrl(&ctrl);
     let legs_motion_id = acvd_data::part_field(design_data.legs as i64, 3, "legs_motion_id") as u8;
     let mut pilot = control::Pilot::new(ctrl, legs_motion_id);
-    pilot.yaw = spawn_yaw;
+    pilot.yaw = if *mode == garage::Mode::Sortie {
+        start_aim.yaw.unwrap_or(spawn_yaw)
+    } else {
+        spawn_yaw
+    };
+    if *mode == garage::Mode::Sortie {
+        if let Some(p) = start_aim.pitch {
+            pilot.set_pitch(p);
+        }
+    }
     if *mode == garage::Mode::Sortie && spawn_y.is_none() && !collision.hits.is_empty() {
         pilot.airborne = true;
     }

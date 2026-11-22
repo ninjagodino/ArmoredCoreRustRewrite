@@ -2706,6 +2706,15 @@ fn apply_impact_blast(
     if blast.hit_fx > 0 {
         commands.spawn((Sfx::new(blast.hit_fx), Transform::from_translation(center)));
     }
+    let flare_scale = (blast.radius / 25.0).clamp(0.7, 2.4);
+    crate::lens_flare::spawn_point_flare(
+        commands,
+        center,
+        Vec3::new(1.0, 0.72, 0.35),
+        1.1,
+        flare_scale,
+        0.38,
+    );
     if blast.hit_se > 0 {
         sound::cue(
             commands,
@@ -2752,6 +2761,15 @@ fn apply_missile_impact_blast(
     if blast.hit_fx > 0 {
         commands.spawn((Sfx::new(blast.hit_fx), Transform::from_translation(center)));
     }
+    let flare_scale = (blast.radius / 25.0).clamp(0.7, 2.4);
+    crate::lens_flare::spawn_point_flare(
+        commands,
+        center,
+        Vec3::new(1.0, 0.72, 0.35),
+        1.1,
+        flare_scale,
+        0.38,
+    );
     if blast.hit_se > 0 {
         sound::cue(
             commands,
@@ -2974,6 +2992,14 @@ pub fn step_overed_weapon(
                             .with_scale(Vec3::splat(MUZZLE_SCALE)),
                     ));
                 }
+                crate::lens_flare::spawn_point_flare(
+                    &mut commands,
+                    ow_muzzle,
+                    Vec3::new(1.0, 0.85, 0.55),
+                    1.4,
+                    2.2,
+                    0.55,
+                );
                 let locked = fcs.and_then(|f| f.locked.as_ref());
                 let fire_aim = locked
                     .map(|l| (l.world_pos - ow_muzzle).normalize_or_zero())
@@ -3730,6 +3756,14 @@ pub fn tick_player_health(
         pilot.velocity = Vec3::ZERO;
         let center = tf.translation + Vec3::Y * 4.5;
         commands.spawn((Sfx::new(4041), Transform::from_translation(center)));
+        crate::lens_flare::spawn_point_flare(
+            &mut commands,
+            center,
+            Vec3::new(1.0, 0.65, 0.28),
+            1.5,
+            2.4,
+            0.65,
+        );
         let destroy_se = find(PARAM_ACSOUNDPARAM_BIN, 0)
             .filter(|r| r.data.se_destroy > 0)
             .map(|r| format!("c{:08}", r.data.se_destroy))
