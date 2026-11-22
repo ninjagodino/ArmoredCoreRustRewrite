@@ -675,10 +675,11 @@ pub struct GarageCamTarget {
 /// Computes the Bevy camera target from an `AcsisDisplaySt` preset (`param/acsisdisplay.bin`,
 /// 360 `0x82586400`), AC bounding box, and active `CustomGarageSt` bounds.
 ///
-/// The AC stands at `(0, 0, 0)` facing `-Z` (`control::FORWARD`), with X mirrored by
-/// `acvd-render` (`+X` = AC's right side, `-X` = AC's left side). `bevy_yaw = PI - eye_angle_y`
-/// maps `eye_angle_y = 0°` to straight ahead (`-Z`), `+69°` (`ArmUnitR`) to the right arm,
-/// `-59°` (`ArmUnitL`) to the left arm, and `±170°` (`Booster` / `OveredUnit`) behind the AC.
+/// The AC stands at `(0, 0, 0)` rotated by `PI` so it faces `+Z` (away from the workshop's `-Z`
+/// backdrop/emblem wall toward the open bay). `bevy_yaw = -eye_angle_y` puts `eye_angle_y = 0°`
+/// at `+Z` looking at the AC's front with the workshop backdrop behind it, `+69°` (`ArmUnitR`) on
+/// the AC's right (`-X`), `-59°` (`ArmUnitL`) on the AC's left (`+X`), and `±170°` (`Booster` /
+/// `OveredUnit`) behind the AC (`-Z`).
 pub fn acsis_camera_pose(
     preset_id: u32,
     bounds: (Vec3, Vec3),
@@ -706,7 +707,7 @@ pub fn acsis_camera_pose(
         }
     };
 
-    let yaw = PI - row.eye_angle_y.to_radians();
+    let yaw = -row.eye_angle_y.to_radians();
     // Positive `eye_angle_x` looks downward from above; clamp gently so close-ups frame the
     // part at a flattering 3/4 workshop angle instead of straight top-down.
     let pitch = if is_full_view {
@@ -722,7 +723,7 @@ pub fn acsis_camera_pose(
     };
 
     // Keep the AC centered in the viewport between the left menu and right specs card.
-    let mut focus = Vec3::new(-row.at_offset_x * 0.35, base_y, row.at_offset_z * 0.25);
+    let mut focus = Vec3::new(row.at_offset_x * 0.35, base_y, -row.at_offset_z * 0.25);
     if !view_mode {
         let cam_right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
         focus -= cam_right * 0.20;
@@ -830,7 +831,7 @@ impl GarageState {
             sortie_map_idx,
             sortie_target_idx,
             parts_fmg,
-            cam_yaw: PI - 19.0f32.to_radians(),
+            cam_yaw: -19.0f32.to_radians(),
             cam_pitch: 0.14,
             cam_dist: 9.8,
             cam_focus: Vec3::new(0.0, 3.2, 0.0),
@@ -3308,8 +3309,9 @@ mod tests {
 
         assert!(head.focus.y > legs.focus.y, "head camera should focus higher than legs");
         assert!(top.dist <= ws.camera_dist_max as f32);
-        // Front camera (`AcsisTop`) sits at -Z (cos(yaw) < 0); rear camera (`OveredWeapon`) at +Z.
-        assert!(top.yaw.cos() < 0.0, "AcsisTop should look from -Z at front of AC");
-        assert!(rear.yaw.cos() > 0.0, "OveredWeapon should look from +Z at rear of AC");
+        // Front camera (`AcsisTop`) sits at +Z (cos(yaw) > 0) facing the AC's front and the `-Z`
+        // workshop backdrop; rear camera (`OveredWeapon`) sits at -Z (cos(yaw) < 0).
+        assert!(top.yaw.cos() > 0.0, "AcsisTop should look from +Z at front of AC");
+        assert!(rear.yaw.cos() < 0.0, "OveredWeapon should look from -Z at rear of AC");
     }
 }

@@ -1075,7 +1075,9 @@ fn show(
             .or_else(|| paint::load_accolor(&garage.disc, design_data.coloring_id))
     };
     let (spawn_pos, spawn_yaw, spawn_y) = if *mode == garage::Mode::Garage {
-        (Vec3::ZERO, 0.0, Some(0.0))
+        // Garage workshops (`menu0300`..`menu1080`) place their emblem banner / backdrop at `-Z`
+        // and open bay toward `+Z`, so rotate the AC 180° to face `+Z` (away from the backdrop).
+        (Vec3::ZERO, std::f32::consts::PI, Some(0.0))
     } else {
         let y = collision.ground_below(start.position + Vec3::Y * RAY_HALF);
         (start.position.with_y(y.unwrap_or(start.position.y)), start.yaw, y)
