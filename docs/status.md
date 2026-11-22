@@ -151,17 +151,16 @@ in order:
 - **Maps leftovers**: rest of MSB (MODEL/EVENT/POINT/ROUTE/LAYER/TREE), `.smd`, map FLVER
   visuals, water-layer materials (none named water on m3100), collision filters 0x100002 /
   0x200002. HNAV/HTR navigation readers.
-- **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`), multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), and scan-mode lock sight (`ACV_ScanModeLockSight`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, and target lock-on HUD cursor are now in (see Done).
-- **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics and range-decay done; see Done):
+- **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`) and scan-mode lock sight (`ACV_ScanModeLockSight`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), and target lock-on HUD cursor (`MissileLock1..6`) are now in (see Done).
+- **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics, range-decay, shoulder weapons & homing missiles done; see Done):
   - Bay shift is in (`acvd-game::bay`, `sheets/ac_states.csv`): hold R (△) and press that
     arm's fire button. Ready-position weapons purge instead of moving onto the rack. The
     rack holds the stow until the hand weapon is seated (frame 40), then `a00_011` turns the prong (`sheets/hanger_anim.csv`).
-  - Not done: target hit shapes and defense mitigation, arm firing-stability reload factor
-    (`0x8286bd00` / `0x8286adf8`), missiles (`bulletmissile`), blades, shoulder
-    weapons (category 12 bullet ids at +356/+360), weapon modes, core aim (shots follow the
-    camera pitch, not a posed upper body). Energy weapon per-shot EN drain (`en_drain`,
-    `0x828a1820`) is now wired. The lock-sight HUD shows AP, live energy, the
-    `AlphaAnimSprite` gauges and the hand-weapon ammo counts (`acvd-game::hud`).
+  - Not done: arm firing-stability reload factor
+    (`0x8286bd00` / `0x8286adf8`), blades, weapon modes, core aim (shots follow the
+    camera pitch, not a posed upper body), sub-munition split missiles (`close_act_id == 8` / `shoot_bullet_id`). Energy weapon per-shot EN drain (`en_drain`,
+    `0x828a1820`), shoulder weapons & homing missiles (`bulletmissile`), and target hit shapes / defense mitigation are now wired. The lock-sight HUD shows AP, live energy, the
+    `AlphaAnimSprite` gauges, hand-weapon ammo counts, and shoulder-weapon ammo (`SWep*` / `Gauge_SWeapon`) (`acvd-game::hud`).
   - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
     360 call that starts `a00_001` on a held trigger was not found (joint-control bit 31 at
     `0x82456f68` selects `sniper_$(LR)` vs `gun_$(LR)` and was not tied back to +0x153).
@@ -280,6 +279,12 @@ in order:
   for per-cue decode at load; stream music would want a faster IMDCT (FFT) or decode-on-play.
 
 ## Done
+
+- **Missiles & Shoulder Weapons** (`acvd-game::fcs`, `weapons`, `hud`, `main`, `sheets/ac_part_fields.csv`, `sheets/ac_ctrl_calc.csv`):
+  - **Category 12 (shoulder unit) `acvparts.bin` layout (`0x82470680`, cat-12 vtable `0x82023258` slot `+0x08`)**: checks byte `+0x135` (`has_weapon_spec != 0`, 1 on all 85 shoulder records) and wraps `record + 0x15c` as the **exact same weapon sub-record struct** as category 10's `+0x134` (`0x82475aa8`), sharing all getters: `is_missile` (`sub +0x00 == 1`, `0x82478850`, 40 of 85 shoulder units), `damp_range` (`+0x04`, `0x82478910`), `missile_lock_time` (`+0x06`, `0x8247cf48`), `bullet_id` (`+0x08` = `+356`, `0x82475bd8`), `hit_id` (`+0x0c` = `+360`, `0x82475c18`), `init_speed` (`+0x14`, `0x8247cbf8`), `en_drain` (`+0x18`, `0x8247cec0`), `lock_use_burst` (`+0x1c`, `0x82478cd0`), `burst_count` (`+0x1d`, `0x82478980`), `lock_once` (`+0x1e`, `0x824789d0`), `burst_interval` (`+0x22`, `0x82478a48`), `reload_time` (`+0x24`, `0x8247cb80`), `magazine` (`+0x42`, `0x82478af0`), `no_decay_range` (`+0x48`, `0x8247d350`), `guarantee_rate` (`+0x4a`, `0x82478ca8`), `min_power_rate` (`+0x4b`, `0x82478cf8`), `damage_type` (`+0x54`, `0x8247d4d8`), `damage_power` (`+0x58`), and `damage_recoil` (`+0x5c`). Arms `float 4` (`+0x24` `shoulder_mount_count`, `0x824795c8`) multiplies shoulder `burst_count` in `0x82858638` (`0x82858824..0x82858838`, 2× on twin-shoulder arms like `am0120`).
+  - **Multi-target missile lock-on (`0x82858638`, `0x82857688`, `0x8247a1a0`, `0x82478cd0`)**: `0x82858638` clamps weapon simultaneous locks (`burst_count` if `lock_use_burst != 0` else `lock_once.max(1)`) against FCS `missile_lock_max` (`+0x135`, `0x8247a1a0`, 1–6). `fcs::step_missile_locks` accumulates locks at `missile_lock_time * missile_lock_effective_rate / 60.0` (`AcCtrlParam` param 81), distributing locks evenly across living targets inside the elliptical lock-sight cone and pruning targets that exit the `+2°` outer hysteresis cone.
+  - **`BulletMissile` flight & homing (`0x828ec898` → `0x828e98c0` / `0x828e9b50` / `0x828ea520` / `0x828eb9c8` → `0x828eaf88`)**: `weapons::Missile` reads `BULLET_BULLETMISSILE_BIN` (`accel`, `air_cp`, `before_accel_gravity`, `after_accel_gravity`, `brake`, `accel_start_frame`, `accel_end_frame`, `act_start_frame`, `trace_trun_angle`, `min/max_speed_km_h / 3.6`, `hit_radius`, `proximity_fuse_range`), launches from `ShoulderHardpoint` (`core` dummy 50) on `G`/`X`/`Tab`/`R1` (`manual.fmg`), fans out locked salvos at `burst_interval`, ignites `after_accel_follow_sfx_id` (`4801`) at `accel_start_frame`, homes onto assigned targets at `trace_trun_angle`, and resolves hits against `TargetHealth` spheres + ground with `damage::calculate_damage`, `bullethitsfxparam`, and `bullethitseparam`.
+  - **HUD (`hud.rs`, `0x829d0290`, `0x829d1910` / `0x829d1a10`)**: `Readout::Shoulder` drives `SWep*` digits, `Gauge_SWeapon`, `Back_SWeapon`, and `SHWeaponBar_base` (with `ammo_red_zone` fade); `hud::lock_cursor` projects up to 6 `MissileLockMarker` brackets with `MissileLock1..6` pips and `MSLxN` readout. Verified by 69/69 `acvd-game` tests (`fcs::tests::multi_lock_missile_accumulation_spreads_and_caps`, `weapons::tests::shoulder_missile_520_reads_cat12_fields_and_homing_flight`, `hud::tests::shoulder_readout_shows_ammo_and_red_zone`), `acvd-index audit` (994 addresses, 0 mismatches), and `--shot` (`private/shots/msl_lock3.png`, `private/shots/msl_hit2_0.png`..`_3.png`).
 
 - **Lock-on / FCS** (`acvd-game::fcs`, `weapons`, `hud`, `sheets/ac_part_fields.csv`, `sheets/tuning_fields.csv`, `sheets/ac_ctrl_calc.csv`):
   - **Head & FCS `acvparts.bin` fields**: traced `Scr_GetPartsParam` per-category getter tables (`0x820236ac` head, `0x820237a0` FCS): head `camera_ability` (`+0x140` `u16`, id 1010, `0x82479188`), FCS `missile_lock_max` (`+0x135` `u8`, id 1500, `0x8247a1a0`), `lock_range` (`+0x13c` `u16`, id 1503, `0x8247a078`), `lock_sight_x` (`+0x13e` `i16`, id 1509, `0x8247a0a0`), `lock_sight_y` (`+0x140` `i16`, `0x8247a0d0`), `lock_calc_speed` (`+0x144` `i16`, id 1501, `0x8247a140`), and `missile_lock_calc_speed` (`+0x146` `i16`, id 1502, `0x8247a170`). `AcCtrlParamCalc.lua` (`NewAcBehavior` fields 532–535, 564–566) computes `first_lock_range_rate`, `first_lock_range` (param 74, `AcCtrlParam +0x12c`), `lock_effective_rate` (param 80, `+0x148`), and `missile_lock_effective_rate` (param 81, `+0x144`); `Assemble.bin` fields 200–202 (`+0x320..+0x328`) provide HUD sight base angles (`20° × 20°`, `0x829d4e40`) and the backward datum offset (`20.0 m`, `0x828577b0`).

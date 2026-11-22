@@ -26,8 +26,8 @@
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::bullet::{
-    BULLET_BULLETENERGY_BIN, BULLET_BULLETRIGID_BIN, PARAM_BULLETHITSEPARAM_BIN,
-    PARAM_BULLETHITSFXPARAM_BIN,
+    BULLET_BULLETENERGY_BIN, BULLET_BULLETMISSILE_BIN, BULLET_BULLETRIGID_BIN,
+    PARAM_BULLETHITSEPARAM_BIN, PARAM_BULLETHITSFXPARAM_BIN,
 };
 use acvd_data::generated::sfx::PARAM_ACWEAPONSFXPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACWEAPONSOUNDPARAM_BIN;
@@ -80,12 +80,19 @@ pub enum Hand {
     Left,
 }
 
-/// The two hand weapons and the two bay weapons of the shown design.
+/// The two hand weapons, two bay weapons, and shoulder unit of the shown design.
 /// `hands` / `bays` are `[right, left]`.
 #[derive(Component)]
 pub struct Armament {
     pub hands: [Gun; 2],
     pub bays: [Gun; 2],
+    pub shoulder: Gun,
+    /// Queued shoulder salvo rounds (`Some(target)` for locked missiles, `None` for dumbfire/rockets).
+    pub salvo: Vec<Option<Entity>>,
+    /// Remaining 60 Hz ticks before the next missile/round leaves the shoulder pod.
+    pub salvo_timer: f32,
+    /// Counter within the current salvo for alternating left/right launch fan-out.
+    pub salvo_index: u32,
 }
 
 /// A bay shift in progress. While this exists the fire buttons do not shoot: they already
@@ -161,22 +168,63 @@ pub struct Flight {
     pub stall_to_vanish_frame: Option<f32>,
 }
 
+/// Missile flight parameters from `bullet/bulletmissile.bin` (`0x828ec898` -> `0x828e98c0`,
+/// `0x828e9b50`, `0x828ea520`, `0x828eb9c8` -> `0x828eaf88`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MissileFlight {
+    /// Booster acceleration in m/s per 60 Hz tick (`+0x28`, `0x828e98c0`).
+    pub accel: f32,
+    /// Aerodynamic drag coefficient (`+0x24`, `0x828e9b50`).
+    pub air_cp: f32,
+    /// Pre-ignition gravity in m/s per 60 Hz tick (`+0x8c`).
+    pub before_accel_gravity: f32,
+    /// Post-burnout gravity in m/s per 60 Hz tick (`+0x2c`, `0x828ec8e4`).
+    pub after_accel_gravity: f32,
+    /// Post-burnout brake in m/s per 60 Hz tick (`+0x88`, `0x828ec8f0`).
+    pub brake: f32,
+    /// Booster ignition start frame at 60 Hz (`+0x30`).
+    pub accel_start_frame: f32,
+    /// Booster burnout frame at 60 Hz (`+0x34`, `0x828eca04`).
+    pub accel_end_frame: f32,
+    /// Homing activation frame at 60 Hz (`+0x38`).
+    pub act_start_frame: f32,
+    /// Maximum homing turn rate in deg/s (`+0x48` `trace_trun_angle`).
+    pub trace_turn_deg_s: f32,
+    /// Minimum speed in m/s (`+0x86` `min_speed_km_h / 3.6`, `0x828eaf88`).
+    pub min_speed: f32,
+    /// Maximum speed in m/s (`+0x84` `max_speed_km_h / 3.6`, `0x828eaf88`).
+    pub max_speed: f32,
+    /// Missile collision radius in m (`+0x0c`).
+    pub hit_radius: f32,
+    /// Proximity fuse detonation distance in m (`+0x10`; 0 = direct impact only).
+    pub proximity_fuse_range: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Gun {
     pub remaining: u16,
     pub magazine: u16,
     pub reload_time: f32,
-    /// Base lock-on time in 60 Hz ticks (`category 10 +0x13a`, `0x8247cf48`, scaled by
-    /// `AcCtrlParam::lock_effective_rate / 60.0` in `0x82857688`).
+    /// Base lock-on time in 60 Hz ticks (`sub +0x06`, `0x8247cf48`, scaled by
+    /// `AcCtrlParam::lock_effective_rate` / `missile_lock_effective_rate` `/ 60.0` in `0x82857688`).
     pub lock_time_ticks: f32,
     pub cooldown: f32,
     pub init_speed: f32,
     pub kind: Kind,
     pub flight: Flight,
+    pub missile_flight: Option<MissileFlight>,
+    /// True when `sub +0x00 == 1` (`0x82478850`): enables multi-lock missile acquisition.
+    pub is_missile: bool,
+    /// Weapon's own max simultaneous missile locks (`0x82478cd0`: `burst_count` if `lock_use_burst != 0`, else `lock_once.max(1)`).
+    pub weapon_lock_max: u8,
+    /// Rounds per burst/salvo (`0x82478980`, multiplied by `arms.shoulder_mount_count` for shoulder units in `0x82858638`).
+    pub burst_count: u8,
+    /// Interval between salvo rounds in 60 Hz ticks (`0x82478a48`).
+    pub burst_interval: f32,
     pub damage_type: DamageType,
     pub damage_power: f32,
     pub damage_recoil: f32,
-    /// Per-shot EN drain (`category 10 +0x14c`, `0x8247cec0`, drained via `0x828a1820` ->
+    /// Per-shot EN drain (`sub +0x18`, `0x8247cec0`, drained via `0x828a1820` ->
     /// `0x82830910`; 0 on kinetic weapons).
     pub en_drain: f32,
     pub decay: RangeDecay,
@@ -195,6 +243,7 @@ pub struct Gun {
 impl Gun {
     /// Effective `(damage_power, damage_recoil)` at flight distance `dist` in metres
     /// (`0x827cf1c0` -> `0x827cee08` / `0x827cee18`).
+    #[cfg(test)]
     pub fn damage_at(&self, dist: f32) -> (f32, f32) {
         let mult = self.decay.multiplier(dist);
         (self.damage_power * mult, self.damage_recoil * mult)
@@ -211,6 +260,10 @@ pub struct Fx {
     pub hit_low: i32,
     /// `bullethitsfxparam.ac_hi_damage` (effective hit VFX).
     pub hit_hi: i32,
+    /// `acweaponsfxparam.after_accel_follow_sfx_id` (missile booster trail after ignition).
+    pub after_accel: i32,
+    /// `acweaponsfxparam.delete_sfx_id` (missile detonation fallback VFX).
+    pub delete_fx: i32,
 }
 
 /// Target hit sound cue ids (`param/bullethitseparam.bin`, `acv2_se_bombs.fev` `w%08d`).
@@ -224,6 +277,7 @@ pub struct HitSe {
 pub enum Kind {
     Rigid,
     Energy,
+    Missile,
     Skip,
 }
 
@@ -232,6 +286,10 @@ pub enum Kind {
 pub struct Hardpoint {
     pub hand: Hand,
 }
+
+/// Shoulder-unit root joint (`core` dummy 50) that shoulder missiles/rockets launch from.
+#[derive(Component)]
+pub struct ShoulderHardpoint;
 
 /// A weapon-clip joint. Body-driven joints keep the locomotion pose.
 #[derive(Component)]
@@ -438,18 +496,149 @@ impl Projectile {
     }
 }
 
+/// Homing missile projectile (`BULLET_BULLETMISSILE_BIN`, `0x828ec898` -> `0x828e98c0`,
+/// `0x828e9b50`, `0x828ea520`, `0x828eb9c8` -> `0x828eaf88`).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Missile {
+    pub velocity: Vec3,
+    pub flight: MissileFlight,
+    pub decay: RangeDecay,
+    pub damage_type: DamageType,
+    pub damage_power: f32,
+    pub damage_recoil: f32,
+    pub target: Option<Entity>,
+    pub age_frames: f32,
+    pub ignited: bool,
+    pub distance: f32,
+    pub life: f32,
+    pub hit: i32,
+    pub hit_low: i32,
+    pub hit_hi: i32,
+    pub delete_fx: i32,
+    pub after_accel_fx: i32,
+    pub hit_se: HitSe,
+}
+
+impl Missile {
+    /// Creates a homing missile launched from `gun` along `launch_dir` toward `target`.
+    pub fn from_gun(gun: &Gun, launch_dir: Vec3, target: Option<Entity>) -> Self {
+        let flight = gun.missile_flight.unwrap_or_default();
+        let dir = launch_dir.normalize_or_zero();
+        let dir = if dir == Vec3::ZERO { Vec3::NEG_Z } else { dir };
+        let init_speed = gun.init_speed.max(flight.min_speed).max(10.0);
+        let max_life = ((flight.accel_end_frame + 120.0) / TICK_RATE).clamp(5.0, 14.0);
+        Self {
+            velocity: dir * init_speed,
+            flight,
+            decay: gun.decay,
+            damage_type: gun.damage_type,
+            damage_power: gun.damage_power,
+            damage_recoil: gun.damage_recoil,
+            target,
+            age_frames: 0.0,
+            ignited: false,
+            distance: 0.0,
+            life: max_life,
+            hit: gun.fx.hit,
+            hit_low: gun.fx.hit_low,
+            hit_hi: gun.fx.hit_hi,
+            delete_fx: gun.fx.delete_fx,
+            after_accel_fx: gun.fx.after_accel,
+            hit_se: gun.hit_se,
+        }
+    }
+
+    /// Steps missile flight & homing for `dt` seconds (`0x828ec898` -> `0x828eaf88`).
+    /// Returns `Some((world_delta, just_ignited))` or `None` when expired.
+    pub fn step(&mut self, pos: Vec3, target_pos: Option<Vec3>, dt: f32) -> Option<(Vec3, bool)> {
+        self.life -= dt;
+        if self.life <= 0.0 {
+            return None;
+        }
+        let frames = dt * TICK_RATE;
+        self.age_frames += frames;
+
+        let in_launch = self.age_frames < self.flight.accel_start_frame;
+        let in_boost = self.age_frames >= self.flight.accel_start_frame
+            && self.age_frames <= self.flight.accel_end_frame;
+        let just_ignited = in_boost && !self.ignited;
+        if just_ignited {
+            self.ignited = true;
+        }
+
+        // Homing steering (`0x828ec300` -> `0x828ea520`): active from `act_start_frame` through `accel_end_frame`.
+        let homing = self.age_frames >= self.flight.act_start_frame
+            && self.age_frames <= self.flight.accel_end_frame;
+        let mut speed = self.velocity.length();
+        let mut dir = if speed > 1.0e-4 {
+            self.velocity / speed
+        } else {
+            Vec3::NEG_Z
+        };
+        if homing {
+            if let Some(tpos) = target_pos {
+                let to_target = (tpos - pos).normalize_or_zero();
+                if to_target != Vec3::ZERO {
+                    let dot = dir.dot(to_target).clamp(-1.0, 1.0);
+                    let ang = dot.acos();
+                    let max_turn = self.flight.trace_turn_deg_s.max(30.0).to_radians() * dt;
+                    if ang > 1.0e-4 {
+                        let frac = (max_turn / ang).min(1.0);
+                        let rot = Quat::from_rotation_arc(dir, to_target);
+                        dir = (Quat::IDENTITY.slerp(rot, frac) * dir).normalize_or_zero();
+                    }
+                }
+            }
+        }
+
+        // Speed & gravity integration (`0x828e98c0`, `0x828e9b50`, `0x828eaf88`).
+        if in_boost {
+            let drag = speed * self.flight.air_cp * frames;
+            speed = (speed + self.flight.accel * frames - drag).max(0.0);
+            if self.flight.max_speed > 0.0 {
+                speed = speed.clamp(self.flight.min_speed, self.flight.max_speed);
+            }
+            self.velocity = dir * speed;
+        } else if in_launch {
+            self.velocity = dir * speed;
+            self.velocity.y -= self.flight.before_accel_gravity * frames;
+        } else {
+            // Post-burnout coast (`0x828ec8dc..0x828ec8f8`): brake + after_accel_gravity.
+            let drag = (speed * self.flight.air_cp + self.flight.brake) * frames;
+            speed = (speed - drag).max(0.0);
+            self.velocity = dir * speed;
+            self.velocity.y -= self.flight.after_accel_gravity * frames;
+        }
+
+        let delta = self.velocity * dt;
+        self.distance += delta.length();
+        Some((delta, just_ignited))
+    }
+
+    pub fn effective_damage(&self) -> (f32, f32) {
+        let mult = self.decay.multiplier(self.distance);
+        (self.damage_power * mult, self.damage_recoil * mult)
+    }
+}
+
 #[derive(Resource)]
 pub(crate) struct Tracers {
     mesh: Handle<Mesh>,
     rigid: Handle<StandardMaterial>,
     energy: Handle<StandardMaterial>,
+    missile: Handle<StandardMaterial>,
 }
 
 impl Armament {
     pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
+        let arms_mount = (part_field(design.arms as i64, 2, "shoulder_mount_count").round() as u8).max(1);
         Self {
             hands: [gun(design.armwep_r as i64), gun(design.armwep_l as i64)],
             bays: [gun(design.hanger_r as i64), gun(design.hanger_l as i64)],
+            shoulder: shoulder_gun(design.shoulder as i64, arms_mount),
+            salvo: Vec::new(),
+            salvo_timer: 0.0,
+            salvo_index: 0,
         }
     }
 }
@@ -462,6 +651,10 @@ pub fn hardpoint(placement: &Placement) -> Option<Hardpoint> {
             _ => return None,
         },
     })
+}
+
+pub fn is_shoulder_hardpoint(placement: &Placement) -> bool {
+    placement.column == "shoulder"
 }
 
 pub fn setup(
@@ -480,6 +673,12 @@ pub fn setup(
         energy: materials.add(StandardMaterial {
             base_color: Color::srgb(0.4, 0.85, 1.0),
             emissive: LinearRgba::rgb(1.0, 4.0, 10.0),
+            unlit: true,
+            ..default()
+        }),
+        missile: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.55, 0.15),
+            emissive: LinearRgba::rgb(10.0, 4.0, 0.6),
             unlit: true,
             ..default()
         }),
@@ -506,6 +705,7 @@ pub(crate) struct Body<'w> {
 #[derive(SystemParam)]
 pub(crate) struct Rigging<'w, 's> {
     hardpoints: Query<'w, 's, (&'static Hardpoint, &'static GlobalTransform)>,
+    shoulder: Query<'w, 's, &'static GlobalTransform, With<ShoulderHardpoint>>,
     globals: Query<'w, 's, (&'static GlobalTransform, Option<&'static ChildOf>)>,
 }
 
@@ -544,7 +744,7 @@ pub fn fire(
     mut speaker: Speaker,
     mut commands: Commands,
     mut acs: Query<
-        (&mut Pilot, &mut Armament, &Transform, Option<&mut Status>, Option<&crate::fcs::Fcs>),
+        (&mut Pilot, &mut Armament, &Transform, Option<&mut Status>, Option<&mut crate::fcs::Fcs>),
         Without<ClipJoint>,
     >,
     rigging: Rigging,
@@ -556,7 +756,7 @@ pub fn fire(
         return;
     }
     let dt = time.delta_secs();
-    let Ok((mut pilot, mut arms, ac_tf, mut status, fcs)) = acs.single_mut() else {
+    let Ok((mut pilot, mut arms, ac_tf, mut status, mut fcs)) = acs.single_mut() else {
         return;
     };
     let down = |k: KeyCode| keys.pressed(k) || held.0.contains(&k);
@@ -564,10 +764,12 @@ pub fn fire(
         down(KeyCode::KeyF) || mouse.pressed(MouseButton::Left),
         down(KeyCode::KeyC) || mouse.pressed(MouseButton::Right),
     ];
-    // Manual (lang/en/text/menu/manual.fmg): R2 right arm weapon, L2 left.
+    let mut want_shoulder = down(KeyCode::KeyG) || down(KeyCode::KeyX) || down(KeyCode::Tab);
+    // Manual (lang/en/text/menu/manual.fmg): R2 right arm weapon, L2 left, R1 shoulder weapon.
     for pad in &pads {
         want[0] |= pad.pressed(GamepadButton::RightTrigger2);
         want[1] |= pad.pressed(GamepadButton::LeftTrigger2);
+        want_shoulder |= pad.pressed(GamepadButton::RightTrigger);
     }
     // Bay shift (manual 20403): while the modifier is held, the fire buttons exchange that
     // arm with its bay weapon instead of shooting. The clip keeps the block after release.
@@ -577,6 +779,7 @@ pub fn fire(
         || pads.iter().any(|pad| pad.pressed(GamepadButton::North));
     if shifting {
         want = [false, false];
+        want_shoulder = false;
     }
     let aim = pilot.aim_direction();
     let frames = dt * TICK_RATE;
@@ -648,7 +851,9 @@ pub fn fire(
             .iter()
             .find(|(h, _)| h.hand == hand)
             .map_or(ac_tf.translation, |(_, t)| t.translation());
-        let hand_aim = fcs.map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
+        let hand_aim = fcs
+            .as_deref()
+            .map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
         gun.remaining = gun.remaining.saturating_sub(1);
         gun.cooldown = gun.reload_time.max(1.0);
         sound::shot(
@@ -697,6 +902,139 @@ pub fn fire(
             commands.spawn((Mesh3d(assets.mesh.clone()), MeshMaterial3d(material), shot));
         }
     }
+
+    // Shoulder unit firing & multi-lock missile salvo (`0x82858638`, manual.fmg R1).
+    arms.shoulder.cooldown = (arms.shoulder.cooldown - frames).max(0.0);
+    if arms.salvo.is_empty()
+        && want_shoulder
+        && arms.shoulder.kind != Kind::Skip
+        && arms.shoulder.remaining > 0
+        && arms.shoulder.cooldown <= 0.0
+        && pilot.en >= arms.shoulder.en_drain
+    {
+        let burst = arms.shoulder.burst_count.max(1) as usize;
+        if arms.shoulder.is_missile {
+            let locks = fcs
+                .as_deref_mut()
+                .map_or_else(Vec::new, crate::fcs::Fcs::take_missile_locks);
+            if locks.is_empty() {
+                for _ in 0..burst.min(arms.shoulder.remaining as usize) {
+                    arms.salvo.push(None);
+                }
+            } else {
+                for target in locks {
+                    for _ in 0..burst {
+                        if arms.salvo.len() >= arms.shoulder.remaining as usize {
+                            break;
+                        }
+                        arms.salvo.push(Some(target));
+                    }
+                }
+            }
+        } else {
+            for _ in 0..burst.min(arms.shoulder.remaining as usize) {
+                arms.salvo.push(None);
+            }
+        }
+        if !arms.salvo.is_empty() {
+            arms.salvo_timer = 0.0;
+            arms.salvo_index = 0;
+            arms.shoulder.cooldown = arms.shoulder.reload_time.max(1.0);
+        }
+    }
+    if !arms.salvo.is_empty() {
+        arms.salvo_timer = (arms.salvo_timer - frames).max(0.0);
+        if arms.salvo_timer <= 0.0 {
+            let target_opt = arms.salvo.remove(0);
+            if arms.shoulder.remaining > 0 && pilot.try_drain_en(arms.shoulder.en_drain) {
+                if let Some(status) = status.as_deref_mut() {
+                    status.en = pilot.en;
+                    status.en_max = pilot.en_max;
+                }
+                let origin = rigging
+                    .shoulder
+                    .iter()
+                    .next()
+                    .map_or(ac_tf.translation + Vec3::Y * 5.0, GlobalTransform::translation);
+                arms.shoulder.remaining = arms.shoulder.remaining.saturating_sub(1);
+                sound::shot(
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    arms.shoulder.shoot,
+                );
+                if arms.shoulder.fx.muzzle > 0 {
+                    commands.spawn((
+                        Sfx::new(arms.shoulder.fx.muzzle),
+                        Transform::from_translation(origin)
+                            .looking_to(-aim, Vec3::Y)
+                            .with_scale(Vec3::splat(MUZZLE_SCALE)),
+                    ));
+                }
+                let shoulder_aim = if target_opt.is_none() {
+                    fcs.as_deref()
+                        .and_then(|f| f.locked.as_ref())
+                        .map(|l| (l.world_pos - origin).normalize_or_zero())
+                        .filter(|&d| d != Vec3::ZERO)
+                        .unwrap_or(aim)
+                } else {
+                    aim
+                };
+                let right = shoulder_aim.cross(Vec3::Y).normalize_or_zero();
+                let side = if arms.salvo_index % 2 == 0 { 1.0 } else { -1.0 };
+                let launch_dir = if arms.shoulder.kind == Kind::Missile && target_opt.is_some() {
+                    (shoulder_aim + Vec3::Y * 0.35 + right * (0.28 * side)).normalize_or_zero()
+                } else {
+                    shoulder_aim
+                };
+                arms.salvo_index = arms.salvo_index.wrapping_add(1);
+                let spawn_pos = origin + right * (0.6 * side) + Vec3::Y * 0.4;
+                if arms.shoulder.kind == Kind::Missile {
+                    let missile = Missile::from_gun(&arms.shoulder, launch_dir, target_opt);
+                    let tf = Transform::from_translation(spawn_pos).looking_to(launch_dir, Vec3::Y);
+                    if arms.shoulder.fx.bullet > 0 {
+                        commands
+                            .spawn((
+                                tf,
+                                missile,
+                                Visibility::default(),
+                                Mesh3d(assets.mesh.clone()),
+                                MeshMaterial3d(assets.missile.clone()),
+                            ))
+                            .with_child((Sfx::new(arms.shoulder.fx.bullet), Transform::default()));
+                    } else {
+                        commands.spawn((
+                            Mesh3d(assets.mesh.clone()),
+                            MeshMaterial3d(assets.missile.clone()),
+                            tf,
+                            missile,
+                        ));
+                    }
+                } else {
+                    let shot = (
+                        Transform::from_translation(spawn_pos).looking_to(launch_dir, Vec3::Y),
+                        Projectile::from_gun(&arms.shoulder, launch_dir),
+                    );
+                    if arms.shoulder.fx.bullet > 0 {
+                        commands
+                            .spawn((shot, Visibility::default()))
+                            .with_child((Sfx::new(arms.shoulder.fx.bullet), Transform::default()));
+                    } else {
+                        let material = match arms.shoulder.kind {
+                            Kind::Energy => assets.energy.clone(),
+                            _ => assets.rigid.clone(),
+                        };
+                        commands.spawn((
+                            Mesh3d(assets.mesh.clone()),
+                            MeshMaterial3d(material),
+                            shot,
+                        ));
+                    }
+                }
+            }
+            arms.salvo_timer = arms.shoulder.burst_interval.max(3.0);
+        }
+    }
     if body.shift.is_none() {
         if let Some(anims) = body.anims.as_mut() {
             for (i, gun) in arms.hands.iter().enumerate() {
@@ -714,7 +1052,9 @@ pub fn fire(
                     .iter()
                     .find(|(h, _)| h.hand == hand)
                     .map_or(ac_tf.translation, |(_, t)| t.translation());
-                let hand_aim = fcs.map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
+                let hand_aim = fcs
+            .as_deref()
+            .map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
                 let arm = &mut anims.aim[i];
                 arm.sniper = gun.sniper;
                 arm.step(want[i] && gun.kind != Kind::Skip && !gun.stance, frames);
@@ -842,6 +1182,157 @@ pub fn step_projectiles(
     }
 }
 
+/// Steps in-flight homing missiles (`BulletMissile`, `0x828ec898` -> `0x828eaf88`) toward their
+/// locked targets, spawns booster-ignition trail VFX, and resolves hits against target spheres
+/// and map terrain.
+pub fn step_missiles(
+    time: Res<Time>,
+    piloting: Res<Piloting>,
+    collision: Res<Collision>,
+    mut speaker: Speaker,
+    mut commands: Commands,
+    mut targets: Query<(Entity, &Target, &mut TargetHealth, &Transform), Without<Missile>>,
+    mut missiles: Query<(Entity, &mut Missile, &mut Transform)>,
+) {
+    if !piloting.0 {
+        return;
+    }
+    let dt = time.delta_secs();
+    for (e, mut missile, mut transform) in &mut missiles {
+        let target_pos = missile.target.and_then(|t_ent| {
+            targets
+                .get(t_ent)
+                .ok()
+                .filter(|(_, _, h, _)| !h.destroyed)
+                .map(|(_, _, h, tf)| tf.translation + Vec3::Y * h.center_offset_y())
+        });
+        let prev = transform.translation;
+        let Some((delta, just_ignited)) = missile.step(prev, target_pos, dt) else {
+            commands.entity(e).despawn();
+            continue;
+        };
+        if just_ignited && missile.after_accel_fx > 0 {
+            commands
+                .entity(e)
+                .with_child((Sfx::new(missile.after_accel_fx), Transform::default()));
+        }
+        let next = prev + delta;
+
+        // Test against all living target hit spheres (inflated by missile hit_radius / proximity fuse).
+        let extra_r = missile
+            .flight
+            .proximity_fuse_range
+            .max(missile.flight.hit_radius.min(2.0));
+        let mut best_target: Option<(f32, Vec3, Vec3, Entity)> = None;
+        for (t_entity, _, health, t_tf) in &targets {
+            if health.destroyed {
+                continue;
+            }
+            for sphere in &health.spheres {
+                let center = t_tf.translation + Vec3::Y * sphere.offset_y;
+                if let Some((t, pos, normal)) =
+                    damage::segment_hits_sphere(prev, next, center, sphere.radius + extra_r)
+                {
+                    if best_target.is_none_or(|(best_t, _, _, _)| t < best_t) {
+                        best_target = Some((t, pos, normal, t_entity));
+                    }
+                }
+            }
+        }
+
+        let ground = collision
+            .ground_below(prev)
+            .filter(|&g| delta.y < 0.0 && next.y <= g)
+            .map(|g| {
+                let t = if delta.y.abs() > 1e-6 {
+                    ((g - prev.y) / delta.y).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                (t, Vec3::new(prev.x + delta.x * t, g, prev.z + delta.z * t))
+            });
+
+        if let Some((t_hit, pos, normal, t_entity)) = best_target {
+            if ground.is_none_or(|(t_g, _)| t_hit <= t_g) {
+                if let Ok((_, target, mut health, _)) = targets.get_mut(t_entity) {
+                    let (power, recoil) = missile.effective_damage();
+                    let (res, lethal) = health.apply_hit(missile.damage_type, power, recoil);
+                    let ffx = if res.effective {
+                        if missile.hit_hi > 0 {
+                            missile.hit_hi
+                        } else if missile.hit > 0 {
+                            missile.hit
+                        } else {
+                            missile.delete_fx
+                        }
+                    } else if missile.hit_low > 0 {
+                        missile.hit_low
+                    } else if missile.hit > 0 {
+                        missile.hit
+                    } else {
+                        missile.delete_fx
+                    };
+                    if ffx > 0 {
+                        let rot = Quat::from_rotation_arc(Vec3::Z, normal);
+                        commands.spawn((
+                            Sfx::new(ffx),
+                            Transform::from_translation(pos).with_rotation(rot),
+                        ));
+                    }
+                    let se = if res.effective {
+                        missile.hit_se.hi
+                    } else {
+                        missile.hit_se.low
+                    };
+                    if se > 0 {
+                        sound::cue(
+                            &mut commands,
+                            &mut speaker.cues,
+                            &mut speaker.sources,
+                            &format!("w{se:08}"),
+                        );
+                    }
+                    info!(
+                        "missile hit {} ({}) [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
+                        target.name,
+                        target.model,
+                        if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                        res.damage,
+                        health.ap,
+                        health.ap_max,
+                        if health.is_staggered() { " STAGGER" } else { "" },
+                        if lethal { " DESTROYED" } else { "" },
+                    );
+                }
+                commands.entity(e).despawn();
+                continue;
+            }
+        }
+
+        if let Some((_, at)) = ground {
+            let ffx = if missile.hit > 0 {
+                missile.hit
+            } else {
+                missile.delete_fx
+            };
+            if ffx > 0 {
+                commands.spawn((
+                    Sfx::new(ffx),
+                    Transform::from_translation(at)
+                        .with_rotation(Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
+                ));
+            }
+            commands.entity(e).despawn();
+            continue;
+        }
+
+        transform.translation = next;
+        if delta.length_squared() > 0.0 {
+            transform.look_to(delta.normalize(), Vec3::Y);
+        }
+    }
+}
+
 pub(crate) fn silent() -> Gun {
     Gun {
         remaining: 0,
@@ -852,6 +1343,11 @@ pub(crate) fn silent() -> Gun {
         init_speed: 0.0,
         kind: Kind::Skip,
         flight: Flight::default(),
+        missile_flight: None,
+        is_missile: false,
+        weapon_lock_max: 0,
+        burst_count: 1,
+        burst_interval: 0.0,
         damage_type: DamageType::Ke,
         damage_power: 0.0,
         damage_recoil: 0.0,
@@ -865,50 +1361,85 @@ pub(crate) fn silent() -> Gun {
     }
 }
 
-fn gun(id: i64) -> Gun {
+fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
     if id <= 0 {
         return silent();
     }
-    let magazine = part_field(id, 10, "magazine").max(0.0) as u16;
-    let init_speed = part_field(id, 10, "init_speed");
-    let (kind, flight, speed) = flight(part_field(id, 10, "bullet_id") as u32, init_speed);
-    let (fx, hit_se) = fx_and_hit_se(id);
+    if category == 12 && part_field(id, 12, "has_weapon_spec") == 0.0 {
+        return silent();
+    }
+    let magazine = part_field(id, category, "magazine").max(0.0) as u16;
+    let init_speed = part_field(id, category, "init_speed");
+    let bullet_id = part_field(id, category, "bullet_id") as u32;
+    let (kind, flight, missile_flight, speed) = flight(bullet_id, init_speed);
+    let hit_id = part_field(id, category, "hit_id") as u32;
+    let (fx, hit_se) = fx_and_hit_se_for(hit_id);
+    let is_missile = part_field(id, category, "is_missile") != 0.0;
+    let base_burst = (part_field(id, category, "burst_count") as u8).max(1);
+    let burst_count = if category == 12 {
+        base_burst.saturating_mul(arms_mount.max(1))
+    } else {
+        base_burst
+    };
+    let lock_once = (part_field(id, category, "lock_once") as u8).max(1);
+    let lock_use_burst = part_field(id, category, "lock_use_burst") != 0.0;
+    // `0x82478cd0`: if sub +0x1c != 0, max weapon locks = burst_count, else lock_once.max(1).
+    let weapon_lock_max = if is_missile {
+        if lock_use_burst {
+            base_burst
+        } else {
+            lock_once
+        }
+    } else {
+        0
+    };
     Gun {
         remaining: magazine,
         magazine,
-        reload_time: part_field(id, 10, "reload_time"),
-        lock_time_ticks: part_field(id, 10, "missile_lock_time"),
+        reload_time: part_field(id, category, "reload_time"),
+        lock_time_ticks: part_field(id, category, "missile_lock_time"),
         cooldown: 0.0,
         init_speed: speed,
         kind,
         flight,
-        damage_type: DamageType::from_raw(part_field(id, 10, "damage_type") as u8),
-        damage_power: part_field(id, 10, "damage_power"),
-        damage_recoil: part_field(id, 10, "damage_recoil"),
-        en_drain: part_field(id, 10, "en_drain"),
+        missile_flight,
+        is_missile,
+        weapon_lock_max,
+        burst_count,
+        burst_interval: part_field(id, category, "burst_interval"),
+        damage_type: DamageType::from_raw(part_field(id, category, "damage_type") as u8),
+        damage_power: part_field(id, category, "damage_power"),
+        damage_recoil: part_field(id, category, "damage_recoil"),
+        en_drain: part_field(id, category, "en_drain"),
         decay: RangeDecay {
-            no_decay_range: part_field(id, 10, "no_decay_range"),
-            damp_range: part_field(id, 10, "damp_range"),
-            guarantee_rate: part_field(id, 10, "guarantee_rate"),
-            min_power_rate: part_field(id, 10, "min_power_rate"),
+            no_decay_range: part_field(id, category, "no_decay_range"),
+            damp_range: part_field(id, category, "damp_range"),
+            guarantee_rate: part_field(id, category, "guarantee_rate"),
+            min_power_rate: part_field(id, category, "min_power_rate"),
         },
         fx,
-        shoot: shoot_of(id),
+        shoot: shoot_of_hit(hit_id),
         hit_se,
-        stance: part_field(id, 10, "ready_position") != 0.0,
-        sniper: part_field(id, 10, "weapon_kind") == 5.0,
+        stance: category == 10 && part_field(id, 10, "ready_position") != 0.0,
+        sniper: category == 10 && part_field(id, 10, "weapon_kind") == 5.0,
     }
 }
 
-fn shoot_of(id: i64) -> i16 {
-    let hit_id = part_field(id, 10, "hit_id") as u32;
+fn gun(id: i64) -> Gun {
+    gun_from_category(id, 10, 1)
+}
+
+fn shoulder_gun(id: i64, arms_mount: u8) -> Gun {
+    gun_from_category(id, 12, arms_mount)
+}
+
+fn shoot_of_hit(hit_id: u32) -> i16 {
     find(PARAM_ACWEAPONSOUNDPARAM_BIN, hit_id)
         .map(|r| r.data.shoot)
         .unwrap_or(DEFAULT_SHOOT)
 }
 
-fn fx_and_hit_se(id: i64) -> (Fx, HitSe) {
-    let hit_id = part_field(id, 10, "hit_id") as u32;
+fn fx_and_hit_se_for(hit_id: u32) -> (Fx, HitSe) {
     let Some(row) = find(PARAM_ACWEAPONSFXPARAM_BIN, hit_id)
         .or_else(|| find(PARAM_ACWEAPONSFXPARAM_BIN, 1))
         .map(|r| &r.data)
@@ -916,7 +1447,9 @@ fn fx_and_hit_se(id: i64) -> (Fx, HitSe) {
         return (Fx::default(), HitSe::default());
     };
     let hit_type = u32::try_from(row.hit_sfx_type).ok();
-    let hit_sfx = hit_type.and_then(|t| find(PARAM_BULLETHITSFXPARAM_BIN, t)).map(|r| &r.data);
+    let hit_sfx = hit_type
+        .and_then(|t| find(PARAM_BULLETHITSFXPARAM_BIN, t))
+        .map(|r| &r.data);
     let hit_se = hit_type
         .and_then(|t| find(PARAM_BULLETHITSEPARAM_BIN, t))
         .map(|r| HitSe {
@@ -930,11 +1463,37 @@ fn fx_and_hit_se(id: i64) -> (Fx, HitSe) {
         hit: hit_sfx.map_or(0, |d| d.default2.into()),
         hit_low: hit_sfx.map_or(0, |d| d.dry_ac_low_damage.into()),
         hit_hi: hit_sfx.map_or(0, |d| d.ac_hi_damage.into()),
+        after_accel: row.after_accel_follow_sfx_id.into(),
+        delete_fx: row.delete_sfx_id.into(),
     };
     (fx, hit_se)
 }
 
-fn flight(id: u32, init_speed: f32) -> (Kind, Flight, f32) {
+fn flight(id: u32, init_speed: f32) -> (Kind, Flight, Option<MissileFlight>, f32) {
+    if let Some(row) = find(BULLET_BULLETMISSILE_BIN, id) {
+        let d = &row.data;
+        let mf = MissileFlight {
+            accel: d.accel,
+            air_cp: d.air_cp,
+            before_accel_gravity: d.before_accel_gravity,
+            after_accel_gravity: d.after_accel_gravity,
+            brake: d.brake,
+            accel_start_frame: d.accel_start_frame as f32,
+            accel_end_frame: d.accel_end_frame as f32,
+            act_start_frame: d.act_start_frame as f32,
+            trace_turn_deg_s: d.trace_trun_angle,
+            min_speed: d.min_speed_km_h as f32 / KMH_PER_MS,
+            max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
+            hit_radius: d.hit_radius,
+            proximity_fuse_range: d.proximity_fuse_range,
+        };
+        return (
+            Kind::Missile,
+            Flight::default(),
+            Some(mf),
+            speed(init_speed, d.max_speed_km_h),
+        );
+    }
     if let Some(row) = find(BULLET_BULLETRIGID_BIN, id) {
         let d = &row.data;
         return (
@@ -949,6 +1508,7 @@ fn flight(id: u32, init_speed: f32) -> (Kind, Flight, f32) {
                 brake: d.brake,
                 stall_to_vanish_frame: None,
             },
+            None,
             speed(init_speed, d.max_speed_km_h),
         );
     }
@@ -966,10 +1526,11 @@ fn flight(id: u32, init_speed: f32) -> (Kind, Flight, f32) {
                 brake: d.brake,
                 stall_to_vanish_frame: Some(d.stall_to_vanish_frame as f32),
             },
+            None,
             speed(init_speed, d.max_speed_km_h),
         );
     }
-    (Kind::Skip, Flight::default(), init_speed)
+    (Kind::Skip, Flight::default(), None, init_speed)
 }
 
 fn speed(init: f32, max_km_h: u16) -> f32 {
@@ -1997,5 +2558,55 @@ mod tests {
         assert_eq!(gun(1720).fx.hit_low, 199);
         assert_eq!(gun(1720).fx.hit_hi, 411);
         assert_eq!(gun(2230).damage_type, DamageType::Ce);
+    }
+
+    #[test]
+    fn shoulder_missile_520_reads_cat12_fields_and_homing_flight() {
+        // Design 5001 shoulder unit 520 (sh0520, Small missile).
+        let sh = shoulder_gun(520, 1);
+        assert_eq!(sh.kind, Kind::Missile);
+        assert!(sh.is_missile);
+        assert_eq!(sh.magazine, 72);
+        assert_eq!(sh.reload_time, 112.0);
+        assert_eq!(sh.lock_time_ticks, 18.0);
+        assert_eq!(sh.weapon_lock_max, 6);
+        assert_eq!(sh.burst_count, 1);
+        assert_eq!(sh.burst_interval, 10.0);
+        assert_eq!(sh.init_speed, 60.0);
+        assert_eq!(sh.damage_type, DamageType::Ce);
+        assert_eq!(sh.damage_power, 1292.0);
+        assert_eq!(sh.damage_recoil, 884.0);
+        assert_eq!(sh.shoot, 70);
+        assert_eq!(sh.fx.bullet, 4800);
+        assert_eq!(sh.fx.after_accel, 4801);
+
+        // Twin-shoulder arms (am0120, float 4 = 2.0) double burst_count (`0x82858824..0x82858838`).
+        let twin = shoulder_gun(520, 2);
+        assert_eq!(twin.burst_count, 2);
+
+        // Homing missile launched upward & right ignites at frame 30 and curves to hit a target ahead.
+        let mut m = Missile::from_gun(&sh, Vec3::new(0.4, 0.5, -0.7).normalize(), None);
+        let mut pos = Vec3::ZERO;
+        let target = Vec3::new(0.0, 2.0, -120.0);
+        let dt = 1.0 / TICK_RATE;
+        let mut ignited_at = None;
+        let mut min_dist = f32::MAX;
+        for tick in 1..=240 {
+            let (delta, just_ignited) = m.step(pos, Some(target), dt).expect("missile alive");
+            if just_ignited {
+                ignited_at = Some(tick);
+            }
+            pos += delta;
+            let d = (pos - target).length();
+            min_dist = min_dist.min(d);
+            if d < 5.0 {
+                break;
+            }
+        }
+        assert_eq!(ignited_at, Some(30), "booster ignites at accel_start_frame = 30");
+        assert!(
+            min_dist < 5.0,
+            "homing missile should intercept target (min_dist = {min_dist})"
+        );
     }
 }

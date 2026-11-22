@@ -47,8 +47,9 @@ pub struct FcsSpec {
     /// Secondary lock-time multiplier (`AcCtrlParam::lock_effective_rate`, param 80).
     pub lock_effective_rate: f32,
     /// Missile lock-time multiplier (`AcCtrlParam::missile_lock_effective_rate`, param 81).
-    #[allow(dead_code)]
     pub missile_lock_effective_rate: f32,
+    /// FCS maximum simultaneous missile locks (`fcs.missile_lock_max`, `0x8247a1a0`, 1..=6).
+    pub missile_lock_max: u8,
     /// Horizontal lock-sight half-angle in radians (`fcs.lock_sight_x`).
     pub sight_x_rad: f32,
     /// Vertical lock-sight half-angle in radians (`fcs.lock_sight_y`).
@@ -63,6 +64,7 @@ impl FcsSpec {
             first_lock_range: ctrl.first_lock_range.max(1.0),
             lock_effective_rate: ctrl.lock_effective_rate.max(0.05),
             missile_lock_effective_rate: ctrl.missile_lock_effective_rate.max(0.05),
+            missile_lock_max: ctrl.missile_lock_max.round().clamp(1.0, 6.0) as u8,
             sight_x_rad: ctrl.lock_sight_x_rad.clamp(0.02, std::f32::consts::FRAC_PI_2 - 0.01),
             sight_y_rad: ctrl.lock_sight_y_rad.clamp(0.02, std::f32::consts::FRAC_PI_2 - 0.01),
             datum_back: ctrl.fcs_datum_back.max(0.0),
@@ -116,6 +118,14 @@ impl LockedTarget {
 pub struct Fcs {
     pub spec: FcsSpec,
     pub locked: Option<LockedTarget>,
+    /// Accumulated multi-target missile lock slots (`0x82858638`, up to 6).
+    pub missile_locks: Vec<Entity>,
+    /// Elapsed seconds toward the next missile lock slot (`0x82857688`).
+    pub missile_lock_timer: f32,
+    /// Effective max simultaneous missile locks (`min(fcs.missile_lock_max, weapon_lock_max)`).
+    pub missile_lock_max: u8,
+    /// Latest world-space center for each missile-locked target (for HUD projection).
+    pub missile_target_pos: HashMap<Entity, Vec3>,
 }
 
 impl Fcs {
@@ -123,7 +133,40 @@ impl Fcs {
         Self {
             spec: FcsSpec::from_ctrl(ctrl),
             locked: None,
+            missile_locks: Vec::new(),
+            missile_lock_timer: 0.0,
+            missile_lock_max: 0,
+            missile_target_pos: HashMap::new(),
         }
+    }
+
+    /// Number of active missile locks on `entity` (`0..=6`, `0x829d1a10`).
+    pub fn missile_lock_count(&self, entity: Entity) -> u8 {
+        self.missile_locks
+            .iter()
+            .filter(|&&e| e == entity)
+            .count()
+            .min(6) as u8
+    }
+
+    /// Unique missile-locked targets with their latest world center and lock count (`1..=6`),
+    /// preserving first-locked order.
+    pub fn missile_targets(&self) -> Vec<(Entity, Vec3, u8)> {
+        let mut out: Vec<(Entity, Vec3, u8)> = Vec::new();
+        for &entity in &self.missile_locks {
+            if let Some(entry) = out.iter_mut().find(|(e, _, _)| *e == entity) {
+                entry.2 = entry.2.saturating_add(1).min(6);
+            } else if let Some(&pos) = self.missile_target_pos.get(&entity) {
+                out.push((entity, pos, 1));
+            }
+        }
+        out
+    }
+
+    /// Drains all accumulated missile locks when firing a shoulder salvo and resets the timer.
+    pub fn take_missile_locks(&mut self) -> Vec<Entity> {
+        self.missile_lock_timer = 0.0;
+        std::mem::take(&mut self.missile_locks)
     }
 
     /// Computes the aim unit vector for hand `hand_idx` (`0` right, `1` left) from `muzzle`
@@ -162,6 +205,62 @@ pub fn secondary_lock_time(lock_time_ticks: f32, lock_effective_rate: f32) -> f3
         return 0.0;
     }
     (lock_time_ticks * lock_effective_rate / TICK_RATE).max(0.0)
+}
+
+/// Computes per-missile lock-on duration in seconds (`0x82857688` + `AcCtrlParam::missile_lock_effective_rate`,
+/// Lua param 81): `weapon.missile_lock_time * missile_lock_effective_rate / 60.0`.
+pub fn missile_lock_time(lock_time_ticks: f32, missile_lock_effective_rate: f32) -> f32 {
+    if lock_time_ticks <= 0.0 {
+        return 0.05;
+    }
+    (lock_time_ticks * missile_lock_effective_rate / TICK_RATE).max(0.05)
+}
+
+/// Pure multi-target missile lock accumulator (`0x82858638` + `0x82857688`):
+/// - Prunes any existing locks whose target left the outer keep-lock cone (`valid_targets`).
+/// - While `locks.len() < max_locks`, advances `timer` by `dt` and assigns each new lock
+///   to the inner-cone candidate with the fewest existing locks (tie-breaking by smallest `ell`).
+pub fn step_missile_locks(
+    locks: &mut Vec<Entity>,
+    timer: &mut f32,
+    inner_candidates: &[(Entity, f32)],
+    valid_targets: &HashMap<Entity, Vec3>,
+    max_locks: u8,
+    step_time: f32,
+    can_acquire: bool,
+    dt: f32,
+) {
+    locks.retain(|e| valid_targets.contains_key(e));
+    let cap = (max_locks.min(6)) as usize;
+    if locks.len() > cap {
+        locks.truncate(cap);
+    }
+    if !can_acquire || cap == 0 || inner_candidates.is_empty() || locks.len() >= cap {
+        *timer = 0.0;
+        return;
+    }
+    let step = step_time.max(0.05);
+    *timer += dt;
+    while *timer >= step && locks.len() < cap {
+        *timer -= step;
+        // Spread locks evenly across targets in the cone, breaking ties by closest to sight center.
+        let pick = inner_candidates
+            .iter()
+            .min_by(|&&(ea, ella), &&(eb, ellb)| {
+                let ca = locks.iter().filter(|&&x| x == ea).count();
+                let cb = locks.iter().filter(|&&x| x == eb).count();
+                ca.cmp(&cb).then_with(|| ella.total_cmp(&ellb))
+            })
+            .map(|&(e, _)| e);
+        if let Some(target) = pick {
+            locks.push(target);
+        } else {
+            break;
+        }
+    }
+    if locks.len() >= cap {
+        *timer = 0.0;
+    }
 }
 
 /// Tests whether `target_pos` is within `range` metres of `ac_pos` and inside the elliptical
@@ -279,8 +378,10 @@ pub fn update(
         .min(std::f32::consts::FRAC_PI_2 - 0.01);
     let cur_entity = fcs.locked.as_ref().map(|l| l.entity);
 
-    // Track target velocities and find best candidate in the lock-sight cone.
+    // Track target velocities and collect all candidates in the inner/outer lock-sight cones.
     let mut best: Option<(f32, Entity, String, String, Vec3, Vec3, f32, f32, f32)> = None;
+    let mut inner_candidates: Vec<(Entity, f32)> = Vec::new();
+    let mut valid_targets: HashMap<Entity, Vec3> = HashMap::new();
     for (entity, target, health, tf) in &targets {
         let center = tf.translation + Vec3::Y * health.center_offset_y();
         let vel = prev_pos
@@ -301,14 +402,17 @@ pub fn update(
             spec.sight_y_rad,
             spec.datum_back,
         );
+        let in_missile_locks = fcs.missile_locks.contains(&entity);
         let score = if let Some(ell) = inner {
+            inner_candidates.push((entity, ell));
+            valid_targets.insert(entity, center);
             // Slight bias toward keeping the current locked target to prevent edge flicker.
             if Some(entity) == cur_entity {
                 ell * 0.85
             } else {
                 ell
             }
-        } else if Some(entity) == cur_entity {
+        } else if Some(entity) == cur_entity || in_missile_locks {
             // Outer +2 deg hysteresis cone (`0x829d8758` / `0x829d8850`).
             match in_lock_cone(
                 ac_pos,
@@ -319,7 +423,14 @@ pub fn update(
                 outer_y,
                 spec.datum_back,
             ) {
-                Some(ell) => 1.0 + ell,
+                Some(ell) => {
+                    valid_targets.insert(entity, center);
+                    if Some(entity) == cur_entity {
+                        1.0 + ell
+                    } else {
+                        continue;
+                    }
+                }
                 None => continue,
             }
         } else {
@@ -341,6 +452,40 @@ pub fn update(
             ));
         }
     }
+
+    // Multi-target missile lock accumulation (`0x82858638` + `0x82857688`).
+    let sh = &arms.shoulder;
+    let effective_max = if sh.is_missile && sh.remaining > 0 {
+        spec.missile_lock_max
+            .min(sh.weapon_lock_max)
+            .min(sh.remaining.min(6) as u8)
+            .min(6)
+    } else {
+        0
+    };
+    fcs.missile_lock_max = effective_max;
+    let step_time = missile_lock_time(sh.lock_time_ticks, spec.missile_lock_effective_rate);
+    let can_acquire = sh.is_missile && sh.remaining > 0 && sh.cooldown <= 0.0 && arms.salvo.is_empty();
+    let mut locks = std::mem::take(&mut fcs.missile_locks);
+    let mut timer = fcs.missile_lock_timer;
+    step_missile_locks(
+        &mut locks,
+        &mut timer,
+        &inner_candidates,
+        &valid_targets,
+        effective_max,
+        step_time,
+        can_acquire,
+        dt,
+    );
+    fcs.missile_target_pos.clear();
+    for &e in &locks {
+        if let Some(&pos) = valid_targets.get(&e) {
+            fcs.missile_target_pos.insert(e, pos);
+        }
+    }
+    fcs.missile_locks = locks;
+    fcs.missile_lock_timer = timer;
 
     let Some((_, entity, name, model, world_pos, velocity, distance, ap, ap_max)) = best else {
         fcs.locked = None;
@@ -490,5 +635,39 @@ mod tests {
         let ticks = acvd_data::part_field(1720, 10, "missile_lock_time");
         let t = secondary_lock_time(ticks, 0.85);
         assert!((t - ticks * 0.85 / 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn multi_lock_missile_accumulation_spreads_and_caps() {
+        let e1 = Entity::from_bits(1);
+        let e2 = Entity::from_bits(2);
+        let e3 = Entity::from_bits(3);
+        let inner = vec![(e1, 0.1), (e2, 0.3), (e3, 0.6)];
+        let mut valid = HashMap::new();
+        valid.insert(e1, Vec3::new(0.0, 0.0, -50.0));
+        valid.insert(e2, Vec3::new(10.0, 0.0, -60.0));
+        valid.insert(e3, Vec3::new(-10.0, 0.0, -70.0));
+
+        let mut locks = Vec::new();
+        let mut timer = 0.0;
+        let step = missile_lock_time(18.0, 1.0); // 0.3 s per lock
+
+        // After 0.95 s -> 3 locks, one on each target in center-ness order.
+        step_missile_locks(&mut locks, &mut timer, &inner, &valid, 6, step, true, 0.95);
+        assert_eq!(locks, vec![e1, e2, e3]);
+
+        // After another 1.0 s -> capped at max_locks = 5 (e1: 2, e2: 2, e3: 1).
+        step_missile_locks(&mut locks, &mut timer, &inner, &valid, 5, step, true, 1.0);
+        assert_eq!(locks.len(), 5);
+        assert_eq!(locks.iter().filter(|&&e| e == e1).count(), 2);
+        assert_eq!(locks.iter().filter(|&&e| e == e2).count(), 2);
+        assert_eq!(locks.iter().filter(|&&e| e == e3).count(), 1);
+
+        // Removing e2 from valid_targets prunes its locks immediately.
+        valid.remove(&e2);
+        let inner2 = vec![(e1, 0.1), (e3, 0.6)];
+        step_missile_locks(&mut locks, &mut timer, &inner2, &valid, 5, step, true, 0.01);
+        assert_eq!(locks.iter().filter(|&&e| e == e2).count(), 0);
+        assert_eq!(locks.len(), 3);
     }
 }

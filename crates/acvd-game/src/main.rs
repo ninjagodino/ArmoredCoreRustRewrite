@@ -7,7 +7,8 @@
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump,
 //! V high boost (quick boost), Ctrl glide boost while boosting on the ground
 //! (air clips once it leaves the ground);
-//! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left (see `weapons`).
+//! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left,
+//! G / X / Tab / R1 fire the shoulder weapon / locked missile salvo (see `weapons`).
 //! Hold R (△ / gamepad North) and press that fire button to bay-shift: the hand weapon trades
 //! places with the one on the rack (see `bay`). A ready-position weapon is purged instead,
 //! because it cannot sit on the bay.
@@ -276,22 +277,29 @@ fn main() {
     .add_systems(
         Update,
         (
-            browse,
-            show,
-            clips,
-            control::pilot,
-            fcs::update,
-            map::lod,
-            pose::animate,
-            boost::pose,
-            boost::hide,
-            hanger::pose,
-            bay::shift,
-            weapons::fire,
-            weapons::step_projectiles,
-            targets::tick,
-            orbit,
-            reframe,
+            (
+                browse,
+                show,
+                clips,
+                control::pilot,
+                fcs::update,
+                map::lod,
+                pose::animate,
+                boost::pose,
+                boost::hide,
+                hanger::pose,
+            )
+                .chain(),
+            (
+                bay::shift,
+                weapons::fire,
+                weapons::step_projectiles,
+                weapons::step_missiles,
+                targets::tick,
+                orbit,
+                reframe,
+            )
+                .chain(),
         )
             .chain(),
     )
@@ -340,6 +348,9 @@ fn key(name: &str) -> Option<KeyCode> {
         "v" => KeyCode::KeyV,
         "f" | "fire" => KeyCode::KeyF,
         "c" => KeyCode::KeyC,
+        "g" | "shoulder" => KeyCode::KeyG,
+        "x" => KeyCode::KeyX,
+        "tab" => KeyCode::Tab,
         "r" => KeyCode::KeyR,
         "up" => KeyCode::ArrowUp,
         "down" => KeyCode::ArrowDown,
@@ -565,7 +576,7 @@ fn show(
     mut commands: Commands,
     mut garage: ResMut<Garage>,
     acs: Query<Entity, With<Ac>>,
-    shots: Query<Entity, With<weapons::Projectile>>,
+    shots: Query<Entity, Or<(With<weapons::Projectile>, With<weapons::Missile>)>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut paint_materials: ResMut<Assets<paint::AcPaintMaterial>>,
@@ -661,6 +672,11 @@ fn show(
         if let Some(h) = weapons::hardpoint(part.placement) {
             if let Some(root) = root {
                 commands.entity(root).insert(h);
+            }
+        }
+        if weapons::is_shoulder_hardpoint(part.placement) {
+            if let Some(root) = root {
+                commands.entity(root).insert(weapons::ShoulderHardpoint);
             }
         }
         if part.placement.column == "rack_r" || part.placement.column == "rack_l" {

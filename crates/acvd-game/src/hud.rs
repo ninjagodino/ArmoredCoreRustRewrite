@@ -129,6 +129,15 @@ pub struct LockCursorTarget;
 #[derive(Component)]
 pub struct LockCursorInfo;
 
+/// Per-target multi-lock missile cursor (`MissileLock1..6`, `0x829d1910` / `0x829d1a10`),
+/// indexed `0..6`.
+#[derive(Component)]
+pub struct MissileLockMarker(usize);
+
+/// Individual missile lock pip (`0..6`) inside `MissileLockMarker(slot)` (`0x829d1a10`).
+#[derive(Component)]
+pub struct MissileLockPip(usize, usize);
+
 fn tuning(index: usize) -> f32 {
     acvd_data::tuning(STATIC_DRAW, index).unwrap_or_default() as f32
 }
@@ -225,6 +234,46 @@ pub fn layout(
         commands
             .entity(root)
             .insert((LockCursorInfo, Visibility::Hidden));
+    }
+    // Up to 6 simultaneous missile-locked target markers with 6 `MissileLock1..6` pips each
+    // (`0x829d1910` / `0x829d1a10`).
+    let msl_color = Color::srgba(1.0, 0.55, 0.1, 0.95);
+    for slot in 0..6 {
+        commands
+            .spawn((
+                MenuRoot,
+                MissileLockMarker(slot),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0.0),
+                    top: px(0.0),
+                    width: px(44.0 * scale),
+                    height: px(44.0 * scale),
+                    border: UiRect::all(px((1.5 * scale).max(1.0))),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::FlexEnd,
+                    justify_content: JustifyContent::Center,
+                    column_gap: px((2.0 * scale).max(1.0)),
+                    padding: UiRect::bottom(px((2.0 * scale).max(1.0))),
+                    ..default()
+                },
+                BorderColor::all(msl_color),
+                Visibility::Hidden,
+            ))
+            .with_children(|parent| {
+                for pip in 0..6 {
+                    parent.spawn((
+                        MissileLockPip(slot, pip),
+                        Node {
+                            width: px((5.0 * scale).max(3.0)),
+                            height: px((5.0 * scale).max(3.0)),
+                            ..default()
+                        },
+                        BackgroundColor(msl_color),
+                        Visibility::Hidden,
+                    ));
+                }
+            });
     }
 }
 
@@ -338,7 +387,13 @@ fn reading(
             let f = fraction(g.remaining as f32, g.magazine as f32);
             (g.remaining as u32, f, g.magazine > 0 && f < tuning(324))
         }),
-        Readout::Shoulder => None,
+        Readout::Shoulder => arms
+            .map(|a| a.shoulder)
+            .filter(|g| g.kind != Kind::Skip)
+            .map(|g| {
+                let f = fraction(g.remaining as f32, g.magazine as f32);
+                (g.remaining as u32, f, g.magazine > 0 && f < tuning(324))
+            }),
     }
 }
 
@@ -569,29 +624,70 @@ pub fn panels(
 }
 
 /// Projects the FCS-locked target onto the viewport and updates the hollow lock-on bracket
-/// (tinted by `StaticDrawParam` 1st/2nd lock colors, shrinking as secondary lock completes)
-/// and `ACV_OutLine_LockCursor_E` (`EnemyName`, `EnemyAP`, `EnemyInfo`, `0x829d1b40`).
-#[allow(clippy::too_many_arguments)]
+/// (tinted by `StaticDrawParam` 1st/2nd lock colors, shrinking as secondary lock completes),
+/// `ACV_OutLine_LockCursor_E` (`EnemyName`, `EnemyAP`, `EnemyInfo`, `0x829d1b40`), and
+/// per-target `MissileLock1..6` markers (`0x829d1910` / `0x829d1a10`).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn lock_cursor(
     hud: Option<Res<Sortie>>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     fcs_q: Query<&Fcs>,
     mut cursor_target: Query<
         (&mut Node, &mut BorderColor, &mut Visibility),
-        (With<LockCursorTarget>, Without<LockCursorInfo>, Without<MenuObject>),
+        (
+            With<LockCursorTarget>,
+            Without<LockCursorInfo>,
+            Without<MissileLockMarker>,
+            Without<MissileLockPip>,
+            Without<MenuObject>,
+        ),
     >,
     mut cursor_info: Query<
         (Entity, &mut Node, &mut Visibility),
-        (With<LockCursorInfo>, Without<LockCursorTarget>, Without<MenuObject>),
+        (
+            With<LockCursorInfo>,
+            Without<LockCursorTarget>,
+            Without<MissileLockMarker>,
+            Without<MissileLockPip>,
+            Without<MenuObject>,
+        ),
+    >,
+    mut msl_markers: Query<
+        (&MissileLockMarker, &mut Node, &mut Visibility),
+        (
+            Without<LockCursorTarget>,
+            Without<LockCursorInfo>,
+            Without<MissileLockPip>,
+            Without<MenuObject>,
+        ),
+    >,
+    mut msl_pips: Query<
+        (&MissileLockPip, &mut Visibility),
+        (
+            Without<LockCursorTarget>,
+            Without<LockCursorInfo>,
+            Without<MissileLockMarker>,
+            Without<MenuObject>,
+        ),
     >,
     children: Query<&Children>,
-    mut objects: Query<(&MenuObject, &mut Visibility, Option<&mut MenuText>)>,
+    mut objects: Query<
+        (&MenuObject, &mut Visibility, Option<&mut MenuText>),
+        (
+            Without<LockCursorTarget>,
+            Without<LockCursorInfo>,
+            Without<MissileLockMarker>,
+            Without<MissileLockPip>,
+        ),
+    >,
 ) {
     let Some(hud) = hud else { return };
     let scale = hud.scale;
-    let locked = fcs_q.single().ok().and_then(|f| f.locked.as_ref());
+    let fcs = fcs_q.single().ok();
+    let cam_pair = cameras.single().ok();
+    let locked = fcs.and_then(|f| f.locked.as_ref());
     let projected = locked.and_then(|lock| {
-        let (cam, cam_gt) = cameras.single().ok()?;
+        let (cam, cam_gt) = cam_pair?;
         let vp = cam.world_to_viewport(cam_gt, lock.world_pos).ok()?;
         Some((lock, vp))
     });
@@ -623,6 +719,7 @@ pub fn lock_cursor(
         node.top = px(vp.y - 16.0 * scale);
         let secondary = lock.any_secondary();
         let pct = (lock.progress(0).max(lock.progress(1)) * 100.0).round() as u32;
+        let msl_count = fcs.map_or(0, |f| f.missile_lock_count(lock.entity));
         for child in children.iter_descendants(root) {
             let Ok((obj, mut cvis, text)) = objects.get_mut(child) else {
                 continue;
@@ -647,11 +744,14 @@ pub fn lock_cursor(
                 }
                 "EnemyInfo" => {
                     if let Some(mut t) = text {
-                        let s = if secondary {
+                        let mut s = if secondary {
                             format!("{:.0}m", lock.distance)
                         } else {
                             format!("{:.0}m {pct}%", lock.distance)
                         };
+                        if msl_count > 0 {
+                            s.push_str(&format!(" MSLx{msl_count}"));
+                        }
                         if t.text != s {
                             t.text = s;
                         }
@@ -667,6 +767,40 @@ pub fn lock_cursor(
                 Visibility::Hidden
             });
         }
+    }
+
+    // Update multi-target missile lock markers (`MissileLock1..6`, `0x829d1910` / `0x829d1a10`).
+    let msl_targets: Vec<(Vec2, u8)> = fcs
+        .into_iter()
+        .flat_map(Fcs::missile_targets)
+        .filter_map(|(_, pos, count)| {
+            let (cam, cam_gt) = cam_pair?;
+            let vp = cam.world_to_viewport(cam_gt, pos).ok()?;
+            Some((vp, count))
+        })
+        .take(6)
+        .collect();
+    let msl_side = 44.0 * scale;
+    for (marker, mut node, mut vis) in &mut msl_markers {
+        let Some(&(vp, _)) = msl_targets.get(marker.0) else {
+            vis.set_if_neq(Visibility::Hidden);
+            continue;
+        };
+        vis.set_if_neq(Visibility::Inherited);
+        node.width = px(msl_side);
+        node.height = px(msl_side);
+        node.left = px(vp.x - msl_side * 0.5);
+        node.top = px(vp.y - msl_side * 0.5);
+    }
+    for (pip, mut vis) in &mut msl_pips {
+        let active = msl_targets
+            .get(pip.0)
+            .is_some_and(|&(_, count)| pip.1 < count as usize);
+        vis.set_if_neq(if active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
     }
 }
 
@@ -737,5 +871,25 @@ mod tests {
         assert_eq!(digits, 2000);
         assert!((fill - 0.2).abs() < 1e-6);
         assert!(low, "20% EN is below en_red_zone");
+    }
+
+    #[test]
+    fn shoulder_readout_shows_ammo_and_red_zone() {
+        let d = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .unwrap();
+        let mut arms = Armament::from_design(&d.data);
+        let (digits, fill, low) = reading(Readout::Shoulder, None, Some(&arms)).unwrap();
+        assert_eq!(digits, 72);
+        assert_eq!(fill, 1.0);
+        assert!(!low);
+
+        arms.shoulder.remaining = 10;
+        let (digits, fill, low) = reading(Readout::Shoulder, None, Some(&arms)).unwrap();
+        assert_eq!(digits, 10);
+        assert!((fill - 10.0 / 72.0).abs() < 1e-5);
+        assert!(low, "10/72 shoulder ammo is below ammo_red_zone");
     }
 }

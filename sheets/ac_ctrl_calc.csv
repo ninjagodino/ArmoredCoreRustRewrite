@@ -128,3 +128,4 @@ missile_lock_effective_rate,81,multiplier,new_ac_behavior.fcs_lock_base + (new_a
 lock_sight_x_rad,-,rad,fcs.lock_sight_x.to_radians(),"360 0x82858178 (vtable 0x820541f0 +0x54) -> 0x828577b0 multiplies fcs.lock_sight_x (+0x13e) by deg2rad (0x8371c0e8) for the elliptical lock-sight horizontal half-angle (0x829d8340 / 0x829dd5b8)"
 lock_sight_y_rad,-,rad,fcs.lock_sight_y.to_radians(),"360 0x82858178 -> 0x828577b0 multiplies fcs.lock_sight_y (+0x140) by deg2rad for the elliptical lock-sight vertical half-angle"
 fcs_datum_back,-,m,assemble.fcs_datum_back,"360 0x828577b0 reads Assemble.bin +0x328 (20.0 m) into lock-sight frustum spec +0x14"
+missile_lock_max,-,locks,fcs.missile_lock_max,"360 0x8247a1a0 (FCS +0x135) clamped against weapon lock_once / burst_count in 0x82858638 (0x828587d8..0x828587f0) for max simultaneous missile locks (1-6)"
