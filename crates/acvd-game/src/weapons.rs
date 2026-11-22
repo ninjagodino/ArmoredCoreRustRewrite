@@ -769,11 +769,13 @@ pub fn fire(
     }
     // Bay shift (manual 20403): while the modifier is held, the fire buttons exchange that
     // arm with its bay weapon instead of shooting. The clip keeps the block after release.
+    // Scan Mode (`AC + 0xdb0 != 0`, `0x828b51e0` -> `0x82879d58(_, 0)`, `manual.fmg` 20407):
+    // weapon fire is disabled while in Scan Mode (R2 becomes Target Scan).
     let shifting = body.shift.is_some()
         || keys.pressed(KeyCode::KeyR)
         || held.0.contains(&KeyCode::KeyR)
         || pads.iter().any(|pad| pad.pressed(GamepadButton::North));
-    if shifting {
+    if shifting || pilot.scan_mode {
         want = [false, false];
         want_shoulder = false;
     }

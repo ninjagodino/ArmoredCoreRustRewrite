@@ -167,6 +167,9 @@ pub struct Pilot {
     pub boost: bool,
     pub glide: bool,
     pub airborne: bool,
+    /// True while Scan Mode is active (`AC + 0xdb0 != 0`, `0x828b41a0`). Switches passive EN
+    /// drain to `scan_passive_en_drain_tick` (`0x8286a558` / `0x828bef18`) and locks out firing.
+    pub scan_mode: bool,
     /// Move stick this frame, x right and y forward in the facing the integrator uses.
     /// The booster effect dispatcher (`0x828932a0`) reads this vector.
     pub command: Vec2,
@@ -892,6 +895,7 @@ impl Pilot {
             boost: false,
             glide: false,
             airborne: false,
+            scan_mode: false,
             command: Vec2::ZERO,
             quick_boosts: 0,
             second_stage_qb: false,
@@ -1427,9 +1431,16 @@ fn step_wall_jump(p: &mut Pilot, input: &Input, facing: Quat) -> Option<WallJump
 /// One 60 Hz tick of generator output minus passive part EN drain (`360 0x828bef18` at
 /// `0x828bf6cc..0x828bf74c`: `0x8287edd8` -> `0x8287eef0` -> `0x82830910(passive=1)` ->
 /// `0x8287ef40` -> `0x828307c8`; Xenia probes `private/xenia/en_drain{,2}.jsonl`).
-/// Runs every tick with no recovery delay and the same rate on ground and in air.
+/// In Scan Mode (`AC + 0xdb0 != 0`, `0x828bf6d4..0x828bf6ec`) uses `0x82868268`
+/// (`scan_passive_en_drain_tick`, `0x8286a558` + `NewAcBehavior` fields 319-331) for faster EN
+/// recharge. Runs every tick with no recovery delay and the same rate on ground and in air.
 fn step_en(p: &mut Pilot) {
-    let net = p.ctrl.en_output_tick - p.ctrl.passive_en_drain_tick;
+    let drain = if p.scan_mode {
+        p.ctrl.scan_passive_en_drain_tick
+    } else {
+        p.ctrl.passive_en_drain_tick
+    };
+    let net = p.ctrl.en_output_tick - drain;
     p.en = (p.en + net).clamp(0.0, p.en_max);
 }
 
@@ -2443,6 +2454,16 @@ mod tests {
         let net_tick = ctrl.en_output_tick - ctrl.passive_en_drain_tick;
         step_en(&mut p);
         assert!((p.en - (before_rec + net_tick)).abs() < 1e-3);
+
+        // Scan Mode (`AC + 0xdb0 != 0`, `0x828bef18` -> `0x82868268`) uses reduced passive EN drain
+        // (`0x8286a558`), so EN recharges strictly faster per tick.
+        p.scan_mode = true;
+        let before_scan = p.en;
+        let scan_net_tick = ctrl.en_output_tick - ctrl.scan_passive_en_drain_tick;
+        assert!(scan_net_tick > net_tick, "Scan Mode recharges EN faster than Combat Mode");
+        step_en(&mut p);
+        assert!((p.en - (before_scan + scan_net_tick)).abs() < 1e-3);
+        p.scan_mode = false;
 
         // High Boost is blocked without draining when EN < qb_en_drain.
         p.qb = None;

@@ -6,6 +6,7 @@ slot,table,column,category,evidence
 4,AC_ASSEMBLY_DESIGN_ST,fcs,4,slot 4
 5,AC_ASSEMBLY_DESIGN_ST,gene,5,slot 5
 6,AC_ASSEMBLY_DESIGN_ST,booster,6,slot 6; Lua reads the booster ids 600/601 here
+9,AC_ASSEMBLY_DESIGN_ST,ob,13,"slot 9 (AC4/FA OverBoost column reused for Recon in ACVD); 360 0x824554a8 reads part list +0xe4 (slot 9) as category 13 recon, and 0x82869370 case 9 reads NewAcBehavior +0x4d2 (Scan Mode Recon EN reduction)"
 10,AC_ASSEMBLY_DESIGN_ST,armwep_r,10,slot 10
 11,AC_ASSEMBLY_DESIGN_ST,armwep_l,10,slot 11
 12,AC_ASSEMBLY_DESIGN_ST,back_r,11,"slot 12; every preset's back_r is an overed weapon id (110, 610, 810)"

@@ -370,6 +370,13 @@ pub fn update(
     let Ok((pilot, arms, ac_tf, mut fcs)) = acs.single_mut() else {
         return;
     };
+    if pilot.scan_mode {
+        fcs.locked = None;
+        fcs.missile_locks.clear();
+        fcs.missile_lock_timer = 0.0;
+        fcs.missile_target_pos.clear();
+        return;
+    }
 
     let ac_pos = ac_tf.translation + Vec3::Y * AC_WAIST_Y;
     let aim_dir = pilot.aim_direction();

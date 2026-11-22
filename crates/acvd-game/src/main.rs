@@ -9,6 +9,11 @@
 //! (air clips once it leaves the ground);
 //! F / left mouse / R2 fire the right arm weapon, C / right mouse / L2 the left,
 //! G / X / Tab / R1 fire the shoulder weapon / locked missile salvo (see `weapons`).
+//! Z / Select / R3 toggles Scan Mode (`AC + 0xdb0`, `scan`): reduces passive EN drain for faster
+//! recharge, disables weapon fire, switches the HUD lock sight to `ACV_ScanModeLockSight`, and
+//! turns F / left mouse / R2 into Target Scan (populating `ACV_Scan_Cur_EnemyParamInfo` with
+//! AP and KE/CE/TE defenses). B / East (○) deploys a Recon unit from the design's category-13
+//! `ob` slot (`bullet/bulletrecon.bin`), marking targets inside its `effective_range`.
 //! Hold R (△ / gamepad North) and press that fire button to bay-shift: the hand weapon trades
 //! places with the one on the rack (see `bay`). A ready-position weapon is purged instead,
 //! because it cannot sit on the bay.
@@ -49,6 +54,7 @@ mod hud;
 mod map;
 mod paint;
 mod pose;
+mod scan;
 mod sfx;
 mod sound;
 mod targets;
@@ -282,6 +288,7 @@ fn main() {
                 show,
                 clips,
                 control::pilot,
+                scan::update,
                 fcs::update,
                 map::lod,
                 pose::animate,
@@ -305,7 +312,15 @@ fn main() {
     )
     .add_systems(
         Update,
-        (hud::layout, hud::tick, hud::readouts, hud::panels, hud::lock_cursor)
+        (
+            hud::layout,
+            hud::tick,
+            hud::readouts,
+            hud::panels,
+            hud::lock_cursor,
+            hud::scan_hud,
+            hud::recon_hud,
+        )
             .chain()
             .after(weapons::fire),
     );
@@ -352,6 +367,8 @@ fn key(name: &str) -> Option<KeyCode> {
         "x" => KeyCode::KeyX,
         "tab" => KeyCode::Tab,
         "r" => KeyCode::KeyR,
+        "z" | "scan" => KeyCode::KeyZ,
+        "b" | "recon" => KeyCode::KeyB,
         "up" => KeyCode::ArrowUp,
         "down" => KeyCode::ArrowDown,
         other => {
@@ -576,7 +593,14 @@ fn show(
     mut commands: Commands,
     mut garage: ResMut<Garage>,
     acs: Query<Entity, With<Ac>>,
-    shots: Query<Entity, Or<(With<weapons::Projectile>, With<weapons::Missile>)>>,
+    shots: Query<
+        Entity,
+        Or<(
+            With<weapons::Projectile>,
+            With<weapons::Missile>,
+            With<scan::ReconUnit>,
+        )>,
+    >,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut paint_materials: ResMut<Assets<paint::AcPaintMaterial>>,
@@ -876,6 +900,7 @@ fn show(
     commands.entity(ac).insert((
         pilot,
         fcs,
+        scan::ScanState::from_design(&design.data),
         weapons::Armament::from_design(&design.data),
         hud::Status::from_design(&design.data),
     ));
