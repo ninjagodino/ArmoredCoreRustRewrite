@@ -655,6 +655,18 @@ impl Flver {
                 let len = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
                 *n = if len > 0.0 { r.map(|c| c / len) } else { r };
             }
+            for ts in &mut v.tangents {
+                if let Some(t) = ts.get_mut(k) {
+                    let r = Xform {
+                        m: x.m,
+                        t: [0.0; 3],
+                    }
+                    .apply([t[0], t[1], t[2]]);
+                    let len = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+                    let u = if len > 0.0 { r.map(|c| c / len) } else { r };
+                    *t = [u[0], u[1], u[2], t[3]];
+                }
+            }
         }
     }
 

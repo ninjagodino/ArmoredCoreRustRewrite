@@ -372,6 +372,88 @@ pub fn block_level_span(
     (face as u64 * stride + before, this)
 }
 
+/// Decodes one 8-byte little-endian Xenos CTX1 4x4 block (as produced by [`xenos::untile`])
+/// into 16 `[r, g]` texels in row-major order.
+///
+/// Layout (Xenia `texture_load_ctx1.cs.xesl` / `XeCTX1TwoBlocksRowToR8G8`, `sheets/texture_formats.csv`
+/// codes 24 and 25):
+/// - bytes `0..4`: two 16-bit LE endpoint pairs `[y0, x0, y1, x1]` (`x` = R in high byte, `y` = G in low byte)
+/// - bytes `4..8`: `u32` LE of 16 two-bit selectors (`0 => e0`, `1 => e1`, `2 => (2*e0+e1)/3`, `3 => (e0+2*e1)/3`)
+pub fn decode_ctx1_block(block: &[u8; 8]) -> [[u8; 2]; 16] {
+    let (y0, x0, y1, x1) = (block[0] as u16, block[1] as u16, block[2] as u16, block[3] as u16);
+    let px = [x0 as u8, x1 as u8, ((2 * x0 + x1) / 3) as u8, ((x0 + 2 * x1) / 3) as u8];
+    let py = [y0 as u8, y1 as u8, ((2 * y0 + y1) / 3) as u8, ((y0 + 2 * y1) / 3) as u8];
+    let idx = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    let mut out = [[0u8; 2]; 16];
+    for (i, texel) in out.iter_mut().enumerate() {
+        let sel = ((idx >> (2 * i)) & 3) as usize;
+        *texel = [px[sel], py[sel]];
+    }
+    out
+}
+
+/// Decodes a linear CTX1 mip chain (as returned by [`Texture::linear`] with `block_bytes = 8`)
+/// into tightly packed `Rg8Unorm` bytes (every mip level of each face in order, 2 bytes/texel).
+pub fn decode_ctx1(
+    linear: &[u8],
+    width: u16,
+    height: u16,
+    levels: u32,
+    faces: u32,
+) -> Result<Vec<u8>> {
+    let faces = faces.max(1);
+    let need = chain(width, height, levels, 8) * faces as u64;
+    ensure!(
+        linear.len() as u64 >= need,
+        "linear CTX1 {width}x{height} ({levels} levels, {faces} faces) is {} bytes, needs {need}",
+        linear.len()
+    );
+    let total_texels: usize = (0..levels)
+        .map(|m| {
+            let lw = (width as usize >> m).max(1);
+            let lh = (height as usize >> m).max(1);
+            lw * lh
+        })
+        .sum::<usize>()
+        * faces as usize;
+    let mut out = vec![0u8; total_texels * 2];
+    let mut src = 0usize;
+    let mut dst_level = 0usize;
+    for _ in 0..faces {
+        for m in 0..levels {
+            let lw = (width as usize >> m).max(1);
+            let lh = (height as usize >> m).max(1);
+            let bw = lw.div_ceil(4);
+            let bh = lh.div_ceil(4);
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let block: &[u8; 8] = linear[src..src + 8].try_into().unwrap();
+                    src += 8;
+                    let texels = decode_ctx1_block(block);
+                    for ly in 0..4 {
+                        let y = by * 4 + ly;
+                        if y >= lh {
+                            break;
+                        }
+                        for lx in 0..4 {
+                            let x = bx * 4 + lx;
+                            if x >= lw {
+                                break;
+                            }
+                            let at = dst_level + (y * lw + x) * 2;
+                            let rg = texels[ly * 4 + lx];
+                            out[at] = rg[0];
+                            out[at + 1] = rg[1];
+                        }
+                    }
+                }
+            }
+            dst_level += lw * lh * 2;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +509,105 @@ mod tests {
             }
             assert_eq!(n, count, "{pack}");
         }
+    }
+
+    #[test]
+    fn ctx1_block_decodes_endpoints_and_weights() {
+        // y0 = 60, x0 = 120, y1 = 180, x1 = 210
+        // selectors: 0, 1, 2, 3 repeated 4 times (0b11_10_01_00 = 0xE4 per byte)
+        let block = [60, 120, 180, 210, 0xE4, 0xE4, 0xE4, 0xE4];
+        let px = decode_ctx1_block(&block);
+        for row in 0..4 {
+            assert_eq!(px[row * 4], [120, 60]);
+            assert_eq!(px[row * 4 + 1], [210, 180]);
+            assert_eq!(px[row * 4 + 2], [150, 100]); // (2*120+210)/3 = 150, (2*60+180)/3 = 100
+            assert_eq!(px[row * 4 + 3], [180, 140]); // (120+2*210)/3 = 180, (60+2*180)/3 = 140
+        }
+    }
+
+    #[test]
+    fn ctx1_mip_chain_handles_sub_block_levels() {
+        // 8x8 -> 4x4 -> 2x2 -> 1x1: 4 + 1 + 1 + 1 = 7 CTX1 blocks = 56 bytes.
+        let mut linear = Vec::new();
+        for b in 0..7u8 {
+            let val = 100 + b * 10;
+            // flat block with x = val, y = val + 5
+            linear.extend_from_slice(&[val + 5, val, val + 5, val, 0, 0, 0, 0]);
+        }
+        let rg = decode_ctx1(&linear, 8, 8, 4, 1).unwrap();
+        assert_eq!(rg.len(), (64 + 16 + 4 + 1) * 2);
+        // Level 0 (0..128): 8x8 -> top-left 4x4 from block 0, bottom-right 4x4 from block 3.
+        assert_eq!(&rg[0..2], &[100, 105]);
+        assert_eq!(&rg[(7 * 8 + 7) * 2..(7 * 8 + 7) * 2 + 2], &[130, 135]);
+        // Level 1 (128..160): 4x4 from block 4.
+        assert_eq!(&rg[128..130], &[140, 145]);
+        // Level 2 (160..168): 2x2 from block 5.
+        assert_eq!(&rg[160..162], &[150, 155]);
+        // Level 3 (168..170): 1x1 from block 6.
+        assert_eq!(&rg[168..170], &[160, 165]);
+    }
+
+    #[test]
+    fn x360_normal_maps_untile_and_decode_ctx1_and_dxn() {
+        let iso = vfs::repo_root().join(vfs::X360_ISO);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = vfs::Disc::open(&iso).unwrap();
+        // Representative DXN (23) and CTX1 (24, 25) packs covering AC parts & map pieces.
+        let packs = [
+            "model/ac/parts/leg/lg3041/lg3041.tpf.dcx",  // code 23 DXN
+            "model/ac/parts/arm/am9000/am9000.tpf.dcx",  // code 24 CTX1
+            "model/ac/parts/arm/am0010/am0010.tpf.dcx",  // code 25 CTX1
+            "model/ac/parts/head/hd0010/hd0010.tpf.dcx", // code 25 CTX1
+            "model/ac/parts/core/cr0010/cr0010.tpf.dcx", // code 25 CTX1
+        ];
+        let (mut dxn_n, mut ctx24_n, mut ctx25_n) = (0, 0, 0);
+        for pack in packs {
+            let data = disc.asset(pack).unwrap();
+            let t = read(&data).unwrap();
+            for tex in &t.textures {
+                match tex.format {
+                    23 => {
+                        let lin = tex.linear(t.platform, &data, 16).unwrap();
+                        assert_eq!(
+                            lin.len() as u64,
+                            chain(tex.width, tex.height, tex.levels(), 16) * tex.faces() as u64,
+                            "{}",
+                            tex.name
+                        );
+                        dxn_n += 1;
+                    }
+                    24 | 25 => {
+                        let lin = tex.linear(t.platform, &data, 8).unwrap();
+                        let rg = decode_ctx1(&lin, tex.width, tex.height, tex.levels(), tex.faces()).unwrap();
+                        let expected_texels: usize = (0..tex.levels())
+                            .map(|m| ((tex.width as usize >> m).max(1)) * ((tex.height as usize >> m).max(1)))
+                            .sum::<usize>()
+                            * tex.faces() as usize;
+                        assert_eq!(rg.len(), expected_texels * 2, "{}", tex.name);
+                        // Mean of tangent-space normal map R and G should sit near neutral 128.
+                        let n0 = (tex.width as usize) * (tex.height as usize);
+                        let (sum_r, sum_g) = rg[..n0 * 2]
+                            .chunks_exact(2)
+                            .fold((0u64, 0u64), |(sr, sg), p| (sr + p[0] as u64, sg + p[1] as u64));
+                        let mean_r = sum_r as f64 / n0 as f64;
+                        let mean_g = sum_g as f64 / n0 as f64;
+                        assert!(
+                            (96.0..=160.0).contains(&mean_r) && (96.0..=160.0).contains(&mean_g),
+                            "{}: mean R={mean_r:.1} G={mean_g:.1}",
+                            tex.name
+                        );
+                        if tex.format == 24 {
+                            ctx24_n += 1;
+                        } else {
+                            ctx25_n += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(dxn_n > 0 && ctx24_n > 0 && ctx25_n > 0, "dxn={dxn_n} ctx24={ctx24_n} ctx25={ctx25_n}");
     }
 }

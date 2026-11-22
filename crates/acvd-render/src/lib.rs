@@ -24,7 +24,11 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 pub struct LoadedMesh {
     pub mesh: Mesh,
     pub diffuse: Option<String>,
+    pub bump: Option<String>,
+    pub specular: Option<String>,
     pub emission: Option<String>,
+    /// FLVER material MTD name (e.g. `ACParts`, `ACParts_Glow`, `ACParts_Rim_ex`).
+    pub mtd: String,
     /// Root bone above the first boned vertex of this mesh (`None` when unboned).
     pub root: Option<String>,
     /// Bounds of the vertices the main face set uses, already mirrored.
@@ -33,10 +37,46 @@ pub struct LoadedMesh {
 }
 
 const DIFFUSE_TYPES: &[&str] = &["g_DiffuseTexture", "g_Diffuse"];
+const BUMP_TYPES: &[&str] = &["g_BumpmapTexture", "g_Bumpmap"];
+const SPECULAR_TYPES: &[&str] = &["g_SpecularTexture", "g_Specular"];
 const EMISSION_TYPES: &[&str] = &["g_EmissionTexture", "g_Emission"];
 
 fn mirror(v: [f32; 3]) -> [f32; 3] {
     [-v[0], v[1], v[2]]
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 1e-6 {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [1.0, 0.0, 0.0]
+    }
+}
+
+/// Converts a FLVER `(normal, stored_tangent)` pair in model space into Bevy's X-mirrored
+/// `ATTRIBUTE_TANGENT` (`[Tx, Ty, Tz, w]`).
+///
+/// In ACVD FLVERs (`Flver_ColDifBump.vpo` / `.fpo`), semantic 6 (`MemberKind::TangentS8`) stores
+/// the bitangent `+dP/dv` with handedness `w = ±1`, and `cross(N, v_stored) * w` is the tangent
+/// `+dP/du`. Under X-mirroring `S = diag(-1, 1, 1)` (`det(S) = -1`):
+/// `T_bevy = S * (cross(N, v_stored) * w)`, and `w * cross(S * N, T_bevy) = S * v_stored`,
+/// matching Bevy's `apply_normal_mapping` with `flip_normal_map_y: false`.
+fn flver_tangent_to_bevy(n: [f32; 3], stored: [f32; 4]) -> [f32; 4] {
+    let w = if stored[3] < 0.0 { -1.0 } else { 1.0 };
+    let b = [stored[0], stored[1], stored[2]];
+    let c = cross(n, b);
+    let t_flver = normalize3([c[0] * w, c[1] * w, c[2] * w]);
+    let t_bevy = mirror(t_flver);
+    [t_bevy[0], t_bevy[1], t_bevy[2], w]
 }
 
 pub fn texture_stem(path: &str) -> String {
@@ -208,6 +248,14 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
                 *n = placed_at(i).apply_dir(*n);
             }
         }
+        for ts in &mut v.tangents {
+            if ts.len() == v.positions.len() {
+                for (i, t) in ts.iter_mut().enumerate() {
+                    let d = normalize3(placed_at(i).apply_dir([t[0], t[1], t[2]]));
+                    *t = [d[0], d[1], d[2], t[3]];
+                }
+            }
+        }
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
         for &i in tris.iter().flatten() {
             let p = v.positions.get(i as usize).copied().map(mirror).context("index past the mesh's vertices")?;
@@ -229,6 +277,17 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
         if v.normals.len() != v.positions.len() {
             mesh.compute_smooth_normals();
         }
+        let has_flver_tangents = v.normals.len() == v.positions.len()
+            && v.tangents.first().is_some_and(|t| t.len() == v.positions.len());
+        if has_flver_tangents {
+            let tangents: Vec<[f32; 4]> = v
+                .normals
+                .iter()
+                .zip(v.tangents[0].iter())
+                .map(|(&n, &t)| flver_tangent_to_bevy(n, t))
+                .collect();
+            mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
+        }
         if let Some((index, weight)) = joints {
             mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_INDEX, VertexAttributeValues::Uint16x4(index));
             mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, weight);
@@ -246,7 +305,21 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
             })
         };
         let diffuse = mat_tex(DIFFUSE_TYPES);
+        let bump = mat_tex(BUMP_TYPES);
+        let specular = mat_tex(SPECULAR_TYPES);
         let emission = mat_tex(EMISSION_TYPES);
+        let mtd = mat.map(|m| m.mtd.clone()).unwrap_or_default();
+        if !has_flver_tangents && bump.is_some() {
+            if mesh.generate_tangents().is_ok() {
+                // MikkTSpace aligns bitangent with -dP/dv (OpenGL); flip w so B aligns with
+                // +dP/dv like FLVER tangents and every normal map uses flip_normal_map_y: false.
+                if let Some(VertexAttributeValues::Float32x4(ts)) = mesh.attribute_mut(Mesh::ATTRIBUTE_TANGENT) {
+                    for t in ts.iter_mut() {
+                        t[3] = -t[3];
+                    }
+                }
+            }
+        }
         let root = bones
             .iter()
             .flatten()
@@ -254,7 +327,7 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
             .and_then(|&b| bone_roots.get(b))
             .and_then(|&r| f.bones.get(r))
             .map(|b| b.name.clone());
-        out.push(LoadedMesh { mesh, diffuse, emission, root, min, max });
+        out.push(LoadedMesh { mesh, diffuse, bump, specular, emission, mtd, root, min, max });
     }
     Ok((out, f))
 }
@@ -291,8 +364,18 @@ fn vertex_joints(f: &flver::Flver, m: &flver::Mesh, v: &flver::Vertices, bones: 
         .unzip()
 }
 
-/// The material for `part`: its diffuse texture, or flat grey when it has none, `flat` is set,
-/// or the texture fails to load (reported to stderr and counted in `missing`).
+/// Strips sRGB from block-compressed formats so data textures (normal, specular, color mask,
+/// camo) sample in linear space.
+pub fn to_linear(img: &mut Image) {
+    img.texture_descriptor.format = match img.texture_descriptor.format {
+        TextureFormat::Bc1RgbaUnormSrgb => TextureFormat::Bc1RgbaUnorm,
+        TextureFormat::Bc3RgbaUnormSrgb => TextureFormat::Bc3RgbaUnorm,
+        other => other,
+    };
+}
+
+/// The material for `part`: its diffuse and normal-map textures, or flat grey when it has none,
+/// `flat` is set, or the texture fails to load (reported to stderr and counted in `missing`).
 pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut Assets<Image>, flat: bool, missing: &mut usize) -> StandardMaterial {
     let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| match packs.image(disc, name) {
         Ok(img) => Some(images.add(img)),
@@ -302,9 +385,14 @@ pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut 
             None
         }
     });
+    let normal_map = part.bump.as_deref().filter(|_| !flat).and_then(|name| {
+        packs.linear_image(disc, name).ok().map(|img| images.add(img))
+    });
     StandardMaterial {
         base_color: if texture.is_some() { Color::WHITE } else { Color::srgb(0.6, 0.6, 0.62) },
         base_color_texture: texture,
+        normal_map_texture: normal_map,
+        flip_normal_map_y: false,
         perceptual_roughness: 0.7,
         ..Default::default()
     }
@@ -318,6 +406,20 @@ impl Packs {
     pub fn image(&mut self, disc: &Disc, name: &str) -> Result<Image> {
         let t: &TextureRef = acvd_data::textures_named(name).next().with_context(|| format!("no texture named `{name}`"))?;
         self.texture(disc, t)
+    }
+
+    /// Like [`Packs::image`], forcing a linear (non-sRGB) texture format for normal/specular/mask maps.
+    pub fn linear_image(&mut self, disc: &Disc, name: &str) -> Result<Image> {
+        let mut img = self.image(disc, name)?;
+        to_linear(&mut img);
+        Ok(img)
+    }
+
+    /// Like [`Packs::texture_at`], forcing a linear (non-sRGB) texture format.
+    pub fn linear_texture_at(&mut self, disc: &Disc, pack: &str, index: usize, name: &str) -> Result<Image> {
+        let mut img = self.texture_at(disc, pack, index, name)?;
+        to_linear(&mut img);
+        Ok(img)
     }
 
     fn pack(&mut self, disc: &Disc, pack: &str) -> Result<&Vec<u8>> {
@@ -345,12 +447,16 @@ impl Packs {
         let header = tpf::read(pack)?;
         let tex = header.textures.get(index).context("texture index past the pack")?;
         let row = acvd_data::texture_format(tex.format);
+        let is_ctx1 = matches!(row.map(|f| f.name), Some("ctx1"));
         let format = match row.map(|f| f.name) {
             Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,
             Some("bc3") => TextureFormat::Bc3RgbaUnormSrgb,
             // DXN is two BC4 blocks, x then y (sheets/texture_formats.csv code 23). Bevy treats
             // Bc5RgUnorm as a two-component normal map.
             Some("dxn") => TextureFormat::Bc5RgUnorm,
+            // CTX1 (sheets/texture_formats.csv codes 24 and 25) is CPU-expanded to Rg8Unorm,
+            // which Bevy also flags as TWO_COMPONENT_NORMAL_MAP.
+            Some("ctx1") => TextureFormat::Rg8Unorm,
             other => bail!("texture `{name}` format {other:?}"),
         };
         ensure!(tex.faces() == 1, "texture `{name}` is a cube map");
@@ -366,17 +472,118 @@ impl Packs {
             end = tpf::block_level_span(width, height, 1, 0, 0, block).1 as usize;
             ensure!(end <= bytes.len(), "texture `{name}` is shorter than its first level");
         }
+        let data = if is_ctx1 {
+            tpf::decode_ctx1(&bytes[..end], width, height, levels, 1)?
+        } else {
+            bytes[..end].to_vec()
+        };
         let mut image = Image::default();
         image.texture_descriptor.size = Extent3d { width: width as u32, height: height as u32, depth_or_array_layers: 1 };
         image.texture_descriptor.dimension = TextureDimension::D2;
         image.texture_descriptor.format = format;
         image.texture_descriptor.mip_level_count = levels;
-        image.data = Some(bytes[..end].to_vec());
+        image.data = Some(data);
         image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
             address_mode_u: ImageAddressMode::Repeat,
             address_mode_v: ImageAddressMode::Repeat,
             ..ImageSamplerDescriptor::linear()
         });
         Ok(image)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flver_tangent_conversion_preserves_mirrored_tbn_for_both_handednesses() {
+        // FLVER N = (0, 0, 1), v_stored (+dP/dv) = (0, 1, 0), w = ±1.
+        // 360: T_360 = cross(N, v_stored) * w = (-w, 0, 0), B_360 = (0, 1, 0).
+        // Mirrored into Bevy by S = diag(-1, 1, 1):
+        //   N_bevy = (0, 0, 1), T_bevy = (w, 0, 0), B_bevy = (0, 1, 0).
+        // Bevy computes B = tangent.w * cross(N_bevy, T_bevy).
+        let n_flver = [0.0, 0.0, 1.0];
+        let n_bevy = mirror(n_flver);
+        for w in [1.0f32, -1.0] {
+            let t = flver_tangent_to_bevy(n_flver, [0.0, 1.0, 0.0, w]);
+            let t_xyz = [t[0], t[1], t[2]];
+            let b_raw = cross(n_bevy, t_xyz);
+            let b_bevy = [b_raw[0] * t[3], b_raw[1] * t[3], b_raw[2] * t[3]];
+            assert!((t_xyz[0] - w).abs() < 1e-5 && t_xyz[1].abs() < 1e-5 && t_xyz[2].abs() < 1e-5, "w={w} t={t:?}");
+            assert!(b_bevy[0].abs() < 1e-5 && (b_bevy[1] - 1.0).abs() < 1e-5 && b_bevy[2].abs() < 1e-5, "w={w} b={b_bevy:?}");
+        }
+    }
+
+    #[test]
+    fn x360_normal_maps_and_tangents_load_on_ac_part() {
+        let iso = vfs::repo_root().join(vfs::X360_ISO);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let meshes = model(&disc, "model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv").unwrap();
+        assert!(!meshes.is_empty());
+        let first = &meshes[0];
+        assert!(first.bump.is_some(), "am0010 should expose g_Bumpmap");
+        assert!(first.specular.is_some(), "am0010 should expose g_Specular");
+        assert!(first.mesh.attribute(Mesh::ATTRIBUTE_TANGENT).is_some(), "am0010 should carry ATTRIBUTE_TANGENT");
+
+        let mut packs = Packs::default();
+        // CTX1 (code 25) normal map -> Rg8Unorm
+        let ctx1_img = packs.linear_image(&disc, first.bump.as_deref().unwrap()).unwrap();
+        assert_eq!(ctx1_img.texture_descriptor.format, TextureFormat::Rg8Unorm);
+        assert!(ctx1_img.texture_descriptor.mip_level_count > 1);
+        // DXN (code 23) normal map -> Bc5RgUnorm
+        let dxn_img = packs.linear_image(&disc, "lg3041_n").unwrap();
+        assert_eq!(dxn_img.texture_descriptor.format, TextureFormat::Bc5RgUnorm);
+        // Specular map -> linear BC1/BC3
+        let spc_img = packs.linear_image(&disc, first.specular.as_deref().unwrap()).unwrap();
+        assert!(
+            matches!(spc_img.texture_descriptor.format, TextureFormat::Bc1RgbaUnorm | TextureFormat::Bc3RgbaUnorm),
+            "unexpected specular format {:?}",
+            spc_img.texture_descriptor.format
+        );
+    }
+
+    #[test]
+    fn x360_all_normal_maps_untile_and_decode() {
+        let iso = vfs::repo_root().join(vfs::X360_ISO);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let mut packs = Packs::default();
+        let (mut dxn_n, mut ctx24_n, mut ctx25_n) = (0usize, 0usize, 0usize);
+        for t in acvd_data::generated::textures::ALL.iter().flat_map(|g| g.iter()) {
+            if !matches!(t.format, 23 | 24 | 25) {
+                continue;
+            }
+            let img = packs
+                .texture(&disc, t)
+                .unwrap_or_else(|e| panic!("{} ({}, fmt {}): {e:#}", t.name, t.pack, t.format));
+            match t.format {
+                23 => {
+                    assert_eq!(img.texture_descriptor.format, TextureFormat::Bc5RgUnorm);
+                    dxn_n += 1;
+                }
+                24 => {
+                    assert_eq!(img.texture_descriptor.format, TextureFormat::Rg8Unorm);
+                    ctx24_n += 1;
+                }
+                25 => {
+                    assert_eq!(img.texture_descriptor.format, TextureFormat::Rg8Unorm);
+                    ctx25_n += 1;
+                }
+                _ => unreachable!(),
+            }
+            // Release cached pack once we move on so memory stays tiny across 3,933 textures.
+            if packs.0.len() > 64 {
+                packs.0.clear();
+            }
+        }
+        assert_eq!(dxn_n, 162, "expected 162 DXN (code 23) normal maps");
+        assert_eq!(ctx24_n, 235, "expected 235 CTX1 (code 24) normal maps");
+        assert_eq!(ctx25_n, 3536, "expected 3536 CTX1 (code 25) normal maps");
     }
 }

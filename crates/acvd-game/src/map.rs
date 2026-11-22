@@ -616,17 +616,32 @@ pub(crate) fn bevy_transform(xf: &flver::Xform) -> Transform {
     Transform::from_matrix(mat)
 }
 
-/// Map materials keyed by diffuse texture name: the map's own full-resolution texture first,
-/// then the first disc pack with that name.
+/// Map materials keyed by `(diffuse, bump)` texture names: the map's own full-resolution
+/// texture first, then the first disc pack with that name.
 #[derive(Default)]
 struct Textures {
     own: String,
     packs: Packs,
-    by_name: HashMap<Option<String>, Handle<StandardMaterial>>,
+    by_name: HashMap<(Option<String>, Option<String>), Handle<StandardMaterial>>,
     missing: usize,
 }
 
 impl Textures {
+    fn load_tex(&mut self, disc: &Disc, name: &str, linear: bool) -> Result<Image, anyhow::Error> {
+        let own = format!("{}|{name}.tpf.dcx", self.own);
+        if disc.exists(&own) {
+            if linear {
+                self.packs.linear_texture_at(disc, &own, 0, name)
+            } else {
+                self.packs.texture_at(disc, &own, 0, name)
+            }
+        } else if linear {
+            self.packs.linear_image(disc, name)
+        } else {
+            self.packs.image(disc, name)
+        }
+    }
+
     fn material(
         &mut self,
         disc: &Disc,
@@ -634,17 +649,12 @@ impl Textures {
         materials: &mut Assets<StandardMaterial>,
         images: &mut Assets<Image>,
     ) -> Handle<StandardMaterial> {
-        if let Some(h) = self.by_name.get(&mesh.diffuse) {
+        let key = (mesh.diffuse.clone(), mesh.bump.clone());
+        if let Some(h) = self.by_name.get(&key) {
             return h.clone();
         }
         let image = mesh.diffuse.as_deref().and_then(|name| {
-            let own = format!("{}|{name}.tpf.dcx", self.own);
-            let img = if disc.exists(&own) {
-                self.packs.texture_at(disc, &own, 0, name)
-            } else {
-                self.packs.image(disc, name)
-            };
-            match img {
+            match self.load_tex(disc, name, false) {
                 Ok(i) => Some(images.add(i)),
                 Err(e) => {
                     self.missing += 1;
@@ -653,6 +663,9 @@ impl Textures {
                 }
             }
         });
+        let normal_map = mesh.bump.as_deref().and_then(|name| {
+            self.load_tex(disc, name, true).ok().map(|i| images.add(i))
+        });
         let handle = materials.add(StandardMaterial {
             base_color: if image.is_some() {
                 Color::WHITE
@@ -660,10 +673,12 @@ impl Textures {
                 Color::srgb(0.55, 0.56, 0.58)
             },
             base_color_texture: image,
+            normal_map_texture: normal_map,
+            flip_normal_map_y: false,
             perceptual_roughness: 0.9,
             ..default()
         });
-        self.by_name.insert(mesh.diffuse.clone(), handle.clone());
+        self.by_name.insert(key, handle.clone());
         handle
     }
 }

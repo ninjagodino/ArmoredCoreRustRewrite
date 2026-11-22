@@ -4,7 +4,11 @@
 // aid2, aid, base], uploaded by `0x82ca9c70` / `0x82bd6588` and `0x82461ce0` after `0x82460ef8`
 // remaps RGB into `[color_min, color_max]`), the `<diffuse>_c` mask (`g_AC_ColorMap`, `s13`),
 // the camouflage pattern (`g_AC_CamouflageMap`, `s15`, UV scaled by `c190.xy` from `0x82461a98`),
-// and the `_Glow` emission map (`g_EmissionMap`, `s6`, scaled by `c138` from `0x82bd7bd8`).
+// the `g_Specular` map (`*_s`, `s1`), the `_Glow` emission map (`g_EmissionMap`, `s6`, scaled by
+// `c138` = `kojima * 20.0` from `0x82bd7bd8`), and the `_Rim` Fresnel highlight
+// (`Flver_ACColDifRim.fpo` instructions 40..46, `c138` = `kojima * 10.0` from `0x82bd8958`).
+// Normal mapping (`g_Bumpmap`, DXN `Bc5RgUnorm` / CTX1 `Rg8Unorm`) is applied to `pbr.N` inside
+// `pbr_input_from_standard_material`.
 
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
@@ -15,8 +19,9 @@
 struct AcPaintParams {
     overlay: array<vec4<f32>, 7>,
     camo_scale: vec2<f32>,
-    _pad: vec2<f32>,
+    flags: vec2<f32>,
     emission: vec4<f32>,
+    rim: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> paint: AcPaintParams;
@@ -24,6 +29,7 @@ struct AcPaintParams {
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var color_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var camo_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var emission_map: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var specular_map: texture_2d<f32>;
 
 // Undoes the diffuse sampler's sRGB decode so the 360 overlay blend runs in raw texel space.
 fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
@@ -60,6 +66,15 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let painted = mix(d, blended, mask.g);
     pbr.material.base_color = vec4(srgb_decode(painted), pbr.material.base_color.a);
 
+    // Flver_ACColorColDifSpcBumpIbl.fpo: `g_Specular` (`*_s`) R drives gloss/specular power
+    // (`c2.x * spc.r`) and RGB luma drives reflectance strength.
+    if paint.flags.x > 0.5 {
+        let spc = textureSample(specular_map, color_sampler, in.uv);
+        let spec_luma = dot(spc.rgb, vec3(0.29891, 0.58661, 0.11448));
+        pbr.material.perceptual_roughness = clamp(mix(0.82, 0.25, spc.r), 0.15, 0.95);
+        pbr.material.reflectance = vec3(clamp(0.25 + 0.65 * spec_luma, 0.08, 1.0));
+    }
+
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr);
 
@@ -67,6 +82,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // `emi = (emi_tex.rgb * emi_tex.a)^2 * c138.rgb`, added to the lit diffuse colour.
     let emi_t = srgb_encode(emi_sample.rgb) * emi_sample.a;
     out.color = vec4(out.color.rgb + (emi_t * emi_t) * paint.emission.rgb, out.color.a);
+
+    // Flver_ACColDifRim.fpo instructions 40..46 (`0x82bd8958` / `0x82008994` = 10.0):
+    // `rim = max(1.0 - dot(N, V), 0.0) * c138.rgb * c138.w`
+    if paint.rim.w > 0.5 {
+        let ndotv = clamp(dot(pbr.N, pbr.V), 0.0, 1.0);
+        let rim = max(1.0 - ndotv, 0.0) * paint.rim.rgb * paint.rim.w;
+        out.color = vec4(out.color.rgb + rim * 0.1, out.color.a);
+    }
 
     out.color = main_pass_post_lighting_processing(pbr, out.color);
     return out;

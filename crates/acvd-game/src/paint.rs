@@ -22,13 +22,13 @@
 //! `(kojima.rgb / 255.0 * 20.0, 1.0)` for `Flver_ACColorColDifEmi.fpo`.
 
 use acvd_data::generated::tuning::STATIC_DRAW_PARAM;
-use acvd_formats::accolor::{self, AcColor, GLOW_INTENSITY, OVERLAY_CHANNELS};
+use acvd_formats::accolor::{self, AcColor, GLOW_INTENSITY, OVERLAY_CHANNELS, RIM_INTENSITY};
 use acvd_formats::vfs::Disc;
 use acvd_render::{LoadedMesh, Packs};
 use bevy::asset::embedded_asset;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, ShaderType, TextureFormat};
+use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat};
 use bevy::shader::ShaderRef;
 
 pub type AcPaintMaterial = ExtendedMaterial<StandardMaterial, AcPaint>;
@@ -44,6 +44,8 @@ pub struct AcPaint {
     pub camo_map: Handle<Image>,
     #[texture(104)]
     pub emission_map: Handle<Image>,
+    #[texture(105)]
+    pub specular_map: Handle<Image>,
 }
 
 #[derive(ShaderType, Debug, Clone, Copy)]
@@ -51,9 +53,13 @@ pub struct AcPaintParams {
     pub overlay: [Vec4; OVERLAY_CHANNELS],
     /// `c190.xy` (`DL_FREG_190`, `0x82461a98`): `mask_size / camo_size`, or `(1, 1)` when `camo == 0`.
     pub camo_scale: Vec2,
-    pub _pad: Vec2,
+    /// `x = 1.0` when a `g_Specular` (`*_s`) texture is bound (`0.0` otherwise); `y = 0.0`.
+    pub flags: Vec2,
     /// `c138` (`DL_FREG_138`, `0x82bd7bd8`): `(kojima.rgb / 255.0 * 20.0, 1.0)` on `_Glow` meshes, or `0`.
     pub emission: Vec4,
+    /// `c138` (`DL_FREG_138`, `0x82bd8958` / `0x82008994` = `10.0`):
+    /// `(kojima.rgb / 255.0 * 10.0, 1.0)` on `_Rim` (`ACParts_Rim*`) meshes, or `0`.
+    pub rim: Vec4,
 }
 
 impl MaterialExtension for AcPaint {
@@ -124,7 +130,28 @@ pub fn load_camo_map(disc: &Disc, packs: &mut Packs, camo_id: u8) -> Option<Imag
     Some(img)
 }
 
-/// Build an [`AcPaintMaterial`] when `accolor` is present and the mesh has a `<diffuse>_c` mask.
+/// True when the FLVER material MTD requests `_Rim` Fresnel highlights (`0x82bd8198` /
+/// `0x82bd8958`, checking substring `_rim` on `ACParts_Rim`, `ACParts_Rim_ex`, etc.).
+pub fn is_rim_mtd(mtd: &str) -> bool {
+    mtd.to_ascii_lowercase().contains("_rim")
+}
+
+/// 1x1 zero RGBA image used as a neutral mask when a `_Rim` mesh has no `<diffuse>_c` mask.
+fn empty_mask_image() -> Image {
+    let mut img = Image::default();
+    img.texture_descriptor.size = Extent3d {
+        width: 1,
+        height: 1,
+        depth_or_array_layers: 1,
+    };
+    img.texture_descriptor.dimension = TextureDimension::D2;
+    img.texture_descriptor.format = TextureFormat::Rgba8Unorm;
+    img.data = Some(vec![0, 0, 0, 0]);
+    img
+}
+
+/// Build an [`AcPaintMaterial`] when `accolor` is present and the mesh has a `<diffuse>_c` mask
+/// or a `_Rim` material (`ACParts_Rim*`).
 pub fn material(
     disc: &Disc,
     base: &StandardMaterial,
@@ -134,8 +161,16 @@ pub fn material(
     packs: &mut Packs,
     images: &mut Assets<Image>,
 ) -> Option<AcPaintMaterial> {
-    let diffuse = mesh.diffuse.as_deref()?;
-    let mask = load_color_map(disc, packs, diffuse)?;
+    let is_rim = is_rim_mtd(&mesh.mtd);
+    let mask = mesh
+        .diffuse
+        .as_deref()
+        .and_then(|d| load_color_map(disc, packs, d));
+    let mask = match mask {
+        Some(m) => m,
+        None if is_rim => empty_mask_image(),
+        None => return None,
+    };
     let mask_size = Vec2::new(
         mask.texture_descriptor.size.width as f32,
         mask.texture_descriptor.size.height as f32,
@@ -170,18 +205,35 @@ pub fn material(
         None => (color_map.clone(), Vec4::ZERO),
     };
 
+    let (specular_map, has_specular) = match mesh
+        .specular
+        .as_deref()
+        .and_then(|name| packs.linear_image(disc, name).ok())
+    {
+        Some(spc) => (images.add(spc), 1.0),
+        None => (color_map.clone(), 0.0),
+    };
+
+    let rim = if is_rim {
+        Vec4::from(accolor.emission_col(group, RIM_INTENSITY))
+    } else {
+        Vec4::ZERO
+    };
+
     Some(AcPaintMaterial {
         base: base.clone(),
         extension: AcPaint {
             params: AcPaintParams {
                 overlay: cols.map(Vec4::from),
                 camo_scale,
-                _pad: Vec2::ZERO,
+                flags: Vec2::new(has_specular, 0.0),
                 emission,
+                rim,
             },
             color_map,
             camo_map,
             emission_map,
+            specular_map,
         },
     })
 }
@@ -238,5 +290,43 @@ mod tests {
         assert_eq!(c5011.camo_id(0), 1);
         let c6002 = load_accolor(&disc, 6002).expect("color6002.bin");
         assert_eq!(c6002.camo_id(0), 6);
+    }
+
+    #[test]
+    fn rim_and_specular_material_params_bind_correctly() {
+        assert!(is_rim_mtd("ACParts_Rim_ex"));
+        assert!(is_rim_mtd("ACParts_Rim.mtd"));
+        assert!(!is_rim_mtd("ACParts"));
+        assert!(!is_rim_mtd("ACParts_Glow"));
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let iso = acvd_formats::vfs::default_disc(&root);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let col = load_accolor(&disc, 5001).expect("color5001.bin");
+        let mut meshes = acvd_render::model(&disc, "model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv").unwrap();
+        let mut packs = Packs::default();
+        let mut images = Assets::<Image>::default();
+        let mut missing = 0;
+
+        // Standard AC armor mesh: binds normal map on base and specular map on AcPaint.
+        let base = acvd_render::material(&disc, &meshes[0], &mut packs, &mut images, false, &mut missing);
+        assert!(base.normal_map_texture.is_some(), "am0010 base should bind normal_map_texture");
+        let painted = material(&disc, &base, &meshes[0], "arms", &col, &mut packs, &mut images)
+            .expect("am0010 painted material");
+        assert_eq!(painted.extension.params.flags.x, 1.0, "specular map bound");
+        assert_eq!(painted.extension.params.rim, Vec4::ZERO, "non-rim mesh has zero rim");
+
+        // Simulated `_Rim` MTD: uploads kojima * 10.0 (`RIM_INTENSITY`, 0x82008994 in 0x82bd8958).
+        meshes[0].mtd = "ACParts_Rim_ex".into();
+        let rim_mat = material(&disc, &base, &meshes[0], "head", &col, &mut packs, &mut images)
+            .expect("rim painted material");
+        let expected_rim = col.emission_col(0, RIM_INTENSITY);
+        assert_eq!(rim_mat.extension.params.rim, Vec4::from(expected_rim));
+        assert!((rim_mat.extension.params.rim.x - (251.0 / 255.0) * 10.0).abs() < 1e-4);
     }
 }

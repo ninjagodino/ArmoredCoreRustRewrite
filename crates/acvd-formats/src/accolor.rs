@@ -32,6 +32,11 @@ pub const CH_KOJIMA: usize = 5;
 /// `0x82bd7bd8` -> `0x82c89c78`).
 pub const GLOW_INTENSITY: f32 = 20.0;
 
+/// Rim highlight multiplier on `ACParts_Rim` / `ACParts_Rim_ex` (`_rim`) submeshes
+/// (`0x82bd8958` overwrites `self + 0x4c` with `10.0` from `0x82008994` when the MTD name
+/// contains `_rim`, uploaded to `c138` by `0x82bd7bd8` -> `0x82c89c78`).
+pub const RIM_INTENSITY: f32 = 10.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcColor {
     /// 34 groups of 6 RGBA colors (`[base, aid, aid2, optional, joint, kojima]`).
