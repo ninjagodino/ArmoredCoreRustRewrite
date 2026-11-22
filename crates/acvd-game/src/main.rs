@@ -57,6 +57,7 @@ mod control;
 mod damage;
 mod env;
 mod fcs;
+mod garage;
 mod hanger;
 mod hud;
 mod map;
@@ -74,10 +75,13 @@ use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, AC_ASSEMBLY_DESIGN_ST_FI
 use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
 use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::Row;
+use acvd_formats::accolor::AcColor;
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::{self, Disc};
 use acvd_render::app::{orbit, take_shot, Orbit, Shot};
+use acvd_render::menu::MenuRoot;
 use acvd_render::text::{self, Font};
+use bevy::audio::AudioSource;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
@@ -85,18 +89,25 @@ use bevy::window::PrimaryWindow;
 use collision::{Collision, Layer, Plane, RAY_HALF};
 
 #[derive(Resource)]
-struct Garage {
-    disc: Disc,
-    designs: Vec<&'static Row<AcAssemblyDesignSt>>,
-    current: usize,
-    shown: Option<usize>,
-    flat: bool,
-    bounds: (Vec3, Vec3),
+pub struct Garage {
+    pub disc: Disc,
+    pub designs: Vec<&'static Row<AcAssemblyDesignSt>>,
+    pub current: usize,
+    pub active_design: AcAssemblyDesignSt,
+    pub active_name: String,
+    pub custom_color: Option<AcColor>,
+    pub dirty: bool,
+    pub flat: bool,
+    pub bounds: (Vec3, Vec3),
     /// Clip entry and paused frame to start the first design on.
-    clip: Option<String>,
-    frame: Option<f32>,
-    status: String,
+    pub clip: Option<String>,
+    pub frame: Option<f32>,
+    pub status: String,
 }
+
+/// Marker for non-`MapPart` sortie geometry (debug collision mesh, water plane, fallback pillars).
+#[derive(Component)]
+struct SortieDecor;
 
 /// The assembled AC; its parts are children.
 #[derive(Component)]
@@ -123,6 +134,13 @@ struct Scene {
     map: Option<String>,
     layout: Option<String>,
     test: targets::TestMode,
+    plane: bool,
+    hits: bool,
+    water: Option<f32>,
+}
+
+fn in_sortie(mode: Res<garage::Mode>) -> bool {
+    *mode == garage::Mode::Sortie
 }
 
 fn main() {
@@ -132,7 +150,10 @@ fn main() {
     let (mut map, mut plane, mut water) = (Some("m4000".to_string()), false, None);
     let (mut layout, mut hits) = (Some("actest".to_string()), false);
     let mut test = targets::TestMode::default();
+    let mut test_arg = "actest2".to_string();
     let (mut preview, mut burst, mut no_hud) = (None, 1, false);
+    let (mut start_garage, mut garage_id, mut garage_screen) =
+        (false, None, garage::GarageScreen::Top);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -165,6 +186,7 @@ fn main() {
             "--test" => {
                 if let Some(m) = args.next() {
                     test = targets::TestMode::parse(&m);
+                    test_arg = m;
                 }
             }
             "--hits" => hits = true,
@@ -173,10 +195,26 @@ fn main() {
             "--sfx" => preview = args.next().and_then(|s| s.parse::<i32>().ok()),
             "--burst" => burst = args.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1),
             "--no-hud" => no_hud = true,
+            "--garage" => start_garage = true,
+            "--garage-id" => {
+                start_garage = true;
+                garage_id = args.next().and_then(|s| s.parse::<u32>().ok());
+            }
+            "--garage-screen" => {
+                start_garage = true;
+                if let Some(s) = args.next().and_then(|s| garage::GarageScreen::from_cli(&s)) {
+                    garage_screen = s;
+                }
+            }
             _ => wanted = a.parse::<u32>().ok(),
         }
     }
-    let piloting = clip.is_none() && frame.is_none();
+    let initial_mode = if start_garage {
+        garage::Mode::Garage
+    } else {
+        garage::Mode::Sortie
+    };
+    let piloting = !start_garage && clip.is_none() && frame.is_none();
     // Piloting starts behind the AC, the browser in front of it.
     let yaw = yaw.unwrap_or(if piloting { 0.25 } else { 2.6 });
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -184,102 +222,29 @@ fn main() {
         .join("..");
     let disc =
         Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
-    let mut collision = if plane {
-        Collision::with_hits(
-            vec![Plane {
-                y: 0.0,
-                layer: Layer::Ground,
-            }],
-            Vec::new(),
-        )
-    } else if let Some(id) = &map {
-        match collision::load_map(&disc, &id) {
-            Ok(c) => {
-                eprintln!("map {id}: {} hit triangles", c.hits.len());
-                c
-            }
-            Err(e) => {
-                eprintln!("map {id}: {e:#}; using a flat plane");
-                Collision::with_hits(
-                    vec![Plane {
-                        y: 0.0,
-                        layer: Layer::Ground,
-                    }],
-                    Vec::new(),
-                )
-            }
-        }
+    let (collision, start, area_bounds, map_nav, water_return) = if initial_mode == garage::Mode::Sortie {
+        load_sortie_data(&disc, map.as_deref(), layout.as_deref(), plane, water)
     } else {
-        Collision::with_hits(
-            vec![Plane {
-                y: 0.0,
-                layer: Layer::Ground,
-            }],
-            Vec::new(),
+        (
+            Collision::with_hits(
+                vec![Plane {
+                    y: 0.0,
+                    layer: Layer::Ground,
+                }],
+                Vec::new(),
+            ),
+            map::Start {
+                position: Vec3::ZERO,
+                yaw: 0.0,
+            },
+            map::AreaBounds::default(),
+            map::MapNav::default(),
+            map::WaterReturnPoints {
+                points: Vec::new(),
+                water_height: water,
+            },
         )
     };
-    let start = match map.as_deref().filter(|_| !plane) {
-        Some(id) => map::start(&disc, id, layout.as_deref()).unwrap_or_else(|e| {
-            eprintln!("map {id} start point: {e:#}");
-            None
-        }),
-        None => None,
-    };
-    let start = start.unwrap_or(map::Start {
-        position: Vec3::ZERO,
-        yaw: 0.0,
-    });
-    let area_bounds = match map.as_deref().filter(|_| !plane) {
-        Some(id) => map::AreaBounds::load(&disc, id, layout.as_deref()).unwrap_or_else(|e| {
-            eprintln!("map {id} area bounds: {e:#}");
-            map::AreaBounds::default()
-        }),
-        None => map::AreaBounds::default(),
-    };
-    let map_nav = match map.as_deref().filter(|_| !plane) {
-        Some(id) => match map::MapNav::load(&disc, id) {
-            Ok(n) => {
-                if n.is_loaded() {
-                    eprintln!("map {id}: {} navmesh regions", n.region_count());
-                }
-                n
-            }
-            Err(e) => {
-                eprintln!("map {id} navmesh: {e:#}");
-                map::MapNav::default()
-            }
-        },
-        None => map::MapNav::default(),
-    };
-    let water_return = match map.as_deref().filter(|_| !plane) {
-        Some(id) => match map::WaterReturnPoints::load(&disc, id, layout.as_deref(), water) {
-            Ok(wr) => {
-                eprintln!(
-                    "map {id}: {} water-return points (kind 50), water_height={:?}",
-                    wr.points.len(),
-                    wr.water_height
-                );
-                wr
-            }
-            Err(e) => {
-                eprintln!("{id} water return: {e:#}");
-                map::WaterReturnPoints {
-                    points: Vec::new(),
-                    water_height: water,
-                }
-            }
-        },
-        None => map::WaterReturnPoints {
-            points: Vec::new(),
-            water_height: water,
-        },
-    };
-    if let Some(y) = water {
-        collision.planes.push(Plane {
-            y,
-            layer: Layer::Water,
-        });
-    }
     let designs: Vec<&'static Row<AcAssemblyDesignSt>> = AC_ASSEMBLY_DESIGN_ST_FILES
         .iter()
         .flat_map(|(_, rows)| rows.iter())
@@ -292,10 +257,45 @@ fn main() {
         .collect();
     let current = wanted
         .and_then(|id| designs.iter().position(|r| r.id == id))
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            if initial_mode == garage::Mode::Garage {
+                // Default the 3D Garage to a clean, non-overweight, non-weapon-arm showcase AC
+                // (preferring 6007 ARENA ATK-6 or 6008 ARENA ATK-2 if available).
+                for pref in [6007u32, 6008, 6004, 6003] {
+                    if let Some(pos) = designs.iter().position(|r| r.id == pref) {
+                        let s = garage::AcSpecs::calculate(&designs[pos].data);
+                        if !s.overweight && !s.en_shortage && !garage::has_weapon_arms(&designs[pos].data) {
+                            return pos;
+                        }
+                    }
+                }
+                designs
+                    .iter()
+                    .position(|r| {
+                        let s = garage::AcSpecs::calculate(&r.data);
+                        !s.overweight && !s.en_shortage && !garage::has_weapon_arms(&r.data)
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        });
     if let Some(id) = wanted.filter(|&id| designs.get(current).is_none_or(|r| r.id != id)) {
         eprintln!("no design {id}; starting at the first");
     }
+    let initial_row = designs[current];
+    let initial_design = initial_row.data;
+    let initial_name = garage::display_design_name(initial_row.id, initial_row.name);
+    let initial_color = (!flat)
+        .then(|| paint::load_accolor(&disc, initial_design.coloring_id))
+        .flatten();
+    let garage_state = garage::GarageState::init(
+        &disc,
+        garage_id,
+        garage_screen,
+        map.as_deref().unwrap_or("m4000"),
+        &test_arg,
+    );
 
     let enemy_parts = weapons::EnemyParts::load(&disc);
     let mut app = App::new();
@@ -310,17 +310,27 @@ fn main() {
     .add_plugins(sfx::SfxPlugin { disc: disc.clone() })
     .add_plugins(sound::SoundPlugin {
         disc: disc.clone(),
-        map: map.clone().filter(|_| !plane && !hits),
+        map: if initial_mode == garage::Mode::Garage {
+            None
+        } else {
+            map.clone().filter(|_| !plane && !hits)
+        },
         play_bgm: shot.is_none(),
     })
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
     .insert_resource(enemy_parts)
+    .insert_resource(initial_mode)
+    .insert_resource(garage::ModeSwitch::default())
+    .insert_resource(garage_state)
     .insert_resource(Garage {
         disc,
         designs,
         current,
-        shown: None,
+        active_design: initial_design,
+        active_name: initial_name,
+        custom_color: initial_color,
+        dirty: true,
         flat,
         bounds: (Vec3::ZERO, Vec3::ONE),
         clip,
@@ -336,6 +346,9 @@ fn main() {
         map: map.filter(|_| !plane && !hits),
         layout: layout.filter(|_| !plane),
         test,
+        plane,
+        hits,
+        water,
     })
     .insert_resource(collision)
     .insert_resource(control::Piloting(piloting))
@@ -345,14 +358,27 @@ fn main() {
     .add_systems(
         Update,
         (
+            sortie_garage_hotkey,
+            process_mode_switch,
+            garage::sync_room,
+            garage::handle_input,
+            garage::sync_ui,
+            garage::update_camera,
+        )
+            .chain()
+            .before(show),
+    )
+    .add_systems(
+        Update,
+        (
             (
-                browse,
+                browse.run_if(in_sortie),
                 show,
-                clips,
-                control::pilot,
-                scan::update,
-                fcs::update,
-                map::lod,
+                clips.run_if(in_sortie),
+                control::pilot.run_if(in_sortie),
+                scan::update.run_if(in_sortie),
+                fcs::update.run_if(in_sortie),
+                map::lod.run_if(in_sortie),
                 pose::animate,
                 boost::pose,
                 boost::hide,
@@ -360,20 +386,20 @@ fn main() {
             )
                 .chain(),
             (
-                bay::shift,
-                weapons::fire,
-                weapons::step_overed_weapon,
-                weapons::step_melee,
-                ai::update,
-                targets::animate_enemies,
-                pose::animate_npcs,
-                weapons::step_projectiles,
-                weapons::step_missiles,
-                weapons::tick_player_health,
-                targets::tick,
-                map::step_destructibles,
-                orbit,
-                reframe,
+                bay::shift.run_if(in_sortie),
+                weapons::fire.run_if(in_sortie),
+                weapons::step_overed_weapon.run_if(in_sortie),
+                weapons::step_melee.run_if(in_sortie),
+                ai::update.run_if(in_sortie),
+                targets::animate_enemies.run_if(in_sortie),
+                pose::animate_npcs.run_if(in_sortie),
+                weapons::step_projectiles.run_if(in_sortie),
+                weapons::step_missiles.run_if(in_sortie),
+                weapons::tick_player_health.run_if(in_sortie),
+                targets::tick.run_if(in_sortie),
+                map::step_destructibles.run_if(in_sortie),
+                orbit.run_if(in_sortie),
+                reframe.run_if(in_sortie),
             )
                 .chain(),
         )
@@ -394,6 +420,7 @@ fn main() {
             hud::area_warning_hud,
         )
             .chain()
+            .run_if(in_sortie)
             .after(weapons::tick_player_health),
     );
     if let Some(id) = preview {
@@ -452,6 +479,414 @@ fn key(name: &str) -> Option<KeyCode> {
     })
 }
 
+fn load_sortie_data(
+    disc: &Disc,
+    map: Option<&str>,
+    layout: Option<&str>,
+    plane: bool,
+    water: Option<f32>,
+) -> (
+    Collision,
+    map::Start,
+    map::AreaBounds,
+    map::MapNav,
+    map::WaterReturnPoints,
+) {
+    let mut collision = if plane {
+        Collision::with_hits(
+            vec![Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            Vec::new(),
+        )
+    } else if let Some(id) = map {
+        match collision::load_map(disc, id) {
+            Ok(c) => {
+                eprintln!("map {id}: {} hit triangles", c.hits.len());
+                c
+            }
+            Err(e) => {
+                eprintln!("map {id}: {e:#}; using a flat plane");
+                Collision::with_hits(
+                    vec![Plane {
+                        y: 0.0,
+                        layer: Layer::Ground,
+                    }],
+                    Vec::new(),
+                )
+            }
+        }
+    } else {
+        Collision::with_hits(
+            vec![Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            Vec::new(),
+        )
+    };
+    let start = match map.filter(|_| !plane) {
+        Some(id) => map::start(disc, id, layout).unwrap_or_else(|e| {
+            eprintln!("map {id} start point: {e:#}");
+            None
+        }),
+        None => None,
+    }
+    .unwrap_or(map::Start {
+        position: Vec3::ZERO,
+        yaw: 0.0,
+    });
+    let area_bounds = match map.filter(|_| !plane) {
+        Some(id) => map::AreaBounds::load(disc, id, layout).unwrap_or_else(|e| {
+            eprintln!("map {id} area bounds: {e:#}");
+            map::AreaBounds::default()
+        }),
+        None => map::AreaBounds::default(),
+    };
+    let map_nav = match map.filter(|_| !plane) {
+        Some(id) => match map::MapNav::load(disc, id) {
+            Ok(n) => {
+                if n.is_loaded() {
+                    eprintln!("map {id}: {} navmesh regions", n.region_count());
+                }
+                n
+            }
+            Err(e) => {
+                eprintln!("map {id} navmesh: {e:#}");
+                map::MapNav::default()
+            }
+        },
+        None => map::MapNav::default(),
+    };
+    let water_return = match map.filter(|_| !plane) {
+        Some(id) => match map::WaterReturnPoints::load(disc, id, layout, water) {
+            Ok(wr) => {
+                eprintln!(
+                    "map {id}: {} water-return points (kind 50), water_height={:?}",
+                    wr.points.len(),
+                    wr.water_height
+                );
+                wr
+            }
+            Err(e) => {
+                eprintln!("{id} water return: {e:#}");
+                map::WaterReturnPoints {
+                    points: Vec::new(),
+                    water_height: water,
+                }
+            }
+        },
+        None => map::WaterReturnPoints {
+            points: Vec::new(),
+            water_height: water,
+        },
+    };
+    if let Some(y) = water {
+        collision.planes.push(Plane {
+            y,
+            layer: Layer::Water,
+        });
+    }
+    (collision, start, area_bounds, map_nav, water_return)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_sortie_world(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    paint_materials: &mut Assets<paint::AcPaintMaterial>,
+    images: &mut Assets<Image>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    garage: &Garage,
+    enemy_parts: &weapons::EnemyParts,
+    collision: &Collision,
+    scene: &Scene,
+) {
+    let drawn = scene.map.as_deref().map_or(0, |id| {
+        match map::spawn(commands, meshes, materials, images, &garage.disc, id) {
+            Ok(n) => {
+                info!("map {id}: {n} parts drawn");
+                n
+            }
+            Err(e) => {
+                warn!("map {id}: {e:#}");
+                0
+            }
+        }
+    });
+    if let (Some(map_id), Some(layout)) = (scene.map.as_deref(), scene.layout.as_deref()) {
+        if let Err(e) = targets::spawn(
+            commands,
+            meshes,
+            materials,
+            paint_materials,
+            images,
+            bindposes,
+            &garage.disc,
+            enemy_parts,
+            map_id,
+            layout,
+            &scene.test,
+            garage.flat,
+        ) {
+            warn!("targets {map_id}_{layout}: {e:#}");
+        }
+    }
+    if drawn == 0 && collision.hits.is_empty() {
+        commands.spawn((
+            SortieDecor,
+            Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.22, 0.23, 0.25),
+                perceptual_roughness: 0.95,
+                ..default()
+            })),
+        ));
+    } else if drawn == 0 {
+        for (layer, color) in [
+            (Layer::Ground, Color::srgb(0.22, 0.23, 0.25)),
+            (Layer::Water, Color::srgba(0.15, 0.35, 0.6, 0.5)),
+        ] {
+            let Some(mesh) = debug_mesh(collision.hits.iter().filter(|h| h.layer == layer)) else {
+                continue;
+            };
+            let mut mat = StandardMaterial {
+                base_color: color,
+                perceptual_roughness: 0.95,
+                ..default()
+            };
+            if layer == Layer::Water {
+                mat.alpha_mode = AlphaMode::Blend;
+            }
+            commands.spawn((
+                SortieDecor,
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(materials.add(mat)),
+            ));
+        }
+    }
+    let water = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.15, 0.35, 0.6, 0.5),
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    for p in collision.planes.iter().filter(|p| p.layer == Layer::Water) {
+        commands.spawn((
+            SortieDecor,
+            Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))),
+            MeshMaterial3d(water.clone()),
+            Transform::from_xyz(0.0, p.y, 0.0),
+        ));
+    }
+    if collision.hits.is_empty() {
+        let (pillar, grey) = (
+            meshes.add(Cuboid::new(1.0, 6.0, 1.0)),
+            materials.add(Color::srgb(0.45, 0.47, 0.5)),
+        );
+        let n = (FLOOR / 2.0 / PILLAR_SPACING) as i32;
+        for x in -n..=n {
+            for z in -n..=n {
+                if (x, z) != (0, 0) {
+                    commands.spawn((
+                        SortieDecor,
+                        Mesh3d(pillar.clone()),
+                        MeshMaterial3d(grey.clone()),
+                        Transform::from_xyz(
+                            x as f32 * PILLAR_SPACING,
+                            3.0,
+                            z as f32 * PILLAR_SPACING,
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Press `F1` during a sortie to return straight to the 3D Garage with the current AC.
+fn sortie_garage_hotkey(
+    mode: Res<garage::Mode>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut switch: ResMut<garage::ModeSwitch>,
+) {
+    if *mode == garage::Mode::Sortie && keys.just_pressed(KeyCode::F1) {
+        switch.target = Some(garage::Mode::Garage);
+    }
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct RenderAssets<'w> {
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    paint_materials: ResMut<'w, Assets<paint::AcPaintMaterial>>,
+    images: ResMut<'w, Assets<Image>>,
+    bindposes: ResMut<'w, Assets<SkinnedMeshInverseBindposes>>,
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct SortieResources<'w> {
+    scene: ResMut<'w, Scene>,
+    collision: ResMut<'w, Collision>,
+    start: ResMut<'w, map::Start>,
+    area_bounds: ResMut<'w, map::AreaBounds>,
+    map_nav: ResMut<'w, map::MapNav>,
+    water_return: ResMut<'w, map::WaterReturnPoints>,
+    piloting: ResMut<'w, control::Piloting>,
+    enemy_parts: Res<'w, weapons::EnemyParts>,
+    sortie_hud: Option<ResMut<'w, hud::Sortie>>,
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct AudioCtx<'w, 's> {
+    cues: ResMut<'w, sound::Cues>,
+    bgm: ResMut<'w, sound::BgmState>,
+    bgm_players: Query<'w, 's, Entity, With<sound::BgmPlayer>>,
+    audio_assets: ResMut<'w, Assets<AudioSource>>,
+}
+
+/// Executes queued transitions between the 3D Garage and live AC TEST sorties.
+#[allow(clippy::too_many_arguments)]
+fn process_mode_switch(
+    mut commands: Commands,
+    mut mode: ResMut<garage::Mode>,
+    mut switch: ResMut<garage::ModeSwitch>,
+    mut garage_state: ResMut<garage::GarageState>,
+    mut garage: ResMut<Garage>,
+    mut sortie: SortieResources,
+    mut audio: AudioCtx,
+    mut assets: RenderAssets,
+    mut dir_lights: Query<(&mut DirectionalLight, &mut Transform)>,
+    mut cam_proj: Query<&mut Projection, With<Camera3d>>,
+    cameras: Query<Entity, With<Camera3d>>,
+    sortie_entities: Query<
+        Entity,
+        Or<(
+            With<map::MapPart>,
+            With<SortieDecor>,
+            With<targets::Target>,
+            With<weapons::Projectile>,
+            With<weapons::Missile>,
+            With<scan::ReconUnit>,
+            With<MenuRoot>,
+            With<hud::AreaWarningHud>,
+            With<text::Label>,
+        )>,
+    >,
+    garage_entities: Query<Entity, Or<(With<garage::GarageWorld>, With<garage::GarageUi>)>>,
+) {
+    let Some(target) = switch.target.take() else {
+        return;
+    };
+    if *mode == target {
+        return;
+    }
+    match target {
+        garage::Mode::Garage => {
+            for e in &sortie_entities {
+                commands.entity(e).despawn();
+            }
+            env::clear_map_env(&mut commands);
+            sortie.piloting.0 = false;
+            *mode = garage::Mode::Garage;
+            garage_state.screen = garage::GarageScreen::Top;
+            garage_state.cursor = 0;
+            garage_state.scroll = 0;
+            garage_state.spawned_workshop = None;
+            garage_state.cam_initialized = false;
+            garage_state.cam_manual_orbit = false;
+            garage_state.ui_dirty = true;
+            garage.dirty = true;
+            sound::switch_bgm(
+                &mut commands,
+                &mut audio.bgm,
+                &audio.bgm_players,
+                &garage.disc,
+                None,
+            );
+            sound::cue(
+                &mut commands,
+                &mut audio.cues,
+                &mut audio.audio_assets,
+                garage::CUE_GARAGE_IN,
+            );
+        }
+        garage::Mode::Sortie => {
+            for e in &garage_entities {
+                commands.entity(e).despawn();
+            }
+            garage_state.spawned_workshop = None;
+            if let Some(m) = switch.sortie_map.take() {
+                sortie.scene.map = Some(m);
+            } else if sortie.scene.map.is_none() && !sortie.scene.plane && !sortie.scene.hits {
+                sortie.scene.map = Some("m4000".to_string());
+            }
+            if let Some(t) = switch.sortie_test.take() {
+                sortie.scene.test = targets::TestMode::parse(&t);
+            }
+            if sortie.scene.map.as_deref() == Some("m4000") {
+                sortie.scene.layout = Some("actest".to_string());
+            } else {
+                sortie.scene.layout = None;
+            }
+            let (new_col, new_start, new_bounds, new_nav, new_wr) = load_sortie_data(
+                &garage.disc,
+                sortie.scene.map.as_deref(),
+                sortie.scene.layout.as_deref(),
+                sortie.scene.plane,
+                sortie.scene.water,
+            );
+            *sortie.collision = new_col;
+            *sortie.start = new_start;
+            *sortie.area_bounds = new_bounds;
+            *sortie.map_nav = new_nav;
+            *sortie.water_return = new_wr;
+
+            spawn_sortie_world(
+                &mut commands,
+                &mut assets.meshes,
+                &mut assets.materials,
+                &mut assets.paint_materials,
+                &mut assets.images,
+                &mut assets.bindposes,
+                &garage,
+                &sortie.enemy_parts,
+                &sortie.collision,
+                &sortie.scene,
+            );
+            if let Some(map_id) = sortie.scene.map.as_deref() {
+                env::load_map_env(
+                    &mut commands,
+                    &garage.disc,
+                    map_id,
+                    &mut dir_lights,
+                    &cameras,
+                    &mut assets.images,
+                );
+            }
+            if let Ok(mut proj) = cam_proj.single_mut() {
+                if let Projection::Perspective(ref mut p) = *proj {
+                    p.fov = PerspectiveProjection::default().fov;
+                }
+            }
+            if let Some(ref mut sh) = sortie.sortie_hud {
+                sh.reset_layout();
+            }
+            sortie.piloting.0 = true;
+            *mode = garage::Mode::Sortie;
+            garage.dirty = true;
+            sound::switch_bgm(
+                &mut commands,
+                &mut audio.bgm,
+                &audio.bgm_players,
+                &garage.disc,
+                sortie.scene.map.as_deref(),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
@@ -460,6 +895,7 @@ fn setup(
     mut paint_materials: ResMut<Assets<paint::AcPaintMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mode: Res<garage::Mode>,
     garage: Res<Garage>,
     enemy_parts: Res<weapons::EnemyParts>,
     yaw: Res<StartYaw>,
@@ -492,104 +928,19 @@ fn setup(
         },
         Transform::from_xyz(-6.0, 3.0, -4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    let drawn = scene.map.as_deref().map_or(0, |id| {
-        match map::spawn(
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            &mut images,
-            &garage.disc,
-            id,
-        ) {
-            Ok(n) => {
-                info!("map {id}: {n} parts drawn");
-                n
-            }
-            Err(e) => {
-                warn!("map {id}: {e:#}");
-                0
-            }
-        }
-    });
-    if let (Some(map_id), Some(layout)) = (scene.map.as_deref(), scene.layout.as_deref()) {
-        if let Err(e) = targets::spawn(
+    if *mode == garage::Mode::Sortie {
+        spawn_sortie_world(
             &mut commands,
             &mut meshes,
             &mut materials,
             &mut paint_materials,
             &mut images,
             &mut bindposes,
-            &garage.disc,
+            &garage,
             &enemy_parts,
-            map_id,
-            layout,
-            &scene.test,
-            garage.flat,
-        ) {
-            warn!("targets {map_id}_{layout}: {e:#}");
-        }
-    }
-    if drawn == 0 && collision.hits.is_empty() {
-        commands.spawn((
-            Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.22, 0.23, 0.25),
-                perceptual_roughness: 0.95,
-                ..default()
-            })),
-        ));
-    } else if drawn == 0 {
-        for (layer, color) in [
-            (Layer::Ground, Color::srgb(0.22, 0.23, 0.25)),
-            (Layer::Water, Color::srgba(0.15, 0.35, 0.6, 0.5)),
-        ] {
-            let Some(mesh) = debug_mesh(collision.hits.iter().filter(|h| h.layer == layer)) else {
-                continue;
-            };
-            let mut mat = StandardMaterial {
-                base_color: color,
-                perceptual_roughness: 0.95,
-                ..default()
-            };
-            if layer == Layer::Water {
-                mat.alpha_mode = AlphaMode::Blend;
-            }
-            commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(materials.add(mat))));
-        }
-    }
-    let water = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.15, 0.35, 0.6, 0.5),
-        alpha_mode: AlphaMode::Blend,
-        ..default()
-    });
-    for p in collision.planes.iter().filter(|p| p.layer == Layer::Water) {
-        commands.spawn((
-            Mesh3d(meshes.add(Plane3d::default().mesh().size(FLOOR, FLOOR))),
-            MeshMaterial3d(water.clone()),
-            Transform::from_xyz(0.0, p.y, 0.0),
-        ));
-    }
-    if collision.hits.is_empty() {
-        let (pillar, grey) = (
-            meshes.add(Cuboid::new(1.0, 6.0, 1.0)),
-            materials.add(Color::srgb(0.45, 0.47, 0.5)),
+            &collision,
+            &scene,
         );
-        let n = (FLOOR / 2.0 / PILLAR_SPACING) as i32;
-        for x in -n..=n {
-            for z in -n..=n {
-                if (x, z) != (0, 0) {
-                    commands.spawn((
-                        Mesh3d(pillar.clone()),
-                        MeshMaterial3d(grey.clone()),
-                        Transform::from_xyz(
-                            x as f32 * PILLAR_SPACING,
-                            3.0,
-                            z as f32 * PILLAR_SPACING,
-                        ),
-                    ));
-                }
-            }
-        }
     }
     if show_hud.0 {
         match load_hud(&garage.disc, &mut images) {
@@ -660,13 +1011,23 @@ fn browse(keys: Res<ButtonInput<KeyCode>>, mut garage: ResMut<Garage>) {
         .map(|(_, s)| *s)
         .sum::<isize>();
     if step != 0 && n > 0 {
-        garage.current = (garage.current as isize + step).rem_euclid(n) as usize;
+        let next = (garage.current as isize + step).rem_euclid(n) as usize;
+        garage.current = next;
+        if let Some(&row) = garage.designs.get(next) {
+            garage.active_design = row.data;
+            garage.active_name = garage::display_design_name(row.id, row.name);
+            garage.custom_color = (!garage.flat)
+                .then(|| paint::load_accolor(&garage.disc, row.data.coloring_id))
+                .flatten();
+            garage.dirty = true;
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn show(
     mut commands: Commands,
+    mode: Res<garage::Mode>,
     mut garage: ResMut<Garage>,
     acs: Query<Entity, With<Ac>>,
     shots: Query<
@@ -677,11 +1038,7 @@ fn show(
             With<scan::ReconUnit>,
         )>,
     >,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut paint_materials: ResMut<Assets<paint::AcPaintMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mut assets: RenderAssets,
     mut orbit: Query<&mut Orbit>,
     mut window: Query<&mut Window, With<PrimaryWindow>>,
     labels: Query<Entity, With<text::Label>>,
@@ -690,13 +1047,17 @@ fn show(
     start: Res<map::Start>,
     shot: Option<ResMut<Shot>>,
 ) {
-    if garage.shown == Some(garage.current) {
+    let meshes = &mut *assets.meshes;
+    let materials = &mut *assets.materials;
+    let paint_materials = &mut *assets.paint_materials;
+    let images = &mut *assets.images;
+    let bindposes = &mut *assets.bindposes;
+    if !garage.dirty {
         return;
     }
-    let Some(&design) = garage.designs.get(garage.current) else {
-        return;
-    };
-    garage.shown = Some(garage.current);
+    garage.dirty = false;
+    let design_data = garage.active_design;
+    let design_name = garage.active_name.clone();
     for e in acs.iter().chain(shots.iter()).chain(labels.iter()) {
         commands.entity(e).despawn();
     }
@@ -705,16 +1066,24 @@ fn show(
     commands.remove_resource::<hanger::HangerPose>();
     commands.remove_resource::<boost::BoostPose>();
 
-    let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design.data);
-    let accolor = (!garage.flat)
-        .then(|| paint::load_accolor(&garage.disc, design.data.coloring_id))
-        .flatten();
-    let spawn_y = collision.ground_below(start.position + Vec3::Y * RAY_HALF);
+    let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design_data);
+    let accolor = if garage.flat {
+        None
+    } else {
+        garage
+            .custom_color
+            .or_else(|| paint::load_accolor(&garage.disc, design_data.coloring_id))
+    };
+    let (spawn_pos, spawn_yaw, spawn_y) = if *mode == garage::Mode::Garage {
+        (Vec3::ZERO, 0.0, Some(0.0))
+    } else {
+        let y = collision.ground_below(start.position + Vec3::Y * RAY_HALF);
+        (start.position.with_y(y.unwrap_or(start.position.y)), start.yaw, y)
+    };
     let ac = commands
         .spawn((
             Ac,
-            Transform::from_translation(start.position.with_y(spawn_y.unwrap_or(start.position.y)))
-                .with_rotation(Quat::from_rotation_y(start.yaw)),
+            Transform::from_translation(spawn_pos).with_rotation(Quat::from_rotation_y(spawn_yaw)),
             Visibility::default(),
         ))
         .id();
@@ -945,7 +1314,7 @@ fn show(
                 &garage.disc,
                 &mesh,
                 &mut packs,
-                &mut images,
+                images,
                 garage.flat,
                 &mut missing,
             );
@@ -957,7 +1326,7 @@ fn show(
                     part.placement.column,
                     col,
                     &mut packs,
-                    &mut images,
+                    images,
                 )
             });
             let mut mesh_entity = commands.spawn((
@@ -1045,11 +1414,8 @@ fn show(
     }
 
     let mut status = format!(
-        "[{}/{}] design {} {} - {} models",
-        garage.current + 1,
-        garage.designs.len(),
-        design.id,
-        design.name,
+        "{} - {} models",
+        design_name,
         built.placements.len()
     );
     if missing > 0 {
@@ -1059,54 +1425,62 @@ fn show(
         status.push_str(&format!(", {} slots unplaced", problems.len()));
     }
     for p in &problems {
-        warn!("design {}: {p}", design.id);
+        warn!("design {}: {p}", design_name);
     }
-    let ctrl = AcCtrlParam::calculate(&design.data);
+    let ctrl = AcCtrlParam::calculate(&design_data);
     let fcs = fcs::Fcs::from_ctrl(&ctrl);
-    let legs_motion_id = acvd_data::part_field(design.data.legs as i64, 3, "legs_motion_id") as u8;
+    let legs_motion_id = acvd_data::part_field(design_data.legs as i64, 3, "legs_motion_id") as u8;
     let mut pilot = control::Pilot::new(ctrl, legs_motion_id);
-    pilot.yaw = start.yaw;
-    if spawn_y.is_none() && !collision.hits.is_empty() {
+    pilot.yaw = spawn_yaw;
+    if *mode == garage::Mode::Sortie && spawn_y.is_none() && !collision.hits.is_empty() {
         pilot.airborne = true;
     }
     commands.entity(ac).insert((
         pilot,
         fcs,
-        scan::ScanState::from_design(&design.data),
-        weapons::Armament::from_design(&design.data),
-        damage::PlayerHealth::from_design(&design.data),
-        hud::Status::from_design(&design.data),
+        scan::ScanState::from_design(&design_data),
+        weapons::Armament::from_design(&design_data),
+        damage::PlayerHealth::from_design(&design_data),
+        hud::Status::from_design(&design_data),
     ));
     if min.x <= max.x {
         garage.bounds = (min, max);
-        if let Ok(mut o) = orbit.single_mut() {
-            o.frame(min, max);
+        if *mode == garage::Mode::Sortie {
+            if let Ok(mut o) = orbit.single_mut() {
+                o.frame(min, max);
+            }
         }
     }
     info!("{status}");
     if let Ok(mut w) = window.single_mut() {
-        w.title = status.clone();
+        w.title = if *mode == garage::Mode::Garage {
+            format!("ACVD Garage — {design_name}")
+        } else {
+            status.clone()
+        };
     }
     garage.status = status;
-    if let Some(hud) = hud.as_deref() {
-        // Tint is not game data; DRB colours are still unread.
-        text::spawn(
-            &mut commands,
-            &hud.font,
-            &hud_lines(design, &hud.parts),
-            Vec2::new(24.0, 20.0),
-            2.0,
-            Color::srgb(0.92, 0.95, 0.98),
-        );
+    if *mode == garage::Mode::Sortie {
+        if let Some(hud) = hud.as_deref() {
+            // Tint is not game data; DRB colours are still unread.
+            text::spawn(
+                &mut commands,
+                &hud.font,
+                &hud_lines(&design_name, &design_data, &hud.parts),
+                Vec2::new(24.0, 20.0),
+                2.0,
+                Color::srgb(0.92, 0.95, 0.98),
+            );
+        }
     }
     if let Some(mut shot) = shot {
         shot.ready = true;
     }
 }
 
-fn hud_lines(design: &Row<AcAssemblyDesignSt>, parts: &Fmg) -> String {
-    let mut text = format!("{} {}", design.id, design.name);
-    let names: Vec<&str> = [design.data.head, design.data.core, design.data.legs]
+fn hud_lines(name: &str, design: &AcAssemblyDesignSt, parts: &Fmg) -> String {
+    let mut text = name.to_string();
+    let names: Vec<&str> = [design.head, design.core, design.legs]
         .into_iter()
         .filter_map(|id| parts.get(id as i32))
         .collect();

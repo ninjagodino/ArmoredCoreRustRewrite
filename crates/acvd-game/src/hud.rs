@@ -149,6 +149,15 @@ pub struct Sortie {
     pub ap_effect: ApEffectState,
 }
 
+impl Sortie {
+    /// Forces [`layout`] to respawn all lock-sight HUD dialogs on the next frame (used when
+    /// re-entering Sortie mode from the 3D Garage).
+    pub fn reset_layout(&mut self) {
+        self.size = Vec2::ZERO;
+        self.show = 0.0;
+    }
+}
+
 pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
     Ok(Sortie {
         layout: menu::load(disc, LAYOUT, images)?,

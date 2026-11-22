@@ -33,33 +33,35 @@ while ($true) {
     Write-Host @"
 
  ACVD rewrite demo ($profileDir build)
-  1  Pilot an AC in the AC test map (m4000, default design)
-  2  Pilot: pick design id and map
-  3  Pilot on a flat plane with test water at y=2
-  4  Model viewer (FLVER browser)
-  5  Regenerate sheets (after editing sheets/*.csv)
-  6  Custom acvd-game arguments
+  1  3D Garage (Assemble, Paint, 13 Workshops, live AC TEST Sortie)
+  2  Pilot an AC directly in AC TEST (m4000, default design; F1 = Garage)
+  3  Pilot: pick design id and map
+  4  Pilot on a flat plane with test water at y=2
+  5  Model viewer (FLVER browser)
+  6  Regenerate sheets (after editing sheets/*.csv)
+  7  Custom acvd-game arguments
   q  Quit
 
- In game: WASD move, Q/E turn, Up/Down pitch, Shift boost, Space jump, F/C fire right/left,
- M mouselook, P clip browser, Left/Right previous/next design, R reframe.
- Close the window to come back here.
+ In Garage: W/S or Up/Down navigate, Enter/Click select, Esc back, Right-drag orbit, V view mode.
+ In Sortie: WASD move, Q/E turn, Shift boost, Space jump, F/C fire, G shoulder, Z scan, B recon,
+ F1 return to Garage, F9 mute BGM. Close the window to come back here.
 "@
     switch ((Read-Host ' choice').Trim()) {
-        '1' { Launch 'acvd-game' @() }
-        '2' {
+        '1' { Launch 'acvd-game' @('--garage') }
+        '2' { Launch 'acvd-game' @() }
+        '3' {
             $a = @()
             $id = (Read-Host ' design id (blank = first)').Trim(); if ($id) { $a += $id }
             $map = (Read-Host ' map folder, e.g. m3200 (blank = m4000 AC test)').Trim(); if ($map) { $a += '--map', $map }
             Launch 'acvd-game' $a
         }
-        '3' { Launch 'acvd-game' @('--plane', '--water', '2') }
-        '4' {
+        '4' { Launch 'acvd-game' @('--plane', '--water', '2') }
+        '5' {
             $m = (Read-Host ' model name (blank = first)').Trim()
             Launch 'acvd-viewer' $(if ($m) { @($m) } else { @() })
         }
-        '5' { try { Sheets } catch { Write-Host $_ -ForegroundColor Red } }
-        '6' { Launch 'acvd-game' ((Read-Host ' args').Trim() -split '\s+' | Where-Object { $_ }) }
+        '6' { try { Sheets } catch { Write-Host $_ -ForegroundColor Red } }
+        '7' { Launch 'acvd-game' ((Read-Host ' args').Trim() -split '\s+' | Where-Object { $_ }) }
         'q' { return }
         default { Write-Host ' ?' }
     }

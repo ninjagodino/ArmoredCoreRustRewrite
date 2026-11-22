@@ -374,30 +374,22 @@ fn lux(linear: f32) -> f32 {
     linear * std::f32::consts::PI / Exposure::default().exposure()
 }
 
-fn load(
-    mut commands: Commands,
-    disc: Res<EnvDisc>,
-    scene: Res<crate::Scene>,
-    mut lights: Query<(&mut DirectionalLight, &mut Transform)>,
-    cameras: Query<Entity, With<Camera3d>>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    let Some(map) = scene.map.as_deref() else {
-        return;
-    };
-    let disc = &disc.0;
-    let path = env_path(map);
-    let env = match vfs::open(disc, &path).and_then(|d| env::read(&d)) {
+/// Applies an env MSB's clear color, AC light set (`SET_AC`), global ambient light, and camera
+/// HDR / bloom settings. Returns the parsed [`Env`] when the file loads.
+pub(crate) fn apply_env_file(
+    commands: &mut Commands,
+    disc: &Disc,
+    path: &str,
+    lights: &mut Query<(&mut DirectionalLight, &mut Transform)>,
+    cameras: &Query<Entity, With<Camera3d>>,
+) -> Option<Env> {
+    let env = match vfs::open(disc, path).and_then(|d| env::read(&d)) {
         Ok(env) => env,
         Err(e) => {
             warn!("{path}: {e:#}");
-            return;
+            return None;
         }
     };
-    let parts_by_name = vfs::open(disc, &map::terrain_msb(disc, map))
-        .and_then(|d| msb::parts(&d))
-        .map(|parts| parts.into_iter().map(|p| (p.name.clone(), p)).collect())
-        .unwrap_or_default();
     if let Some(s) = env.scene {
         commands.insert_resource(ClearColor(Color::srgb_u8(
             s.clear[0], s.clear[1], s.clear[2],
@@ -419,15 +411,14 @@ fn load(
             ..default()
         });
     }
-    let bloom = env
-        .scene
-        .map(|s| s.tonemap.bloom)
-        .and_then(bevy_bloom);
-    for camera in &cameras {
+    let bloom = env.scene.map(|s| s.tonemap.bloom).and_then(bevy_bloom);
+    for camera in cameras {
         let mut cam = commands.entity(camera);
         cam.insert((Hdr, Tonemapping::None));
         if let Some(bloom) = bloom.clone() {
             cam.insert(bloom);
+        } else {
+            cam.remove::<Bloom>();
         }
     }
     info!(
@@ -435,6 +426,27 @@ fn load(
         env.lights.len(),
         env.scene
     );
+    Some(env)
+}
+
+/// Loads `ch_env/{map}_env.msb`, applies its AC lights & bloom, and installs [`MapEnv`] so map
+/// parts are relit by [`relight`].
+pub(crate) fn load_map_env(
+    commands: &mut Commands,
+    disc: &Disc,
+    map: &str,
+    lights: &mut Query<(&mut DirectionalLight, &mut Transform)>,
+    cameras: &Query<Entity, With<Camera3d>>,
+    images: &mut Assets<Image>,
+) {
+    let path = env_path(map);
+    let Some(env) = apply_env_file(commands, disc, &path, lights, cameras) else {
+        return;
+    };
+    let parts_by_name = vfs::open(disc, &map::terrain_msb(disc, map))
+        .and_then(|d| msb::parts(&d))
+        .map(|parts| parts.into_iter().map(|p| (p.name.clone(), p)).collect())
+        .unwrap_or_default();
     let white_srgb = images.add(solid_pixel([255, 255, 255, 255], TextureFormat::Rgba8UnormSrgb));
     let flat_normal = images.add(solid_pixel([128, 128, 255, 255], TextureFormat::Rgba8Unorm));
     commands.insert_resource(MapEnv {
@@ -447,6 +459,29 @@ fn load(
         white_srgb,
         flat_normal,
     });
+}
+
+/// Removes active sortie map-env relighting state (e.g. when returning to the 3D garage).
+pub(crate) fn clear_map_env(commands: &mut Commands) {
+    commands.remove_resource::<MapEnv>();
+}
+
+fn load(
+    mut commands: Commands,
+    disc: Res<EnvDisc>,
+    scene: Res<crate::Scene>,
+    mode: Res<crate::garage::Mode>,
+    mut lights: Query<(&mut DirectionalLight, &mut Transform)>,
+    cameras: Query<Entity, With<Camera3d>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if *mode != crate::garage::Mode::Sortie {
+        return;
+    }
+    let Some(map) = scene.map.as_deref() else {
+        return;
+    };
+    load_map_env(&mut commands, &disc.0, map, &mut lights, &cameras, &mut images);
 }
 
 /// Moves every newly spawned map-part mesh onto `SkyMaterial` (`Map_Sky`), `WaterMaterial`

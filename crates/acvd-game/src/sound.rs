@@ -51,6 +51,8 @@ impl Cues {
             "acv2_se_booster.fev",
             "acv2_se_ac.fev",
             "acv2_se_enemy.fev",
+            "acv2_se_menu.fev",
+            "acv2_se_garage.fev",
         ] {
             match disc
                 .read(&format!("sound/{name}"))
@@ -203,12 +205,34 @@ impl Plugin for SoundPlugin {
 }
 
 #[derive(Component)]
-struct BgmPlayer;
+pub struct BgmPlayer;
 
 #[derive(Resource, Default)]
-struct BgmState {
+pub struct BgmState {
     rx: Option<Mutex<mpsc::Receiver<Vec<u8>>>>,
     muted: bool,
+    enabled: bool,
+}
+
+/// Switches the active looping BGM track (`None` plays the garage theme `grg` from
+/// `acv2_bgm_menu_bgm_menu.fev`; `Some(map)` plays that map's `EVENT_BGM` from `acv2_bgm_bgm.fev`).
+pub fn switch_bgm(
+    commands: &mut Commands,
+    bgm: &mut BgmState,
+    players: &Query<Entity, With<BgmPlayer>>,
+    disc: &Disc,
+    map: Option<&str>,
+) {
+    for entity in players {
+        commands.entity(entity).despawn();
+    }
+    if !bgm.enabled {
+        bgm.rx = None;
+        return;
+    }
+    let muted = bgm.muted;
+    *bgm = BgmState::spawn_decode(disc, map);
+    bgm.muted = muted;
 }
 
 /// Resolves the BGM wave for `map` from `ch_env/{map}_env.msb` (`EVENT_BGM`, 360 `0x82800128`)
@@ -252,7 +276,11 @@ fn resolve_bgm_wave(disc: &Disc, map: Option<&str>) -> Option<(String, fev::Wave
 impl BgmState {
     fn spawn_decode(disc: &Disc, map: Option<&str>) -> Self {
         let Some((cue, wave)) = resolve_bgm_wave(disc, map) else {
-            return Self::default();
+            return Self {
+                rx: None,
+                muted: false,
+                enabled: true,
+            };
         };
         let disc = disc.clone();
         let (tx, rx) = mpsc::channel();
@@ -278,6 +306,7 @@ impl BgmState {
         Self {
             rx: Some(Mutex::new(rx)),
             muted: false,
+            enabled: true,
         }
     }
 }
@@ -467,7 +496,7 @@ mod tests {
         let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
         let Ok(disc) = Disc::open(&iso) else { return };
         let mut cues = Cues::load(&disc);
-        assert_eq!(cues.projects.len(), 5);
+        assert_eq!(cues.projects.len(), 7);
         for cue in [
             "w00000034",
             "w00001012",
@@ -481,6 +510,8 @@ mod tests {
             QUICK_BOOST[0],
             QUICK_BOOST[1],
             GLIDE_ON,
+            "menu_0000",
+            "menu_0001",
         ] {
             let waves: Vec<fev::Wave> = cues
                 .projects
