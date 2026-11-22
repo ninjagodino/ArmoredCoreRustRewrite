@@ -22,8 +22,10 @@ use bevy::prelude::*;
 use crate::collision::{Collision, RayFilter, RAY_HALF};
 use crate::control::{Pilot, Piloting};
 use crate::damage::PlayerHealth;
+use crate::map::MapNav;
+use crate::pose::NpcMotion;
 use crate::sound::Cues;
-use crate::targets::{enemy_param_id, Target, TargetHealth};
+use crate::targets::{enemy_param_id, EnemyAnim, Target, TargetHealth};
 use crate::weapons::{self, Armament, EnemyParts, Gun, Kind, Tracers};
 
 const TICK_RATE: f32 = 60.0;
@@ -149,6 +151,11 @@ pub struct EnemyAi {
     pub patrol_yaw: f32,
     pub rng: u32,
     pub weapons: Vec<AiWeaponSlot>,
+    /// Current `HNAV` navmesh waypoint path in Bevy world space (grounded units).
+    pub nav_path: Vec<Vec3>,
+    pub nav_index: usize,
+    pub nav_repath_timer: f32,
+    pub nav_last_goal: Vec3,
 }
 
 impl EnemyAi {
@@ -337,6 +344,10 @@ impl EnemyAi {
             patrol_yaw: init_yaw,
             rng: seed,
             weapons,
+            nav_path: Vec::new(),
+            nav_index: 0,
+            nav_repath_timer: 0.0,
+            nav_last_goal: Vec3::ZERO,
         }
     }
 
@@ -430,6 +441,10 @@ impl EnemyAi {
             patrol_yaw: init_yaw,
             rng: seed,
             weapons,
+            nav_path: Vec::new(),
+            nav_index: 0,
+            nav_repath_timer: 0.0,
+            nav_last_goal: Vec3::ZERO,
         }
     }
 
@@ -849,6 +864,78 @@ impl EnemyAi {
             shots,
         }
     }
+
+    /// Reroutes `desired_vel` along the map's `HNAV`/`HTR` navmesh for grounded enemies when
+    /// line-of-sight is blocked or a wall lies directly ahead.
+    pub fn apply_navmesh(
+        &mut self,
+        pos: Vec3,
+        desired_vel: Vec3,
+        player_pos: Vec3,
+        has_los: bool,
+        nav: &MapNav,
+        collision: &Collision,
+        dt: f32,
+    ) -> Vec3 {
+        if self.airborne || !nav.is_loaded() {
+            return desired_vel;
+        }
+        let speed = Vec2::new(desired_vel.x, desired_vel.z).length();
+        if speed < 0.5 {
+            self.nav_path.clear();
+            self.nav_index = 0;
+            return desired_vel;
+        }
+        self.nav_repath_timer = (self.nav_repath_timer - dt).max(0.0);
+
+        let dir_xz = Vec3::new(desired_vel.x, 0.0, desired_vel.z) / speed;
+        // Probe 14 m ahead at chest height to detect walls/pillars in our steering direction.
+        let chest = pos + Vec3::Y * 3.0;
+        let blocked_ahead = !collision.has_los(chest, chest + dir_xz * 14.0, RayFilter::AiLos);
+        let need_nav = (self.engaged && !has_los) || blocked_ahead;
+
+        if !need_nav {
+            self.nav_path.clear();
+            self.nav_index = 0;
+            return desired_vel;
+        }
+
+        let goal = if self.engaged && !has_los {
+            player_pos
+        } else {
+            pos + dir_xz * 45.0
+        };
+
+        let goal_moved = Vec2::new(goal.x - self.nav_last_goal.x, goal.z - self.nav_last_goal.z).length() > 12.0;
+        if self.nav_path.is_empty()
+            || self.nav_index >= self.nav_path.len()
+            || (self.nav_repath_timer <= 0.0 && goal_moved)
+        {
+            self.nav_path = nav.find_path(pos, goal);
+            self.nav_index = 0;
+            self.nav_last_goal = goal;
+            self.nav_repath_timer = 0.75;
+        }
+
+        // Advance past waypoints within 6 m XZ.
+        while self.nav_index < self.nav_path.len() {
+            let wp = self.nav_path[self.nav_index];
+            let d = Vec2::new(wp.x - pos.x, wp.z - pos.z).length();
+            if d < 6.0 && self.nav_index + 1 < self.nav_path.len() {
+                self.nav_index += 1;
+            } else {
+                break;
+            }
+        }
+
+        if let Some(&wp) = self.nav_path.get(self.nav_index) {
+            let to_wp = Vec3::new(wp.x - pos.x, 0.0, wp.z - pos.z);
+            if let Some(nav_dir) = to_wp.try_normalize() {
+                return nav_dir * speed;
+            }
+        }
+        desired_vel
+    }
 }
 
 /// Bevy update system driving all living AC TEST enemies and test ACs.
@@ -856,13 +943,24 @@ impl EnemyAi {
 pub fn update(
     time: Res<Time>,
     piloting: Res<Piloting>,
+    garage: Res<crate::Garage>,
     collision: Res<Collision>,
+    nav: Res<MapNav>,
     tracers: Res<Tracers>,
     mut cues: ResMut<Cues>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
     mut commands: Commands,
     player_q: Query<(Entity, &Transform, &Pilot, &PlayerHealth), Without<Target>>,
-    mut enemies: Query<(&mut Transform, &mut EnemyAi, &TargetHealth), With<Target>>,
+    mut enemies: Query<
+        (
+            &mut Transform,
+            &mut EnemyAi,
+            &TargetHealth,
+            Option<&mut EnemyAnim>,
+            Option<&mut NpcMotion>,
+        ),
+        With<Target>,
+    >,
 ) {
     if !piloting.0 {
         return;
@@ -878,10 +976,11 @@ pub fn update(
     let player_vel = pilot.velocity * TICK_RATE;
     let player_alive = !player_health.destroyed;
 
-    for (mut tf, mut ai, health) in &mut enemies {
+    for (mut tf, mut ai, health, enemy_anim, npc_motion) in &mut enemies {
         if health.destroyed {
             continue;
         }
+        let prev_yaw = ai.yaw;
         let has_los = collision.has_los(
             tf.translation + Vec3::Y * ai.muzzle_height,
             player_pos + Vec3::Y * PLAYER_AIM_Y,
@@ -897,7 +996,16 @@ pub fn update(
             dt,
         );
 
-        let mut next = tf.translation + out.velocity * dt;
+        let nav_vel = ai.apply_navmesh(
+            tf.translation,
+            out.velocity,
+            player_pos,
+            has_los,
+            &nav,
+            &collision,
+            dt,
+        );
+        let mut next = tf.translation + nav_vel * dt;
         if ai.airborne {
             if let Some(target_alt) = out.target_altitude {
                 let max_lift = ai.lift_speed_ms.max(6.0) * dt;
@@ -919,6 +1027,39 @@ pub fn update(
         }
         tf.translation = next;
         tf.rotation = Quat::from_rotation_y(out.yaw);
+
+        // Compute local-space velocity & aim angles for skeletal animation + turret/core tracking.
+        let inv_rot = Quat::from_rotation_y(-out.yaw);
+        let local_vel = inv_rot * nav_vel;
+        let yaw_rate = wrap_angle(out.yaw - prev_yaw) / dt.max(1e-4);
+        let aim_yaw_pitch = if ai.engaged && player_alive {
+            let rel = (player_pos + Vec3::Y * PLAYER_AIM_Y) - (next + Vec3::Y * ai.muzzle_height);
+            let local_rel = inv_rot * rel;
+            let horiz = Vec2::new(local_rel.x, local_rel.z).length().max(1e-3);
+            let rel_yaw = (-local_rel.x).atan2(-local_rel.z);
+            let rel_pitch = local_rel.y.atan2(horiz);
+            Some((rel_yaw, rel_pitch))
+        } else {
+            None
+        };
+
+        if let Some(mut anim) = enemy_anim {
+            anim.select_state(
+                ai.archetype,
+                local_vel,
+                ai.walk_speed_ms,
+                yaw_rate,
+                ai.sub_state,
+                health.is_staggered(),
+                !out.shots.is_empty(),
+                dt,
+            );
+            anim.step(dt, aim_yaw_pitch);
+            anim.prev_yaw = out.yaw;
+        }
+        if let Some(mut npc) = npc_motion {
+            npc.set_locomotion(&garage.disc, local_vel, ai.walk_speed_ms, aim_yaw_pitch);
+        }
 
         for shot in out.shots {
             weapons::spawn_enemy_shot(
@@ -1175,5 +1316,44 @@ mod tests {
             clear_shots += out.shots.len();
         }
         assert!(clear_shots >= 1, "enemy should fire once LOS is clear");
+    }
+
+    #[test]
+    fn navmesh_routes_grounded_enemy_across_m4000() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let nav = MapNav::load(&disc, "m4000").expect("load m4000 navmesh");
+        assert!(nav.is_loaded());
+        assert_eq!(nav.region_count(), 607);
+
+        let parts = EnemyParts::load(&disc);
+        // Bevy coordinates for m4000 (X mirrored from FLVER).
+        let start = Vec3::new(324.65, 29.0, 649.5);
+        let goal = Vec3::new(620.0, 29.0, 520.0);
+        let mut mt = EnemyAi::for_enemy("e0210", start, 0.0, &parts);
+        mt.engaged = true;
+        let collision = Collision::with_hits(Vec::new(), Vec::new());
+
+        let routed = mt.apply_navmesh(
+            start,
+            Vec3::new(10.0, 0.0, 0.0),
+            goal,
+            false, // occluded -> triggers navmesh pathfinding
+            &nav,
+            &collision,
+            0.05,
+        );
+        assert!(
+            !mt.nav_path.is_empty(),
+            "grounded enemy without LOS should compute HNAV waypoints"
+        );
+        assert!(
+            routed.length() > 5.0 && routed.is_finite(),
+            "routed velocity should maintain movement speed: {routed}"
+        );
     }
 }

@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{bnd3, flver, msb};
+use acvd_formats::{bnd3, flver, msb, nav};
 use acvd_render::{LoadedMesh, Packs};
 use anyhow::Result;
 use bevy::prelude::*;
@@ -197,6 +197,54 @@ pub struct AreaBounds {
     pub operation: Option<AreaBox>,
     pub warning: Option<AreaBox>,
     pub caution: Option<AreaBox>,
+}
+
+/// Loaded `HNAV` + `HTR` navigation mesh for the active map (`model/map/ch_nav/{map}.hnav`,
+/// `*.htr`), with coordinate conversion between Bevy world space and FLVER/game axes (`x -> -x`).
+#[derive(Resource, Clone, Debug, Default)]
+pub struct MapNav {
+    inner: Option<nav::NavMesh>,
+}
+
+impl MapNav {
+    /// Loads `model/map/ch_nav/{map}.hnav` (and optional `.htr`) from the disc.
+    pub fn load(disc: &Disc, map: &str) -> Result<Self> {
+        let hnav_path = format!("model/map/ch_nav/{map}.hnav");
+        if !disc.exists(&hnav_path) {
+            return Ok(Self { inner: None });
+        }
+        let hnav = nav::read_hnav(&vfs::open(disc, &hnav_path)?)?;
+        let htr_path = format!("model/map/ch_nav/{map}.htr");
+        let htr = if disc.exists(&htr_path) {
+            Some(nav::read_htr(&vfs::open(disc, &htr_path)?)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            inner: Some(nav::NavMesh::new(hnav, htr)),
+        })
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    pub fn region_count(&self) -> usize {
+        self.inner.as_ref().map_or(0, nav::NavMesh::region_count)
+    }
+
+    /// Computes a Bevy-world waypoint path from `start` to `goal` over the `HNAV` navmesh.
+    pub fn find_path(&self, start: Vec3, goal: Vec3) -> Vec<Vec3> {
+        let Some(mesh) = &self.inner else {
+            return Vec::new();
+        };
+        let s = [-start.x, start.y, start.z];
+        let g = [-goal.x, goal.y, goal.z];
+        mesh.find_path(s, g)
+            .into_iter()
+            .map(|p| Vec3::new(-p[0], p[1], p[2]))
+            .collect()
+    }
 }
 
 impl AreaBounds {

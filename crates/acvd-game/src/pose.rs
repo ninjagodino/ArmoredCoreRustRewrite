@@ -10,8 +10,10 @@
 
 use std::collections::HashMap;
 
-use acvd_data::generated::ac_unit::{AcanimHokanparamSt, PARAM_MOTIONCOLLATE_BIN};
-use acvd_data::{Asset, SocketRef};
+use acvd_data::generated::ac_unit::{
+    AcanimHokanparamSt, PARAM_ACMOTION_BIN, PARAM_MOTIONCOLLATE_BIN,
+};
+use acvd_data::{find, Asset, SocketRef};
 use acvd_formats::vfs::{self, Disc};
 use acvd_formats::{ani, flver, jcon, tae};
 use acvd_render::{Rig, RigBone};
@@ -594,7 +596,7 @@ pub fn affine(x: &flver::Xform) -> Affine3A {
     )
 }
 
-fn mirror(a: Affine3A) -> Affine3A {
+pub(crate) fn mirror(a: Affine3A) -> Affine3A {
     let m = Affine3A::from_scale(Vec3::new(-1.0, 1.0, 1.0));
     m * a * m
 }
@@ -904,9 +906,258 @@ pub fn spawn(
     (entities, skins)
 }
 
+/// Per-entity AC animation driver for non-player ACs (such as AC TEST targets `a0000`–`a0003`),
+/// independent of the player's global [`Motion`] resource.
+#[derive(Component)]
+pub struct NpcMotion {
+    pub motion: Motion,
+    joints: Vec<(Entity, Driven)>,
+}
+
+impl NpcMotion {
+    /// Selects the test AC's locomotion clip (`acmotion.bin` / `motioncollate.bin`) from its
+    /// local-space horizontal velocity (`+Z` backward, `-Z` forward, `+X` right in Bevy axes),
+    /// and updates Core Control aim tracking toward the player AC.
+    pub fn set_locomotion(
+        &mut self,
+        disc: &Disc,
+        local_vel: Vec3,
+        walk_speed: f32,
+        aim_yaw_pitch: Option<(f32, f32)>,
+    ) {
+        let speed = Vec2::new(local_vel.x, local_vel.z).length();
+        // Local forward is -Z in Bevy axes.
+        let fwd = -local_vel.z;
+        let right = local_vel.x;
+
+        if speed < 1.2 {
+            // Standing idle (`ac_states.csv` row 0 -> `acmotion.bin` anim_id 0).
+            self.motion.wheel = None;
+            let anim_id = find(PARAM_ACMOTION_BIN, 0).map_or(0, |r| r.data.anim_id);
+            let _ = self.motion.play(disc, anim_id, true, 1.0, [0.15; 8]);
+        } else if speed >= walk_speed.max(8.0) * 1.15 {
+            // Dash / boost strafe (`ac_states.csv` row 17 -> 360-frame wheel `anim_id 55`).
+            let deg = right.atan2(fwd).to_degrees().rem_euclid(360.0);
+            let dash_id = find(PARAM_ACMOTION_BIN, 17).map_or(55, |r| r.data.anim_id);
+            if self.motion.play(disc, dash_id, false, 1.0, [0.12; 8]).is_ok() {
+                self.motion.wheel = Some(deg);
+                self.motion.lean = 1.0;
+            } else {
+                self.motion.wheel = None;
+                let walk_id = find(PARAM_ACMOTION_BIN, 9).map_or(10, |r| r.data.anim_id);
+                let _ = self.motion.play(disc, walk_id, true, 1.25, [0.12; 8]);
+            }
+        } else {
+            // 8-direction walk (`ac_states.csv` rows 9..=16, clockwise from forward).
+            self.motion.wheel = None;
+            let deg = right.atan2(fwd).to_degrees().rem_euclid(360.0);
+            let octant = ((deg + 22.5) / 45.0).floor() as u32 % 8;
+            let row_id = 9 + octant;
+            let anim_id = find(PARAM_ACMOTION_BIN, row_id).map_or(10, |r| r.data.anim_id);
+            let play_speed = (speed / walk_speed.max(6.0)).clamp(0.7, 1.4);
+            if self.motion.play(disc, anim_id, true, play_speed, [0.12; 8]).is_err() {
+                let fallback = find(PARAM_ACMOTION_BIN, 9).map_or(10, |r| r.data.anim_id);
+                let _ = self.motion.play(disc, fallback, true, play_speed, [0.12; 8]);
+            }
+        }
+
+        if let Some((yaw, pitch)) = aim_yaw_pitch {
+            self.motion.core_ctrl.enabled = true;
+            self.motion.core_ctrl.target_yaw = yaw;
+            self.motion.core_ctrl.target_pitch = pitch;
+        } else {
+            self.motion.core_ctrl.enabled = false;
+        }
+    }
+
+    /// Advances the clip clock and Core Control by `dt` seconds and returns the current frame.
+    pub fn step_clock(&mut self, dt: f32) -> f32 {
+        let m = &mut self.motion;
+        let frames = m.clip.frames.max(1) as f32;
+        if let Some(target) = m.wheel {
+            let diff = (target - m.frame + 540.0).rem_euclid(360.0) - 180.0;
+            let step = WHEEL_RATE * dt;
+            m.frame = (m.frame + diff.clamp(-step, step)).rem_euclid(360.0);
+        } else if m.playing {
+            let next = m.frame + dt * FRAME_RATE * m.speed;
+            m.frame = if m.looping {
+                next % frames
+            } else {
+                next.min(frames - 1.0)
+            };
+        }
+        m.fade.t += dt;
+        m.core_ctrl.step(dt);
+        m.frame
+    }
+}
+
+/// Spawns the joints under `ac` with a per-entity [`NpcMotion`] component so test ACs
+/// (`a0000`–`a0003`) play full locomotion clips and Core Control aim tracking independently of
+/// the player's [`Motion`] resource.
+pub fn spawn_npc(
+    commands: &mut Commands,
+    ac: Entity,
+    built: Built,
+    parts: &[Loaded],
+) -> (Option<NpcMotion>, Vec<Entity>, Vec<(Vec<Entity>, Vec<Mat4>)>) {
+    let entities: Vec<Entity> = built
+        .joints
+        .iter()
+        .map(|_| {
+            commands
+                .spawn((Transform::default(), Visibility::default()))
+                .id()
+        })
+        .collect();
+    let mut driven_joints = Vec::new();
+    for (j, spec) in built.joints.iter().enumerate() {
+        let parent_bind = spec
+            .parent
+            .map_or(Affine3A::IDENTITY, |p| built.joints[p].bind);
+        let local = parent_bind.inverse() * spec.bind;
+        let (s, r, t) = local.to_scale_rotation_translation();
+        let transform = to_transform(t, r, s);
+        commands
+            .entity(entities[j])
+            .insert((transform, ChildOf(spec.parent.map_or(ac, |p| entities[p]))));
+        if let Some(bone) = spec.bone {
+            let absolute = spec.parent.is_none_or(|p| built.joints[p].virtual_bone);
+            driven_joints.push((
+                entities[j],
+                Driven {
+                    bone,
+                    absolute,
+                    bind: t,
+                    upper: built.upper.get(bone).copied().unwrap_or(false),
+                    core_bone: built.core_bones.get(bone).copied().unwrap_or_default(),
+                    group: built.groups.get(bone).copied().unwrap_or(0),
+                    from: transform,
+                    generation: 0,
+                    upper_from: transform,
+                    upper_gen: 0,
+                },
+            ));
+        }
+    }
+    let skins = parts
+        .iter()
+        .zip(&built.parts)
+        .map(|(p, &(f, unboned))| {
+            let n = p.rig.bones.len();
+            let extra = commands
+                .spawn((
+                    to_transform(unboned.translation.into(), Quat::IDENTITY, Vec3::ONE),
+                    Visibility::default(),
+                    ChildOf(ac),
+                ))
+                .id();
+            let joints = entities[f..f + n].iter().copied().chain([extra]).collect();
+            let binds = built.joints[f..f + n]
+                .iter()
+                .map(|s| s.bind)
+                .chain([unboned])
+                .map(|b| Mat4::from(mirror(b).inverse()))
+                .collect();
+            (joints, binds)
+        })
+        .collect();
+    let npc = built.motion.map(|motion| NpcMotion {
+        motion,
+        joints: driven_joints,
+    });
+    (npc, entities, skins)
+}
+
+/// Steps all [`NpcMotion`] test-AC skeletons and writes their posed joint transforms.
+pub fn animate_npcs(
+    time: Res<Time>,
+    mut npcs: Query<&mut NpcMotion>,
+    mut transforms: Query<&mut Transform>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    for mut npc in &mut npcs {
+        npc.step_clock(dt);
+        let NpcMotion { motion: m, joints } = &mut *npc;
+        let (f, scale, fade) = (m.frame, m.scale, m.fade);
+        let wheel = m.wheel.is_some();
+        let lean = m.lean;
+        let cc = m.core_ctrl;
+
+        for (entity, d) in joints.iter_mut() {
+            let Ok(mut transform) = transforms.get_mut(*entity) else {
+                continue;
+            };
+            let Some(rest) = m.skeleton.bones.get(d.bone).and_then(|b| b.rest.as_ref()) else {
+                continue;
+            };
+            if d.generation != fade.generation {
+                (d.from, d.generation) = (*transform, fade.generation);
+            }
+            let Some(bone) = m.clip.bones.get(d.bone) else {
+                continue;
+            };
+            let bone = if m.in_place && rest.parent.is_none() {
+                &m.skeleton.bones[d.bone]
+            } else {
+                bone
+            };
+            let rotation = Quat::from_array(
+                bone.track
+                    .rotation(f)
+                    .unwrap_or_else(|| ani::euler_quat(rest.euler)),
+            );
+            let t = Vec3::from(bone.track.translation(f).unwrap_or(rest.translation));
+            let s = Vec3::from(bone.track.scale(f).unwrap_or(rest.scale));
+            let translation = if d.absolute {
+                t * scale
+            } else {
+                d.bind + (t - Vec3::from(rest.translation)) * scale
+            };
+            let target = to_transform(translation, rotation, s);
+            let secs = fade.secs[d.group];
+            let w = if wheel {
+                lean
+            } else if secs > 0.0 {
+                (fade.t / secs).min(1.0)
+            } else {
+                1.0
+            };
+            *transform = if w >= 1.0 {
+                target
+            } else {
+                Transform {
+                    translation: d.from.translation.lerp(target.translation, w),
+                    rotation: d.from.rotation.slerp(target.rotation, w),
+                    scale: d.from.scale.lerp(target.scale, w),
+                }
+            };
+            if cc.weight > 1e-4 {
+                match d.core_bone {
+                    CoreBone::Core => {
+                        let yaw_q = Quat::from_rotation_y(cc.yaw * cc.weight);
+                        let pitch_q = Quat::from_rotation_x(cc.pitch * cc.weight);
+                        transform.rotation = yaw_q * pitch_q * transform.rotation;
+                    }
+                    CoreBone::Head => {
+                        let yaw_q = Quat::from_rotation_y(cc.yaw * cc.weight * 0.2);
+                        let pitch_q = Quat::from_rotation_x(cc.pitch * cc.weight * 0.25);
+                        transform.rotation = yaw_q * pitch_q * transform.rotation;
+                    }
+                    CoreBone::None => {}
+                }
+            }
+        }
+    }
+}
+
 /// Spawns the joints under `ac` posed on frame 0 of `built.motion` without inserting [`Driven`],
 /// so non-player ACs (such as AC TEST targets) hold their standing pose independently of the
 /// player's [`Motion`] resource.
+#[allow(dead_code)]
 pub fn spawn_static(
     commands: &mut Commands,
     ac: Entity,

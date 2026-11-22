@@ -17,6 +17,7 @@
 //! `0x82b91470`) and assemble with `assemble`, `pose::spawn_static` and `paint`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, AC_ASSEMBLY_DESIGN_ST_FILES};
 use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
@@ -27,12 +28,13 @@ use acvd_data::generated::enemy::{
 use acvd_data::generated::sfx::PARAM_SFXSESETPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_data::{find, part_field};
-use acvd_formats::msb;
+use acvd_formats::{ani, bnd3, flver, msb};
 use acvd_formats::vfs::{self, Disc};
 use acvd_render::Packs;
 use anyhow::Result;
 use bevy::audio::AudioSource;
 use bevy::camera::visibility::NoFrustumCulling;
+use bevy::math::Affine3A;
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
 
@@ -279,6 +281,473 @@ pub fn enemy_asset(model: &str) -> String {
     format!("model/ene/{model}/{model}_m.bnd.dcx|{model}.flv")
 }
 
+/// Asset path of an enemy's animation binder (`model/ene/{m}/{m}_a.bnd.dcx`).
+pub fn enemy_anim_binder(model: &str) -> String {
+    format!("model/ene/{model}/{model}_a.bnd.dcx")
+}
+
+/// Procedural joint-control spec for one enemy bone (from `param/enemyjcondata.xml`).
+#[derive(Clone, Copy, Debug)]
+pub struct EnemyJcon {
+    pub bone_idx: usize,
+    pub min_yaw: f32,
+    pub max_yaw: f32,
+    pub min_pitch: f32,
+    pub max_pitch: f32,
+    pub max_vel: f32,
+}
+
+/// Shared per-enemy-model animation clips and skeleton mapping loaded from
+/// `model/ene/{m}/{m}_a.bnd.dcx` + `model/ene/{m}/{m}_m.bnd.dcx|{m}.flv`.
+#[derive(Debug)]
+pub struct EnemyAnimBank {
+    pub clips: HashMap<u16, ani::Anim>,
+    /// Local bind transform (in Bevy axes) for each FLVER rig bone.
+    pub rest_locals: Vec<Transform>,
+    /// FLVER-space local translation for each rig bone (for delta-translation animation).
+    pub bind_t: Vec<Vec3>,
+    /// Parent index in `rig.bones`.
+    pub parents: Vec<Option<usize>>,
+    /// Mapping from FLVER rig bone index → `.ani` clip bone index (matched by bone name).
+    pub ani_bone_map: Vec<Option<usize>>,
+    /// Whether this rig bone is a root/master bone (held in place when animating).
+    pub is_root: Vec<bool>,
+    /// Optional turret/upper-body yaw tracking bone (`y` on `e1020`, `body_01` on `e0110`,
+    /// `l_arm_03` on `e0210`; `param/enemyjcondata.xml`).
+    pub aim_yaw: Option<EnemyJcon>,
+    /// Optional gun barrel pitch tracking bone (`x` on `e1020`, `body_01` on `e0110`,
+    /// `l_arm_03` on `e0210`; `param/enemyjcondata.xml`).
+    pub aim_pitch: Option<EnemyJcon>,
+}
+
+fn xform_to_affine(xf: &flver::Xform) -> Affine3A {
+    Affine3A::from_cols(
+        Vec3::new(xf.m[0][0], xf.m[1][0], xf.m[2][0]).into(),
+        Vec3::new(xf.m[0][1], xf.m[1][1], xf.m[2][1]).into(),
+        Vec3::new(xf.m[0][2], xf.m[1][2], xf.m[2][2]).into(),
+        Vec3::from(xf.t).into(),
+    )
+}
+
+impl EnemyAnimBank {
+    /// Loads every `a00_NNN.ani` clip from `model/ene/{model}/{model}_a.bnd.dcx` and maps its
+    /// bone tracks onto `rig`.
+    pub fn load(disc: &Disc, model: &str, rig: &acvd_render::Rig) -> Arc<Self> {
+        let mut clips = HashMap::new();
+        let binder_path = enemy_anim_binder(model);
+        if let Ok(binder_bytes) = vfs::open(disc, &binder_path) {
+            if let Ok(bnd) = bnd3::read(&binder_bytes) {
+                for (i, entry) in bnd.entries.iter().enumerate() {
+                    let Some(name) = entry.name.as_deref() else {
+                        continue;
+                    };
+                    let base = name.rsplit(['\\', '/']).next().unwrap_or(name);
+                    let lower = base.to_ascii_lowercase();
+                    let Some(num_str) = lower
+                        .strip_prefix("a00_")
+                        .and_then(|s| s.strip_suffix(".ani"))
+                    else {
+                        continue;
+                    };
+                    let Ok(id) = num_str.parse::<u16>() else {
+                        continue;
+                    };
+                    if let Ok(raw) = vfs::entry(&binder_bytes, &format!("#{i}")) {
+                        if let Ok(clip) = ani::read(&raw) {
+                            clips.insert(id, clip);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reference skeleton from clip 0 (or any loaded clip) to map bone names -> clip indices.
+        let ref_clip = clips.get(&0).or_else(|| clips.values().next());
+        let mut name_to_ani: HashMap<String, usize> = HashMap::new();
+        if let Some(c) = ref_clip {
+            for (idx, b) in c.bones.iter().enumerate() {
+                if let Some(r) = &b.rest {
+                    name_to_ani.insert(r.name.to_ascii_lowercase(), idx);
+                }
+            }
+        }
+
+        let mut rest_locals = Vec::with_capacity(rig.bones.len());
+        let mut bind_t = Vec::with_capacity(rig.bones.len());
+        let mut parents = Vec::with_capacity(rig.bones.len());
+        let mut ani_bone_map = Vec::with_capacity(rig.bones.len());
+        let mut is_root = Vec::with_capacity(rig.bones.len());
+        let mut bone_by_name: HashMap<String, usize> = HashMap::new();
+
+        for (i, b) in rig.bones.iter().enumerate() {
+            let parent = b.parent;
+            let parent_bind =
+                parent.map_or(Affine3A::IDENTITY, |p| xform_to_affine(&rig.bones[p].bind));
+            let local = parent_bind.inverse() * xform_to_affine(&b.bind);
+            let (s, r, t) = local.to_scale_rotation_translation();
+            rest_locals.push(pose::to_transform(t, r, s));
+            bind_t.push(t);
+            parents.push(parent);
+            let lower = b.name.to_ascii_lowercase();
+            bone_by_name.insert(lower.clone(), i);
+            ani_bone_map.push(name_to_ani.get(&lower).copied());
+            is_root.push(parent.is_none() || lower == "master");
+        }
+
+        // Joint-control specs from `param/enemyjcondata.xml`:
+        // - `e1020` (`[03] Cannon`): `y` (±180° yaw, 0.5 rad/s? -> 60 deg/s), `x` (-30..70° pitch).
+        // - `e0110` (`[08] e0110`): `body_01` (±60° yaw, -30..40° pitch).
+        // - `e0210` (`[07] e0210`): `l_arm_03` (-75..65° yaw, -15..60° pitch).
+        let (aim_yaw, aim_pitch) = if let (Some(&by), Some(&bx)) =
+            (bone_by_name.get("y"), bone_by_name.get("x"))
+        {
+            (
+                Some(EnemyJcon {
+                    bone_idx: by,
+                    min_yaw: -180.0_f32.to_radians(),
+                    max_yaw: 180.0_f32.to_radians(),
+                    min_pitch: 0.0,
+                    max_pitch: 0.0,
+                    max_vel: 60.0_f32.to_radians(),
+                }),
+                Some(EnemyJcon {
+                    bone_idx: bx,
+                    min_yaw: 0.0,
+                    max_yaw: 0.0,
+                    min_pitch: -30.0_f32.to_radians(),
+                    max_pitch: 70.0_f32.to_radians(),
+                    max_vel: 45.0_f32.to_radians(),
+                }),
+            )
+        } else if let Some(&b) = bone_by_name.get("body_01") {
+            let jc = EnemyJcon {
+                bone_idx: b,
+                min_yaw: -60.0_f32.to_radians(),
+                max_yaw: 60.0_f32.to_radians(),
+                min_pitch: -30.0_f32.to_radians(),
+                max_pitch: 40.0_f32.to_radians(),
+                max_vel: 90.0_f32.to_radians(),
+            };
+            (Some(jc), Some(jc))
+        } else if let Some(&b) = bone_by_name.get("l_arm_03") {
+            let jc = EnemyJcon {
+                bone_idx: b,
+                min_yaw: -75.0_f32.to_radians(),
+                max_yaw: 65.0_f32.to_radians(),
+                min_pitch: -15.0_f32.to_radians(),
+                max_pitch: 60.0_f32.to_radians(),
+                max_vel: 90.0_f32.to_radians(),
+            };
+            (Some(jc), Some(jc))
+        } else {
+            (None, None)
+        };
+
+        Arc::new(Self {
+            clips,
+            rest_locals,
+            bind_t,
+            parents,
+            ani_bone_map,
+            is_root,
+            aim_yaw,
+            aim_pitch,
+        })
+    }
+
+    /// Picks the first clip ID in `candidates` that exists in this enemy's `_a.bnd.dcx`.
+    pub fn pick_clip(&self, candidates: &[u16]) -> Option<u16> {
+        candidates.iter().copied().find(|id| self.clips.contains_key(id))
+    }
+}
+
+/// Per-entity skeletal animation controller for non-AC enemies (`e1020`, `e2030`, `e0010`,
+/// `e0110`, `e0210`).
+#[derive(Component, Debug)]
+pub struct EnemyAnim {
+    pub bank: Arc<EnemyAnimBank>,
+    pub joints: Vec<Entity>,
+    pub clip_id: u16,
+    pub frame: f32,
+    pub looping: bool,
+    pub speed: f32,
+    pub blend_t: f32,
+    pub blend_secs: f32,
+    pub blend_from: Vec<Transform>,
+    pub turret_yaw: f32,
+    pub turret_pitch: f32,
+    pub fire_anim_timer: f32,
+    pub prev_yaw: f32,
+}
+
+impl EnemyAnim {
+    pub fn new(bank: Arc<EnemyAnimBank>, joints: Vec<Entity>, init_yaw: f32) -> Self {
+        let blend_from = bank.rest_locals.clone();
+        let clip_id = bank.pick_clip(&[0]).unwrap_or(0);
+        Self {
+            bank,
+            joints,
+            clip_id,
+            frame: 0.0,
+            looping: true,
+            speed: 1.0,
+            blend_t: 1.0,
+            blend_secs: 0.0,
+            blend_from,
+            turret_yaw: 0.0,
+            turret_pitch: 0.0,
+            fire_anim_timer: 0.0,
+            prev_yaw: init_yaw,
+        }
+    }
+
+    /// Transitions to `clip_id` with a crossfade over `fade_secs` if not already playing it.
+    pub fn play(&mut self, clip_id: u16, looping: bool, speed: f32, fade_secs: f32) {
+        if !self.bank.clips.contains_key(&clip_id) {
+            return;
+        }
+        if self.clip_id != clip_id {
+            self.clip_id = clip_id;
+            self.frame = 0.0;
+            self.blend_t = 0.0;
+            self.blend_secs = fade_secs;
+        }
+        self.looping = looping;
+        self.speed = speed;
+    }
+
+    /// Selects the enemy's animation clip from its AI movement/combat state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_state(
+        &mut self,
+        archetype: ai::Archetype,
+        local_vel: Vec3,
+        walk_speed: f32,
+        yaw_rate: f32,
+        sub_state: u8,
+        staggered: bool,
+        fired: bool,
+        dt: f32,
+    ) {
+        if fired {
+            self.fire_anim_timer = 0.45;
+        } else if self.fire_anim_timer > 0.0 {
+            self.fire_anim_timer = (self.fire_anim_timer - dt).max(0.0);
+        }
+
+        if staggered {
+            if let Some(id) = self.bank.pick_clip(&[48, 49, 0]) {
+                self.play(id, false, 1.0, 0.1);
+                return;
+            }
+        }
+
+        let speed = Vec2::new(local_vel.x, local_vel.z).length();
+        // Local forward is -Z in Bevy axes.
+        let fwd = -local_vel.z;
+        let right = local_vel.x;
+
+        match archetype {
+            ai::Archetype::Heli => {
+                // `e2030`: all clips include full `pro_l`/`pro_r` rotor spin + body tilt.
+                let candidates: &[u16] = if speed < 2.0 {
+                    &[0]
+                } else if fwd.abs() >= right.abs() {
+                    if fwd >= 0.0 {
+                        if speed > walk_speed * 0.8 { &[17, 2, 0] } else { &[2, 0] }
+                    } else if speed > walk_speed * 0.8 {
+                        &[18, 8, 0]
+                    } else {
+                        &[8, 0]
+                    }
+                } else if right >= 0.0 {
+                    &[12, 22, 2, 0]
+                } else {
+                    &[10, 21, 2, 0]
+                };
+                if let Some(id) = self.bank.pick_clip(candidates) {
+                    self.play(id, true, 1.0, 0.2);
+                }
+            }
+            ai::Archetype::Tank => {
+                // `e1020`: hull clip `0` (idle) or `2`/`8` (drive); turret `y`/`x` tracked procedurally.
+                let candidates: &[u16] = if speed > 1.5 {
+                    if fwd >= 0.0 { &[2, 0] } else { &[8, 2, 0] }
+                } else {
+                    &[0]
+                };
+                if let Some(id) = self.bank.pick_clip(candidates) {
+                    self.play(id, true, 1.0, 0.15);
+                }
+            }
+            ai::Archetype::AtkMt | ai::Archetype::SnpMt | ai::Archetype::DefMt => {
+                if self.fire_anim_timer > 0.0 && speed < 2.5 {
+                    if let Some(id) = self.bank.pick_clip(&[220, 210, 75, 0]) {
+                        self.play(id, true, 1.0, 0.12);
+                        return;
+                    }
+                }
+                if archetype == ai::Archetype::SnpMt && sub_state == 0 && speed < 1.5 {
+                    if let Some(id) = self.bank.pick_clip(&[75, 76, 0]) {
+                        self.play(id, true, 1.0, 0.2);
+                        return;
+                    }
+                }
+                if speed >= 1.2 {
+                    let dashing = speed > walk_speed.max(6.0) * 1.1;
+                    let candidates: &[u16] = if dashing {
+                        if fwd.abs() >= right.abs() {
+                            if fwd >= 0.0 { &[17, 55, 2, 0] } else { &[18, 56, 8, 2, 0] }
+                        } else if right >= 0.0 {
+                            &[22, 12, 2, 0]
+                        } else {
+                            &[21, 10, 2, 0]
+                        }
+                    } else if fwd.abs() >= right.abs() {
+                        if fwd >= 0.0 { &[2, 1, 0] } else { &[8, 7, 2, 0] }
+                    } else if right >= 0.0 {
+                        &[12, 11, 2, 0]
+                    } else {
+                        &[10, 9, 2, 0]
+                    };
+                    if let Some(id) = self.bank.pick_clip(candidates) {
+                        let rate = (speed / walk_speed.max(6.0)).clamp(0.75, 1.45);
+                        self.play(id, true, rate, 0.15);
+                    }
+                } else if yaw_rate.abs() > 0.2 {
+                    let candidates: &[u16] = if yaw_rate > 0.0 { &[33, 34, 0] } else { &[34, 33, 0] };
+                    if let Some(id) = self.bank.pick_clip(candidates) {
+                        self.play(id, true, 1.0, 0.15);
+                    }
+                } else if let Some(id) = self.bank.pick_clip(&[0]) {
+                    self.play(id, true, 1.0, 0.18);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Advances the active clip clock and updates turret tracking angles by `dt` seconds.
+    pub fn step(&mut self, dt: f32, aim_yaw_pitch: Option<(f32, f32)>) {
+        if let Some(clip) = self.bank.clips.get(&self.clip_id) {
+            let frames = clip.frames.max(1) as f32;
+            let next = self.frame + dt * pose::FRAME_RATE * self.speed;
+            self.frame = if self.looping {
+                next % frames
+            } else {
+                next.min(frames - 1.0)
+            };
+        }
+        self.blend_t += dt;
+
+        // Slew procedural turret / upper-body aim angles within `enemyjcondata.xml` limits.
+        if let Some(jc) = self.bank.aim_yaw {
+            let goal = aim_yaw_pitch
+                .map(|(y, _)| y.clamp(jc.min_yaw, jc.max_yaw))
+                .unwrap_or(0.0);
+            let step = jc.max_vel * dt;
+            self.turret_yaw += (goal - self.turret_yaw).clamp(-step, step);
+        }
+        if let Some(jc) = self.bank.aim_pitch {
+            let goal = aim_yaw_pitch
+                .map(|(_, p)| p.clamp(jc.min_pitch, jc.max_pitch))
+                .unwrap_or(0.0);
+            let step = jc.max_vel * dt;
+            self.turret_pitch += (goal - self.turret_pitch).clamp(-step, step);
+        }
+    }
+
+    /// Computes the posed local [`Transform`] for rig bone `i` at the current frame.
+    pub fn sample_bone(&self, i: usize) -> Transform {
+        let mut out = self.bank.rest_locals[i];
+        if let Some(clip) = self.bank.clips.get(&self.clip_id) {
+            if let Some(ani_idx) = self.bank.ani_bone_map[i] {
+                if !self.bank.is_root[i] {
+                    if let Some(cbone) = clip.bones.get(ani_idx) {
+                        let rest = cbone.rest.as_ref();
+                        let rot = Quat::from_array(
+                            cbone
+                                .track
+                                .rotation(self.frame)
+                                .or_else(|| rest.map(|r| ani::euler_quat(r.euler)))
+                                .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                        );
+                        let rest_t = rest.map_or(Vec3::ZERO, |r| Vec3::from(r.translation));
+                        let ct = cbone
+                            .track
+                            .translation(self.frame)
+                            .map(Vec3::from)
+                            .unwrap_or(rest_t);
+                        let cs = cbone
+                            .track
+                            .scale(self.frame)
+                            .map(Vec3::from)
+                            .unwrap_or(Vec3::ONE);
+                        let translation = self.bank.bind_t[i] + (ct - rest_t);
+                        out = pose::to_transform(translation, rot, cs);
+                    }
+                }
+            }
+        }
+        if self.blend_secs > 0.0 && self.blend_t < self.blend_secs {
+            let w = (self.blend_t / self.blend_secs).clamp(0.0, 1.0);
+            let from = self.blend_from[i];
+            out = Transform {
+                translation: from.translation.lerp(out.translation, w),
+                rotation: from.rotation.slerp(out.rotation, w),
+                scale: from.scale.lerp(out.scale, w),
+            };
+        }
+        // Apply procedural turret / weapon aim tracking (`enemyjcondata.xml`).
+        if let Some(jc) = self.bank.aim_yaw {
+            if jc.bone_idx == i && self.turret_yaw.abs() > 1e-4 {
+                out.rotation = Quat::from_rotation_y(self.turret_yaw) * out.rotation;
+            }
+        }
+        if let Some(jc) = self.bank.aim_pitch {
+            if jc.bone_idx == i && self.turret_pitch.abs() > 1e-4 {
+                out.rotation = out.rotation * Quat::from_rotation_x(self.turret_pitch);
+            }
+        }
+        out
+    }
+}
+
+/// Steps all living [`EnemyAnim`] skeletons and writes their posed joint transforms.
+pub fn animate_enemies(
+    time: Res<Time>,
+    mut enemies: Query<(&mut EnemyAnim, &TargetHealth)>,
+    mut transforms: Query<&mut Transform>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    for (mut anim, health) in &mut enemies {
+        if health.destroyed {
+            continue;
+        }
+        let was_blending = anim.blend_secs > 0.0 && anim.blend_t == 0.0;
+        if was_blending {
+            let EnemyAnim {
+                joints, blend_from, ..
+            } = &mut *anim;
+            for (i, &ent) in joints.iter().enumerate() {
+                if let Ok(tf) = transforms.get(ent) {
+                    blend_from[i] = *tf;
+                }
+            }
+        }
+        let n = anim.joints.len();
+        for i in 0..n {
+            let ent = anim.joints[i];
+            if let Ok(mut tf) = transforms.get_mut(ent) {
+                *tf = anim.sample_bone(i);
+            }
+        }
+    }
+}
+
 fn find_design(id: u16) -> Option<&'static AcAssemblyDesignSt> {
     let id = u32::from(id);
     AC_ASSEMBLY_DESIGN_ST_FILES
@@ -319,10 +788,15 @@ pub fn spawn(
         return Ok(0);
     }
 
+    struct CachedEnemy {
+        meshes: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
+        inv_bindposes: Handle<SkinnedMeshInverseBindposes>,
+        bank: Arc<EnemyAnimBank>,
+    }
+
     let mut packs = Packs::default();
     let mut missing = 0usize;
-    let mut enemy_cache: HashMap<String, Option<Vec<(Handle<Mesh>, Handle<StandardMaterial>)>>> =
-        HashMap::new();
+    let mut enemy_cache: HashMap<String, Option<CachedEnemy>> = HashMap::new();
     let mut spawned = 0usize;
 
     for part in chosen {
@@ -351,9 +825,20 @@ pub fn spawn(
         }
         let asset = enemy_asset(&part.model);
         let entry = enemy_cache.entry(part.model.clone()).or_insert_with(|| {
-            match acvd_render::model(disc, &asset) {
-                Ok(list) => Some(
-                    list.into_iter()
+            match acvd_render::rigged_model(disc, &asset, &|_| acvd_render::RootPlace::IDENTITY) {
+                Ok((list, rig)) if !list.is_empty() => {
+                    let bank = EnemyAnimBank::load(disc, &part.model, &rig);
+                    let unboned = Affine3A::from_translation(Vec3::from(rig.unboned));
+                    let binds: Vec<Mat4> = rig
+                        .bones
+                        .iter()
+                        .map(|b| xform_to_affine(&b.bind))
+                        .chain([unboned])
+                        .map(|b| Mat4::from(pose::mirror(b).inverse()))
+                        .collect();
+                    let inv_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
+                    let meshes_mats = list
+                        .into_iter()
                         .map(|m| {
                             let mat = acvd_render::material(
                                 disc,
@@ -365,25 +850,32 @@ pub fn spawn(
                             );
                             (meshes.add(m.mesh), materials.add(mat))
                         })
-                        .collect(),
-                ),
+                        .collect();
+                    Some(CachedEnemy {
+                        meshes: meshes_mats,
+                        inv_bindposes,
+                        bank,
+                    })
+                }
+                Ok(_) => None,
                 Err(e) => {
                     warn!("target {} ({asset}): {e:#}", part.name);
                     None
                 }
             }
         });
-        let Some(list) = entry.as_ref().filter(|l| !l.is_empty()) else {
+        let Some(cached) = entry.as_ref() else {
             continue;
         };
         let health = TargetHealth::from_enemy(&part.model);
+        let init_yaw = ai::yaw_from_quat(xf.rotation);
         let enemy_ai = ai::EnemyAi::for_enemy(
             &part.model,
             xf.translation,
-            ai::yaw_from_quat(xf.rotation),
+            init_yaw,
             enemy_parts,
         );
-        commands
+        let root = commands
             .spawn((
                 Target {
                     name: part.name.clone(),
@@ -397,11 +889,46 @@ pub fn spawn(
                 xf,
                 Visibility::default(),
             ))
-            .with_children(|c| {
-                for (mesh, mat) in list {
-                    c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone())));
-                }
-            });
+            .id();
+
+        // Spawn skeletal joint hierarchy for this enemy instance.
+        let mut joint_entities: Vec<Entity> = Vec::with_capacity(cached.bank.rest_locals.len());
+        for _ in 0..cached.bank.rest_locals.len() {
+            joint_entities.push(
+                commands
+                    .spawn((Transform::default(), Visibility::default()))
+                    .id(),
+            );
+        }
+        for (i, &ent) in joint_entities.iter().enumerate() {
+            let parent_ent = cached.bank.parents[i].map_or(root, |p| joint_entities[p]);
+            commands
+                .entity(ent)
+                .insert((cached.bank.rest_locals[i], ChildOf(parent_ent)));
+        }
+        let extra_unboned = commands
+            .spawn((Transform::default(), Visibility::default(), ChildOf(root)))
+            .id();
+        let mut skin_joints = joint_entities.clone();
+        skin_joints.push(extra_unboned);
+
+        for (mesh, mat) in &cached.meshes {
+            commands.spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(mat.clone()),
+                SkinnedMesh {
+                    inverse_bindposes: cached.inv_bindposes.clone(),
+                    joints: skin_joints.clone(),
+                },
+                NoFrustumCulling,
+                Transform::default(),
+                ChildOf(root),
+            ));
+        }
+
+        commands
+            .entity(root)
+            .insert(EnemyAnim::new(cached.bank.clone(), joint_entities, init_yaw));
         spawned += 1;
     }
 
@@ -487,7 +1014,10 @@ fn spawn_ac_target(
             Visibility::default(),
         ))
         .id();
-    let (_, skins) = pose::spawn_static(commands, root, &rig, &loaded);
+    let (npc_motion, _, skins) = pose::spawn_npc(commands, root, rig, &loaded);
+    if let Some(npc) = npc_motion {
+        commands.entity(root).insert(npc);
+    }
     for (part_loaded, (joints, binds)) in loaded.into_iter().zip(skins) {
         boost::fold(commands, part_loaded.placement, &part_loaded.rig, &joints);
         let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
@@ -672,5 +1202,119 @@ mod tests {
                 assert!(res.effective && lethal && hp.destroyed && hp.just_destroyed);
             }
         }
+    }
+
+    #[test]
+    fn enemy_anim_banks_and_playback_work_for_all_actest_enemies() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        for (model, arch) in [
+            ("e1020", ai::Archetype::Tank),
+            ("e2030", ai::Archetype::Heli),
+            ("e0010", ai::Archetype::AtkMt),
+            ("e0110", ai::Archetype::SnpMt),
+            ("e0210", ai::Archetype::DefMt),
+        ] {
+            let asset = enemy_asset(model);
+            let (meshes, rig) =
+                acvd_render::rigged_model(&disc, &asset, &|_| acvd_render::RootPlace::IDENTITY)
+                    .unwrap_or_else(|e| panic!("{model} rigged_model: {e:#}"));
+            assert!(!meshes.is_empty());
+            let bank = EnemyAnimBank::load(&disc, model, &rig);
+            assert!(
+                !bank.clips.is_empty(),
+                "{model} should load at least one .ani clip"
+            );
+            assert!(bank.clips.contains_key(&0), "{model} missing idle clip 0");
+
+            let mut anim = EnemyAnim::new(bank.clone(), Vec::new(), 0.0);
+            // Drive forward movement and verify clip advances + bone poses stay finite.
+            anim.select_state(arch, Vec3::new(0.0, 0.0, -12.0), 10.0, 0.0, 0, false, false, 0.016);
+            for _ in 0..30 {
+                anim.step(1.0 / 60.0, Some((0.5, 0.2)));
+            }
+            for i in 0..bank.rest_locals.len() {
+                let tf = anim.sample_bone(i);
+                assert!(tf.translation.is_finite(), "{model} bone {i} non-finite translation");
+                assert!(tf.rotation.is_finite(), "{model} bone {i} non-finite rotation");
+            }
+
+            if model == "e1020" {
+                assert!(bank.aim_yaw.is_some() && bank.aim_pitch.is_some());
+                assert!(anim.turret_yaw > 0.1, "e1020 turret yaw should track player");
+                assert!(anim.turret_pitch > 0.05, "e1020 barrel pitch should track player");
+            }
+            if model == "e2030" {
+                // Verify rotor bone `pro_l` actually rotates across frames.
+                let pro_l = rig
+                    .bones
+                    .iter()
+                    .position(|b| b.name.eq_ignore_ascii_case("pro_l"))
+                    .expect("e2030 pro_l rotor bone");
+                let r0 = anim.sample_bone(pro_l).rotation;
+                anim.step(0.1, None);
+                let r1 = anim.sample_bone(pro_l).rotation;
+                assert!(
+                    r0.angle_between(r1) > 0.05,
+                    "e2030 pro_l rotor should spin across frames"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_ac_npc_motion_locomotion_clips_and_core_ctrl() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let design = find_design(5011).expect("design 5011");
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
+        let mut loaded = Vec::new();
+        let mut known = vec![None; built.placements.len()];
+        for (index, p) in built.placements.iter().enumerate() {
+            let places = assemble::root_places(p, &built.placements, &known);
+            let (part_meshes, rig) = acvd_render::rigged_model(&disc, p.model.path, &|root| {
+                assemble::place_of(&places, root)
+            })
+            .unwrap();
+            known[index] = Some(assemble::Stored {
+                places,
+                frames: rig.frames.clone(),
+            });
+            loaded.push(pose::Loaded {
+                index,
+                placement: p,
+                meshes: part_meshes,
+                rig,
+            });
+        }
+        let rig = pose::build(&disc, &loaded).unwrap();
+        let mut world = World::new();
+        let root_ent = world.spawn_empty().id();
+        let (npc_opt, _, _) = {
+            let mut cmds = world.commands();
+            let res = pose::spawn_npc(&mut cmds, root_ent, rig, &loaded);
+            world.flush();
+            res
+        };
+        let mut npc = npc_opt.expect("design 5011 should build NpcMotion");
+        // Idle -> Walk -> Dash wheel transitions.
+        npc.set_locomotion(&disc, Vec3::ZERO, 12.0, Some((0.4, 0.1)));
+        assert_eq!(npc.motion.current_anim_id, 0);
+        npc.set_locomotion(&disc, Vec3::new(0.0, 0.0, -8.0), 12.0, Some((0.4, 0.1)));
+        assert_ne!(npc.motion.current_anim_id, 0, "walk should switch off idle clip");
+        npc.set_locomotion(&disc, Vec3::new(15.0, 0.0, -15.0), 12.0, Some((0.4, 0.1)));
+        assert!(npc.motion.wheel.is_some(), "dash speed should engage 360 wheel");
+        let f_before = npc.motion.frame;
+        npc.step_clock(0.2);
+        assert_ne!(npc.motion.frame, f_before);
+        assert!(npc.motion.core_ctrl.yaw > 0.05);
     }
 }

@@ -21,6 +21,7 @@ pub mod hmd;
 pub mod jcon;
 pub mod layout;
 pub mod msb;
+pub mod nav;
 pub mod param;
 pub mod paramdef;
 pub mod reader;

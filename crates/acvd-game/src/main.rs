@@ -229,6 +229,21 @@ fn main() {
         }),
         None => map::AreaBounds::default(),
     };
+    let map_nav = match map.as_deref().filter(|_| !plane) {
+        Some(id) => match map::MapNav::load(&disc, id) {
+            Ok(n) => {
+                if n.is_loaded() {
+                    eprintln!("map {id}: {} navmesh regions", n.region_count());
+                }
+                n
+            }
+            Err(e) => {
+                eprintln!("map {id} navmesh: {e:#}");
+                map::MapNav::default()
+            }
+        },
+        None => map::MapNav::default(),
+    };
     if let Some(y) = water {
         collision.planes.push(Plane {
             y,
@@ -281,6 +296,7 @@ fn main() {
     .insert_resource(StartYaw(yaw))
     .insert_resource(start)
     .insert_resource(area_bounds)
+    .insert_resource(map_nav)
     .insert_resource(Scene {
         map: map.filter(|_| !plane && !hits),
         layout: layout.filter(|_| !plane),
@@ -313,6 +329,8 @@ fn main() {
                 weapons::fire,
                 weapons::step_melee,
                 ai::update,
+                targets::animate_enemies,
+                pose::animate_npcs,
                 weapons::step_projectiles,
                 weapons::step_missiles,
                 weapons::tick_player_health,
