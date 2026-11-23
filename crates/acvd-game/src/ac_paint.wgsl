@@ -22,6 +22,7 @@ struct AcPaintParams {
     flags: vec2<f32>,
     emission: vec4<f32>,
     rim: vec4<f32>,
+    highlight: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> paint: AcPaintParams;
@@ -78,6 +79,18 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let decal = textureSample(decal_map, decal_sampler, decal_uv) * paint.flags.y;
     let composited = painted * (1.0 - decal.a) + decal.rgb;
     pbr.material.base_color = vec4(srgb_decode(composited), pbr.material.base_color.a);
+
+    // Garage Assemble part-selection hologram: translucent amber Fresnel glow preserving surface detail.
+    if paint.highlight.a > 0.01 {
+        let ndotv = clamp(dot(pbr.N, pbr.V), 0.0, 1.0);
+        let fresnel = pow(1.0 - ndotv, 2.0);
+        let detail = dot(composited, vec3(0.299, 0.587, 0.114));
+        let holo_rgb = paint.highlight.rgb * (0.28 + 0.55 * detail + 1.9 * fresnel);
+        let holo_a = clamp(paint.highlight.a * (0.16 + 0.62 * fresnel), 0.12, 0.72);
+        var holo_out: FragmentOutput;
+        holo_out.color = vec4(holo_rgb, holo_a);
+        return holo_out;
+    }
 
     // Flver_ACColorColDifSpcBumpIbl.fpo: `g_Specular` (`*_s`) R drives gloss/specular power
     // (`c2.x * spc.r`) and RGB luma drives reflectance strength.

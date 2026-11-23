@@ -29,9 +29,11 @@ use acvd_formats::accolor::AcColor;
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
 use acvd_render::menu::{self, Layout, MenuObject, MenuRoot, MenuText};
+use acvd_render::ui_kit::{palette, AcvdUiKit, ButtonState, FontRole, PanelStyle, TraceStyle};
 use acvd_render::Packs;
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::RenderTarget;
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::ui::px;
@@ -65,23 +67,65 @@ pub enum AssembleScrollStrip {
     PartsList,
 }
 
-/// Maps a window-space cursor position to the hovered scrollable strip in `AssembleParts`,
-/// using the exact same virtual `1280×720` layout transform as [`spawn_assemble_ui`].
-pub fn hovered_scroll_strip(window_size: Vec2, cursor: Vec2) -> Option<AssembleScrollStrip> {
+/// Default camera position for the offscreen 3D part/weapon preview studio (`zoom == 1.0`).
+pub const PREVIEW_CAM_BASE: Vec3 = Vec3::new(0.0, 0.55, 3.15);
+/// Minimum camera zoom multiplier (closest inspection distance) for the 3D part preview.
+pub const PREVIEW_ZOOM_MIN: f32 = 0.45;
+/// Maximum camera zoom multiplier (farthest pull-back distance) for the 3D part preview.
+pub const PREVIEW_ZOOM_MAX: f32 = 2.20;
+/// Maximum vertical pitch tilt (radians) when orbiting the 3D part preview with the mouse.
+pub const PREVIEW_PITCH_LIMIT: f32 = 1.25;
+
+/// Converts a window-space cursor coordinate into the virtual `1280×720` DRB canvas space,
+/// using the exact same letterbox transform as [`spawn_assemble_ui`].
+fn window_to_virtual(window_size: Vec2, cursor: Vec2) -> Vec2 {
     let scale = (window_size.x / SCREEN_W).min(window_size.y / SCREEN_H).max(0.5);
     let origin = Vec2::new(
         ((window_size.x - SCREEN_W * scale) * 0.5).round(),
         ((window_size.y - SCREEN_H * scale) * 0.5).round(),
     );
-    let vx = (cursor.x - origin.x) / scale;
-    let vy = (cursor.y - origin.y) / scale;
-    if (58.0..=714.0).contains(&vx) && (148.0..=202.0).contains(&vy) {
+    (cursor - origin) / scale
+}
+
+/// Maps a window-space cursor position to the hovered scrollable strip in `AssembleParts`,
+/// using the exact same virtual `1280×720` layout transform as [`spawn_assemble_ui`].
+pub fn hovered_scroll_strip(window_size: Vec2, cursor: Vec2) -> Option<AssembleScrollStrip> {
+    let v = window_to_virtual(window_size, cursor);
+    if (58.0..=714.0).contains(&v.x) && (148.0..=202.0).contains(&v.y) {
         Some(AssembleScrollStrip::CategoryList)
-    } else if (86.0..=170.0).contains(&vx) && (202.0..=584.0).contains(&vy) {
+    } else if (86.0..=170.0).contains(&v.x) && (202.0..=584.0).contains(&v.y) {
         Some(AssembleScrollStrip::PartsList)
     } else {
         None
     }
+}
+
+/// True when the cursor is hovering over the left `PARTS VIEW` panel (`[173,220,686,567]` in
+/// virtual `1280×720` coordinates), where mouse drag rotates and mouse wheel zooms the 3D part.
+pub fn cursor_in_part_preview_panel(window_size: Vec2, cursor: Vec2) -> bool {
+    let v = window_to_virtual(window_size, cursor);
+    (173.0..=686.0).contains(&v.x) && (220.0..=567.0).contains(&v.y)
+}
+
+/// Applies mouse-drag delta (pixels) to the 3D part preview yaw & pitch.
+pub fn apply_part_preview_drag(yaw: &mut f32, pitch: &mut f32, delta: Vec2) {
+    *yaw = (*yaw + delta.x * 0.01).rem_euclid(std::f32::consts::TAU);
+    *pitch = (*pitch + delta.y * 0.01).clamp(-PREVIEW_PITCH_LIMIT, PREVIEW_PITCH_LIMIT);
+}
+
+/// Applies mouse-wheel scroll delta to the 3D part preview zoom distance multiplier.
+pub fn apply_part_preview_zoom(zoom: &mut f32, scroll_y: f32, unit: MouseScrollUnit) {
+    let step = match unit {
+        MouseScrollUnit::Line => scroll_y,
+        MouseScrollUnit::Pixel => scroll_y * 0.02,
+    };
+    *zoom = (*zoom * (1.0 - step * 0.12)).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
+}
+
+/// Computes the offscreen studio camera transform for a given preview zoom multiplier.
+pub fn part_preview_camera_transform(zoom: f32) -> Transform {
+    let z = zoom.clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
+    Transform::from_translation(PREVIEW_CAM_BASE * z).looking_at(Vec3::ZERO, Vec3::Y)
 }
 
 /// Marker on the offscreen 3D camera & lights that render the hovered part/weapon into `@PartsLayout`.
@@ -116,10 +160,11 @@ pub struct CachedPreviewMesh {
 }
 
 /// Cached retail DRB layout, FMG text banks, per-part thumbnail handles, and 3D preview target.
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct AssembleUiAssets {
     pub initialized: bool,
     pub layout: Option<Layout>,
+    pub kit: AcvdUiKit,
     pub subcat_fmg: Option<Fmg>,
     pub explain_fmg: Option<Fmg>,
     /// Cached `image/partsthumbnail/<dir>/<prefix><model_id:04>.tpf.dcx` textures.
@@ -133,18 +178,55 @@ pub struct AssembleUiAssets {
     /// Cached 3D preview meshes & materials per `(category, part_id, is_left, paint_rev)`.
     pub preview_cache: HashMap<PreviewKey, Vec<CachedPreviewMesh>>,
     pub preview_yaw: f32,
+    pub preview_pitch: f32,
+    pub preview_zoom: f32,
+    pub preview_dragging: bool,
+    pub preview_manual: bool,
     /// Dedicated TPF pack cache for 128×64 part thumbnails.
     pub packs: Packs,
 }
 
+impl Default for AssembleUiAssets {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            layout: None,
+            kit: AcvdUiKit::default(),
+            subcat_fmg: None,
+            explain_fmg: None,
+            thumbnails: HashMap::new(),
+            preview_image: None,
+            preview_loaded: None,
+            preview_pending: None,
+            preview_cache: HashMap::new(),
+            preview_yaw: 0.0,
+            preview_pitch: 0.0,
+            preview_zoom: 1.0,
+            preview_dragging: false,
+            preview_manual: false,
+            packs: Packs::default(),
+        }
+    }
+}
+
 impl AssembleUiAssets {
+    /// Resets manual orbit/zoom back to the default turntable framing.
+    pub fn reset_preview_view(&mut self) {
+        self.preview_pitch = 0.0;
+        self.preview_zoom = 1.0;
+        self.preview_dragging = false;
+        self.preview_manual = false;
+    }
     pub fn ensure_loaded(&mut self, disc: &Disc, images: &mut Assets<Image>) {
         if self.initialized {
             return;
         }
         self.initialized = true;
         match menu::load(disc, ASSEMBLE_DRB, images) {
-            Ok(layout) => self.layout = Some(layout),
+            Ok(layout) => {
+                self.kit = AcvdUiKit::from_layout(&layout);
+                self.layout = Some(layout);
+            }
             Err(e) => warn!("assemble UI: failed to load {ASSEMBLE_DRB}: {e:#}"),
         }
         self.subcat_fmg = disc
@@ -619,7 +701,7 @@ pub fn spawn_assemble_ui(
     };
     let sel_name = part_name(state.parts_fmg.as_ref(), cat, sel_id);
     let explain = part_description(assets.explain_fmg.as_ref(), cat, sel_id);
-    let (help_line1, help_line2) = split_two_lines(&explain, 92);
+    let (help_line1, help_line2) = wrap_two_lines_px(&assets.kit, &explain, 1085.0);
 
     // Full-screen container anchored at `origin` in 1280×720 virtual space.
     let screen_root = commands
@@ -645,11 +727,11 @@ pub fn spawn_assemble_ui(
         ..default()
     };
 
-    // 1. Tactical dark backdrop behind the left Assemble pane (`x = 0..695`) so the UI is crisp
-    //    while keeping the right-side 3D AC Assembly View (`x = 705..1213`) open to the workshop.
+    // 1. Scoped translucent backing behind the left Assemble pane (`x = 76..696, y = 108..586`)
+    //    so the 3D workshop flows naturally behind the right-side AC without a harsh vertical seam.
     commands.spawn((
-        px_rect(0.0, 0.0, 702.0, SCREEN_H),
-        BackgroundColor(Color::srgba(0.03, 0.05, 0.07, 0.72)),
+        px_rect(76.0, 108.0, 696.0, 586.0),
+        BackgroundColor(Color::srgba(0.01, 0.03, 0.05, 0.56)),
         ChildOf(screen_root),
     ));
 
@@ -732,27 +814,20 @@ pub fn spawn_assemble_ui(
 
         // Damage-type badge pill on the right of `@PartsFrameName` when inspecting a weapon.
         if let Some((_, dtag, dcol)) = part_damage_badge(cat, sel_id) {
-            commands
+            let wrap = commands
                 .spawn((
-                    px_rect(460.0, 236.0, 526.0, 260.0),
-                    BackgroundColor(Color::srgba(0.06, 0.08, 0.11, 0.90)),
-                    BorderColor::all(dcol),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(460.0 * scale),
+                        top: px(236.0 * scale),
+                        ..default()
+                    },
                     ChildOf(screen_root),
                 ))
-                .with_children(|b| {
-                    b.spawn((
-                        Node {
-                            margin: UiRect::all(Val::Auto),
-                            ..default()
-                        },
-                        Text::new(format!("{dtag} DMG")),
-                        TextFont {
-                            font_size: FontSize::Px(11.0 * scale),
-                            ..default()
-                        },
-                        TextColor(dcol),
-                    ));
-                });
+                .id();
+            assets
+                .kit
+                .spawn_badge(commands, wrap, &format!("{dtag} DMG"), dcol, true, scale);
         }
     } else {
         // Detail View (`@PartsDetail` + `@SpecDetail` from `lang/en/menu/assemble.drb.dcx`).
@@ -780,198 +855,181 @@ pub fn spawn_assemble_ui(
         }
     }
 
-    // 4. Top Bar (`y = 14..52`): Title + Retail-style button prompts.
-    let top_bar = commands
+    // 4. Full-width ACVD Top Bar (`y = 0..42`) + retail stepped trace (`LinePatrs_UP`).
+    let top_wrap = commands
         .spawn((
-            px_rect(18.0, 14.0, 1262.0, 50.0),
-            BackgroundColor(Color::srgba(0.04, 0.06, 0.09, 0.90)),
-            BorderColor::all(Color::srgba(0.32, 0.44, 0.52, 0.55)),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: px(SCREEN_W * scale),
+                flex_direction: FlexDirection::Column,
+                ..default()
+            },
             ChildOf(screen_root),
         ))
         .id();
+    let top_bar = assets.kit.spawn_panel(
+        commands,
+        Some(top_wrap),
+        PanelStyle::Bar,
+        Node {
+            width: Val::Percent(100.0),
+            padding: UiRect::axes(px((22.0 * scale).round()), px((7.0 * scale).round())),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::SpaceBetween,
+            ..default()
+        },
+        scale,
+    );
+    commands
+        .entity(top_bar)
+        .insert(BackgroundColor(Color::srgba(0.0, 0.03, 0.04, 0.86)));
+    let title_left = commands
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px((8.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(top_bar),
+        ))
+        .id();
+    let sq = (7.0 * scale).round().max(4.0);
     commands.spawn((
         Node {
-            position_type: PositionType::Absolute,
-            left: px(16.0 * scale),
-            top: px(8.0 * scale),
+            width: px(sq),
+            height: px(sq),
+            flex_shrink: 0.0,
             ..default()
         },
-        Text::new(format!("ASSEMBLE  //  {}", slot.label())),
-        TextFont {
-            font_size: FontSize::Px(16.0 * scale),
-            ..default()
-        },
-        TextColor(Color::srgb(0.92, 0.36, 0.28)),
-        ChildOf(top_bar),
+        BackgroundColor(palette::TEXT_ALERT),
+        ChildOf(title_left),
     ));
+    assets.kit.spawn_text(
+        commands,
+        title_left,
+        FontRole::Header,
+        &format!("ASSEMBLE  //  {}", slot.label()),
+        scale,
+        palette::TEXT_ALERT,
+    );
 
-    // Toggle Display button (`Tab` -> Normal / Detail Specs).
-    commands
+    let top_actions = commands
         .spawn((
-            Button,
-            UiAction::AssembleToggleDetail,
             Node {
-                position_type: PositionType::Absolute,
-                right: px(120.0 * scale),
-                top: px(5.0 * scale),
-                padding: UiRect::axes(px(10.0 * scale), px(4.0 * scale)),
-                border: UiRect::all(px(1.0)),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px((8.0 * scale).round()),
                 ..default()
             },
-            BackgroundColor(if state.assemble_detail_view {
-                Color::srgba(0.18, 0.44, 0.56, 0.92)
-            } else {
-                Color::srgba(0.08, 0.12, 0.17, 0.90)
-            }),
-            BorderColor::all(Color::srgba(0.45, 0.72, 0.84, 0.70)),
             ChildOf(top_bar),
         ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(if state.assemble_detail_view {
-                    "[Tab] Normal View"
-                } else {
-                    "[Tab] Detail Specs"
-                }),
-                TextFont {
-                    font_size: FontSize::Px(12.0 * scale),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.92, 0.95, 0.98)),
-            ));
-        });
-
-    // Back button (`Esc`).
-    commands
+        .id();
+    let detail_wrap = commands
         .spawn((
-            Button,
-            UiAction::Back,
             Node {
-                position_type: PositionType::Absolute,
-                right: px(12.0 * scale),
-                top: px(5.0 * scale),
-                padding: UiRect::axes(px(10.0 * scale), px(4.0 * scale)),
-                border: UiRect::all(px(1.0)),
+                width: px((164.0 * scale).round()),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.12, 0.10, 0.12, 0.90)),
-            BorderColor::all(Color::srgba(0.75, 0.38, 0.32, 0.70)),
-            ChildOf(top_bar),
+            ChildOf(top_actions),
         ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new("[Esc] Back"),
-                TextFont {
-                    font_size: FontSize::Px(12.0 * scale),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.96, 0.85, 0.80)),
-            ));
-        });
+        .id();
+    let detail_btn = assets.kit.spawn_button(
+        commands,
+        detail_wrap,
+        if state.assemble_detail_view {
+            "[Tab] Normal View"
+        } else {
+            "[Tab] Detail Specs"
+        },
+        None,
+        if state.assemble_detail_view {
+            ButtonState::Active
+        } else {
+            ButtonState::Normal
+        },
+        scale,
+    );
+    commands
+        .entity(detail_btn)
+        .insert((Button, UiAction::AssembleToggleDetail));
 
-    // 5. Subcategory / Weapon-Type & Damage-Type Filter Tabs (`y = 66..106`, right above `@CategoryName`).
+    let back_wrap = commands
+        .spawn((
+            Node {
+                width: px((108.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(top_actions),
+        ))
+        .id();
+    let back_btn =
+        assets
+            .kit
+            .spawn_button(commands, back_wrap, "[Esc] Back", None, ButtonState::Normal, scale);
+    commands.entity(back_btn).insert((Button, UiAction::Back));
+
+    assets
+        .kit
+        .spawn_trace(commands, top_wrap, TraceStyle::Stepped, scale);
+
+    // 5. Subcategory / Weapon-Type & Damage-Type Filter Tabs (`y = 62..104`, right above `@CategoryName`).
     let subcats = subcategories_for_slot(slot, assets.subcat_fmg.as_ref());
     let filter_row = commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
                 left: px(84.0 * scale),
-                top: px(64.0 * scale),
+                top: px(60.0 * scale),
                 width: px(1130.0 * scale),
                 height: px(42.0 * scale),
                 flex_direction: FlexDirection::Row,
                 flex_wrap: FlexWrap::Wrap,
                 align_items: AlignItems::Center,
-                column_gap: px(4.0 * scale),
-                row_gap: px(3.0 * scale),
+                column_gap: px((5.0 * scale).round()),
+                row_gap: px((4.0 * scale).round()),
                 ..default()
             },
             ChildOf(screen_root),
         ))
         .id();
 
-    // Damage type filter chips for weapons (`ALL | KE | CE | TE`).
+    // Damage type filter chips for weapons (`ALL DMG | KE | CE | TE`).
     if slot_has_damage_filter(slot) {
         let dmg_opts: [(Option<u8>, &str, Color); 4] = [
-            (None, "ALL DMG", Color::srgb(0.82, 0.88, 0.94)),
+            (None, "ALL DMG", palette::ACCENT_TEAL),
             (Some(0), "KE", Color::srgb(0.95, 0.72, 0.24)),
             (Some(6), "CE", Color::srgb(0.32, 0.88, 0.45)),
             (Some(1), "TE", Color::srgb(0.32, 0.76, 0.98)),
         ];
         for (val, lbl, col) in dmg_opts {
             let active = state.assemble_dmg_filter == val;
+            let chip = assets
+                .kit
+                .spawn_badge(commands, filter_row, lbl, col, active, scale);
             commands
-                .spawn((
-                    Button,
-                    UiAction::AssembleDmgFilter(val),
-                    Node {
-                        padding: UiRect::axes(px(7.0 * scale), px(2.0 * scale)),
-                        border: UiRect::all(px(1.0)),
-                        ..default()
-                    },
-                    BackgroundColor(if active {
-                        Color::srgba(0.18, 0.34, 0.42, 0.96)
-                    } else {
-                        Color::srgba(0.06, 0.08, 0.12, 0.86)
-                    }),
-                    BorderColor::all(if active {
-                        col
-                    } else {
-                        Color::srgba(0.32, 0.42, 0.48, 0.55)
-                    }),
-                    ChildOf(filter_row),
-                ))
-                .with_children(|b| {
-                    b.spawn((
-                        Text::new(lbl),
-                        TextFont {
-                            font_size: FontSize::Px(10.5 * scale),
-                            ..default()
-                        },
-                        TextColor(if active { Color::WHITE } else { col }),
-                    ));
-                });
+                .entity(chip)
+                .insert((Button, UiAction::AssembleDmgFilter(val)));
         }
     }
 
     // Subcategory / weapon-type tabs (from `partssubcategory_en.fmg`).
     if !subcats.is_empty() {
         let all_active = state.assemble_subcat.is_none();
+        let all_chip = assets.kit.spawn_badge(
+            commands,
+            filter_row,
+            "ALL TYPES",
+            palette::ACCENT_TEAL,
+            all_active,
+            scale,
+        );
         commands
-            .spawn((
-                Button,
-                UiAction::AssembleSubcat(None),
-                Node {
-                    padding: UiRect::axes(px(7.0 * scale), px(2.0 * scale)),
-                    border: UiRect::all(px(1.0)),
-                    ..default()
-                },
-                BackgroundColor(if all_active {
-                    Color::srgba(0.14, 0.56, 0.46, 0.94)
-                } else {
-                    Color::srgba(0.06, 0.09, 0.13, 0.86)
-                }),
-                BorderColor::all(if all_active {
-                    Color::srgb(0.35, 0.95, 0.76)
-                } else {
-                    Color::srgba(0.30, 0.40, 0.46, 0.55)
-                }),
-                ChildOf(filter_row),
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("ALL TYPES"),
-                    TextFont {
-                        font_size: FontSize::Px(10.0 * scale),
-                        ..default()
-                    },
-                    TextColor(if all_active {
-                        Color::WHITE
-                    } else {
-                        Color::srgb(0.75, 0.82, 0.88)
-                    }),
-                ));
-            });
+            .entity(all_chip)
+            .insert((Button, UiAction::AssembleSubcat(None)));
 
         // Show up to 11 subcategory chips (cycle any beyond with Q/E!).
         let max_chips = if slot_has_damage_filter(slot) { 10 } else { 12 };
@@ -979,45 +1037,27 @@ pub fn spawn_assemble_ui(
             .assemble_subcat
             .and_then(|s| subcats.iter().position(|(id, _)| *id == s))
             .unwrap_or(0);
-        let start_chip = active_pos.saturating_sub(max_chips / 2).min(subcats.len().saturating_sub(max_chips));
+        let start_chip = active_pos
+            .saturating_sub(max_chips / 2)
+            .min(subcats.len().saturating_sub(max_chips));
         let end_chip = (start_chip + max_chips).min(subcats.len());
         for &(sid, ref sname) in &subcats[start_chip..end_chip] {
             let active = state.assemble_subcat == Some(sid);
+            let chip = assets.kit.spawn_badge(
+                commands,
+                filter_row,
+                &short_subcat_label(sname),
+                if active {
+                    palette::ACCENT_TEAL
+                } else {
+                    palette::SQUARE_MARK
+                },
+                active,
+                scale,
+            );
             commands
-                .spawn((
-                    Button,
-                    UiAction::AssembleSubcat(Some(sid)),
-                    Node {
-                        padding: UiRect::axes(px(6.0 * scale), px(2.0 * scale)),
-                        border: UiRect::all(px(1.0)),
-                        ..default()
-                    },
-                    BackgroundColor(if active {
-                        Color::srgba(0.14, 0.56, 0.46, 0.94)
-                    } else {
-                        Color::srgba(0.06, 0.09, 0.13, 0.86)
-                    }),
-                    BorderColor::all(if active {
-                        Color::srgb(0.35, 0.95, 0.76)
-                    } else {
-                        Color::srgba(0.30, 0.40, 0.46, 0.55)
-                    }),
-                    ChildOf(filter_row),
-                ))
-                .with_children(|b| {
-                    b.spawn((
-                        Text::new(short_subcat_label(sname)),
-                        TextFont {
-                            font_size: FontSize::Px(10.0 * scale),
-                            ..default()
-                        },
-                        TextColor(if active {
-                            Color::WHITE
-                        } else {
-                            Color::srgb(0.75, 0.82, 0.88)
-                        }),
-                    ));
-                });
+                .entity(chip)
+                .insert((Button, UiAction::AssembleSubcat(Some(sid))));
         }
     }
 
@@ -1040,38 +1080,31 @@ pub fn spawn_assemble_ui(
             .spawn((
                 Button,
                 UiAction::AssembleSelectSlot(tab_slot),
-                px_rect(x0, 148.0, x0 + 84.0, 202.0),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px((x0 * scale).round()),
+                    top: px((148.0 * scale).round()),
+                    width: px((84.0 * scale).round()),
+                    height: px((54.0 * scale).round()),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
                 BackgroundColor(if is_cur {
-                    Color::srgba(0.12, 0.46, 0.36, 0.92)
+                    palette::ACCENT_TEAL_FILL_TOP
                 } else {
-                    Color::srgba(0.05, 0.07, 0.10, 0.88)
-                }),
-                BorderColor::all(if is_cur {
-                    Color::srgb(0.32, 0.98, 0.75)
-                } else {
-                    Color::srgba(0.45, 0.52, 0.58, 0.65)
+                    palette::BG_BAR
                 }),
                 ChildOf(screen_root),
             ))
             .id();
-        commands.entity(tab).insert(Node {
-            position_type: PositionType::Absolute,
-            left: px(x0 * scale),
-            top: px(148.0 * scale),
-            width: px(84.0 * scale),
-            height: px(54.0 * scale),
-            border: UiRect::all(px(if is_cur { 2.0 } else { 1.0 })),
-            overflow: Overflow::clip(),
-            ..default()
-        });
         if let Some(img) = thumb {
             commands.spawn((
                 Node {
                     position_type: PositionType::Absolute,
                     left: px(0.0),
                     top: px(0.0),
-                    width: percent(100.0),
-                    height: percent(100.0),
+                    width: px((84.0 * scale).round()),
+                    height: px((54.0 * scale).round()),
                     ..default()
                 },
                 ImageNode {
@@ -1080,35 +1113,60 @@ pub fn spawn_assemble_ui(
                     // inside each 128×64 power-of-two thumbnail TPF (remaining pixels are PoT padding).
                     rect: Some(Rect::new(0.0, 0.0, 84.0, 54.0)),
                     color: if is_cur {
-                        Color::srgb(0.80, 1.0, 0.92)
+                        Color::srgb(0.82, 1.0, 0.92)
                     } else {
-                        Color::srgb(0.85, 0.88, 0.90)
+                        Color::srgb(0.86, 0.89, 0.90)
                     },
                     ..default()
                 },
                 ChildOf(tab),
             ));
         }
-        // Compact slot tag at top-left of the tab.
+        // Non-shifting border overlay so the 84×54 thumbnail aspect ratio stays exact.
+        let tab_bw = (if is_cur { 2.0 } else { 1.0 } * scale).round().max(1.0);
         commands.spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: px(3.0 * scale),
-                top: px(2.0 * scale),
+                left: px(0.0),
+                top: px(0.0),
+                width: px((84.0 * scale).round()),
+                height: px((54.0 * scale).round()),
+                border: UiRect::all(px(tab_bw)),
                 ..default()
             },
-            Text::new(short_slot_tag(tab_slot)),
-            TextFont {
-                font_size: FontSize::Px(9.0 * scale),
-                ..default()
-            },
-            TextColor(if is_cur {
-                Color::srgb(0.55, 1.0, 0.84)
+            BorderColor::all(if is_cur {
+                palette::ACCENT_TEAL
             } else {
-                Color::srgba(0.85, 0.90, 0.95, 0.85)
+                palette::BORDER_BUTTON
             }),
             ChildOf(tab),
         ));
+        // Compact disc-font slot tag at top-left of the tab.
+        let tag_box = commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px((3.0 * scale).round()),
+                    top: px((2.0 * scale).round()),
+                    padding: UiRect::axes(px((2.0 * scale).round()), px(0.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.03, 0.04, 0.72)),
+                ChildOf(tab),
+            ))
+            .id();
+        assets.kit.spawn_text(
+            commands,
+            tag_box,
+            FontRole::Small,
+            short_slot_tag(tab_slot),
+            scale * 0.82,
+            if is_cur {
+                palette::ACCENT_TEAL
+            } else {
+                palette::TEXT_PRIMARY
+            },
+        );
     }
 
     // 7. Left Vertical Part Thumbnail Strip (`@PartsList` `[86, 220, 170, 562]`, 6 × `84×54`).
@@ -1131,23 +1189,17 @@ pub fn spawn_assemble_ui(
                 UiRow(idx),
                 Node {
                     position_type: PositionType::Absolute,
-                    left: px(86.0 * scale),
-                    top: px(y0 * scale),
-                    width: px(84.0 * scale),
-                    height: px(54.0 * scale),
-                    border: UiRect::all(px(if is_sel { 2.0 } else { 1.0 })),
+                    left: px((86.0 * scale).round()),
+                    top: px((y0 * scale).round()),
+                    width: px((84.0 * scale).round()),
+                    height: px((54.0 * scale).round()),
                     overflow: Overflow::clip(),
                     ..default()
                 },
                 BackgroundColor(if is_sel {
-                    Color::srgba(0.14, 0.44, 0.36, 0.92)
+                    palette::ACCENT_AMBER_FILL_TOP
                 } else {
-                    Color::srgba(0.05, 0.07, 0.10, 0.88)
-                }),
-                BorderColor::all(if is_sel {
-                    Color::srgb(0.95, 0.68, 0.22)
-                } else {
-                    Color::srgba(0.45, 0.52, 0.58, 0.65)
+                    palette::BG_BAR
                 }),
                 ChildOf(screen_root),
             ))
@@ -1159,8 +1211,8 @@ pub fn spawn_assemble_ui(
                     position_type: PositionType::Absolute,
                     left: px(0.0),
                     top: px(0.0),
-                    width: percent(100.0),
-                    height: percent(100.0),
+                    width: px((84.0 * scale).round()),
+                    height: px((54.0 * scale).round()),
                     ..default()
                 },
                 ImageNode {
@@ -1169,7 +1221,7 @@ pub fn spawn_assemble_ui(
                     // inside each 128×64 power-of-two thumbnail TPF.
                     rect: Some(Rect::new(0.0, 0.0, 84.0, 54.0)),
                     color: if is_sel {
-                        Color::srgb(0.88, 1.0, 0.94)
+                        Color::srgb(0.96, 1.0, 0.94)
                     } else {
                         Color::WHITE
                     },
@@ -1179,56 +1231,64 @@ pub fn spawn_assemble_ui(
             ));
         }
 
+        // Non-shifting border overlay (`パーツ選択カーソル` amber highlight on selected part).
+        let item_bw = (if is_sel { 2.0 } else { 1.0 } * scale).round().max(1.0);
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: px((84.0 * scale).round()),
+                height: px((54.0 * scale).round()),
+                border: UiRect::all(px(item_bw)),
+                ..default()
+            },
+            BorderColor::all(if is_sel {
+                palette::ACCENT_AMBER
+            } else {
+                palette::BORDER_BUTTON
+            }),
+            ChildOf(item),
+        ));
+
         // Equipped badge (`E`, matching `@LogoEquip`).
         if is_eq {
-            commands
+            let eq_box = commands
                 .spawn((
                     Node {
                         position_type: PositionType::Absolute,
-                        left: px(3.0 * scale),
-                        top: px(2.0 * scale),
-                        padding: UiRect::axes(px(3.0 * scale), px(0.5 * scale)),
+                        left: px((3.0 * scale).round()),
+                        top: px((2.0 * scale).round()),
+                        padding: UiRect::axes(px((3.0 * scale).round()), px((1.0 * scale).round())),
                         ..default()
                     },
-                    BackgroundColor(Color::srgba(0.05, 0.12, 0.16, 0.88)),
+                    BackgroundColor(Color::srgba(0.0, 0.06, 0.08, 0.88)),
                     ChildOf(item),
                 ))
-                .with_children(|b| {
-                    b.spawn((
-                        Text::new("E"),
-                        TextFont {
-                            font_size: FontSize::Px(10.0 * scale),
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.32, 0.98, 0.72)),
-                    ));
-                });
+                .id();
+            assets
+                .kit
+                .spawn_text(commands, eq_box, FontRole::Small, "E", scale * 0.85, palette::ACCENT_TEAL);
         }
 
         // Damage-type pip in bottom-right corner for weapons.
         if let Some((_, dtag, dcol)) = part_damage_badge(cat, pid) {
-            commands
+            let dmg_box = commands
                 .spawn((
                     Node {
                         position_type: PositionType::Absolute,
-                        right: px(3.0 * scale),
-                        bottom: px(2.0 * scale),
-                        padding: UiRect::axes(px(3.0 * scale), px(0.5 * scale)),
+                        right: px((3.0 * scale).round()),
+                        bottom: px((2.0 * scale).round()),
+                        padding: UiRect::axes(px((3.0 * scale).round()), px((1.0 * scale).round())),
                         ..default()
                     },
-                    BackgroundColor(Color::srgba(0.04, 0.06, 0.09, 0.88)),
+                    BackgroundColor(Color::srgba(0.0, 0.04, 0.06, 0.88)),
                     ChildOf(item),
                 ))
-                .with_children(|b| {
-                    b.spawn((
-                        Text::new(dtag),
-                        TextFont {
-                            font_size: FontSize::Px(9.0 * scale),
-                            ..default()
-                        },
-                        TextColor(dcol),
-                    ));
-                });
+                .id();
+            assets
+                .kit
+                .spawn_text(commands, dmg_box, FontRole::Small, dtag, scale * 0.8, dcol);
         }
     }
 
@@ -1248,15 +1308,29 @@ pub fn spawn_assemble_ui(
         ));
     }
 
-    // 8. Footer Controls Strip (`y = 668..706`).
-    let footer = commands
-        .spawn((
-            px_rect(18.0, 668.0, 1262.0, 704.0),
-            BackgroundColor(Color::srgba(0.04, 0.06, 0.09, 0.88)),
-            BorderColor::all(Color::srgba(0.30, 0.42, 0.48, 0.45)),
-            ChildOf(screen_root),
-        ))
-        .id();
+    // 8. Full-width ACVD Footer Controls Bar (`y = 674..720`).
+    let footer = assets.kit.spawn_panel(
+        commands,
+        Some(screen_root),
+        PanelStyle::Bar,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0.0),
+            top: px((676.0 * scale).round()),
+            width: px((SCREEN_W * scale).round()),
+            height: px((44.0 * scale).round()),
+            padding: UiRect::axes(px((22.0 * scale).round()), px((6.0 * scale).round())),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::SpaceBetween,
+            column_gap: px((12.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+    commands
+        .entity(footer)
+        .insert(BackgroundColor(Color::srgba(0.0, 0.03, 0.04, 0.86)));
     let slot_prompt = match slot {
         AssembleSlot::Arms => "an arms part",
         AssembleSlot::ArmUnitR => "a right arm unit",
@@ -1273,49 +1347,68 @@ pub fn spawn_assemble_ui(
         AssembleSlot::Booster => "a booster",
         AssembleSlot::Recon => "a recon unit",
     };
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(16.0 * scale),
-            top: px(9.0 * scale),
-            ..default()
-        },
-        Text::new(format!(
-            "Select {slot_prompt}.  ({} / {})   |   W/S: Part   A/D: Slot Tab   Q/E: Subcategory   Tab: Detail Specs   Enter: Equip   Right-Drag: Orbit AC   Esc: Back",
+    let footer_left = commands
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px((16.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(footer),
+        ))
+        .id();
+    assets.kit.spawn_text(
+        commands,
+        footer_left,
+        FontRole::Body,
+        &format!("Select {slot_prompt}."),
+        scale,
+        palette::TEXT_ALERT,
+    );
+    assets.kit.spawn_text(
+        commands,
+        footer_left,
+        FontRole::Small,
+        "W/S: Part   A/D: Slot   Q/E: Filter   Tab: Specs   Enter: Equip   Right-Drag: Orbit",
+        scale,
+        palette::TEXT_PRIMARY,
+    );
+    assets.kit.spawn_badge(
+        commands,
+        footer,
+        &format!(
+            "{} / {}",
             if parts.is_empty() { 0 } else { state.cursor + 1 },
             parts.len()
-        )),
-        TextFont {
-            font_size: FontSize::Px(12.0 * scale),
-            ..default()
-        },
-        TextColor(Color::srgb(0.86, 0.56, 0.48)),
-        ChildOf(footer),
-    ));
+        ),
+        palette::SQUARE_MARK,
+        false,
+        scale,
+    );
 
     // Transient banner (e.g. "EQUIPPED ...", "OVERWEIGHT!").
     if let Some((ref msg, col, _)) = state.banner {
-        commands
-            .spawn((
-                px_rect(710.0, 66.0, 1208.0, 96.0),
-                BackgroundColor(Color::srgba(0.05, 0.07, 0.10, 0.92)),
-                BorderColor::all(col),
-                ChildOf(screen_root),
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Node {
-                        margin: UiRect::all(Val::Auto),
-                        ..default()
-                    },
-                    Text::new(msg.clone()),
-                    TextFont {
-                        font_size: FontSize::Px(13.0 * scale),
-                        ..default()
-                    },
-                    TextColor(col),
-                ));
-            });
+        let banner = assets.kit.spawn_panel(
+            commands,
+            Some(screen_root),
+            PanelStyle::Framed,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px((710.0 * scale).round()),
+                top: px((62.0 * scale).round()),
+                width: px((498.0 * scale).round()),
+                padding: UiRect::axes(px((12.0 * scale).round()), px((6.0 * scale).round())),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            scale,
+        );
+        assets
+            .kit
+            .spawn_text(commands, banner, FontRole::Body, msg, scale, col);
     }
 
     true
@@ -1340,22 +1433,173 @@ fn short_slot_tag(slot: AssembleSlot) -> &'static str {
     }
 }
 
-fn split_two_lines(s: &str, max_line: usize) -> (String, String) {
-    if s.chars().count() <= max_line {
-        return (s.to_string(), String::new());
+/// Word-wraps `s` into at most two lines using the real disc CCM body font metrics so
+/// `@2Line_Helpline` (`[86, 4, 1193, 44]` = `1107px` wide) never clips mid-word.
+fn wrap_two_lines_px(kit: &AcvdUiKit, s: &str, max_px: f32) -> (String, String) {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if words.is_empty() {
+        return (String::new(), String::new());
     }
-    let mut split_at = max_line;
-    for (idx, ch) in s.char_indices() {
-        if idx > max_line {
+    let mut line1 = String::new();
+    let mut idx = 0;
+    while idx < words.len() {
+        let cand = if line1.is_empty() {
+            words[idx].to_string()
+        } else {
+            format!("{line1} {}", words[idx])
+        };
+        if !line1.is_empty() && kit.measure_text(FontRole::Body, &cand, 1.0).x > max_px {
             break;
         }
-        if ch == ' ' {
-            split_at = idx;
+        line1 = cand;
+        idx += 1;
+    }
+    let mut line2 = String::new();
+    while idx < words.len() {
+        let cand = if line2.is_empty() {
+            words[idx].to_string()
+        } else {
+            format!("{line2} {}", words[idx])
+        };
+        let suffix = if idx + 1 < words.len() { "..." } else { "" };
+        if !line2.is_empty()
+            && kit
+                .measure_text(FontRole::Body, &format!("{cand}{suffix}"), 1.0)
+                .x
+                > max_px
+        {
+            line2.push_str("...");
+            break;
+        }
+        line2 = cand;
+        idx += 1;
+    }
+    (line1, line2)
+}
+
+/// Maps an [`AssembleSlot`] to the `AC_ASSEMBLY_DESIGN_ST_SLOTS` column name attached to its
+/// 3D AC submeshes (`None` for internal non-drawn parts: FCS, Generator, Recon).
+pub fn slot_column(slot: AssembleSlot) -> Option<&'static str> {
+    match slot {
+        AssembleSlot::Head => Some("head"),
+        AssembleSlot::Core => Some("core"),
+        AssembleSlot::Arms => Some("arms"),
+        AssembleSlot::Legs => Some("legs"),
+        AssembleSlot::Booster => Some("booster"),
+        AssembleSlot::ArmUnitR => Some("armwep_r"),
+        AssembleSlot::ArmUnitL => Some("armwep_l"),
+        AssembleSlot::Shoulder => Some("shoulder"),
+        AssembleSlot::HangerR => Some("hanger_r"),
+        AssembleSlot::HangerL => Some("hanger_l"),
+        AssembleSlot::OveredWeapon => Some("back_r"),
+        AssembleSlot::Fcs | AssembleSlot::Generator | AssembleSlot::Recon => None,
+    }
+}
+
+/// Stores the original opaque material of a main-AC submesh while [`sync_part_hologram`] renders
+/// it as a translucent amber-orange Fresnel hologram during Garage Assemble part selection.
+#[derive(Component)]
+pub enum HoloSavedMat {
+    Painted {
+        original: Handle<paint::AcPaintMaterial>,
+        holo: Handle<paint::AcPaintMaterial>,
+    },
+    Std {
+        original: Handle<StandardMaterial>,
+    },
+}
+
+/// Applies the ACVD translucent amber-orange hologram highlight to the currently selected
+/// [`AssembleSlot`]'s submeshes on the main 3D AC while in `GarageScreen::AssembleParts`, and
+/// cleanly restores original opaque materials when switching slots or leaving Assemble.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_part_hologram(
+    mut commands: Commands,
+    mode: Res<Mode>,
+    state: Res<GarageState>,
+    time: Res<Time>,
+    mut ac_mats: ResMut<Assets<paint::AcPaintMaterial>>,
+    mut std_mats: ResMut<Assets<StandardMaterial>>,
+    mut holo_std: Local<Option<Handle<StandardMaterial>>>,
+    meshes: Query<(
+        Entity,
+        &crate::AcPartColumn,
+        Option<&MeshMaterial3d<paint::AcPaintMaterial>>,
+        Option<&MeshMaterial3d<StandardMaterial>>,
+        Option<&HoloSavedMat>,
+    )>,
+) {
+    let target_col = if *mode == Mode::Garage {
+        match state.screen {
+            GarageScreen::AssembleParts { slot } => slot_column(slot),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let pulse = 0.78 + 0.12 * (time.elapsed_secs() * 3.2).sin();
+    let holo_param = Vec4::new(1.0, 0.24, 0.02, pulse);
+
+    for (entity, col, painted_mat, std_mat, saved) in &meshes {
+        let should_holo = target_col == Some(col.0);
+        match (should_holo, saved) {
+            (true, Some(HoloSavedMat::Painted { holo, .. })) => {
+                if let Some(mut m) = ac_mats.get_mut(holo) {
+                    m.extension.params.highlight = holo_param;
+                }
+            }
+            (true, Some(HoloSavedMat::Std { .. })) => {}
+            (true, None) => {
+                if let Some(pm) = painted_mat {
+                    if let Some(mut cloned) = ac_mats.get(&pm.0).cloned() {
+                        cloned.base.alpha_mode = AlphaMode::Blend;
+                        cloned.extension.params.highlight = holo_param;
+                        let holo = ac_mats.add(cloned);
+                        commands.entity(entity).insert((
+                            MeshMaterial3d(holo.clone()),
+                            HoloSavedMat::Painted {
+                                original: pm.0.clone(),
+                                holo,
+                            },
+                        ));
+                    }
+                } else if let Some(sm) = std_mat {
+                    let h = holo_std
+                        .get_or_insert_with(|| {
+                            std_mats.add(StandardMaterial {
+                                base_color: Color::srgba(1.0, 0.50, 0.10, 0.44),
+                                emissive: LinearRgba::new(2.4, 1.0, 0.16, 1.0),
+                                alpha_mode: AlphaMode::Blend,
+                                cull_mode: None,
+                                unlit: false,
+                                ..default()
+                            })
+                        })
+                        .clone();
+                    commands.entity(entity).insert((
+                        MeshMaterial3d(h),
+                        HoloSavedMat::Std {
+                            original: sm.0.clone(),
+                        },
+                    ));
+                }
+            }
+            (false, Some(HoloSavedMat::Painted { original, .. })) => {
+                commands
+                    .entity(entity)
+                    .insert(MeshMaterial3d(original.clone()))
+                    .remove::<HoloSavedMat>();
+            }
+            (false, Some(HoloSavedMat::Std { original })) => {
+                commands
+                    .entity(entity)
+                    .insert(MeshMaterial3d(original.clone()))
+                    .remove::<HoloSavedMat>();
+            }
+            (false, None) => {}
         }
     }
-    let l1 = s[..split_at].trim().to_string();
-    let l2: String = s[split_at..].trim().chars().take(max_line).collect();
-    (l1, l2)
 }
 
 /// Marker attached to a spawned `@PartsNormal` DRB dialog root so [`populate_drb_dialogs`] fills
@@ -1678,6 +1922,7 @@ pub fn sync_part_preview(
             }
             assets.preview_loaded = None;
             assets.preview_pending = None;
+            assets.reset_preview_view();
         }
         return;
     };
@@ -1704,7 +1949,7 @@ pub fn sync_part_preview(
                     far: 100.0,
                     ..default()
                 }),
-                Transform::from_xyz(0.0, 0.55, 3.15).looking_at(Vec3::ZERO, Vec3::Y),
+                part_preview_camera_transform(assets.preview_zoom),
                 layer.clone(),
             ));
             // Studio key light (warm-white front-top-right).
@@ -1774,6 +2019,7 @@ pub fn sync_part_preview(
     }
     assets.preview_pending = None;
     assets.preview_loaded = Some(want);
+    assets.reset_preview_view();
 
     for e in &mesh_q {
         commands.entity(e).despawn();
@@ -1882,7 +2128,10 @@ pub fn sync_part_preview(
     let pivot = commands
         .spawn((
             PartPreviewPivot,
-            Transform::from_rotation(Quat::from_rotation_y(assets.preview_yaw)),
+            Transform::from_rotation(
+                Quat::from_rotation_x(assets.preview_pitch)
+                    * Quat::from_rotation_y(assets.preview_yaw),
+            ),
             Visibility::default(),
             layer.clone(),
         ))
@@ -1914,18 +2163,71 @@ pub fn sync_part_preview(
     }
 }
 
-/// Gently rotates the 3D part/weapon preview on its studio turntable.
+/// Gently rotates the 3D part/weapon preview on its studio turntable, and supports
+/// interactive mouse-drag rotation and scroll-wheel zoom when hovering the `PARTS VIEW` panel.
+#[allow(clippy::too_many_arguments)]
 pub fn rotate_part_preview(
     time: Res<Time>,
+    mode: Res<Mode>,
+    state: Res<GarageState>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut assets: ResMut<AssembleUiAssets>,
-    mut pivots: Query<&mut Transform, With<PartPreviewPivot>>,
+    mut pivots: Query<&mut Transform, (With<PartPreviewPivot>, Without<PartPreviewCamera>)>,
+    mut cams: Query<&mut Transform, (With<PartPreviewCamera>, Without<PartPreviewPivot>)>,
 ) {
-    if pivots.is_empty() {
+    let active = *mode == Mode::Garage
+        && matches!(state.screen, GarageScreen::AssembleParts { .. })
+        && !state.assemble_detail_view;
+    if !active || pivots.is_empty() {
+        assets.preview_dragging = false;
         return;
     }
-    assets.preview_yaw = (assets.preview_yaw + time.delta_secs() * 0.55) % std::f32::consts::TAU;
+
+    let over_panel = windows
+        .single()
+        .ok()
+        .and_then(|w| {
+            w.cursor_position()
+                .map(|c| cursor_in_part_preview_panel(Vec2::new(w.width(), w.height()), c))
+        })
+        .unwrap_or(false);
+
+    if buttons.just_pressed(MouseButton::Left) && over_panel {
+        assets.preview_dragging = true;
+        assets.preview_manual = true;
+    }
+    if !buttons.pressed(MouseButton::Left) {
+        assets.preview_dragging = false;
+    }
+
+    if assets.preview_dragging {
+        if motion.delta.length_squared() > 0.0 {
+            let (mut yaw, mut pitch) = (assets.preview_yaw, assets.preview_pitch);
+            apply_part_preview_drag(&mut yaw, &mut pitch, motion.delta);
+            assets.preview_yaw = yaw;
+            assets.preview_pitch = pitch;
+        }
+    } else if !assets.preview_manual {
+        assets.preview_yaw = (assets.preview_yaw + time.delta_secs() * 0.55) % std::f32::consts::TAU;
+    }
+
+    if over_panel && scroll.delta.y.abs() > 0.0 {
+        let mut zoom = assets.preview_zoom;
+        apply_part_preview_zoom(&mut zoom, scroll.delta.y, scroll.unit);
+        assets.preview_zoom = zoom;
+    }
+
+    let rot =
+        Quat::from_rotation_x(assets.preview_pitch) * Quat::from_rotation_y(assets.preview_yaw);
     for mut tf in &mut pivots {
-        tf.rotation = Quat::from_rotation_y(assets.preview_yaw);
+        tf.rotation = rot;
+    }
+    let cam_tf = part_preview_camera_transform(assets.preview_zoom);
+    for mut tf in &mut cams {
+        *tf = cam_tf;
     }
 }
 
@@ -1952,6 +2254,45 @@ mod tests {
             hovered_scroll_strip(Vec2::new(1280.0, 900.0), Vec2::new(120.0, 10.0)),
             None
         );
+    }
+
+    #[test]
+    fn part_preview_panel_hit_test_and_drag_zoom_controls() {
+        let win = Vec2::new(SCREEN_W, SCREEN_H);
+        // Inside 3D preview box and lower stat rows of `PARTS VIEW` panel.
+        assert!(cursor_in_part_preview_panel(win, Vec2::new(420.0, 320.0)));
+        assert!(cursor_in_part_preview_panel(win, Vec2::new(420.0, 500.0)));
+        // Outside: `@PartsList` thumbnail strip, `@PartsCategoryList`, right `ASSEMBLY VIEW`.
+        assert!(!cursor_in_part_preview_panel(win, Vec2::new(120.0, 320.0)));
+        assert!(!cursor_in_part_preview_panel(win, Vec2::new(420.0, 170.0)));
+        assert!(!cursor_in_part_preview_panel(win, Vec2::new(900.0, 360.0)));
+
+        // Dragging updates yaw and clamps pitch within ±PREVIEW_PITCH_LIMIT.
+        let mut yaw = 0.0f32;
+        let mut pitch = 0.0f32;
+        apply_part_preview_drag(&mut yaw, &mut pitch, Vec2::new(100.0, 50.0));
+        assert!((yaw - 1.0).abs() < 1e-5);
+        assert!((pitch - 0.5).abs() < 1e-5);
+        apply_part_preview_drag(&mut yaw, &mut pitch, Vec2::new(0.0, 500.0));
+        assert_eq!(pitch, PREVIEW_PITCH_LIMIT);
+        apply_part_preview_drag(&mut yaw, &mut pitch, Vec2::new(0.0, -900.0));
+        assert_eq!(pitch, -PREVIEW_PITCH_LIMIT);
+
+        // Scroll up zooms in (smaller multiplier), scroll down zooms out (larger multiplier).
+        let mut zoom = AssembleUiAssets::default().preview_zoom;
+        assert_eq!(zoom, 1.0);
+        apply_part_preview_zoom(&mut zoom, 1.0, MouseScrollUnit::Line);
+        assert!(zoom < 1.0 && zoom >= PREVIEW_ZOOM_MIN);
+        let close_dist = part_preview_camera_transform(zoom).translation.length();
+        assert!(close_dist < PREVIEW_CAM_BASE.length());
+        for _ in 0..30 {
+            apply_part_preview_zoom(&mut zoom, 1.0, MouseScrollUnit::Line);
+        }
+        assert_eq!(zoom, PREVIEW_ZOOM_MIN);
+        for _ in 0..40 {
+            apply_part_preview_zoom(&mut zoom, -1.0, MouseScrollUnit::Line);
+        }
+        assert_eq!(zoom, PREVIEW_ZOOM_MAX);
     }
 
     #[test]

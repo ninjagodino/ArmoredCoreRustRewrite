@@ -65,6 +65,9 @@ pub struct AcPaintParams {
     /// `c138` (`DL_FREG_138`, `0x82bd8958` / `0x82008994` = `10.0`):
     /// `(kojima.rgb / 255.0 * 10.0, 1.0)` on `_Rim` (`ACParts_Rim*`) meshes, or `0`.
     pub rim: Vec4,
+    /// Garage Assemble part-selection hologram highlight: `rgb` = linear glow tint, `a > 0`
+    /// enables translucent Fresnel hologram rendering on the hovered slot's 3D AC meshes.
+    pub highlight: Vec4,
 }
 
 impl MaterialExtension for AcPaint {
@@ -273,6 +276,7 @@ pub fn material(
                 flags: Vec2::new(has_specular, has_decal),
                 emission,
                 rim,
+                highlight: Vec4::ZERO,
             },
             color_map,
             camo_map,

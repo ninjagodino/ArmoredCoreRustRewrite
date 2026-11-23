@@ -126,6 +126,12 @@ pub struct AcTexturePacks {
 #[derive(Component)]
 struct Ac;
 
+/// Identifies which `AC_ASSEMBLY_DESIGN_ST_SLOTS` column (`"head"`, `"core"`, `"arms"`, `"legs"`,
+/// `"booster"`, `"armwep_r"`, `"armwep_l"`, `"shoulder"`, `"hanger_r"`, `"hanger_l"`, `"back_r"`)
+/// a spawned AC submesh belongs to.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcPartColumn(pub &'static str);
+
 /// When false (`--no-hud`), the lock-sight and the part-name overlay are not drawn.
 #[derive(Resource)]
 struct ShowHud(bool);
@@ -443,6 +449,7 @@ fn main() {
             (
                 browse.run_if(in_sortie),
                 show,
+                garage_assemble::sync_part_hologram,
                 clips.run_if(in_sortie),
                 control::pilot.run_if(in_sortie),
                 scan::update.run_if(in_sortie),
@@ -1515,6 +1522,7 @@ fn show(
                 )
             });
             let mut mesh_entity = commands.spawn((
+                AcPartColumn(part.placement.column),
                 Mesh3d(meshes.add(mesh.mesh)),
                 SkinnedMesh {
                     inverse_bindposes: inverse_bindposes.clone(),
