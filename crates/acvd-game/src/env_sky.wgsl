@@ -1,11 +1,13 @@
-// Map_Sky (NoLightNoFog.spx): the squared texel, unlit and unfogged, halved by c31 = 0.5 and
-// passed through m_ToneMapFilter (0x82c18628, sheets/map_env.csv sky and tonemap rows). The 360's
-// sky pass (0x827f3d38) zeroes the projection's depth row and sets the viewport MinZ to the far
-// end, so the dome sits on the far plane behind every other draw.
+// Map_Sky / Map_SkyMulti / Map_NoLightNoFog (`NoLightNoFog.spx`): squared texel, unlit and
+// unfogged, written as linear HDR so HDR Bloom and fullscreen `m_ToneMapFilter` (`0x82c18628`,
+// `zoom_blur.wgsl`) tonemap the sky identically to the 360. When `flags.x > 0.5` (sortie sky
+// domes `o9700..o9705`), writes depth = 0.0 (far plane in reverse Z, matching 360 `0x827f3d38`).
 
 #import bevy_pbr::forward_io::VertexOutput
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> tonemap: vec4<f32>;
+/// `x > 0.5`: force far-plane depth (0.0 in reverse Z); `y > 0.5`: use texture alpha for blend;
+/// `z`: linear HDR scale (default 1.0).
+@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> sky_flags: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var sky_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var sky_sampler: sampler;
 
@@ -20,30 +22,21 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3(0.0031308));
 }
 
-fn apply_tonemap(hdr: vec3<f32>, tm: vec4<f32>) -> vec3<f32> {
-    let src = max(hdr, vec3(0.0)) * 0.5;
-    let x = src * tm.x;
-    let mode = u32(tm.w + 0.5);
-    if mode == 0u {
-        return sqrt(max(vec3(1.0) - exp2(-x), vec3(0.0))) * tm.y;
-    } else if mode == 1u {
-        return (x / (x + vec3(1.0))) * tm.y;
-    } else if mode == 2u {
-        let w = max(tm.z * tm.x, 1e-4);
-        let w2 = w * w;
-        return (x * (vec3(1.0) + x / w2) / (x + vec3(1.0))) * tm.y;
-    }
-    return src;
-}
-
 @fragment
 fn fragment(in: VertexOutput) -> SkyOut {
     // Sample sky_tex directly so dome vertex alpha does not zero out tex.a near the horizon.
     let s = textureSample(sky_tex, sky_sampler, in.uv);
-    let raw = srgb_encode(s.rgb) * s.a;
+    let scale = max(sky_flags.z, 0.001);
     var out: SkyOut;
-    out.color = vec4(apply_tonemap(raw * raw, tonemap), 1.0);
-    // Reverse Z: 0 is the far plane.
-    out.depth = 0.0;
+    if sky_flags.y > 0.5 {
+        // Alpha-blended cloud dome (`Map_SkyMulti`) or additive sky (`Map_NoLightNoFog_Add`).
+        let raw = srgb_encode(s.rgb);
+        out.color = vec4(raw * raw * scale, s.a);
+    } else {
+        let raw = srgb_encode(s.rgb) * s.a;
+        out.color = vec4(raw * raw * scale, 1.0);
+    }
+    // Reverse Z: 0.0 is the far plane; otherwise keep normal rasterized depth.
+    out.depth = select(in.position.z, 0.0, sky_flags.x > 0.5);
     return out;
 }

@@ -813,19 +813,19 @@ impl FollowCam {
         self.blur = (self.blur + (target - self.blur) * b.blur_intp_rate).clamp(0.0, 1.0);
     }
 
-    /// The zoom-blur filter for this intensity (360 0x82bfa9f0, 0x82bf8c20); the filter skips
-    /// drawing at alpha 9 or less (360 0x82c98368).
-    fn zoom_blur(&self) -> ZoomBlur {
+    /// Applies the zoom-blur filter for this intensity (360 0x82bfa9f0, 0x82bf8c20); the filter
+    /// skips drawing at alpha 9 or less (360 0x82c98368). Preserves `god_ray` and `tonemap`.
+    fn apply_zoom_blur(&self, blur: &mut ZoomBlur) {
         let b = self.behavior;
         let i = self.blur;
         let alpha = ((b.blur_alpha as f32 * i) as i32).clamp(0, 255) as u8;
         let alpha = if alpha > BLUR_MIN_ALPHA { alpha } else { 0 };
-        ZoomBlur::new(
+        blur.set_speed_blur(
             b.blur_offset * i,
             alpha,
             b.blur_thin_pow * i,
             Vec2::new(b.blur_no_effect_size_x, b.blur_no_effect_size_y),
-        )
+        );
     }
 
     /// Rotates the eased camera points about pivot by delta (yaw), so freelook turns the view
@@ -2719,7 +2719,7 @@ pub fn pilot(
             ReadyCamera::Off,
         );
         if let Ok((mut o, _, _, mut blur)) = cams.single_mut() {
-            *blur = ZoomBlur::default();
+            blur.clear_speed_blur();
             if o.follow {
                 o.follow = false;
                 o.frame(garage.bounds.0, garage.bounds.1);
@@ -2987,7 +2987,7 @@ pub fn pilot(
         if let Projection::Perspective(persp) = proj.as_mut() {
             persp.fov = p.cam.fov(time.delta_secs());
         }
-        *blur = p.cam.zoom_blur();
+        p.cam.apply_zoom_blur(&mut blur);
     }
     if changed || time.elapsed_secs() % 0.25 < time.delta_secs() {
         let speed = Vec2::new(p.velocity.x, p.velocity.z).length() * TICK_TO_KMH;

@@ -1,6 +1,11 @@
-// Speed blur (`shader/filter_shader.bnd` ZoomBlur_ZoomBlurNoPS / ZoomBlur_ZoomBlurHiPS, drawn by
-// 360 0x82c98368 with its +0x38 flag set) and crepuscular god rays (`LensFlareGodRay12/16/20PS` +
-// `LensFlareGodRayMerge{Add,Modulate,Transparent}PS`, executed by 360 0x82c9f9f0).
+// Fullscreen post-processing pass:
+// 1. Speed zoom blur (`shader/filter_shader.bnd` ZoomBlur_ZoomBlurNoPS / ZoomBlur_ZoomBlurHiPS,
+//    drawn by 360 `0x82c98368`).
+// 2. Crepuscular god rays (`LensFlareGodRay12/16/20PS` + `LensFlareGodRayMerge*PS`, 360
+//    `0x82c9f9f0`).
+// 3. `m_ToneMapFilter` (`shader/filter_shader.bnd` `ToneMap_{Exp,Divide,Reinhard}ToneMap*PS`,
+//    360 `0x82c18628`): `c31 = 0.5` halving + tonemapping applied once after HDR Bloom to the
+//    entire composited 3D frame (terrain, garage, sky dome, water, AC parts, lights, VFX).
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
 struct GodRayFilter {
@@ -27,6 +32,8 @@ struct ZoomBlur {
     thin: f32,
     no_effect: vec2<f32>,
     god_ray: GodRayFilter,
+    // `m_ToneMapFilter` (`0x82c18628`): `(c32 = 1 / (lum * key), c33 = mul, c34 = white, mode)`.
+    tonemap: vec4<f32>,
 }
 
 @group(0) @binding(0) var screen: texture_2d<f32>;
@@ -84,6 +91,25 @@ fn apply_god_rays(base: vec3<f32>, uv_in: vec2<f32>, gr: GodRayFilter) -> vec3<f
     }
 }
 
+fn apply_tonemap(hdr: vec3<f32>, tm: vec4<f32>) -> vec3<f32> {
+    if tm.w > 10.0 || tm.x <= 0.0 {
+        return hdr;
+    }
+    let src = max(hdr, vec3<f32>(0.0)) * 0.5;
+    let x = src * tm.x;
+    let mode = u32(tm.w + 0.5);
+    if mode == 0u {
+        return sqrt(max(vec3<f32>(1.0) - exp2(-x), vec3<f32>(0.0))) * tm.y;
+    } else if mode == 1u {
+        return (x / (x + vec3<f32>(1.0))) * tm.y;
+    } else if mode == 2u {
+        let w = max(tm.z * tm.x, 1e-4);
+        let w2 = w * w;
+        return (x * (vec3<f32>(1.0) + x / w2) / (x + vec3<f32>(1.0))) * tm.y;
+    }
+    return src;
+}
+
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let centre = textureSampleLevel(screen, screen_sampler, in.uv, 0.0);
@@ -105,6 +131,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     // 2. Crepuscular god-ray radial blur + merge (`0x82c9f9f0`).
     rgb = apply_god_rays(rgb, in.uv, blur.god_ray);
+
+    // 3. `m_ToneMapFilter` (`0x82c18628`, `c31 = 0.5` + Divide/Reinhard/Exp tonemap).
+    rgb = apply_tonemap(rgb, blur.tonemap);
 
     return vec4<f32>(rgb, centre.a);
 }

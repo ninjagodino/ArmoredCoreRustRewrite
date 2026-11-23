@@ -3,8 +3,10 @@
 //!   (`PARAM_CUSTOMGARAGE_BIN`, `id` 1..=13, default `id = 5` → `menu1000` Underpass):
 //!   `model/menu/menu{id:04}/menu{id:04}_m.bnd.dcx|menu{id:04}.flv` + `menu{id:04}.tpf.dcx`.
 //! - Lights the bay with `model/map/ingamegarage/ingamegaragemenu{id:04}_env.msb` (360
-//!   `0x82306860` / `0x82580080`) and `param/garagelighting.bin` (`PARAM_GARAGELIGHTING_BIN`:
-//!   overhead spot light + up to 6 colored point lights).
+//!   `0x82306860` / `0x82580080` / `0x825bc318` / `0x825d33b0`): workshop world meshes use light
+//!   set `1` (`SET_MAP`) + fog + clustered dynamic `POINT_PARAM_ST` point (`1300`) and spot
+//!   (`1310`) lights (`0x82800170` -> `0x82be8218`), sky/clouds use `SkyMaterial`, and the entire
+//!   HDR frame passes once through `m_ToneMapFilter` (`0x82c18628`).
 //! - Frames the assembled AC with `param/acsisdisplay.bin` (`PARAM_ACSISDISPLAY_BIN`, 360
 //!   `0x8257c988` / `0x8257cde8` / `0x8257ce50` / `0x82586400` / `0x82684958`) and
 //!   `param/acsisdisplaycommon.bin` (`40.0°` FOV), smoothly sweeping to each part slot on hover
@@ -24,7 +26,8 @@ use acvd_data::generated::assembly::AC_PARTS;
 use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::generated::menu::{AcsisDisplaySt, PARAM_ACSISDISPLAY_BIN};
 use acvd_data::generated::progression::{CustomGarageSt, PARAM_CUSTOMGARAGE_BIN};
-use acvd_data::generated::render::{GarageLightingParamSt, PARAM_GARAGELIGHTING_BIN};
+#[cfg(test)]
+use acvd_data::generated::render::PARAM_GARAGELIGHTING_BIN;
 use acvd_data::{ac_part, find};
 use acvd_formats::accolor::{
     AcColor, CH_AID, CH_AID2, CH_BASE, CH_JOINT, CH_KOJIMA, CH_OPTIONAL, GROUP_COUNT,
@@ -33,6 +36,7 @@ use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
 use acvd_render::Packs;
 use bevy::audio::AudioSource;
+use bevy::camera::Exposure;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
 use bevy::ui::px;
@@ -871,8 +875,9 @@ impl GarageState {
     }
 }
 
-/// Ensures the active 3D garage workshop model, env lighting, and `PARAM_GARAGELIGHTING_BIN`
-/// light rig are spawned whenever `Mode::Garage` is active or the workshop changes.
+/// Ensures the active 3D garage workshop model, `_env.msb` light sets (`SET_AC` + `SET_MAP`),
+/// and `POINT_PARAM_ST` dynamic point/spot lights (`0x82be8218`) are spawned whenever
+/// `Mode::Garage` is active or the workshop changes.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_room(
     mut commands: Commands,
@@ -882,9 +887,11 @@ pub fn sync_room(
     world: Query<Entity, With<GarageWorld>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut env_materials: ResMut<Assets<env::EnvMaterial>>,
+    mut sky_materials: ResMut<Assets<env::SkyMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut dir_lights: Query<(&mut DirectionalLight, &mut Transform)>,
-    cameras: Query<Entity, With<Camera3d>>,
+    cameras: Query<Entity, (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
 ) {
     if *mode != Mode::Garage {
         if state.spawned_workshop.is_some() {
@@ -909,8 +916,16 @@ pub fn sync_room(
     state.spawned_workshop = Some(ws.model_id);
 
     // 1. Apply the workshop's real 360 env MSB (`ingamegaragemenuXXXX_env.msb` or fallback).
+    // Sets ClearColor, SET_AC (slot 0) on the AC lights, HDR Bloom, and fullscreen m_ToneMapFilter.
     let env_file = garage_env_path(&garage.disc, ws.model_id);
-    env::apply_env_file(&mut commands, &garage.disc, &env_file, &mut dir_lights, &cameras);
+    let loaded_env =
+        env::apply_env_file(&mut commands, &garage.disc, &env_file, &mut dir_lights, &cameras);
+    // 360 `0x825d33b0` -> `0x825d3108(this, 1)` assigns light/fog set 1 (`SET_MAP`) to all
+    // garage workshop submeshes.
+    let map_light_set = loaded_env
+        .as_ref()
+        .and_then(|e| e.light(env::SET_MAP).or_else(|| e.light(env::SET_AC)));
+    let white_srgb = env::white_srgb_pixel(&mut images);
 
     // 2. Spawn the real 3D garage FLVER (`menuXXXX.flv`) with per-garage TPF texture priority.
     let flv_path = garage_model_path(ws.model_id);
@@ -932,72 +947,184 @@ pub fn sync_room(
                 .id();
 
             for part in loaded_meshes {
-                let mtd_low = part.mtd.to_ascii_lowercase();
+                let mtd_stem = part
+                    .mtd
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&part.mtd)
+                    .trim_end_matches(".mtd")
+                    .to_ascii_lowercase();
                 let diff_low = part
                     .diffuse
                     .as_deref()
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                let is_sky = mtd_low.contains("sky")
-                    || diff_low.contains("sky")
+
+                let is_sky_cloud = mtd_stem.contains("skymulti")
                     || diff_low.contains("cloud")
                     || diff_low.contains("kumo");
-                let is_cutout = diff_low.contains("wire")
+                let is_nolight_add = mtd_stem == "map_nolightnofog_add";
+                let is_sky = !is_sky_cloud
+                    && !is_nolight_add
+                    && (mtd_stem.contains("sky")
+                        || mtd_stem == "map_nolightnofog"
+                        || diff_low.contains("sky"));
+                let is_add = !is_nolight_add && mtd_stem.ends_with("_add");
+                let is_glow = mtd_stem.contains("_grow")
+                    || mtd_stem.contains("_glow")
+                    || mtd_stem.contains("carlight");
+                let is_alpha_mask = mtd_stem.contains("alphamask")
+                    || diff_low.contains("wire")
                     || diff_low.contains("net")
-                    || diff_low.contains("fence")
-                    || diff_low.contains("decal")
-                    || diff_low.contains("sign")
-                    || diff_low.contains("smoke")
-                    || diff_low.contains("light")
-                    || mtd_low.contains("alpha")
-                    || mtd_low.contains("decal");
-                let is_glass = diff_low.contains("glass") || mtd_low.contains("glass");
+                    || diff_low.contains("fence");
+                let is_alpha_blend = !is_alpha_mask
+                    && (mtd_stem == "emblem"
+                        || mtd_stem.ends_with("_alpha")
+                        || mtd_stem.contains("_alpha_")
+                        || diff_low.contains("glass")
+                        || mtd_stem.contains("glass"));
+                let is_specular = mtd_stem.contains("specul") || mtd_stem.contains("env");
 
-                let diffuse = part.diffuse.as_deref().filter(|_| !garage.flat).and_then(|name| {
-                    load_garage_tex(&garage.disc, &mut packs, &primary_tpf, fallback_tpf, name, false)
+                let diffuse = part
+                    .diffuse
+                    .as_deref()
+                    .filter(|_| !garage.flat)
+                    .and_then(|name| {
+                        load_garage_tex(
+                            &garage.disc,
+                            &mut packs,
+                            &primary_tpf,
+                            fallback_tpf,
+                            name,
+                            false,
+                        )
                         .map(|img| images.add(img))
                         .or_else(|| {
                             missing += 1;
                             None
                         })
-                });
-                let normal = part.bump.as_deref().filter(|_| !garage.flat && !is_sky).and_then(|name| {
-                    load_garage_tex(&garage.disc, &mut packs, &primary_tpf, fallback_tpf, name, true)
+                    });
+                let normal = part
+                    .bump
+                    .as_deref()
+                    .filter(|_| !garage.flat && !is_sky && !is_sky_cloud && !is_add && !is_nolight_add)
+                    .and_then(|name| {
+                        load_garage_tex(
+                            &garage.disc,
+                            &mut packs,
+                            &primary_tpf,
+                            fallback_tpf,
+                            name,
+                            true,
+                        )
                         .map(|img| images.add(img))
-                });
+                    });
 
-                let alpha_mode = if is_glass {
-                    AlphaMode::Blend
-                } else if is_cutout {
-                    AlphaMode::Mask(0.45)
-                } else {
-                    AlphaMode::Opaque
-                };
-
-                let mat = StandardMaterial {
-                    base_color: if is_glass {
-                        Color::srgba(0.85, 0.92, 1.0, 0.35)
-                    } else if diffuse.is_some() {
-                        Color::WHITE
+                if is_sky || is_sky_cloud || is_nolight_add {
+                    let tex = diffuse.unwrap_or_else(|| white_srgb.clone());
+                    let (alpha_mode, use_tex_alpha) = if is_nolight_add {
+                        (AlphaMode::Add, true)
+                    } else if is_sky_cloud {
+                        (AlphaMode::Blend, true)
                     } else {
-                        Color::srgb(0.32, 0.34, 0.38)
-                    },
-                    base_color_texture: diffuse,
-                    normal_map_texture: normal,
-                    flip_normal_map_y: false,
-                    perceptual_roughness: if is_glass { 0.15 } else { 0.78 },
-                    metallic: 0.12,
-                    unlit: is_sky,
-                    cull_mode: if is_sky || is_cutout { None } else { Some(bevy::render::render_resource::Face::Back) },
-                    alpha_mode,
-                    ..default()
-                };
-                commands.spawn((
-                    Mesh3d(meshes.add(part.mesh)),
-                    MeshMaterial3d(materials.add(mat)),
-                    Transform::IDENTITY,
-                    ChildOf(root),
-                ));
+                        (AlphaMode::Opaque, false)
+                    };
+                    let sky_mat =
+                        env::make_sky_material(tex, alpha_mode, false, use_tex_alpha, 1.0);
+                    commands.spawn((
+                        Mesh3d(meshes.add(part.mesh)),
+                        MeshMaterial3d(sky_materials.add(sky_mat)),
+                        Transform::IDENTITY,
+                        ChildOf(root),
+                    ));
+                } else if is_add {
+                    // Additive volumetric light shafts (`menu1000` 差し込む光 `Ene_Diffuse_Add`)
+                    // and additive floor/wall light decals (`Map_Diffuse_Add`).
+                    let mat = StandardMaterial {
+                        base_color: Color::linear_rgba(0.65, 0.65, 0.65, 1.0),
+                        base_color_texture: diffuse,
+                        unlit: true,
+                        cull_mode: None,
+                        alpha_mode: AlphaMode::Add,
+                        ..default()
+                    };
+                    commands.spawn((
+                        Mesh3d(meshes.add(part.mesh)),
+                        MeshMaterial3d(materials.add(mat)),
+                        Transform::IDENTITY,
+                        ChildOf(root),
+                    ));
+                } else if let Some(set) = map_light_set {
+                    let is_glass = diff_low.contains("glass") || mtd_stem.contains("glass");
+                    let alpha_mode = if is_alpha_blend {
+                        AlphaMode::Blend
+                    } else if is_alpha_mask {
+                        AlphaMode::Mask(0.45)
+                    } else {
+                        AlphaMode::Opaque
+                    };
+                    let base = StandardMaterial {
+                        base_color: if is_glass {
+                            Color::srgba(0.85, 0.92, 1.0, 0.35)
+                        } else if diffuse.is_some() {
+                            Color::WHITE
+                        } else {
+                            Color::srgb(0.32, 0.34, 0.38)
+                        },
+                        base_color_texture: diffuse,
+                        normal_map_texture: normal,
+                        flip_normal_map_y: false,
+                        perceptual_roughness: if is_glass {
+                            0.18
+                        } else if is_specular {
+                            0.52
+                        } else {
+                            0.82
+                        },
+                        metallic: if is_specular { 0.18 } else { 0.05 },
+                        cull_mode: if is_alpha_mask || is_alpha_blend {
+                            None
+                        } else {
+                            Some(bevy::render::render_resource::Face::Back)
+                        },
+                        alpha_mode,
+                        ..default()
+                    };
+                    let emissive_boost = if is_glow { 1.6 } else { 0.0 };
+                    let env_mat = env::make_env_material(
+                        base,
+                        set,
+                        &white_srgb,
+                        true,
+                        emissive_boost,
+                    );
+                    commands.spawn((
+                        Mesh3d(meshes.add(part.mesh)),
+                        MeshMaterial3d(env_materials.add(env_mat)),
+                        Transform::IDENTITY,
+                        ChildOf(root),
+                    ));
+                } else {
+                    let mat = StandardMaterial {
+                        base_color: if diffuse.is_some() {
+                            Color::WHITE
+                        } else {
+                            Color::srgb(0.32, 0.34, 0.38)
+                        },
+                        base_color_texture: diffuse,
+                        normal_map_texture: normal,
+                        flip_normal_map_y: false,
+                        perceptual_roughness: 0.78,
+                        metallic: 0.12,
+                        ..default()
+                    };
+                    commands.spawn((
+                        Mesh3d(meshes.add(part.mesh)),
+                        MeshMaterial3d(materials.add(mat)),
+                        Transform::IDENTITY,
+                        ChildOf(root),
+                    ));
+                }
                 drawn += 1;
             }
             info!(
@@ -1008,131 +1135,111 @@ pub fn sync_room(
         Err(e) => warn!("garage {flv_path}: {e:#}"),
     }
 
-    // 3. Spawn `param/garagelighting.bin` spotlight + 6 colored point lights.
-    let lighting: &GarageLightingParamSt = find(PARAM_GARAGELIGHTING_BIN, u32::from(ws.model_id))
-        .or_else(|| find(PARAM_GARAGELIGHTING_BIN, 0))
-        .map(|r| &r.data)
-        .expect("PARAM_GARAGELIGHTING_BIN has default row 0");
+    // 3. Spawn the workshop's real 360 `POINT_PARAM_ST` PointLights (`1300`) and SpotLights
+    // (`1310`) from `ingamegaragemenuXXXX_env.msb` (`0x82800170` -> `0x82be8218`).
+    let inv_exposure = 1.0 / Exposure::default().exposure();
+    let mut spawned_dyn = 0usize;
 
-    let spot_pos = Vec3::new(
-        -lighting.spot_light_pos_x,
-        lighting.spot_light_pos_y,
-        lighting.spot_light_pos_z,
-    );
-    let spot_at = Vec3::new(
-        -lighting.spot_light_look_at_x,
-        lighting.spot_light_look_at_y.max(2.5),
-        lighting.spot_light_look_at_z,
-    );
-    if spot_pos.length_squared() > 0.25 {
+    if let Some(ref e) = loaded_env {
+        for sp in &e.spot_lights {
+            if !sp.enabled || sp.far <= 0.1 {
+                continue;
+            }
+            let c = env::conv(sp.diffuse) * sp.scale.max(0.0);
+            let peak = c.max_element();
+            if peak <= 1e-4 {
+                continue;
+            }
+            let pos = Vec3::new(-sp.position[0], sp.position[1], sp.position[2]);
+            let d = sp.direction();
+            let dir = Vec3::new(-d[0], d[1], d[2]).normalize_or(Vec3::NEG_Y);
+            let up = if dir.y.abs() > 0.98 { Vec3::Z } else { Vec3::Y };
+            let outer = (sp.fov_y_deg.max(sp.fov_x_deg) * 0.5)
+                .to_radians()
+                .clamp(0.18, std::f32::consts::FRAC_PI_2 - 0.05);
+            let inner = (sp.fov_y_deg.min(sp.fov_x_deg) * 0.32)
+                .to_radians()
+                .min(outer * 0.85);
+            // Match 360 linear-range attenuation `(1 - d/far)^falloff` at the AC working distance
+            // (~55% of `far`) to Bevy's inverse-square lumens.
+            let atten_ref = 0.25_f32.powf(sp.falloff.clamp(0.25, 4.0));
+            let d_ref = (sp.far * 0.55).max(3.0);
+            let intensity =
+                (peak * atten_ref * 4.0 * PI * PI * d_ref * d_ref * inv_exposure).min(60_000_000.0);
+            commands.spawn((
+                GarageWorld,
+                SpotLight {
+                    color: Color::linear_rgb(c.x / peak, c.y / peak, c.z / peak),
+                    intensity,
+                    range: (sp.far * 1.5).max(16.0),
+                    outer_angle: outer,
+                    inner_angle: inner,
+                    shadow_maps_enabled: true,
+                    ..default()
+                },
+                Transform::from_translation(pos).looking_to(dir, up),
+            ));
+            spawned_dyn += 1;
+        }
+
+        for pt in &e.point_lights {
+            if !pt.enabled || pt.radius <= 0.1 {
+                continue;
+            }
+            let c = env::conv(pt.diffuse) * pt.scale.max(0.0);
+            let peak = c.max_element();
+            if peak <= 1e-4 {
+                continue;
+            }
+            // Match 360 normalized-radius falloff `(1 - d/R)^falloff` without letting Bevy's
+            // `1/d^2` inverse-square law blow out surfaces close to the emitter.
+            let atten_ref = 0.65_f32.powf(pt.falloff.clamp(0.25, 4.0));
+            let d_ref = (pt.radius * 0.22).clamp(1.5, 8.0);
+            let intensity =
+                (peak * atten_ref * 4.0 * PI * PI * d_ref * d_ref * inv_exposure).min(12_000_000.0);
+            let mut pos = Vec3::new(-pt.position[0], pt.position[1], pt.position[2]);
+            // 360's `(1 - d/R)^p` point lights have no `1/d^2` singularity, so artists sometimes
+            // place bay fill lights inside the AC's waist (e.g. `menu0310` at `(0.42, 3.02, 0.95)`).
+            // Nudge emitters that fall inside the AC torso radius out to a safe stand-off along
+            // the same direction so they illuminate the bay smoothly without a close-contact flare.
+            let ac_center = Vec3::new(0.0, 4.2, 0.0);
+            let from_ac = pos - ac_center;
+            if from_ac.length() < 2.6 {
+                let dir = from_ac.normalize_or(Vec3::new(0.0, 0.2, 1.0));
+                pos = ac_center + dir * 2.8;
+            }
+            commands.spawn((
+                GarageWorld,
+                PointLight {
+                    color: Color::linear_rgb(c.x / peak, c.y / peak, c.z / peak),
+                    intensity,
+                    range: (pt.radius * 1.15).max(4.0),
+                    radius: (pt.radius * 0.12).clamp(0.6, 2.5),
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_translation(pos),
+            ));
+            spawned_dyn += 1;
+        }
+    }
+
+    if spawned_dyn == 0 {
+        // Fallback overhead bay key light only when an env MSB defines no `POINT_PARAM_ST` lights.
         commands.spawn((
             GarageWorld,
             SpotLight {
-                color: Color::srgb(1.0, 0.96, 0.90),
-                intensity: 18_000_000.0,
-                range: 85.0,
-                outer_angle: 0.75,
+                color: Color::srgb(0.95, 0.97, 1.0),
+                intensity: 14_000_000.0,
+                range: 50.0,
+                outer_angle: 0.72,
                 inner_angle: 0.35,
                 shadow_maps_enabled: true,
                 ..default()
             },
-            Transform::from_translation(spot_pos).looking_at(spot_at, Vec3::Y),
+            Transform::from_xyz(0.0, 18.0, 2.0).looking_at(Vec3::new(0.0, 4.0, 0.0), Vec3::Y),
         ));
     }
-
-    let point_lights = [
-        (
-            lighting.point_light0_pos_x,
-            lighting.point_light0_pos_y,
-            lighting.point_light0_pos_z,
-            lighting.point_light0_renge,
-            lighting.point_light0_color_r,
-            lighting.point_light0_color_g,
-            lighting.point_light0_color_b,
-            lighting.point_light0_color_a,
-        ),
-        (
-            lighting.point_light1_pos_x,
-            lighting.point_light1_pos_y,
-            lighting.point_light1_pos_z,
-            lighting.point_light1_renge,
-            lighting.point_light1_color_r,
-            lighting.point_light1_color_g,
-            lighting.point_light1_color_b,
-            lighting.point_light1_color_a,
-        ),
-        (
-            lighting.point_light2_pos_x,
-            lighting.point_light2_pos_y,
-            lighting.point_light2_pos_z,
-            lighting.point_light2_renge,
-            lighting.point_light2_color_r,
-            lighting.point_light2_color_g,
-            lighting.point_light2_color_b,
-            lighting.point_light2_color_a,
-        ),
-        (
-            lighting.point_light3_pos_x,
-            lighting.point_light3_pos_y,
-            lighting.point_light3_pos_z,
-            lighting.point_light3_renge,
-            lighting.point_light3_color_r,
-            lighting.point_light3_color_g,
-            lighting.point_light3_color_b,
-            lighting.point_light3_color_a,
-        ),
-        (
-            lighting.point_light4_pos_x,
-            lighting.point_light4_pos_y,
-            lighting.point_light4_pos_z,
-            lighting.point_light4_renge,
-            lighting.point_light4_color_r,
-            lighting.point_light4_color_g,
-            lighting.point_light4_color_b,
-            lighting.point_light4_color_a,
-        ),
-        (
-            lighting.point_light5_pos_x,
-            lighting.point_light5_pos_y,
-            lighting.point_light5_pos_z,
-            lighting.point_light5_renge,
-            lighting.point_light5_color_r,
-            lighting.point_light5_color_g,
-            lighting.point_light5_color_b,
-            lighting.point_light5_color_a,
-        ),
-    ];
-    for (x, y, z, range, r, g, b, a) in point_lights {
-        if range <= 0.1 || a <= 0.005 {
-            continue;
-        }
-        let peak = r.max(g).max(b).max(1e-4);
-        let intensity = (peak * a * range * range * 4800.0).clamp(15_000.0, 24_000_000.0);
-        commands.spawn((
-            GarageWorld,
-            PointLight {
-                color: Color::srgb((r / peak).clamp(0.0, 1.0), (g / peak).clamp(0.0, 1.0), (b / peak).clamp(0.0, 1.0)),
-                intensity,
-                range: range.max(6.0) * 1.4,
-                shadow_maps_enabled: false,
-                ..default()
-            },
-            Transform::from_xyz(-x, y, z),
-        ));
-    }
-
-    // Subtle rim/key fill right near the AC bay so dark armor plates always read crisply.
-    commands.spawn((
-        GarageWorld,
-        PointLight {
-            color: Color::srgb(0.86, 0.92, 1.0),
-            intensity: 480_000.0,
-            range: 24.0,
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::from_xyz(3.5, 5.5, -6.0),
-    ));
 }
 
 fn load_garage_tex(
@@ -1172,7 +1279,10 @@ pub fn update_camera(
     scroll: Res<AccumulatedMouseScroll>,
     garage: Res<crate::Garage>,
     mut state: ResMut<GarageState>,
-    mut cams: Query<(&mut Transform, &mut Projection), With<Camera3d>>,
+    mut cams: Query<
+        (&mut Transform, &mut Projection),
+        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+    >,
 ) {
     if *mode != Mode::Garage {
         state.cam_initialized = false;

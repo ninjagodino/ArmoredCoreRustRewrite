@@ -16,6 +16,10 @@ pub const EVENT_SCENE: u32 = 101;
 pub const EVENT_WIND: u32 = 102;
 pub const EVENT_BGM: u32 = 400;
 
+/// `POINT_PARAM_ST` dynamic light region types (`0x8280021c` -> `0x827fbb30` -> `0x82be8218`).
+pub const POINT_LIGHT: u32 = 1300;
+pub const SPOT_LIGHT: u32 = 1310;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub name: String,
@@ -302,12 +306,80 @@ pub struct Bgm {
     pub param_b: u32,
 }
 
+/// `POINT_PARAM_ST` dynamic point light (`kind == 1300`, `shape == 2` Sphere; 360 `0x82be7be0`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PointLight {
+    pub name: String,
+    /// World position in game axes (`+0x14..+0x20`).
+    pub position: [f32; 3],
+    /// Sphere radius (`shape_data + 0x00`).
+    pub radius: f32,
+    /// Entity `+0x00`: nonzero enables the light.
+    pub enabled: bool,
+    /// Entity `+0x01`: shadow / extra flag (`light + 0x45`).
+    pub flag: u8,
+    /// Entity `+0x04`: intensity/scale factor (`light + 0x34`).
+    pub scale: f32,
+    /// Entity `+0x08..+0x17`: diffuse RGBA (360 converts with `rgb^2 * w` at `0x82d10984` -> `0x82bd2268`).
+    pub diffuse: [f32; 4],
+    /// Entity `+0x18..+0x27`: specular RGBA (`0x82d10994` -> `0x82bd2268`).
+    pub specular: [f32; 4],
+    /// Entity `+0x28`: attenuation falloff parameter (`light + 0x30`, `0x82d10874`).
+    pub falloff: f32,
+}
+
+/// `POINT_PARAM_ST` dynamic spot light (`kind == 1310`, `shape == 3` Cylinder/Cone; 360 `0x82be7d08`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SpotLight {
+    pub name: String,
+    /// World position in game axes (`+0x14..+0x20`).
+    pub position: [f32; 3],
+    /// Euler angles in degrees (`+0x20..+0x2c`; `0x82be7de8`: `yaw = ry + 180`, `pitch = 270 - rx`).
+    pub rotation_deg: [f32; 3],
+    /// Entity `+0x00`: nonzero enables the light.
+    pub enabled: bool,
+    /// Entity `+0x01`: shadow flag (`light + 0x45`, checked in `0x82cbc058`).
+    pub flag: u8,
+    /// Entity `+0x04`: scale factor (`light + 0x34`).
+    pub scale: f32,
+    /// Entity `+0x08..+0x17`: diffuse RGBA.
+    pub diffuse: [f32; 4],
+    /// Entity `+0x18..+0x27`: specular RGBA.
+    pub specular: [f32; 4],
+    /// Entity `+0x28`: attenuation falloff parameter (`light + 0x30`).
+    pub falloff: f32,
+    /// Entity `+0x2c`: near clip distance (`0x82c03610`).
+    pub near: f32,
+    /// Entity `+0x30`: far range (`0x82c03610`).
+    pub far: f32,
+    /// Entity `+0x34`: vertical cone angle in degrees (`0x82be81d0`).
+    pub fov_y_deg: f32,
+    /// Entity `+0x38`: horizontal cone angle in degrees (`0x82be81d0`).
+    pub fov_x_deg: f32,
+}
+
+impl SpotLight {
+    /// Unit forward beam direction in game axes, matching `0x82be7de8..0x82be7e20`
+    /// (`pitch = 270 - rx`, `yaw = ry + 180`, `+Z` rotated by `Ry(yaw) * Rx(pitch)`).
+    pub fn direction(&self) -> [f32; 3] {
+        let pitch = (270.0 - self.rotation_deg[0]).to_radians();
+        let yaw = (self.rotation_deg[1] + 180.0).to_radians();
+        // Forward vector: pitch=+90 points straight down (0, -1, 0).
+        let cp = pitch.cos();
+        [cp * yaw.sin(), -pitch.sin(), cp * yaw.cos()]
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Env {
     pub events: Vec<Event>,
     pub lights: Vec<LightSet>,
     pub scene: Option<Scene>,
     pub bgm: Option<Bgm>,
+    /// Dynamic point lights from `POINT_PARAM_ST` (`kind == 1300`, `0x82be7be0`).
+    pub point_lights: Vec<PointLight>,
+    /// Dynamic spot lights from `POINT_PARAM_ST` (`kind == 1310`, `0x82be7d08`).
+    pub spot_lights: Vec<SpotLight>,
 }
 
 impl Env {
@@ -468,6 +540,8 @@ pub fn read(data: &[u8]) -> Result<Env> {
         lights: Vec::new(),
         scene: None,
         bgm: None,
+        point_lights: Vec::new(),
+        spot_lights: Vec::new(),
     };
     for off in msb::section(data, "EVENT_PARAM_ST")? {
         let name_rel = r.u32(off)? as usize;
@@ -537,6 +611,55 @@ pub fn read(data: &[u8]) -> Result<Env> {
             _ => {}
         }
         env.events.push(e);
+    }
+    if let Ok(points) = msb::section(data, "POINT_PARAM_ST") {
+        for off in points {
+            let kind = r.u32(off + 8)?;
+            if kind != POINT_LIGHT && kind != SPOT_LIGHT {
+                continue;
+            }
+            let shape = r.u32(off + 0x10)?;
+            let name_rel = r.u32(off)? as usize;
+            let name = r.cstr_sjis(off + name_rel)?;
+            let position = [r.f32(off + 0x14)?, r.f32(off + 0x18)?, r.f32(off + 0x1c)?];
+            let rotation_deg = [r.f32(off + 0x20)?, r.f32(off + 0x24)?, r.f32(off + 0x28)?];
+            let s_rel = r.u32(off + 0x38)? as usize;
+            let e_rel = r.u32(off + 0x44)? as usize;
+            if s_rel == 0 || e_rel == 0 {
+                continue;
+            }
+            let s_off = off + s_rel;
+            let e_off = off + e_rel;
+            if kind == POINT_LIGHT && shape == 2 && e_off + 0x2c <= data.len() {
+                env.point_lights.push(PointLight {
+                    name,
+                    position,
+                    radius: r.f32(s_off)?,
+                    enabled: r.u8(e_off)? != 0,
+                    flag: r.u8(e_off + 1)?,
+                    scale: r.f32(e_off + 4)?,
+                    diffuse: vec4(&r, e_off + 8)?,
+                    specular: vec4(&r, e_off + 0x18)?,
+                    falloff: r.f32(e_off + 0x28)?,
+                });
+            } else if kind == SPOT_LIGHT && shape == 3 && e_off + 0x3c <= data.len() {
+                env.spot_lights.push(SpotLight {
+                    name,
+                    position,
+                    rotation_deg,
+                    enabled: r.u8(e_off)? != 0,
+                    flag: r.u8(e_off + 1)?,
+                    scale: r.f32(e_off + 4)?,
+                    diffuse: vec4(&r, e_off + 8)?,
+                    specular: vec4(&r, e_off + 0x18)?,
+                    falloff: r.f32(e_off + 0x28)?,
+                    near: r.f32(e_off + 0x2c)?,
+                    far: r.f32(e_off + 0x30)?,
+                    fov_y_deg: r.f32(e_off + 0x34)?,
+                    fov_x_deg: r.f32(e_off + 0x38)?,
+                });
+            }
+        }
     }
     Ok(env)
 }
@@ -664,5 +787,51 @@ mod tests {
             }
         }
         println!("total maps with active god_ray: {godray_maps}");
+    }
+
+    #[test]
+    fn garage_env_from_disc() {
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
+        // Outdoor Yard (`menu0310`): dark twilight slot-1 world + 10 active point lights + 1 spot.
+        let yard = read(
+            &crate::vfs::open(&disc, "model/map/ingamegarage/ingamegaragemenu0310_env.msb")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(yard.point_lights.iter().filter(|l| l.enabled).count(), 10);
+        assert_eq!(yard.spot_lights.iter().filter(|l| l.enabled).count(), 1);
+        let yard_map = yard.light(1).unwrap();
+        assert!(near(yard_map.sky[3], 0.0) && near(yard_map.ground[3], 0.0));
+        assert!(near(yard_map.fog.density, 0.9) && near(yard_map.fog.range, 400.0));
+        let yard_spot = &yard.spot_lights[0];
+        let yd = yard_spot.direction();
+        // Positioned at (+11.02, 12.79, 0.31), pointing down and toward the AC bay (-X, -Y).
+        assert!(yd[0] < -0.3 && yd[1] < -0.85, "unexpected yard spot dir: {yd:?}");
+        assert!(near(yard_spot.far, 22.0) && near(yard_spot.fov_y_deg, 70.0));
+        let yard_tm = yard.scene.as_ref().unwrap().tonemap;
+        assert_eq!(yard_tm.mode, 1);
+        assert!(near(yard_tm.lum, 1.0) && near(yard_tm.key, 0.6) && near(yard_tm.mul, 1.1));
+
+        // Warehouse (`menu0300`): 7 active point lights + 1 overhead spot pointing straight down.
+        let wh = read(
+            &crate::vfs::open(&disc, "model/map/ingamegarage/ingamegaragemenu0300_env.msb")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wh.point_lights.iter().filter(|l| l.enabled).count(), 7);
+        assert_eq!(wh.spot_lights.iter().filter(|l| l.enabled).count(), 1);
+        let wd = wh.spot_lights[0].direction();
+        assert!(wd[1] < -0.99, "expected straight-down warehouse spot dir: {wd:?}");
+
+        // Underpass (`menu1000`): 9 active point lights, 0 spot lights.
+        let up = read(
+            &crate::vfs::open(&disc, "model/map/ingamegarage/ingamegaragemenu1000_env.msb")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(up.point_lights.iter().filter(|l| l.enabled).count(), 9);
+        assert_eq!(up.spot_lights.iter().filter(|l| l.enabled).count(), 0);
     }
 }

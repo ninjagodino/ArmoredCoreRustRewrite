@@ -78,15 +78,19 @@ in order:
       now blend naturally into rocky grey-brown/green slopes instead of flat orange-brown.
     - **`Water.spx` (`Normal/Flver_Water.vpo` / `.fpo`, `material/m4000_mtd.bnd` `Water.mtd`)**:
       `acvd-game::env` detects `Water` / `WaterRiver` / `WaterWave` MTDs (`m9100`/`m9101`, light
-      set 3) and switches them to `WaterMaterial` (`env_water.wgsl`), animating 3 world-XZ scrolled
-      `water_n` normal layers (`g_TileScale` `0.0019 / 0.00268 / 0.0462`, `g_TexScroll`,
-      `g_BumpMapSmoose = 2.0`), Fresnel reflection (`g_FresnelPow = 70`, `g_FresnelBias = 0.5`,
-      `g_FresnelScale = 0.9`) over `g_WaterColor (0.15, 0.10, 0.05)`, directional specular lobes
-      from `colors_b` (`c11`/`c12`, `g_SpecularPower = 10`), distance/height fog, and tonemap.
+      set 3), moves them to `WATER_RENDER_LAYER`, spawns a half-res mirrored `WaterReflectionCamera`
+      (`y_refl = 2 * water_y - y_cam` with oblique clip plane at `y = water_y - 0.15` via
+      `PerspectiveProjection::near_clip_plane`), and renders `WaterMaterial` (`env_water.wgsl`):
+      3 world-XZ scrolled `water_n` normal layers (`g_TileScale` `0.0019 / 0.00268 / 0.0462`,
+      `g_TexScroll`, `g_BumpMapSmoose = 2.0`), planar reflection sampled at mirrored screen UV
+      distorted by `n.xz * g_ReflectBand (0.2)` and tinted by `g_FresnelColor (0.4784314)` (fixing
+      the old flat light-gray look caused by `ID03`'s white `(1,1,1)` hemisphere ambient), Fresnel
+      blend (`g_FresnelPow = 70`, `g_FresnelBias = 0.5`, `g_FresnelScale = 0.9`) over squared
+      `g_WaterColor (0.15, 0.10, 0.05)`, directional specular lobes from `colors_b` (`c11`/`c12`,
+      `g_SpecularPower = 10`), distance/height fog, and tonemap.
   - Open, in order: (1) sky leftovers: which pixel shader the sky pass binds (NoLightNoFog vs
     Flver_Sky.fpo with fog; the colour already matches the 360 shot). (2) c0 / c16 / c19 / c136
-    values (taken as 1, no SSAO). (3) planar water reflection render target (currently reflects
-    hemisphere sky/horizon gradient).
+    values (taken as 1, no SSAO).
 - **AC vs world collision leftovers** (walls are in, see Done "AC wall collision"):
   - The upper sphere is built with radius = height = tuning `+0x230` (`0x82863b60`) but runs at
     radius 5.5 / height 6.0; what shrinks the radius is not found. A third sphere (`+0x10`,
@@ -279,6 +283,12 @@ in order:
   `LogAI` state names; no sheet yet).
 
 ## Done
+
+- **3D Garage Lighting & Fullscreen `m_ToneMapFilter` Parity** (`acvd-formats::env`, `acvd-game::blur`, `zoom_blur.wgsl`, `env`, `env_lit.wgsl`, `env_sky.wgsl`, `env_water.wgsl`, `garage`, `control`, `sheets/map_env.csv`, `sheets/systems.csv`):
+  - **Reverse-Engineered 360 Garage Dynamic Lighting (`0x82800170` → `0x827fbb30` → `0x82be7be0` / `0x82be7d08`)**: proved `param/garagelighting.bin` (param ID `0x4a`) has **zero callers** in `ACV2.pe`; retail workshops instead load dynamic deferred `LightAcc` lights directly from `POINT_PARAM_ST` inside `model/map/ingamegarage/ingamegaragemenuXXXX_env.msb` (`kind == 1300` Sphere PointLight via `0x82be7be0` + `0x82d107f0` → `0x82bd2268` `rgb^2 * w`, `kind == 1310` Cone SpotLight via `0x82be7d08` with `yaw = ry + 180°`, `pitch = 270° - rx` + `0x82c03610` / `0x82c032d8` / `0x82cbc058`). Verified counts on disc: `menu0310` Outdoor Yard has 10 active point lights + 1 overhead spot (`far=22`, `fov=70°×110°`), `menu0300` Warehouse has 7 point + 1 straight-down spot (`far=29`), `menu1000` Underpass has 9 point + 0 spot. Parsed `env::PointLight` and `env::SpotLight` in `crates/acvd-formats/src/env.rs` (covered by `env::tests::garage_env_from_disc`).
+  - **Garage Light Set `1` (`SET_MAP`) & MTD Classification (`0x825d33b0` → `0x825d3108(this, 1)`)**: routed `menuXXXX.flv` world submeshes in `garage.rs` through `EnvMaterial` (`env_lit.wgsl`) with light/fog set `1` (`SET_MAP`, e.g. `menu0310`'s zero-ambient twilight `L0 [1,1.4,1.4,0.4]` + dark teal fog `[0.1,0.2,0.2]`) plus Bevy clustered `PointLight` + shadow-casting `SpotLight` evaluation (`env.flags.z = 1.0`, matching 360 deferred `LightAcc`), `SkyMaterial` (`env_sky.wgsl`) for `Map_Sky` / `Map_SkyMulti` / `Map_NoLightNoFog*`, `AlphaMode::Add` for `*_Add` light shafts & decals (`menu1000` `差し込む光`), `AlphaMode::Blend` for `emblem` & `*_Alpha` (removing dark bounding squares around floor/wall emblems), and emissive boost (`env.flags.w`) for `_Grow` / `_Glow` / `Carlight_Phong` fixtures. Replaced the unused `PARAM_GARAGELIGHTING_BIN` light rig with calibrated `POINT_PARAM_ST` lights (with sphere `radius` + AC-core stand-off to match 360's non-singular `(1 - d/R)^falloff`).
+  - **Unified Fullscreen `m_ToneMapFilter` (`0x82c18628`, `blur.rs` + `zoom_blur.wgsl`)**: moved `apply_tonemap` (`c31 = 0.5` + Exp/Divide/Reinhard) out of per-shader `env_lit.wgsl` / `env_sky.wgsl` / `env_water.wgsl` into the single `ZoomBlur` fullscreen pass ordered deterministically `.after(bloom).before(tonemapping)`, driven by `ActiveToneMap` (never clobbered by `control.rs`'s `set_speed_blur` / `clear_speed_blur`). All 3D passes (Sortie terrain/sky/water/AC, Garage world/sky/lights/AC, VFX) now share one linear HDR buffer (`BloomPrefilter.threshold = b.threshold * 2.0`, planar water reflection sampled directly in linear HDR without `invert_tonemap`, UI/HUD rendered cleanly after post-process untouched).
+  - Verified with `acvd-sheets all` (0 errors), `acvd-index audit` (0 mismatches, 0 PS3 citations), `cargo test --workspace`, and visual `--shot` review across Workshop 1 `menu0310` Outdoor Yard (`garage_yard_v2.png` + `garage_yard_ui_after.png`), Workshop 5 `menu1000` Underpass (`garage_underpass_v2.png`), Workshop 2 `menu0300` Warehouse (`garage_ws2_v2.png`), `m4000` Sortie (`sortie_m4000_after.png`), and `m3130` Sortie (`sortie_m3130_after.png`).
 
 - **3D ACVD Garage (`--garage`, Live Assemble / Paint / 13 Workshops / AC TEST Sortie Loop)** (`acvd-game::garage`, `main`, `env`, `sound`, `hud`, `demo.ps1`, `sheets/systems.csv`):
   - **13 Real 3D Retail Workshops (`PARAM_CUSTOMGARAGE_BIN` `id 1..=13`, `PARAM_GARAGELIGHTING_BIN`, `model/menu/menu{model_id:04}/menu{model_id:04}_m.bnd.dcx|menu{model_id:04}.flv`, `model/map/ingamegarage/ingamegaragemenu{id:04}_env.msb`)**: loads any of the 13 retail 3D garage environments (default Workshop 5 `menu1000` Underpass, plus Outdoor Yard `menu0310`, Warehouse `menu0300`, Carrier Deck `menu0330`, Vertical Shaft `menu0340`, Desert Base `menu1020`, Sci-Fi Facility `menu1010`, Modeler's Room `menu1030`, Corporate Bay `menu1040`, WWII Hangar `menu1050`, 8-Bit Retro `menu1060`, AC Museum I `menu1070`, AC Museum II `menu1080`) with per-garage TPF lookup (`menu{id:04}.tpf.dcx` → `ingamegarage.tpf.dcx` → global `Packs`, 0 missing textures across `menu1000` 187 submeshes, `menu0300` 34 submeshes, `menu1010` 57 submeshes), applies each workshop's `ingamegaragemenu*_env.msb` via `env::apply_env_file`, and spawns `PARAM_GARAGELIGHTING_BIN` overhead `SpotLight` + up to 6 colored `PointLight`s.
