@@ -1040,14 +1040,17 @@ pub fn spawn_assemble_ui(
             commands.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: px(-15.0 * scale),
-                    top: px(-2.0 * scale),
-                    width: px(112.0 * scale),
-                    height: px(56.0 * scale),
+                    left: px(0.0),
+                    top: px(0.0),
+                    width: percent(100.0),
+                    height: percent(100.0),
                     ..default()
                 },
                 ImageNode {
                     image: img,
+                    // Retail `assemble.drb.dcx` `@PartsCategoryItem/@CategoryPic` uses `uv=[0,0,84,54]`
+                    // inside each 128×64 power-of-two thumbnail TPF (remaining pixels are PoT padding).
+                    rect: Some(Rect::new(0.0, 0.0, 84.0, 54.0)),
                     color: if is_cur {
                         Color::srgb(0.80, 1.0, 0.92)
                     } else {
@@ -1124,14 +1127,17 @@ pub fn spawn_assemble_ui(
             commands.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: px(-15.0 * scale),
-                    top: px(-2.0 * scale),
-                    width: px(112.0 * scale),
-                    height: px(56.0 * scale),
+                    left: px(0.0),
+                    top: px(0.0),
+                    width: percent(100.0),
+                    height: percent(100.0),
                     ..default()
                 },
                 ImageNode {
                     image: img,
+                    // Retail `assemble.drb.dcx` `@PartsItem/@PARTS_PIC` uses `uv=[0,0,84,54]`
+                    // inside each 128×64 power-of-two thumbnail TPF.
+                    rect: Some(Rect::new(0.0, 0.0, 84.0, 54.0)),
                     color: if is_sel {
                         Color::srgb(0.88, 1.0, 0.94)
                     } else {
@@ -1903,6 +1909,20 @@ mod tests {
     fn part_thumbnails_subcategories_and_descriptions_resolve_from_disc() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
         let disc = Disc::open(&vfs::default_disc(&root)).expect("open 360 disc");
+        let drb = acvd_formats::drb::read(
+            &disc.asset(ASSEMBLE_DRB).expect("assemble.drb"),
+        )
+        .expect("parse assemble.drb");
+        for dlg in &drb.dialogs {
+            if dlg.name == "@PartsItem" || dlg.name == "@PartsCategoryItem" {
+                assert_eq!(dlg.size, [84, 54]);
+                for obj in &dlg.objects {
+                    if let acvd_formats::drb::Shape::Sprite { uv, .. } = obj.shape {
+                        assert_eq!(uv, [0, 0, 84, 54], "thumbnail UV in {}", dlg.name);
+                    }
+                }
+            }
+        }
         let sub_fmg = acvd_formats::fmg::read(
             &disc
                 .asset("lang/en/text/partssubcategory_en.fmg")
