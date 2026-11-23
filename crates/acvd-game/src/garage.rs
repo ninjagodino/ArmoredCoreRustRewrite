@@ -130,6 +130,8 @@ pub enum UiAction {
     SortieTargetStep(i8),
     LaunchSortie,
     AssembleSelectSlot(AssembleSlot),
+    AssembleCatStep(i8),
+    AssemblePartStep(i8),
     AssembleSubcat(Option<u8>),
     AssembleDmgFilter(Option<u8>),
     AssembleToggleDetail,
@@ -1843,6 +1845,54 @@ pub fn handle_input(
                     &mut audio_assets,
                     new_slot,
                 );
+                return;
+            }
+            UiAction::AssembleCatStep(delta) => {
+                if let GarageScreen::AssembleParts { slot } = state.screen {
+                    let cur = AssembleSlot::ALL
+                        .iter()
+                        .position(|&s| s == slot)
+                        .unwrap_or(0);
+                    let len = AssembleSlot::ALL.len();
+                    let next = (cur + len + (delta as isize).rem_euclid(len as isize) as usize) % len;
+                    let new_slot = AssembleSlot::ALL[next];
+                    switch_assemble_slot(
+                        &mut commands,
+                        &mut state,
+                        &mut garage,
+                        &mut cues,
+                        &mut audio_assets,
+                        new_slot,
+                    );
+                }
+                return;
+            }
+            UiAction::AssemblePartStep(delta) => {
+                if let GarageScreen::AssembleParts { slot } = state.screen {
+                    let count = crate::garage_assemble::filtered_parts_for_slot(
+                        slot,
+                        state.assemble_subcat,
+                        state.assemble_dmg_filter,
+                    )
+                    .len();
+                    if count > 0 {
+                        let next = if delta < 0 {
+                            if state.cursor == 0 { count - 1 } else { state.cursor - 1 }
+                        } else {
+                            (state.cursor + 1) % count
+                        };
+                        state.cursor = next;
+                        clamp_scroll_win(
+                            &mut state.scroll,
+                            next,
+                            count,
+                            crate::garage_assemble::ASSEMBLE_THUMB_WINDOW,
+                        );
+                        apply_cursor_preview(&mut state, &mut garage);
+                        sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+                        state.ui_dirty = true;
+                    }
+                }
                 return;
             }
             UiAction::AssembleSubcat(sub) => {

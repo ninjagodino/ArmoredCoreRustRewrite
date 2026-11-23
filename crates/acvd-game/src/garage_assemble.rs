@@ -1040,10 +1040,10 @@ pub fn spawn_assemble_ui(
             commands.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: px(1.0),
-                    top: px(1.0),
-                    width: px(80.0 * scale),
-                    height: px(50.0 * scale),
+                    left: px(-15.0 * scale),
+                    top: px(-2.0 * scale),
+                    width: px(112.0 * scale),
+                    height: px(56.0 * scale),
                     ..default()
                 },
                 ImageNode {
@@ -1124,10 +1124,10 @@ pub fn spawn_assemble_ui(
             commands.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: px(1.0),
-                    top: px(1.0),
-                    width: px(80.0 * scale),
-                    height: px(50.0 * scale),
+                    left: px(-15.0 * scale),
+                    top: px(-2.0 * scale),
+                    width: px(112.0 * scale),
+                    height: px(56.0 * scale),
                     ..default()
                 },
                 ImageNode {
@@ -1194,6 +1194,22 @@ pub fn spawn_assemble_ui(
                     ));
                 });
         }
+    }
+
+    // 7b. Clickable mouse hitboxes over the 4 DRB navigation arrows (`<`, `>`, `^`, `v`).
+    for (x0, y0, x1, y1, action) in [
+        (58.0, 148.0, 86.0, 202.0, UiAction::AssembleCatStep(-1)),
+        (686.0, 148.0, 714.0, 202.0, UiAction::AssembleCatStep(1)),
+        (86.0, 202.0, 170.0, 220.0, UiAction::AssemblePartStep(-1)),
+        (86.0, 562.0, 170.0, 584.0, UiAction::AssemblePartStep(1)),
+    ] {
+        commands.spawn((
+            Button,
+            action,
+            px_rect(x0, y0, x1, y1),
+            BackgroundColor(Color::NONE),
+            ChildOf(screen_root),
+        ));
     }
 
     // 8. Footer Controls Strip (`y = 668..706`).
