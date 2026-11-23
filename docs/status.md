@@ -282,6 +282,24 @@ in order:
 
 ## Done
 
+- **3D-Projected Lock-Sight HUD & Rotating Rings (`hud::track_lock_sight`, `control::Pilot`, `sheets/tuning_fields.csv`)**:
+  - Traced 360 HUD camera movement (`0x829d3a08` / `0x829d3a98` → `0x829d2120`, `0x829d1df0` mode 3, `0x829d2c08` / `0x829d2c48`) and verified live in Xenia (`private/xenia/hud_move.jsonl` + `private/xenia/shots/hud_{still,turn_right,pitch_up}.png`):
+    - The Lock-Sight billboard is placed in 3D at `sight_origin + aim_dir * 700 m` (`StaticDrawParam` 51 `locksight_draw_offset_m` `+0xc8` = 700.0 m, 53 `ow_locksight_draw_offset_m` `+0xd0` = 700.0 m; `0x8287cdd0` → `0x8260f878`) and projected through the active camera so the reticle naturally lags/shifts off-center as the follow camera swings behind the AC, plus tilts with follow-camera roll (`FollowCam::roll` `0x82bfa708`).
+    - `0x829d1df0` mode 3 computes `rot = (pitch + yaw)` in radians (`[r5+0x20]` + `[r5+0x24]`), rotating `rocksight_out_rotation` (`ACV_FE_LockSightRotation`, `0x829d24ec`) by `+rot` and `rocksight_out_rotationInv` (`ACV_FE_LockSightRotationInv`, `0x829d2740`) by `-rot` around the projected sight center (scaled to match the 360 `0x829d2c08` / `0x829d2c48` matrix ratio `(550/402)*(0.6654/1.1336)` so the ring and pointer triangles sit flush on the `163` px `Gauge_AP` / `Gauge_EN` outer edge).
+  - Wired `hud::track_lock_sight` (plus `SHOT hud_sight` telemetry) for Combat, Scan, and OW lock-sight roots, added `StaticDrawParam` rows 51, 53, 309 to `sheets/tuning_fields.csv`, and verified with `cargo test -p acvd-game` (154/154 passed), `acvd-index audit` (1552 cited addresses / 0 mismatches), and `--shot` probes (`private/shots/hud_track_{still,turn_right,pitch_up}.png`).
+
+- **AC TEST / general frame performance** (`Cargo.toml` `[profile.dev]`, `acvd-game` `--shot` PERF dump):
+  - Measured with `--shot` frame sampling on m4000 AC TEST: stock debug was **~17 fps**
+    (`avg 58 ms`, 550 map parts / ~3100 `Mesh3d`, 43450 HMD tris, water reflection cam on);
+    flat `--plane` was fine at **~84 fps**. Enemies (`actest2`, 12 targets) added almost nothing.
+    `--release` was already **~116 fps** on the same scene — so the content is GPU-cheap here;
+    the cost was Bevy **debug-assertions** (and unoptimized root crate) over thousands of mesh
+    entities × two cameras. Setting `[profile.dev] opt-level = 1`, `debug-assertions = false`,
+    `overflow-checks = false` brings debug AC TEST to **~122 fps** (matches release). Longer-term
+    map work still open if weaker GPUs hurt: distance cull past LOD metric 15 was intentionally
+    disabled (`map::lod`), and water is a second full scene pass at 640×360.
+  - `--shot` now prints a one-line `PERF frames=… avg=…ms (…) fps … mesh3d=… map_parts=…` dump.
+
 - **Garage Options Menu (Fullscreen + Master Volume)** (`acvd-game::settings`, `garage`, `sound`, `main`):
   - Added `OPTIONS` to the garage top menu (`GarageScreen::Options`, `--garage-screen options`) with borderless fullscreen toggle and 5% master-volume steps (Left/Right / Enter / click). Settings persist in local `settings.json` (gitignored); volume drives Bevy `GlobalVolume` and re-scales already-playing sinks (including BGM, respecting F9 mute). Verified by `cargo test -p acvd-game -- settings garage` and `--shot` (`private/shots/garage_options.png`).
 

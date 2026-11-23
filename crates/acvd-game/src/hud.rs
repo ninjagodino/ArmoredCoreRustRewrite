@@ -29,11 +29,13 @@
 
 use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
 use acvd_formats::vfs::Disc;
+use acvd_render::app::ShotMark;
 use acvd_render::menu::{self, Layout, MenuGauge, MenuObject, MenuRoot, MenuSprite, MenuText};
 use bevy::prelude::*;
-use bevy::ui::px;
+use bevy::ui::{px, UiTransform};
 use bevy::window::PrimaryWindow;
 
+use crate::control::Pilot;
 use crate::damage::PlayerHealth;
 use crate::fcs::Fcs;
 use crate::scan::{ReconUnit, ScanState, MAX_RECON_SLOTS};
@@ -248,6 +250,45 @@ pub struct MissileLockDialog(usize);
 #[derive(Component)]
 pub struct CombatSightRoot;
 
+/// How a Lock-Sight root dialog tracks the 3D-projected aim point (`0x829d2120` via `0x829d3a08` /
+/// `0x829d3a98`, `StaticDrawParam` 51/53 = 700 m) and aim/camera rotation (`0x829d1df0` mode 3 +
+/// `0x829d24ec` / `0x829d2740`).
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct LockSightTrack {
+    /// Center of the dialog in logical pixels relative to its root `Node` top-left (`Vec2::ZERO`
+    /// for dialogs authored around `(0, 0)` like `ACV_FE_LockSightCenter`, `SCREEN * 0.5 * scale`
+    /// for `ACV_LockSight_base`, `Vec2::splat(201.0 * rot_scale)` for `rocksight_out_rotation*`).
+    pub center_offset: Vec2,
+    /// `0` = camera roll only, `+1` = `rocksight_out_rotation`, `-1` = `rocksight_out_rotationInv`.
+    pub spin_sign: i8,
+    /// True for Overed Weapon lock-sight dialogs (`StaticDrawParam` 53, `+0xd0` = 700 m).
+    pub ow: bool,
+}
+
+/// Relative scale of the 360 main lock-sight matrix (`0x829d2c08`, `sx = 0.6654`) to the center
+/// matrix (`0x829d2c48`, `sx = 1.1336`) times the `rocksight_out` `[-275..275]` / `402` sub-dialog
+/// ratio (`(550 / 402) * (0.6654 / 1.1336) ≈ 0.803`), placing `rocksight_out_rotation*` right on
+/// the `163` px `Gauge_AP` / `Gauge_EN` outer ring (Xenia `private/xenia/hud_move.jsonl`).
+const ROT_RING_SCALE: f32 = (550.0 / 402.0) * (0.6654177 / 1.1335863);
+
+/// 3D world-space position of the Lock Sight billboard (`0x829d2120`: `origin + aim_dir * offset_dist`).
+pub fn sight_world_pos(origin: Vec3, aim_dir: Vec3, offset_dist: f32) -> Vec3 {
+    origin + aim_dir.normalize_or(Vec3::NEG_Z) * offset_dist
+}
+
+/// Lock-Sight rotating ring angle in Bevy Y-down UI radians (`0x829d1df0` mode 3:
+/// `(pitch + yaw)` in 360 where right-turn is +yaw; in Bevy right-turn is -yaw, so `-(yaw + pitch)`
+/// rotates clockwise when turning right and counter-clockwise when pitching up, matching Xenia
+/// shots `private/xenia/shots/hud_turn_right.png` / `hud_pitch_up.png`).
+pub fn sight_ring_rotation(yaw_rad: f32, pitch_rad: f32) -> f32 {
+    -(yaw_rad + pitch_rad)
+}
+
+/// Top-left logical pixel origin for a `LockSightTrack` root given the projected screen point.
+pub fn sight_root_origin(sight_vp: Vec2, center_offset: Vec2) -> Vec2 {
+    sight_vp - center_offset
+}
+
 /// Marker on the Scan Mode `ACV_ScanModeLockSight` root (`0x825a26a0`, 1280×720 centered).
 #[derive(Component)]
 pub struct ScanSightRoot;
@@ -363,18 +404,62 @@ pub fn layout(
         } else {
             corner
         };
+        let center_offset = if centered {
+            Vec2::ZERO
+        } else {
+            SCREEN * scale * 0.5
+        };
         let root = menu::spawn(&mut commands, &hud.layout, index, origin, scale);
+        commands.entity(root).insert((
+            LockSightTrack {
+                center_offset,
+                spin_sign: 0,
+                ow: false,
+            },
+            UiTransform::IDENTITY,
+        ));
         if name == "ACV_LockSight_base" {
             commands.entity(root).insert(CombatSightRoot);
+        }
+    }
+    // Rotating outer lock-sight ring & triangles (`0x829d4e40` -> `0x829d2120`, driven by
+    // `0x829d1df0` mode 3: `rocksight_out_rotation` rotates by `+rot`, `_Inv` by `-rot`).
+    // Spawned directly from the 402x402 sub-dialogs so their `(0.5, 0.5)` pivot is dead-center.
+    let rot_scale = scale * ROT_RING_SCALE;
+    for (name, spin_sign) in [
+        ("rocksight_out_rotation", 1i8),
+        ("rocksight_out_rotationInv", -1i8),
+    ] {
+        if let Some(dlg) = dialog(name) {
+            let sz = hud.layout.drb.dialogs[dlg].size;
+            let center_offset = Vec2::new(sz[0] as f32, sz[1] as f32) * 0.5 * rot_scale;
+            let origin = corner + SCREEN * scale * 0.5 - center_offset;
+            let root = menu::spawn(&mut commands, &hud.layout, dlg, origin, rot_scale);
+            commands.entity(root).insert((
+                CombatSightRoot,
+                LockSightTrack {
+                    center_offset,
+                    spin_sign,
+                    ow: false,
+                },
+                UiTransform::IDENTITY,
+            ));
         }
     }
     // Scan Mode lock sight (`ACV_ScanModeLockSight`, 1280x720 centered around screen middle).
     if let Some(dlg) = dialog("ACV_ScanModeLockSight") {
         let origin = corner + SCREEN * scale / 2.0;
         let root = menu::spawn(&mut commands, &hud.layout, dlg, origin, scale);
-        commands
-            .entity(root)
-            .insert((ScanSightRoot, Visibility::Hidden));
+        commands.entity(root).insert((
+            ScanSightRoot,
+            LockSightTrack {
+                center_offset: Vec2::ZERO,
+                spin_sign: 0,
+                ow: false,
+            },
+            UiTransform::IDENTITY,
+            Visibility::Hidden,
+        ));
     }
     // Scan Mode target bracket, scan progress gauge, and scanned enemy AP/KE/CE/TE info card.
     if let Some(dlg) = dialog("ACV_Scan_Cur_Center") {
@@ -467,9 +552,16 @@ pub fn layout(
     for name in ["ACV_OWLockSight", "ACV_OWLockSightCenter"] {
         if let Some(dlg) = dialog(name) {
             let root = menu::spawn(&mut commands, &hud.layout, dlg, size / 2.0, scale);
-            commands
-                .entity(root)
-                .insert((OwSightHud, Visibility::Hidden));
+            commands.entity(root).insert((
+                OwSightHud,
+                LockSightTrack {
+                    center_offset: Vec2::ZERO,
+                    spin_sign: 0,
+                    ow: true,
+                },
+                UiTransform::IDENTITY,
+                Visibility::Hidden,
+            ));
         }
     }
     if let Some(dlg) = dialog("ACV_OW_ErrorLog") {
@@ -1809,6 +1901,79 @@ pub fn lock_cursor(
     }
 }
 
+/// Projects the Lock-Sight billboard 700 m along the AC's aim direction (`0x829d2120` via
+/// `0x829d3a08` / `0x829d3a98`, `StaticDrawParam` 51/53) and rotates `ACV_FE_LockSightRotation` /
+/// `ACV_FE_LockSightRotationInv` by `±(yaw + pitch)` (`0x829d1df0` mode 3) plus follow-camera roll.
+#[allow(clippy::type_complexity)]
+pub fn track_lock_sight(
+    hud: Option<Res<Sortie>>,
+    mark: Option<Res<ShotMark>>,
+    cameras: Query<
+        (&Camera, &Transform),
+        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+    >,
+    pilots: Query<(&Pilot, &Transform), Without<Camera3d>>,
+    mut roots: Query<(&LockSightTrack, &mut Node, &mut UiTransform)>,
+    mut shot_logged: Local<bool>,
+) {
+    let Some(hud) = hud else { return };
+    let (Ok((cam, cam_tf)), Ok((pilot, ac_tf))) = (cameras.single(), pilots.single()) else {
+        return;
+    };
+    let cam_gt = GlobalTransform::from(*cam_tf);
+    let origin = pilot.sight_origin(ac_tf.translation);
+    let aim_dir = pilot.aim_direction();
+    let (yaw, pitch) = pilot.aim_angles();
+    let roll = pilot.camera_roll();
+    let ring_rot = sight_ring_rotation(yaw, pitch);
+    let normal_dist = tuning(51).max(1.0);
+    let ow_dist = tuning(53).max(1.0);
+    let normal_vp = cam
+        .world_to_viewport(&cam_gt, sight_world_pos(origin, aim_dir, normal_dist))
+        .ok();
+    let ow_vp = if (ow_dist - normal_dist).abs() < 1e-3 {
+        normal_vp
+    } else {
+        cam.world_to_viewport(&cam_gt, sight_world_pos(origin, aim_dir, ow_dist))
+            .ok()
+    };
+
+    for (track, mut node, mut ui_tf) in &mut roots {
+        let Some(vp) = (if track.ow { ow_vp } else { normal_vp }) else {
+            continue;
+        };
+        let pos = sight_root_origin(vp, track.center_offset);
+        node.left = px(pos.x);
+        node.top = px(pos.y);
+        if track.center_offset == Vec2::ZERO {
+            // Centered DRB dialogs (e.g. `ACV_FE_LockSightCenter`) have `size = [315, 315]` while
+            // their child sprites are authored around `(0, 0)`. Zeroing the root box puts Bevy's
+            // `(0.5, 0.5)` `UiTransform` pivot right on `(0, 0)` = `vp`.
+            node.width = px(0.0);
+            node.height = px(0.0);
+        }
+        ui_tf.rotation = Rot2::radians(roll + f32::from(track.spin_sign) * ring_rot);
+    }
+
+    if mark.is_some_and(|m| m.path.is_some()) && !*shot_logged {
+        *shot_logged = true;
+        if let Some(vp) = normal_vp {
+            let off = vp - hud.size * 0.5;
+            eprintln!(
+                "SHOT hud_sight vp=({:.1},{:.1}) offset=({:+.1},{:+.1}) yaw_deg={:.1} pitch_deg={:.1} roll_deg={:.1} ring_deg={:.1}",
+                vp.x,
+                vp.y,
+                off.x,
+                off.y,
+                yaw.to_degrees(),
+                pitch.to_degrees(),
+                roll.to_degrees(),
+                ring_rot.to_degrees(),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1841,10 +2006,47 @@ mod tests {
 
     #[test]
     fn tuning_rows() {
+        assert!((tuning(51) - 700.0).abs() < 1e-4 && (tuning(53) - 700.0).abs() < 1e-4);
+        assert!((tuning(309) - 0.53).abs() < 1e-4);
         assert!((tuning(298) - 0.3).abs() < 1e-6 && (tuning(322) - 0.3).abs() < 1e-6);
         assert!((tuning(300) - 5.0).abs() < 1e-6 && (tuning(301) - 0.02).abs() < 1e-6);
         assert_eq!(low_color().to_srgba().to_u8_array(), [255, 0, 0, 255]);
         assert_eq!(ap_damage_color().to_srgba().to_u8_array(), [255, 80, 0, 255]);
+    }
+
+    #[test]
+    fn lock_sight_projection_and_ring_rotation() {
+        let origin = Vec3::new(10.0, 5.0, -20.0);
+        let aim = Vec3::new(0.0, 0.0, -2.0);
+        let world = sight_world_pos(origin, aim, 700.0);
+        assert!((world - Vec3::new(10.0, 5.0, -720.0)).length() < 1e-4);
+
+        // Right turn in Bevy decreases yaw -> positive (clockwise) UI rotation.
+        assert!(sight_ring_rotation(-0.5, 0.0) > 0.0);
+        // Pitching up increases pitch -> negative (counter-clockwise) UI rotation.
+        assert!(sight_ring_rotation(0.0, 0.5) < 0.0);
+
+        let vp = Vec2::new(700.0, 380.0);
+        assert_eq!(sight_root_origin(vp, Vec2::ZERO), vp);
+        assert_eq!(
+            sight_root_origin(vp, SCREEN * 0.5),
+            Vec2::new(60.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn locksight_rotation_subdialogs_exist() {
+        let iso = acvd_formats::vfs::default_disc(std::path::Path::new("../.."));
+        if !iso.exists() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let d = acvd_formats::drb::read(&disc.asset(LAYOUT).unwrap()).unwrap();
+        assert_eq!(d.dialog("rocksight_out_rotation").unwrap().size, [402, 402]);
+        assert_eq!(
+            d.dialog("rocksight_out_rotationInv").unwrap().size,
+            [402, 402]
+        );
     }
 
     #[test]

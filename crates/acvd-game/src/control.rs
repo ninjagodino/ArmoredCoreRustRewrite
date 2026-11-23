@@ -1,8 +1,8 @@
 //! Piloting the shown AC, with the pad layout of the game's manual (`lang/en/text/menu/manual.fmg`):
 //! WASD / left stick move relative to its facing, Q/E / right stick X turn, Up/Down / right stick Y
-//! pitch the follow camera, Shift / L1 toggles boost mode, Space / South (×) jumps and turns boost
+//! pitch the follow camera, V / L1 toggles boost mode, Space / South (×) jumps and turns boost
 //! mode on, Ctrl / L3 glides while boosting on the ground (the air clips take over once it
-//! leaves the ground), V / West (□) high-boosts (quick boost)
+//! leaves the ground), Shift / West (□) high-boosts (quick boost)
 //! along the stick, forward without one. Movement steps at the game's 60 Hz tick
 //! in metres per tick with the AC's `AcCtrlParam`
 //! (`sheets/ac_ctrl_calc.csv`: its parts and build weight through the game's
@@ -424,6 +424,9 @@ struct FollowCam {
     yaw_off: f32,
     /// Camera yaw (body + offset) last frame, so mouse swings can rotate the eased points rigidly.
     cam_yaw: f32,
+    /// Waist bone offset from the AC root on the last `pilot` step, used by the 3D lock-sight
+    /// datum (`0x8287cdd0` -> `0x8260f878`).
+    waist: Vec3,
     /// Roll from sideways speed: ZTiltStart/MaxXSpeed (km/h), MaxZTiltAngle (rad), the seconds to
     /// tilt and to level out, and the -1..1 tilt in use.
     tilt_speeds: (f32, f32),
@@ -761,6 +764,7 @@ impl FollowCam {
             pitch_vel: 0.0,
             yaw_off: 0.0,
             cam_yaw: 0.0,
+            waist: Vec3::ZERO,
             tilt_speeds: (behavior.z_tilt_start_x_speed, behavior.z_tilt_max_x_speed),
             tilt_max: behavior.max_z_tilt_angle.to_radians(),
             tilt_secs: (
@@ -1380,6 +1384,23 @@ impl Pilot {
             * FORWARD
     }
 
+    /// Current camera aim angles `(yaw, pitch)` in radians (`yaw + yaw_off`, `pitch`), matching
+    /// the 360 HUD status block `+0x24` / `+0x20` (`0x829d1df0`).
+    pub fn aim_angles(&self) -> (f32, f32) {
+        (self.yaw + self.cam.yaw_off, self.cam.pitch)
+    }
+
+    /// 3D Lock-Sight datum origin in world space (`0x8287cdd0` -> `0x8260f878`), matching
+    /// `FollowCam::place`'s waist + `look_at_height`.
+    pub fn sight_origin(&self, root: Vec3) -> Vec3 {
+        root + self.cam.waist + Vec3::Y * self.cam.look_at_height
+    }
+
+    /// Current follow-camera roll in radians (`FollowCam::roll`, `0x82bfa708`).
+    pub fn camera_roll(&self) -> f32 {
+        self.cam.tilt_max * self.cam.tilt.value
+    }
+
     pub fn set_pitch(&mut self, pitch: f32) {
         self.cam.pitch = pitch;
     }
@@ -1417,11 +1438,13 @@ fn read_input(keys: &ButtonInput<KeyCode>, held: &[KeyCode], pads: &Query<&Gamep
     let mut turn = axis(KeyCode::KeyQ, KeyCode::KeyE);
     let mut look = axis(KeyCode::ArrowUp, KeyCode::ArrowDown);
     let mut jump = keys.just_pressed(KeyCode::Space) || held.contains(&KeyCode::Space);
-    let mut boost_toggle =
-        keys.just_pressed(KeyCode::ShiftLeft) || keys.just_pressed(KeyCode::ShiftRight);
+    let mut boost_toggle = keys.just_pressed(KeyCode::KeyV);
     let mut glide = keys.just_pressed(KeyCode::ControlLeft) || held.contains(&KeyCode::ControlLeft);
-    let mut quick_boost = keys.just_pressed(KeyCode::KeyV) || held.contains(&KeyCode::KeyV);
-    let mut qb_held = down(KeyCode::KeyV);
+    let mut quick_boost = keys.just_pressed(KeyCode::ShiftLeft)
+        || keys.just_pressed(KeyCode::ShiftRight)
+        || held.contains(&KeyCode::ShiftLeft)
+        || held.contains(&KeyCode::ShiftRight);
+    let mut qb_held = down(KeyCode::ShiftLeft) || down(KeyCode::ShiftRight);
     let kick = keys.just_pressed(KeyCode::KeyK) || held.contains(&KeyCode::KeyK);
     for pad in pads {
         let left = pad.left_stick();
@@ -2748,7 +2771,7 @@ pub fn pilot(
     if input.boost_toggle {
         p.boost = !p.boost;
     }
-    p.boost |= held.0.contains(&KeyCode::ShiftLeft);
+    p.boost |= held.0.contains(&KeyCode::KeyV);
     p.command = input.stick;
     if p.qb.is_none() && p.wj.is_none() && p.kick.is_none() && p.blade.is_none() {
         p.glide |= input.glide && p.boost && !p.airborne && p.en >= p.ctrl.glide_en_tick;
@@ -2975,6 +2998,7 @@ pub fn pilot(
             p.cam.swing(root + waist, delta);
         }
         p.cam.cam_yaw = total_yaw;
+        p.cam.waist = waist;
         let (eye, look_at) = p.cam.place(root + waist, cam_rot, water);
         let (eye, look_at) = p
             .cam

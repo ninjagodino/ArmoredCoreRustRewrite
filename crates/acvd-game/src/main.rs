@@ -4,8 +4,8 @@
 //! `acvd-game [design id] [--disc <360 ISO>] [--shot <png>] [--flat] [--yaw <degrees>]
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
 //! [--water <y>]`
-//! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, Shift boost mode, Space jump,
-//! V high boost (quick boost) / hold V (or K, gamepad □ + HOLD) Boost Charge Kick, Ctrl glide boost while boosting on the ground
+//! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, V boost mode, Space jump,
+//! Shift high boost (quick boost) / hold Shift (or K, gamepad □ + HOLD) Boost Charge Kick, Ctrl glide boost while boosting on the ground
 //! (air clips once it leaves the ground);
 //! F / left mouse / R2 fire the right arm weapon (guns or melee blades/piles), C / right mouse / L2 the left,
 //! G / X / Tab / R1 fire the shoulder weapon / locked missile salvo (see `weapons`).
@@ -482,6 +482,7 @@ fn main() {
         (
             hud::layout,
             hud::tick,
+            hud::track_lock_sight,
             hud::readouts,
             hud::panels,
             hud::lock_cursor,
@@ -493,7 +494,7 @@ fn main() {
         )
             .chain()
             .run_if(in_sortie)
-            .after(weapons::tick_player_health),
+            .after(reframe),
     );
     if let Some(id) = preview {
         app.insert_resource(sfx::Preview(id));
@@ -503,7 +504,13 @@ fn main() {
         app.insert_resource(ShotDelay(wait, false))
             .insert_resource(shot)
             .insert_resource(acvd_render::app::ShotMark::default())
-            .add_systems(Update, (delay_shot, take_shot).chain().after(pose::animate));
+            .init_resource::<FramePerf>()
+            .add_systems(
+                Update,
+                (sample_frame_perf, delay_shot, take_shot, dump_frame_perf)
+                    .chain()
+                    .after(pose::animate),
+            );
     }
     app.run();
 }
@@ -512,12 +519,74 @@ fn main() {
 #[derive(Resource)]
 struct ShotDelay(f32, bool);
 
+/// Rolling frame-time samples for `--shot` PERF dumps (ms).
+#[derive(Resource, Default)]
+struct FramePerf {
+    samples: Vec<f32>,
+    warmed: bool,
+}
+
 fn delay_shot(time: Res<Time>, mut delay: ResMut<ShotDelay>, mut shot: ResMut<Shot>) {
     delay.1 |= shot.ready;
     if delay.1 && delay.0 > 0.0 {
         delay.0 -= time.delta_secs();
         shot.ready = delay.0 <= 0.0;
     }
+}
+
+fn sample_frame_perf(time: Res<Time>, mut perf: ResMut<FramePerf>, delay: Option<Res<ShotDelay>>) {
+    let dt_ms = time.delta_secs() * 1000.0;
+    // Skip the first couple of frames (shader compile / asset upload spikes).
+    if !perf.warmed {
+        if delay.is_some_and(|d| d.1) && dt_ms < 100.0 {
+            perf.warmed = true;
+        }
+        return;
+    }
+    if dt_ms > 0.0 && dt_ms < 500.0 {
+        perf.samples.push(dt_ms);
+    }
+}
+
+fn dump_frame_perf(
+    mark: Option<Res<acvd_render::app::ShotMark>>,
+    perf: Res<FramePerf>,
+    collision: Res<Collision>,
+    meshes: Query<(), With<Mesh3d>>,
+    map_parts: Query<(), With<map::MapPart>>,
+    water_cams: Query<(), With<env::WaterReflectionCamera>>,
+    targets: Query<(), With<targets::Target>>,
+    sfx_q: Query<(), With<sfx::Sfx>>,
+    mut dumped: Local<bool>,
+) {
+    let Some(mark) = mark else { return };
+    if mark.path.is_none() || *dumped {
+        return;
+    }
+    *dumped = true;
+    let mut samples = perf.samples.clone();
+    if samples.is_empty() {
+        eprintln!("PERF no frame samples yet");
+        return;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = samples.len();
+    let sum: f32 = samples.iter().sum();
+    let avg = sum / n as f32;
+    let p50 = samples[n / 2];
+    let p95 = samples[((n as f32) * 0.95) as usize].min(samples[n - 1]);
+    let max = samples[n - 1];
+    eprintln!(
+        "PERF frames={n} avg={avg:.1}ms ({:.0} fps) p50={p50:.1}ms p95={p95:.1}ms max={max:.1}ms \
+         hits={} mesh3d={} map_parts={} water_cams={} targets={} sfx={}",
+        1000.0 / avg.max(0.001),
+        collision.hits.len(),
+        meshes.iter().count(),
+        map_parts.iter().count(),
+        water_cams.iter().count(),
+        targets.iter().count(),
+        sfx_q.iter().count(),
+    );
 }
 
 fn key(name: &str) -> Option<KeyCode> {
