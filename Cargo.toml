@@ -24,3 +24,11 @@ opt-level = 3
 # External deps (Bevy/wgpu/naga/image) emit >4 GB of CodeView debug info on MSVC and trip
 # `LNK1318: Unexpected PDB error; LIMIT (12)`; keep full debug info on workspace crates only.
 debug = false
+
+# Pure format/untile/decode hot loops (Xenos TPF untiling, CTX1/HT-BC3, FLVER/DCX/ANI parsing)
+# and mesh/texture asset builders run ~15x faster optimized in debug builds without slowing down
+# `acvd-game` incremental builds.
+[profile.dev.package.acvd-formats]
+opt-level = 3
+[profile.dev.package.acvd-render]
+opt-level = 3

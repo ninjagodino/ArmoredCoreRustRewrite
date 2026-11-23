@@ -345,6 +345,9 @@ pub struct DecalState {
     picker_rx: Option<Mutex<mpsc::Receiver<Option<PathBuf>>>>,
     /// Last hover hit on the AC for rendering the 3D surface gizmo.
     pub last_hover: Option<SurfaceHit>,
+    /// Last baked `(head, core, arms, legs)` part IDs so `main::show` only rebakes decal slots
+    /// whose underlying AC frame mesh actually changed.
+    pub last_frame_parts: Option<(i16, i16, i16, i16)>,
 }
 
 /// Raycast result against the live skinned AC mesh.
@@ -397,6 +400,7 @@ impl DecalState {
             initialized: false,
             picker_rx: None,
             last_hover: None,
+            last_frame_parts: None,
         }
     }
 
@@ -456,6 +460,36 @@ impl DecalState {
         for slot in DecalSlot::ALL {
             self.mark_slot_dirty(slot, full_res);
         }
+    }
+
+    /// Marks only the decal slots whose underlying AC frame mesh changed since the last AC build.
+    /// Swapping weapons, boosters, shoulders, OWs, internals, or paint changes none of
+    /// `(head, core, arms, legs)` and therefore triggers zero CPU decal rebakes.
+    pub fn mark_changed_frame_parts(&mut self, head: i16, core: i16, arms: i16, legs: i16) {
+        match self.last_frame_parts {
+            None => self.mark_all_dirty(true),
+            Some((oh, oc, oa, ol)) => {
+                if legs != ol {
+                    // Legs determine root height of core/arms/head in AC rest space.
+                    self.mark_all_dirty(true);
+                } else if core != oc {
+                    // Core determines mount sockets of head and arms.
+                    self.mark_slot_dirty(DecalSlot::Core, true);
+                    self.mark_slot_dirty(DecalSlot::Head, true);
+                    self.mark_slot_dirty(DecalSlot::RightArm, true);
+                    self.mark_slot_dirty(DecalSlot::LeftArm, true);
+                } else {
+                    if head != oh {
+                        self.mark_slot_dirty(DecalSlot::Head, true);
+                    }
+                    if arms != oa {
+                        self.mark_slot_dirty(DecalSlot::RightArm, true);
+                        self.mark_slot_dirty(DecalSlot::LeftArm, true);
+                    }
+                }
+            }
+        }
+        self.last_frame_parts = Some((head, core, arms, legs));
     }
 
     /// Scans `decals/` for user-supplied image files on startup.

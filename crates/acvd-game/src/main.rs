@@ -112,10 +112,14 @@ pub struct Garage {
 #[derive(Component)]
 struct SortieDecor;
 
-/// Persistent TPF texture pack cache shared across AC rebuilds and the garage 3D part preview
-/// so swapping parts never re-reads or re-untiles already-decoded AC part textures from the ISO.
+/// Persistent TPF texture pack + FLVER model cache shared across AC rebuilds and the garage 3D
+/// part preview so swapping parts never re-reads, re-decompresses, or re-untiles already-decoded
+/// AC part meshes or textures from the ISO.
 #[derive(Resource, Default)]
-pub struct AcTexturePacks(pub acvd_render::Packs);
+pub struct AcTexturePacks {
+    pub packs: acvd_render::Packs,
+    pub flvers: acvd_render::FlverCache,
+}
 
 /// The assembled AC; its parts are children.
 #[derive(Component)]
@@ -1169,14 +1173,15 @@ fn show(
         ))
         .id();
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    let (packs, mut missing) = (&mut assets.ac_packs.0, 0);
+    let ac_cache = &mut *assets.ac_packs;
+    let (packs, flvers, mut missing) = (&mut ac_cache.packs, &mut ac_cache.flvers, 0);
     let mut problems = built.problems;
     let mut loaded = Vec::new();
     let mut known = vec![None; built.placements.len()];
     for (index, p) in built.placements.iter().enumerate() {
         let places = assemble::root_places(p, &built.placements, &known);
         debug!("{} {}", p.column, p.model.path);
-        match acvd_render::rigged_model(&garage.disc, p.model.path, &|root| {
+        match flvers.rigged_model(&garage.disc, p.model.path, &|root| {
             assemble::place_of(&places, root)
         }) {
             Ok((meshes, rig)) => {
@@ -1457,7 +1462,12 @@ fn show(
             }
         }
     }
-    decals.mark_all_dirty(true);
+    decals.mark_changed_frame_parts(
+        design_data.head,
+        design_data.core,
+        design_data.arms,
+        design_data.legs,
+    );
     commands.insert_resource(loadout);
     if let Some(att) = ow_arm_attach {
         commands.insert_resource(att);

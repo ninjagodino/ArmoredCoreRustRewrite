@@ -282,6 +282,14 @@ in order:
 
 ## Done
 
+- **Garage Part/Weapon Swap Performance (`acvd-render::Packs` / `FlverCache`, `acvd-game::paint`, `decal`, `main`, `garage_assemble`, `Cargo.toml`)**:
+  - Eliminated the 3–5 s freeze when selecting/scrolling parts and weapons in the 3D Garage (debug build part-swap time dropped from **3,221.8 ms → 25.1 ms** on uncached swaps and **9.8 ms** when returning to a previously seen part, 3D preview from **145.7 ms → 0.4–1.0 ms**):
+    - Upgraded `acvd_render::Packs` to cache decoded GPU `Handle<Image>`s keyed by `(pack_path, texture_index, linear)`, per-pack TPF name->index maps, and 1×1 utility handles (`empty_mask`, `empty_decal`) and wired `acvd_render::material` + `paint::material` through it so unchanged parts and shared submesh textures never re-untile/re-decode or re-upload to the GPU.
+    - Added `acvd_render::FlverCache` to `AcTexturePacks` so `main::show` and `garage_assemble::sync_part_preview` skip ISO reads, DCX decompression, and BND3/FLVER header parsing for already-loaded parts.
+    - Added `[profile.dev.package.acvd-formats]` and `[profile.dev.package.acvd-render]` `opt-level = 3` in `Cargo.toml` so cold Xenos TPF untiling, CTX1/HT-BC3 decoding, and FLVER vertex decoding run ~15× faster in debug builds without slowing `acvd-game` incremental builds.
+    - Replaced unconditional `decals.mark_all_dirty(true)` in `main::show` with `DecalState::mark_changed_frame_parts(head, core, arms, legs)` so swapping weapons, boosters, shoulders, OWs, internals, or paint skips unnecessary `1024×1024` CPU decal rebakes.
+  - Verified with `cargo test -p acvd-render` (7/7), `cargo test -p acvd-game -- garage` (8/8, including `garage_part_swap_reuses_cached_textures_and_flvers`), `decal` (4/4), `paint` (3/3), and `--shot` (`private/shots/garage_assemble_fast.png`).
+
 - **Crisp CCM Bitmap Font Rendering (`acvd-render::text`, `menu`, `glyph_sprite.wgsl`, `acvd-game::garage_assemble`)**:
   - Replaced plain bilinear `ImageNode` rendering of 720p BC3 CCM font sheets with a dedicated `GlyphSprite` `UiMaterial` (`glyph_sprite.wgsl`) using screen-space sharp-bilinear (`fwidth`-clamped) UV sampling, atlas-rect half-texel clamping, and translucent-edge RGB un-premultiplication to eliminate dark BC3 straight-alpha fringing while preserving shaded controller icons.
   - Pixel-snapped `write_glyphs`, `spawn_glyphs`, `Shape::Text`/`Shape::Dialog` nodes, and `garage_assemble` screen origin (fixing `.5px` vertical centering blur on `@ParamLine` `21px` / `ASSEMBLY VIEW` `11px` boxes), and used glyph UV extents in `text::layout` so narrow glyphs (e.g. `e16_ext` `'1'`) are not horizontally stretched. Verified by `acvd-render` unit tests (`does_not_stretch_glyph_past_uv_rect`) and before/after `--shot` (`private/shots/text_compare_720p.png`).

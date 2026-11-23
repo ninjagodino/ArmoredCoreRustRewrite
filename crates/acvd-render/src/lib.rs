@@ -14,7 +14,7 @@ use acvd_data::TextureRef;
 use acvd_formats::vfs::{self, Disc};
 use acvd_formats::{flver, tpf};
 use anyhow::{bail, ensure, Context, Result};
-use bevy::asset::{Assets, RenderAssetUsages};
+use bevy::asset::{Assets, Handle, RenderAssetUsages};
 use bevy::color::Color;
 use bevy::pbr::StandardMaterial;
 use bevy::image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
@@ -184,7 +184,49 @@ pub struct RigEffect {
 /// Like [`model_with_offsets`], with joint indices and weights on every mesh for GPU skinning.
 /// `place(root)` is where that root sits on the assembled AC.
 pub fn rigged_model(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace) -> Result<(Vec<LoadedMesh>, Rig)> {
-    let (meshes, f) = load(disc, asset, place, true)?;
+    let data = vfs::open(disc, asset)?;
+    let f = flver::read(&data)?;
+    let meshes = load_from_flver(&data, &f, place, true)?;
+    let rig = build_rig(&f, place)?;
+    Ok((meshes, rig))
+}
+
+/// Cache of decompressed FLVER bytes + parsed headers keyed by disc asset path so repeated AC
+/// rebuilds and 3D part previews skip ISO reads, DCX decompression, and BND3/FLVER header parsing.
+#[derive(Default)]
+pub struct FlverCache {
+    entries: HashMap<String, (Vec<u8>, flver::Flver)>,
+}
+
+impl FlverCache {
+    fn get_or_load(&mut self, disc: &Disc, asset: &str) -> Result<&(Vec<u8>, flver::Flver)> {
+        if !self.entries.contains_key(asset) {
+            let data = vfs::open(disc, asset)?;
+            let f = flver::read(&data)?;
+            self.entries.insert(asset.to_string(), (data, f));
+        }
+        Ok(&self.entries[asset])
+    }
+
+    pub fn model(&mut self, disc: &Disc, asset: &str) -> Result<Vec<LoadedMesh>> {
+        let (data, f) = self.get_or_load(disc, asset)?;
+        load_from_flver(data, f, &|_| RootPlace::IDENTITY, false)
+    }
+
+    pub fn rigged_model(
+        &mut self,
+        disc: &Disc,
+        asset: &str,
+        place: &dyn Fn(Option<&str>) -> RootPlace,
+    ) -> Result<(Vec<LoadedMesh>, Rig)> {
+        let (data, f) = self.get_or_load(disc, asset)?;
+        let meshes = load_from_flver(data, f, place, true)?;
+        let rig = build_rig(f, place)?;
+        Ok((meshes, rig))
+    }
+}
+
+fn build_rig(f: &flver::Flver, place: &dyn Fn(Option<&str>) -> RootPlace) -> Result<Rig> {
     let world = f.bone_transforms()?;
     let roots = f.bone_roots();
     let bones = f
@@ -222,12 +264,17 @@ pub fn rigged_model(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> Ro
             forward: d.forward,
         })
         .collect();
-    Ok((meshes, Rig { bones, unboned: place(None).t, sockets, frames, effects }))
+    Ok(Rig { bones, unboned: place(None).t, sockets, frames, effects })
 }
 
 fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig: bool) -> Result<(Vec<LoadedMesh>, flver::Flver)> {
     let data = vfs::open(disc, asset)?;
     let f = flver::read(&data)?;
+    let out = load_from_flver(&data, &f, place, rig)?;
+    Ok((out, f))
+}
+
+fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -> RootPlace, rig: bool) -> Result<Vec<LoadedMesh>> {
     let world = f.bone_transforms()?;
     let bone_roots = f.bone_roots();
     let by_bone: Vec<RootPlace> = bone_roots.iter().map(|&r| place(Some(&f.bones[r].name))).collect();
@@ -235,8 +282,8 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
     let mut out = Vec::new();
     for (i, m) in f.meshes.iter().enumerate() {
         let Some(fs) = f.main_face_set(m) else { continue };
-        let tris = f.triangles(&data, fs).with_context(|| format!("mesh {i}"))?;
-        let mut v = f.vertices(&data, m).with_context(|| format!("mesh {i}"))?;
+        let tris = f.triangles(data, fs).with_context(|| format!("mesh {i}"))?;
+        let mut v = f.vertices(data, m).with_context(|| format!("mesh {i}"))?;
         if tris.is_empty() || v.positions.is_empty() {
             continue;
         }
@@ -341,7 +388,7 @@ fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig
             .map(|b| b.name.clone());
         out.push(LoadedMesh { mesh, diffuse, diffuse2, bump, bump2, specular, emission, mtd, root, min, max });
     }
-    Ok((out, f))
+    Ok(out)
 }
 
 /// Joint indices and weights per vertex. Dynamic meshes keep all four weighted bones (their
@@ -414,8 +461,8 @@ pub fn best_texture_ref(name: &str) -> Option<&'static TextureRef> {
 /// The material for `part`: its diffuse and normal-map textures, or flat grey when it has none,
 /// `flat` is set, or the texture fails to load (reported to stderr and counted in `missing`).
 pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut Assets<Image>, flat: bool, missing: &mut usize) -> StandardMaterial {
-    let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| match packs.image(disc, name) {
-        Ok(img) => Some(images.add(img)),
+    let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| match packs.image_handle(disc, images, name) {
+        Ok(h) => Some(h),
         Err(e) => {
             *missing += 1;
             eprintln!("{e:#}");
@@ -423,7 +470,7 @@ pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut 
         }
     });
     let normal_map = part.bump.as_deref().filter(|_| !flat).and_then(|name| {
-        packs.linear_image(disc, name).ok().map(|img| images.add(img))
+        packs.linear_image_handle(disc, images, name).ok()
     });
     StandardMaterial {
         base_color: if texture.is_some() { Color::WHITE } else { Color::srgb(0.6, 0.6, 0.62) },
@@ -435,9 +482,15 @@ pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut 
     }
 }
 
-/// Decoded TPF packs, keyed by pack asset path, so a model's textures open each pack once.
+/// Decoded TPF packs and GPU texture handles, keyed by pack asset path and `(pack, index, linear)`
+/// so repeated AC rebuilds and shared submesh textures decode and untile each texture once.
 #[derive(Default)]
-pub struct Packs(HashMap<String, Vec<u8>>);
+pub struct Packs {
+    packs: HashMap<String, Vec<u8>>,
+    index_by_name: HashMap<String, HashMap<String, usize>>,
+    handles: HashMap<(String, usize, bool), Handle<Image>>,
+    utility: HashMap<&'static str, Handle<Image>>,
+}
 
 impl Packs {
     pub fn image(&mut self, disc: &Disc, name: &str) -> Result<Image> {
@@ -452,6 +505,61 @@ impl Packs {
         Ok(img)
     }
 
+    /// Cached GPU [`Handle<Image>`] for texture `name` (sRGB). Decodes/untiles once per `(pack, index, false)`.
+    pub fn image_handle(&mut self, disc: &Disc, images: &mut Assets<Image>, name: &str) -> Result<Handle<Image>> {
+        let t: &TextureRef = best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
+        self.texture_handle_at(disc, images, t.pack, t.index, t.name, false)
+    }
+
+    /// Cached GPU [`Handle<Image>`] for texture `name` in linear (non-sRGB) format.
+    pub fn linear_image_handle(&mut self, disc: &Disc, images: &mut Assets<Image>, name: &str) -> Result<Handle<Image>> {
+        let t: &TextureRef = best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
+        self.texture_handle_at(disc, images, t.pack, t.index, t.name, true)
+    }
+
+    /// Cached GPU [`Handle<Image>`] for texture `index` of TPF `pack`.
+    pub fn texture_handle_at(
+        &mut self,
+        disc: &Disc,
+        images: &mut Assets<Image>,
+        pack: &str,
+        index: usize,
+        name: &str,
+        linear: bool,
+    ) -> Result<Handle<Image>> {
+        let key = (pack.to_string(), index, linear);
+        if let Some(h) = self.handles.get(&key) {
+            if images.contains(h) {
+                return Ok(h.clone());
+            }
+        }
+        let img = if linear {
+            self.linear_texture_at(disc, pack, index, name)?
+        } else {
+            self.texture_at(disc, pack, index, name)?
+        };
+        let handle = images.add(img);
+        self.handles.insert(key, handle.clone());
+        Ok(handle)
+    }
+
+    /// Cached 1×1 utility texture handle (e.g. empty color mask or empty decal map).
+    pub fn utility_handle(
+        &mut self,
+        images: &mut Assets<Image>,
+        key: &'static str,
+        make: impl FnOnce() -> Image,
+    ) -> Handle<Image> {
+        if let Some(h) = self.utility.get(key) {
+            if images.contains(h) {
+                return h.clone();
+            }
+        }
+        let h = images.add(make());
+        self.utility.insert(key, h.clone());
+        h
+    }
+
     /// Like [`Packs::texture_at`], forcing a linear (non-sRGB) texture format.
     pub fn linear_texture_at(&mut self, disc: &Disc, pack: &str, index: usize, name: &str) -> Result<Image> {
         let mut img = self.texture_at(disc, pack, index, name)?;
@@ -460,7 +568,7 @@ impl Packs {
     }
 
     fn pack(&mut self, disc: &Disc, pack: &str) -> Result<&Vec<u8>> {
-        Ok(match self.0.entry(pack.to_string()) {
+        Ok(match self.packs.entry(pack.to_string()) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(vfs::open(disc, pack)?),
         })
@@ -468,8 +576,15 @@ impl Packs {
 
     /// Index of the texture called `name` (ASCII case-insensitive) in the TPF at asset path `pack`.
     pub fn find(&mut self, disc: &Disc, pack: &str, name: &str) -> Result<Option<usize>> {
-        let header = tpf::read(self.pack(disc, pack)?)?;
-        Ok(header.textures.iter().position(|t| t.name.eq_ignore_ascii_case(name)))
+        if !self.index_by_name.contains_key(pack) {
+            let header = tpf::read(self.pack(disc, pack)?)?;
+            let mut map = HashMap::with_capacity(header.textures.len());
+            for (i, t) in header.textures.iter().enumerate() {
+                map.entry(t.name.to_ascii_lowercase()).or_insert(i);
+            }
+            self.index_by_name.insert(pack.to_string(), map);
+        }
+        Ok(self.index_by_name[pack].get(&name.to_ascii_lowercase()).copied())
     }
 
     /// `t` comes from the extracted sheets; the format, size and levels are read from the pack on
@@ -626,8 +741,8 @@ mod tests {
                 _ => unreachable!(),
             }
             // Release cached pack once we move on so memory stays tiny across 3,933 textures.
-            if packs.0.len() > 64 {
-                packs.0.clear();
+            if packs.packs.len() > 64 {
+                packs.packs.clear();
             }
         }
         assert_eq!(dxn_n, 162, "expected 162 DXN (code 23) normal maps");

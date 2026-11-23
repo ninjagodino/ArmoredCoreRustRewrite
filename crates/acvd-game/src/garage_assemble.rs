@@ -1769,7 +1769,7 @@ pub fn sync_part_preview(
             return;
         };
 
-        let Ok(loaded) = acvd_render::model(&garage.disc, asset_path) else {
+        let Ok(loaded) = ac_packs.flvers.model(&garage.disc, asset_path) else {
             return;
         };
         if loaded.is_empty() {
@@ -1810,7 +1810,7 @@ pub fn sync_part_preview(
             let base = acvd_render::material(
                 &garage.disc,
                 &lm,
-                &mut ac_packs.0,
+                &mut ac_packs.packs,
                 &mut images,
                 garage.flat,
                 &mut missing,
@@ -1823,7 +1823,7 @@ pub fn sync_part_preview(
                     column,
                     col,
                     None,
-                    &mut ac_packs.0,
+                    &mut ac_packs.packs,
                     &mut images,
                 )
             });

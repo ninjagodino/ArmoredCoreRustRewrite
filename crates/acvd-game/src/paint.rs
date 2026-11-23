@@ -98,25 +98,10 @@ pub fn load_accolor(disc: &Disc, coloring_id: u16) -> Option<AcColor> {
     }
 }
 
-/// Look up `<diffuse>_c` in the same TPF pack (or across texture packs) with a linear (non-sRGB)
-/// format so the pixel shader reads the exact 5-bit `R` channel index and `G` weight.
-pub fn load_color_map(disc: &Disc, packs: &mut Packs, diffuse: &str) -> Option<Image> {
-    let mask_name = format!("{diffuse}_c");
-    let mut img = if let Some(d_ref) = acvd_render::best_texture_ref(diffuse) {
-        let idx = packs.find(disc, d_ref.pack, &mask_name).ok().flatten();
-        idx.and_then(|i| packs.texture_at(disc, d_ref.pack, i, &mask_name).ok())
-    } else {
-        None
-    }
-    .or_else(|| packs.image(disc, &mask_name).ok())?;
-
-    acvd_render::to_linear(&mut img);
-    Some(img)
-}
-
 /// Load camouflage pattern `ca{camo_id:04}` from `model/image/camouflage/camouflage_t.bnd|camouflage.tpf`
 /// (`0x824611b8` / `0x82460e58`) with a linear format so its 5-bit `R` channel decodes directly into
 /// palette indices `3..=6` (`optional, aid2, aid, base`).
+#[cfg(test)]
 pub fn load_camo_map(disc: &Disc, packs: &mut Packs, camo_id: u8) -> Option<Image> {
     if camo_id == 0 {
         return None;
@@ -164,6 +149,38 @@ pub fn empty_decal_image() -> Image {
     img
 }
 
+/// Cached GPU [`Handle<Image>`] for `<diffuse>_c` in linear (non-sRGB) format.
+pub fn load_color_map_handle(
+    disc: &Disc,
+    packs: &mut Packs,
+    images: &mut Assets<Image>,
+    diffuse: &str,
+) -> Option<Handle<Image>> {
+    let mask_name = format!("{diffuse}_c");
+    if let Some(d_ref) = acvd_render::best_texture_ref(diffuse) {
+        if let Ok(Some(idx)) = packs.find(disc, d_ref.pack, &mask_name) {
+            if let Ok(h) = packs.texture_handle_at(disc, images, d_ref.pack, idx, &mask_name, true) {
+                return Some(h);
+            }
+        }
+    }
+    packs.linear_image_handle(disc, images, &mask_name).ok()
+}
+
+/// Cached GPU [`Handle<Image>`] for camouflage pattern `ca{camo_id:04}` in linear format.
+pub fn load_camo_map_handle(
+    disc: &Disc,
+    packs: &mut Packs,
+    images: &mut Assets<Image>,
+    camo_id: u8,
+) -> Option<Handle<Image>> {
+    if camo_id == 0 {
+        return None;
+    }
+    let name = format!("ca{camo_id:04}");
+    packs.linear_image_handle(disc, images, &name).ok()
+}
+
 /// Build an [`AcPaintMaterial`] when `accolor` is present and the mesh has a `<diffuse>_c` mask
 /// or a `_Rim` material (`ACParts_Rim*`).
 #[allow(clippy::too_many_arguments)]
@@ -178,55 +195,61 @@ pub fn material(
     images: &mut Assets<Image>,
 ) -> Option<AcPaintMaterial> {
     let is_rim = is_rim_mtd(&mesh.mtd);
-    let mask = mesh
+    let color_map = match mesh
         .diffuse
         .as_deref()
-        .and_then(|d| load_color_map(disc, packs, d));
-    let mask = match mask {
-        Some(m) => m,
-        None if is_rim => empty_mask_image(),
+        .and_then(|d| load_color_map_handle(disc, packs, images, d))
+    {
+        Some(h) => h,
+        None if is_rim => packs.utility_handle(images, "empty_mask", empty_mask_image),
         None => return None,
     };
-    let mask_size = Vec2::new(
-        mask.texture_descriptor.size.width as f32,
-        mask.texture_descriptor.size.height as f32,
-    );
+    let mask_size = images
+        .get(&color_map)
+        .map(|img| {
+            Vec2::new(
+                img.texture_descriptor.size.width as f32,
+                img.texture_descriptor.size.height as f32,
+            )
+        })
+        .unwrap_or(Vec2::ONE);
     let group = accolor::slot_group(column, mesh.root.as_deref());
     let cols = accolor.overlay_cols(group, STATIC_DRAW_PARAM.color_min, STATIC_DRAW_PARAM.color_max);
-    let color_map = images.add(mask);
 
     // 360 `0x82ca9c70` (`0x82ca9e98..0x82ca9f14`) binds `ca{camo_id:04}` (`0x82460e58`) to `s15`
     // with `c190.xy = mask_size / camo_size` (`0x82461a98`), or binds `color_map` itself with
     // `c190 = (1, 1, 1, 1)` when `camo_id == 0`.
-    let (camo_map, camo_scale) = if let Some(camo) = load_camo_map(disc, packs, accolor.camo_id(group)) {
-        let camo_w = (camo.texture_descriptor.size.width as f32).max(1.0);
-        let camo_h = (camo.texture_descriptor.size.height as f32).max(1.0);
-        (
-            images.add(camo),
-            Vec2::new(mask_size.x / camo_w, mask_size.y / camo_h),
-        )
-    } else {
-        (color_map.clone(), Vec2::ONE)
-    };
+    let (camo_map, camo_scale) =
+        if let Some(camo_h) = load_camo_map_handle(disc, packs, images, accolor.camo_id(group)) {
+            let (camo_w, camo_h_px) = images
+                .get(&camo_h)
+                .map(|img| {
+                    (
+                        (img.texture_descriptor.size.width as f32).max(1.0),
+                        (img.texture_descriptor.size.height as f32).max(1.0),
+                    )
+                })
+                .unwrap_or((1.0, 1.0));
+            (camo_h, Vec2::new(mask_size.x / camo_w, mask_size.y / camo_h_px))
+        } else {
+            (color_map.clone(), Vec2::ONE)
+        };
 
     let (emission_map, emission) = match mesh
         .emission
         .as_deref()
-        .and_then(|name| packs.image(disc, name).ok())
+        .and_then(|name| packs.image_handle(disc, images, name).ok())
     {
-        Some(emi) => (
-            images.add(emi),
-            Vec4::from(accolor.emission_col(group, GLOW_INTENSITY)),
-        ),
+        Some(emi) => (emi, Vec4::from(accolor.emission_col(group, GLOW_INTENSITY))),
         None => (color_map.clone(), Vec4::ZERO),
     };
 
     let (specular_map, has_specular) = match mesh
         .specular
         .as_deref()
-        .and_then(|name| packs.linear_image(disc, name).ok())
+        .and_then(|name| packs.linear_image_handle(disc, images, name).ok())
     {
-        Some(spc) => (images.add(spc), 1.0),
+        Some(spc) => (spc, 1.0),
         None => (color_map.clone(), 0.0),
     };
 
@@ -238,7 +261,7 @@ pub fn material(
 
     let (decal_map, has_decal) = match decal_map {
         Some(h) => (h, 1.0),
-        None => (images.add(empty_decal_image()), 0.0),
+        None => (packs.utility_handle(images, "empty_decal", empty_decal_image), 0.0),
     };
 
     Some(AcPaintMaterial {

@@ -4759,4 +4759,111 @@ mod tests {
         assert!(top.yaw.cos() > 0.0, "AcsisTop should look from +Z at front of AC");
         assert!(rear.yaw.cos() < 0.0, "OveredWeapon should look from -Z at rear of AC");
     }
+
+    #[test]
+    fn garage_part_swap_reuses_cached_textures_and_flvers() {
+        use std::time::Instant;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&acvd_formats::vfs::default_disc(&root)) else {
+            return;
+        };
+        let (_, rows) = AC_ASSEMBLY_DESIGN_ST_FILES[0];
+        let base_row = rows
+            .iter()
+            .find(|r| r.id == 5001)
+            .expect("design 5001");
+        let mut design = base_row.data;
+        let accolor = paint::load_accolor(&disc, design.coloring_id);
+        let mut packs = Packs::default();
+        let mut flvers = acvd_render::FlverCache::default();
+        let mut images = Assets::<Image>::default();
+        let orig_head = AssembleSlot::Head.get(&design);
+        let alt_head = parts_for_slot(AssembleSlot::Head)
+            .into_iter()
+            .find(|&id| id != orig_head)
+            .unwrap();
+        let alt_wep = parts_for_slot(AssembleSlot::ArmUnitR)
+            .into_iter()
+            .find(|&id| id != 0 && id != AssembleSlot::ArmUnitR.get(&design))
+            .unwrap();
+
+        for pass in ["cold_initial", "warm_head_swap", "warm_weapon_swap", "warm_return_head"] {
+            if pass == "warm_head_swap" {
+                AssembleSlot::Head.set(&mut design, alt_head);
+            } else if pass == "warm_weapon_swap" {
+                AssembleSlot::ArmUnitR.set(&mut design, alt_wep);
+            } else if pass == "warm_return_head" {
+                AssembleSlot::Head.set(&mut design, orig_head);
+            }
+            let t_total = Instant::now();
+            let built = crate::assemble::assemble(
+                acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS,
+                &design,
+            );
+            let t_flver = Instant::now();
+            let mut loaded = Vec::new();
+            let mut known = vec![None; built.placements.len()];
+            for (index, p) in built.placements.iter().enumerate() {
+                let places = crate::assemble::root_places(p, &built.placements, &known);
+                let (meshes, rig) = flvers
+                    .rigged_model(&disc, p.model.path, &|root| {
+                        crate::assemble::place_of(&places, root)
+                    })
+                    .expect("rigged_model");
+                known[index] = Some(crate::assemble::Stored {
+                    places,
+                    frames: rig.frames.clone(),
+                });
+                loaded.push(crate::pose::Loaded {
+                    index,
+                    placement: p,
+                    meshes,
+                    rig,
+                });
+            }
+            let ms_flver = t_flver.elapsed().as_secs_f64() * 1000.0;
+
+            let t_pose = Instant::now();
+            let _rig = crate::pose::build(&disc, &loaded).expect("pose::build");
+            let ms_pose = t_pose.elapsed().as_secs_f64() * 1000.0;
+
+            let t_mats = Instant::now();
+            let mut missing = 0;
+            let mut mesh_count = 0;
+            let img_before = images.len();
+            for part in &loaded {
+                for mesh in &part.meshes {
+                    mesh_count += 1;
+                    let base = acvd_render::material(&disc, mesh, &mut packs, &mut images, false, &mut missing);
+                    if let Some(ref col) = accolor {
+                        let _ = paint::material(&disc, &base, mesh, part.placement.column, col, None, &mut packs, &mut images);
+                    }
+                }
+            }
+            let new_imgs = images.len() - img_before;
+            let ms_mats = t_mats.elapsed().as_secs_f64() * 1000.0;
+
+            let t_preview = Instant::now();
+            let head_part = ac_part(0, AssembleSlot::Head.get(&design)).unwrap();
+            let preview_meshes = flvers.model(&disc, head_part.models[0].1).unwrap();
+            for lm in &preview_meshes {
+                let base = acvd_render::material(&disc, lm, &mut packs, &mut images, false, &mut missing);
+                if let Some(ref col) = accolor {
+                    let _ = paint::material(&disc, &base, lm, "head", col, None, &mut packs, &mut images);
+                }
+            }
+            let ms_preview = t_preview.elapsed().as_secs_f64() * 1000.0;
+            let ms_total = t_total.elapsed().as_secs_f64() * 1000.0;
+
+            eprintln!(
+                "PROFILE [{pass}] total={ms_total:.1}ms | flver({} parts)={ms_flver:.1}ms | pose={ms_pose:.1}ms | mats({mesh_count} meshes, +{new_imgs} imgs)={ms_mats:.1}ms | preview={ms_preview:.1}ms",
+                loaded.len(),
+            );
+            if pass == "warm_return_head" {
+                assert_eq!(new_imgs, 0, "returning to an already-seen head must reuse all GPU texture handles");
+            }
+        }
+    }
 }
