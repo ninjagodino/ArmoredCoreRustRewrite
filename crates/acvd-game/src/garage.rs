@@ -1322,6 +1322,25 @@ fn load_garage_tex(
     }
 }
 
+/// True when the cursor sits over `@PartsCategoryList` / `@PartsList` so the mouse wheel should
+/// scroll those strips instead of zooming the garage camera.
+fn assemble_ui_owns_wheel(state: &GarageState, window: Option<&Window>) -> bool {
+    if !matches!(state.screen, GarageScreen::AssembleParts { .. }) {
+        return false;
+    }
+    let Some(window) = window else {
+        return false;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return false;
+    };
+    crate::garage_assemble::hovered_scroll_strip(
+        Vec2::new(window.width(), window.height()),
+        cursor,
+    )
+    .is_some()
+}
+
 /// Drives the smooth `PARAM_ACSISDISPLAY_BIN` garage camera + free mouse orbit/zoom.
 #[allow(clippy::too_many_arguments)]
 pub fn update_camera(
@@ -1333,6 +1352,7 @@ pub fn update_camera(
     scroll: Res<AccumulatedMouseScroll>,
     garage: Res<crate::Garage>,
     mut state: ResMut<GarageState>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut cams: Query<
         (&mut Transform, &mut Projection),
         (
@@ -1389,7 +1409,8 @@ pub fn update_camera(
             || keys.pressed(KeyCode::ShiftRight)
             || keys.pressed(KeyCode::ControlLeft)
             || keys.pressed(KeyCode::ControlRight));
-    if !decal_wheel_mod && scroll.delta.y.abs() > 0.0 {
+    let ui_owns_wheel = assemble_ui_owns_wheel(&state, windows.single().ok());
+    if !decal_wheel_mod && !ui_owns_wheel && scroll.delta.y.abs() > 0.0 {
         state.cam_manual_orbit = true;
         let max_d = (ws_row.camera_dist_max as f32).max(18.0);
         state.cam_dist = (state.cam_dist * (1.0 - scroll.delta.y * 0.09)).clamp(3.2, max_d);
@@ -1452,7 +1473,9 @@ pub fn handle_input(
     mode: Res<Mode>,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    scroll: Res<AccumulatedMouseScroll>,
     gamepads: Query<&Gamepad>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut state: ResMut<GarageState>,
     mut garage: ResMut<crate::Garage>,
     mut decals: ResMut<DecalState>,
@@ -1945,6 +1968,75 @@ pub fn handle_input(
                 &mut mode_switch,
             );
             return;
+        }
+    }
+
+    // Mouse-wheel over `@PartsCategoryList` / `@PartsList` scrolls those strips instead of zooming.
+    if matches!(state.screen, GarageScreen::AssembleParts { .. }) && scroll.delta.y.abs() > 0.0 {
+        if let Ok(window) = windows.single() {
+            if let Some(cursor) = window.cursor_position() {
+                let strip = crate::garage_assemble::hovered_scroll_strip(
+                    Vec2::new(window.width(), window.height()),
+                    cursor,
+                );
+                // Bevy: positive Y = scroll up / away from user.
+                let steps = (-scroll.delta.y).round() as i32;
+                let steps = if steps == 0 {
+                    if scroll.delta.y < 0.0 { 1 } else { -1 }
+                } else {
+                    steps
+                };
+                match strip {
+                    Some(crate::garage_assemble::AssembleScrollStrip::CategoryList) => {
+                        let GarageScreen::AssembleParts { slot } = state.screen else {
+                            unreachable!()
+                        };
+                        let cur = AssembleSlot::ALL
+                            .iter()
+                            .position(|&s| s == slot)
+                            .unwrap_or(0);
+                        let len = AssembleSlot::ALL.len() as isize;
+                        let next = (cur as isize + steps as isize).rem_euclid(len) as usize;
+                        switch_assemble_slot(
+                            &mut commands,
+                            &mut state,
+                            &mut garage,
+                            &mut cues,
+                            &mut audio_assets,
+                            AssembleSlot::ALL[next],
+                        );
+                        return;
+                    }
+                    Some(crate::garage_assemble::AssembleScrollStrip::PartsList) => {
+                        let GarageScreen::AssembleParts { slot } = state.screen else {
+                            unreachable!()
+                        };
+                        let count = crate::garage_assemble::filtered_parts_for_slot(
+                            slot,
+                            state.assemble_subcat,
+                            state.assemble_dmg_filter,
+                        )
+                        .len();
+                        if count > 0 {
+                            let next = (state.cursor as isize + steps as isize)
+                                .rem_euclid(count as isize)
+                                as usize;
+                            state.cursor = next;
+                            clamp_scroll_win(
+                                &mut state.scroll,
+                                next,
+                                count,
+                                crate::garage_assemble::ASSEMBLE_THUMB_WINDOW,
+                            );
+                            apply_cursor_preview(&mut state, &mut garage);
+                            sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+                            state.ui_dirty = true;
+                        }
+                        return;
+                    }
+                    None => {}
+                }
+            }
         }
     }
 

@@ -56,6 +56,34 @@ pub const ASSEMBLE_THUMB_WINDOW: usize = 6;
 /// Number of visible slot tabs in `@PartsCategoryList` (`[86,148,686,202]`, 7 × 86px).
 pub const ASSEMBLE_CAT_WINDOW: usize = 7;
 
+/// Which scrollable thumbnail strip in `AssembleParts` the mouse cursor is hovering over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssembleScrollStrip {
+    /// Top horizontal slot tab bar `@PartsCategoryList` (including `<` / `>` arrows).
+    CategoryList,
+    /// Left vertical part thumbnail strip `@PartsList` (including `^` / `v` arrows).
+    PartsList,
+}
+
+/// Maps a window-space cursor position to the hovered scrollable strip in `AssembleParts`,
+/// using the exact same virtual `1280×720` layout transform as [`spawn_assemble_ui`].
+pub fn hovered_scroll_strip(window_size: Vec2, cursor: Vec2) -> Option<AssembleScrollStrip> {
+    let scale = (window_size.x / SCREEN_W).min(window_size.y / SCREEN_H).max(0.5);
+    let origin = Vec2::new(
+        ((window_size.x - SCREEN_W * scale) * 0.5).round(),
+        ((window_size.y - SCREEN_H * scale) * 0.5).round(),
+    );
+    let vx = (cursor.x - origin.x) / scale;
+    let vy = (cursor.y - origin.y) / scale;
+    if (58.0..=714.0).contains(&vx) && (148.0..=202.0).contains(&vy) {
+        Some(AssembleScrollStrip::CategoryList)
+    } else if (86.0..=170.0).contains(&vx) && (202.0..=584.0).contains(&vy) {
+        Some(AssembleScrollStrip::PartsList)
+    } else {
+        None
+    }
+}
+
 /// Marker on the offscreen 3D camera & lights that render the hovered part/weapon into `@PartsLayout`.
 #[derive(Component)]
 pub struct PartPreviewCamera;
@@ -1086,7 +1114,9 @@ pub fn spawn_assemble_ui(
     // 7. Left Vertical Part Thumbnail Strip (`@PartsList` `[86, 220, 170, 562]`, 6 × `84×54`).
     //    Displays the real disc picture (`image/partsthumbnail/<dir>/<prefix><model_id:04>.tpf.dcx`)
     //    for every part in the filtered list!
-    let list_start = state.scroll.min(parts.len().saturating_sub(1));
+    let list_start = state
+        .scroll
+        .min(parts.len().saturating_sub(ASSEMBLE_THUMB_WINDOW));
     let list_end = (list_start + ASSEMBLE_THUMB_WINDOW).min(parts.len());
     for (vis_i, idx) in (list_start..list_end).enumerate() {
         let pid = parts[idx];
@@ -1904,6 +1934,25 @@ mod tests {
     use super::*;
     use acvd_formats::vfs;
     use std::path::PathBuf;
+
+    #[test]
+    fn hovered_scroll_strip_maps_category_and_parts_rects() {
+        let win = Vec2::new(SCREEN_W, SCREEN_H);
+        assert_eq!(
+            hovered_scroll_strip(win, Vec2::new(400.0, 170.0)),
+            Some(AssembleScrollStrip::CategoryList)
+        );
+        assert_eq!(
+            hovered_scroll_strip(win, Vec2::new(120.0, 300.0)),
+            Some(AssembleScrollStrip::PartsList)
+        );
+        assert_eq!(hovered_scroll_strip(win, Vec2::new(900.0, 400.0)), None);
+        // Outside the letterboxed UI origin on a taller window should miss.
+        assert_eq!(
+            hovered_scroll_strip(Vec2::new(1280.0, 900.0), Vec2::new(120.0, 10.0)),
+            None
+        );
+    }
 
     #[test]
     fn part_thumbnails_subcategories_and_descriptions_resolve_from_disc() {

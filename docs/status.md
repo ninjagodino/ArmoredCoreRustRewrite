@@ -282,6 +282,9 @@ in order:
 
 ## Done
 
+- **Garage Assemble Mouse-Wheel Strips (`garage::handle_input` / `update_camera`, `garage_assemble::hovered_scroll_strip`)**:
+  - Wheel over `@PartsCategoryList` (horizontal slot tabs) or `@PartsList` (vertical part thumbnails) now scrolls that strip instead of zooming the AC camera; zoom still works when the cursor is elsewhere. Verified by `garage_assemble::tests::hovered_scroll_strip_maps_category_and_parts_rects`.
+
 - **Garage Part/Weapon Swap Performance (`acvd-render::Packs` / `FlverCache`, `acvd-game::paint`, `decal`, `main`, `garage_assemble`, `Cargo.toml`)**:
   - Eliminated the 3–5 s freeze when selecting/scrolling parts and weapons in the 3D Garage (debug build part-swap time dropped from **3,221.8 ms → 25.1 ms** on uncached swaps and **9.8 ms** when returning to a previously seen part, 3D preview from **145.7 ms → 0.4–1.0 ms**):
     - Upgraded `acvd_render::Packs` to cache decoded GPU `Handle<Image>`s keyed by `(pack_path, texture_index, linear)`, per-pack TPF name->index maps, and 1×1 utility handles (`empty_mask`, `empty_decal`) and wired `acvd_render::material` + `paint::material` through it so unchanged parts and shared submesh textures never re-untile/re-decode or re-upload to the GPU.
