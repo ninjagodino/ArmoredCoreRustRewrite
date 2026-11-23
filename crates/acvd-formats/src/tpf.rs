@@ -454,6 +454,148 @@ pub fn decode_ctx1(
     Ok(out)
 }
 
+#[inline]
+fn rgb565_to_rgba(c: u16) -> [u8; 4] {
+    let r = ((c >> 11) & 0x1f) as u8;
+    let g = ((c >> 5) & 0x3f) as u8;
+    let b = (c & 0x1f) as u8;
+    [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2), 255]
+}
+
+/// Decodes one 8-byte little-endian BC1 (DXT1) 4x4 block into 16 RGBA8 texels.
+pub fn decode_bc1_block(block: &[u8; 8], opaque_only: bool) -> [[u8; 4]; 16] {
+    let c0 = u16::from_le_bytes([block[0], block[1]]);
+    let c1 = u16::from_le_bytes([block[2], block[3]]);
+    let mut pal = [[0u8; 4]; 4];
+    pal[0] = rgb565_to_rgba(c0);
+    pal[1] = rgb565_to_rgba(c1);
+    if opaque_only || c0 > c1 {
+        for ch in 0..3 {
+            pal[2][ch] = ((2 * pal[0][ch] as u16 + pal[1][ch] as u16 + 1) / 3) as u8;
+            pal[3][ch] = ((pal[0][ch] as u16 + 2 * pal[1][ch] as u16 + 1) / 3) as u8;
+        }
+        pal[2][3] = 255;
+        pal[3][3] = 255;
+    } else {
+        for ch in 0..3 {
+            pal[2][ch] = ((pal[0][ch] as u16 + pal[1][ch] as u16) / 2) as u8;
+        }
+        pal[2][3] = 255;
+        pal[3] = [0, 0, 0, 0];
+    }
+    let bits = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    let mut out = [[0u8; 4]; 16];
+    for (i, texel) in out.iter_mut().enumerate() {
+        *texel = pal[((bits >> (2 * i)) & 3) as usize];
+    }
+    out
+}
+
+/// Decodes one 16-byte little-endian BC3 (DXT5) 4x4 block into 16 RGBA8 texels.
+pub fn decode_bc3_block(block: &[u8; 16]) -> [[u8; 4]; 16] {
+    let a0 = block[0] as u16;
+    let a1 = block[1] as u16;
+    let mut apal = [0u8; 8];
+    apal[0] = a0 as u8;
+    apal[1] = a1 as u8;
+    if a0 > a1 {
+        for i in 1..7 {
+            apal[i + 1] = (((7 - i as u16) * a0 + (i as u16) * a1 + 3) / 7) as u8;
+        }
+    } else {
+        for i in 1..5 {
+            apal[i + 1] = (((5 - i as u16) * a0 + (i as u16) * a1 + 2) / 5) as u8;
+        }
+        apal[6] = 0;
+        apal[7] = 255;
+    }
+    let abits = u64::from_le_bytes([
+        block[2], block[3], block[4], block[5], block[6], block[7], 0, 0,
+    ]);
+    let color_block: &[u8; 8] = block[8..16].try_into().unwrap();
+    let mut out = decode_bc1_block(color_block, true);
+    for (i, texel) in out.iter_mut().enumerate() {
+        texel[3] = apal[((abits >> (3 * i)) & 7) as usize];
+    }
+    out
+}
+
+/// Decodes mip level 0 of a linear BC1 (format 0) texture into tightly packed RGBA8 bytes.
+pub fn decode_bc1(linear: &[u8], width: u16, height: u16) -> Result<Vec<u8>> {
+    let lw = width as usize;
+    let lh = height as usize;
+    let bw = lw.div_ceil(4);
+    let bh = lh.div_ceil(4);
+    let need = bw * bh * 8;
+    ensure!(
+        linear.len() >= need,
+        "linear BC1 {width}x{height} is {} bytes, needs {need}",
+        linear.len()
+    );
+    let mut out = vec![0u8; lw * lh * 4];
+    let mut src = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let block: &[u8; 8] = linear[src..src + 8].try_into().unwrap();
+            src += 8;
+            let texels = decode_bc1_block(block, false);
+            for ly in 0..4 {
+                let y = by * 4 + ly;
+                if y >= lh {
+                    break;
+                }
+                for lx in 0..4 {
+                    let x = bx * 4 + lx;
+                    if x >= lw {
+                        break;
+                    }
+                    let at = (y * lw + x) * 4;
+                    out[at..at + 4].copy_from_slice(&texels[ly * 4 + lx]);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decodes mip level 0 of a linear BC3 (DXT5, format 5) texture into tightly packed RGBA8 bytes.
+pub fn decode_bc3(linear: &[u8], width: u16, height: u16) -> Result<Vec<u8>> {
+    let lw = width as usize;
+    let lh = height as usize;
+    let bw = lw.div_ceil(4);
+    let bh = lh.div_ceil(4);
+    let need = bw * bh * 16;
+    ensure!(
+        linear.len() >= need,
+        "linear BC3 {width}x{height} is {} bytes, needs {need}",
+        linear.len()
+    );
+    let mut out = vec![0u8; lw * lh * 4];
+    let mut src = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let block: &[u8; 16] = linear[src..src + 16].try_into().unwrap();
+            src += 16;
+            let texels = decode_bc3_block(block);
+            for ly in 0..4 {
+                let y = by * 4 + ly;
+                if y >= lh {
+                    break;
+                }
+                for lx in 0..4 {
+                    let x = bx * 4 + lx;
+                    if x >= lw {
+                        break;
+                    }
+                    let at = (y * lw + x) * 4;
+                    out[at..at + 4].copy_from_slice(&texels[ly * 4 + lx]);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +751,25 @@ mod tests {
             }
         }
         assert!(dxn_n > 0 && ctx24_n > 0 && ctx25_n > 0, "dxn={dxn_n} ctx24={ctx24_n} ctx25={ctx25_n}");
+    }
+
+    #[test]
+    fn x360_emblem_bc3_decodes_to_rgba8() {
+        let iso = vfs::repo_root().join(vfs::X360_ISO);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = vfs::Disc::open(&iso).unwrap();
+        let data = disc.asset("image/emblem/im0001.tpf").unwrap();
+        let t = read(&data).unwrap();
+        let tex = &t.textures[0];
+        assert_eq!(tex.format, 5);
+        assert_eq!((tex.width, tex.height), (256, 256));
+        let lin = tex.linear(t.platform, &data, 16).unwrap();
+        let rgba = decode_bc3(&lin, tex.width, tex.height).unwrap();
+        assert_eq!(rgba.len(), 256 * 256 * 4);
+        let opaque = rgba.chunks_exact(4).filter(|p| p[3] > 200).count();
+        let transparent = rgba.chunks_exact(4).filter(|p| p[3] < 20).count();
+        assert!(opaque > 500 && transparent > 500, "opaque={opaque} transparent={transparent}");
     }
 }

@@ -30,6 +30,8 @@ struct AcPaintParams {
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var camo_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var emission_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var specular_map: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var decal_map: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var decal_sampler: sampler;
 
 // Undoes the diffuse sampler's sRGB decode so the 360 overlay blend runs in raw texel space.
 fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
@@ -64,7 +66,18 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let hi = 1.0 - 2.0 * (1.0 - d) * (1.0 - col);
     let blended = select(lo, hi, d >= vec3(0.5));
     let painted = mix(d, blended, mask.g);
-    pbr.material.base_color = vec4(srgb_decode(painted), pbr.material.base_color.a);
+
+    // Flver_ACColorDecalColDifSpcBumpIbl.fpo instructions 107, 110, 131..132:
+    // sample `g_AC_DecalMap` (`s3`) at UV1 (`r5.zw`) and composite premultiplied sRGB over `painted`:
+    //   `final = painted * (1.0 - decal.a) + decal.rgb`
+#ifdef VERTEX_UVS_B
+    let decal_uv = in.uv_b;
+#else
+    let decal_uv = in.uv;
+#endif
+    let decal = textureSample(decal_map, decal_sampler, decal_uv) * paint.flags.y;
+    let composited = painted * (1.0 - decal.a) + decal.rgb;
+    pbr.material.base_color = vec4(srgb_decode(composited), pbr.material.base_color.a);
 
     // Flver_ACColorColDifSpcBumpIbl.fpo: `g_Specular` (`*_s`) R drives gloss/specular power
     // (`c2.x * spc.r`) and RGB luma drives reflectance strength.

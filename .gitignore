@@ -7,6 +7,9 @@
 # Downloaded third-party tooling (Ghidra, ghidra-cli, Paramdex snapshot).
 /external/
 
+# User-uploaded garage decal images and saved decal layouts.
+/decals/
+
 /target/
 *.gpr
 *.rep/

@@ -1030,6 +1030,7 @@ fn spawn_ac_target(
                     &mesh,
                     part_loaded.placement.column,
                     col,
+                    None,
                     packs,
                     images,
                 )

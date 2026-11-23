@@ -55,6 +55,7 @@ mod boost;
 mod collision;
 mod control;
 mod damage;
+mod decal;
 mod env;
 mod fcs;
 mod garage;
@@ -161,8 +162,8 @@ fn main() {
     let mut test = targets::TestMode::default();
     let mut test_arg = "actest2".to_string();
     let (mut preview, mut burst, mut no_hud) = (None, 1, false);
-    let (mut start_garage, mut garage_id, mut garage_screen) =
-        (false, None, garage::GarageScreen::Top);
+    let (mut start_garage, mut garage_id, mut garage_screen, mut garage_paint_tab, mut cli_decal) =
+        (false, None, garage::GarageScreen::Top, garage::PaintTab::Presets, None::<PathBuf>);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -223,9 +224,17 @@ fn main() {
             }
             "--garage-screen" => {
                 start_garage = true;
-                if let Some(s) = args.next().and_then(|s| garage::GarageScreen::from_cli(&s)) {
-                    garage_screen = s;
+                if let Some(raw) = args.next() {
+                    if raw.trim().eq_ignore_ascii_case("decals") {
+                        garage_screen = garage::GarageScreen::Paint;
+                        garage_paint_tab = garage::PaintTab::Decals;
+                    } else if let Some(s) = garage::GarageScreen::from_cli(&raw) {
+                        garage_screen = s;
+                    }
                 }
+            }
+            "--decal" => {
+                cli_decal = args.next().map(PathBuf::from);
             }
             _ => wanted = a.parse::<u32>().ok(),
         }
@@ -315,13 +324,14 @@ fn main() {
     let initial_color = (!flat)
         .then(|| paint::load_accolor(&disc, initial_design.coloring_id))
         .flatten();
-    let garage_state = garage::GarageState::init(
+    let mut garage_state = garage::GarageState::init(
         &disc,
         garage_id,
         garage_screen,
         map.as_deref().unwrap_or("m4000"),
         &test_arg,
     );
+    garage_state.paint_tab = garage_paint_tab;
 
     let enemy_parts = weapons::EnemyParts::load(&disc);
     let mut app = App::new();
@@ -350,6 +360,8 @@ fn main() {
     .insert_resource(initial_mode)
     .insert_resource(garage::ModeSwitch::default())
     .insert_resource(garage_state)
+    .insert_resource(decal::DecalState::new(cli_decal))
+    .insert_resource(decal::DecalMeshCache::default())
     .insert_resource(Garage {
         disc,
         designs,
@@ -389,6 +401,7 @@ fn main() {
             sortie_garage_hotkey,
             process_mode_switch,
             garage::sync_room,
+            decal::handle_imports,
             garage::handle_input,
             garage::sync_ui,
             garage::update_camera,
@@ -413,6 +426,9 @@ fn main() {
                 hanger::pose,
             )
                 .chain(),
+            (decal::interact_and_gizmo, decal::sync_bakes)
+                .chain()
+                .after(hanger::pose),
             (
                 bay::shift.run_if(in_sortie),
                 weapons::fire.run_if(in_sortie),
@@ -923,6 +939,7 @@ fn setup(
     mut paint_materials: ResMut<Assets<paint::AcPaintMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mut decals: ResMut<decal::DecalState>,
     mode: Res<garage::Mode>,
     garage: Res<Garage>,
     enemy_parts: Res<weapons::EnemyParts>,
@@ -971,7 +988,9 @@ fn setup(
             &scene,
         );
     }
-    if show_hud.0 {
+    let show_hud_flag = show_hud.0;
+    decals.init_assets(&mut images);
+    if show_hud_flag {
         match load_hud(&garage.disc, &mut images) {
             Ok(hud) => commands.insert_resource(hud),
             Err(e) => warn!("hud: {e:#}"),
@@ -1076,6 +1095,8 @@ fn show(
     start: Res<map::Start>,
     start_aim: Res<StartAim>,
     shot: Option<ResMut<Shot>>,
+    mut decals: ResMut<decal::DecalState>,
+    mut decal_cache: ResMut<decal::DecalMeshCache>,
 ) {
     let meshes = &mut *assets.meshes;
     let materials = &mut *assets.materials;
@@ -1086,6 +1107,8 @@ fn show(
         return;
     }
     garage.dirty = false;
+    decals.init_assets(images);
+    decal_cache.meshes.clear();
     let design_data = garage.active_design;
     let design_name = garage.active_name.clone();
     for e in acs.iter().chain(shots.iter()).chain(labels.iter()) {
@@ -1164,7 +1187,8 @@ fn show(
     for (loaded_i, (part, (joints, binds))) in loaded.into_iter().zip(skins).enumerate() {
         boost::note(&part.placement, &part.rig, &joints, &mut nozzles);
         boost::fold(&mut commands, part.placement, &part.rig, &joints);
-        let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
+        let binds_vec = binds;
+        let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds_vec.clone()));
         let root_bone = part
             .rig
             .bones
@@ -1342,6 +1366,20 @@ fn show(
         for mesh in part.meshes {
             min = min.min(Vec3::from(mesh.min));
             max = max.max(Vec3::from(mesh.max));
+            let decal_slot = decal::DecalSlot::from_mesh(
+                part.placement.column,
+                mesh.root.as_deref(),
+            );
+            if let Some(slot) = decal_slot {
+                if let Some(cached) = decal::CachedPartMesh::from_mesh(
+                    slot,
+                    &mesh.mesh,
+                    joints.clone(),
+                    binds_vec.clone(),
+                ) {
+                    decal_cache.meshes.push(cached);
+                }
+            }
             let base = acvd_render::material(
                 &garage.disc,
                 &mesh,
@@ -1357,6 +1395,7 @@ fn show(
                     &mesh,
                     part.placement.column,
                     col,
+                    decal_slot.map(|s| decals.slot_handle(s)),
                     &mut packs,
                     images,
                 )
@@ -1392,6 +1431,7 @@ fn show(
             }
         }
     }
+    decals.mark_all_dirty(true);
     commands.insert_resource(loadout);
     if let Some(att) = ow_arm_attach {
         commands.insert_resource(att);

@@ -26,6 +26,7 @@ use acvd_formats::accolor::{self, AcColor, GLOW_INTENSITY, OVERLAY_CHANNELS, RIM
 use acvd_formats::vfs::Disc;
 use acvd_render::{LoadedMesh, Packs};
 use bevy::asset::embedded_asset;
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat};
@@ -46,6 +47,10 @@ pub struct AcPaint {
     pub emission_map: Handle<Image>,
     #[texture(105)]
     pub specular_map: Handle<Image>,
+    /// `g_AC_DecalMap` (`s3`, UV1): per-part premultiplied sRGB decal atlas (`0x82b4ca00`).
+    #[texture(106)]
+    #[sampler(107)]
+    pub decal_map: Handle<Image>,
 }
 
 #[derive(ShaderType, Debug, Clone, Copy)]
@@ -53,7 +58,7 @@ pub struct AcPaintParams {
     pub overlay: [Vec4; OVERLAY_CHANNELS],
     /// `c190.xy` (`DL_FREG_190`, `0x82461a98`): `mask_size / camo_size`, or `(1, 1)` when `camo == 0`.
     pub camo_scale: Vec2,
-    /// `x = 1.0` when a `g_Specular` (`*_s`) texture is bound (`0.0` otherwise); `y = 0.0`.
+    /// `x = 1.0` when a `g_Specular` (`*_s`) texture is bound; `y = 1.0` when `g_AC_DecalMap` is active.
     pub flags: Vec2,
     /// `c138` (`DL_FREG_138`, `0x82bd7bd8`): `(kojima.rgb / 255.0 * 20.0, 1.0)` on `_Glow` meshes, or `0`.
     pub emission: Vec4,
@@ -150,14 +155,29 @@ fn empty_mask_image() -> Image {
     img
 }
 
+/// 1x1 transparent RGBA8 image with ClampToEdge + Linear sampler for empty decal maps.
+pub fn empty_decal_image() -> Image {
+    let mut img = empty_mask_image();
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::ClampToEdge,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    img
+}
+
 /// Build an [`AcPaintMaterial`] when `accolor` is present and the mesh has a `<diffuse>_c` mask
 /// or a `_Rim` material (`ACParts_Rim*`).
+#[allow(clippy::too_many_arguments)]
 pub fn material(
     disc: &Disc,
     base: &StandardMaterial,
     mesh: &LoadedMesh,
     column: &str,
     accolor: &AcColor,
+    decal_map: Option<Handle<Image>>,
     packs: &mut Packs,
     images: &mut Assets<Image>,
 ) -> Option<AcPaintMaterial> {
@@ -220,13 +240,18 @@ pub fn material(
         Vec4::ZERO
     };
 
+    let (decal_map, has_decal) = match decal_map {
+        Some(h) => (h, 1.0),
+        None => (images.add(empty_decal_image()), 0.0),
+    };
+
     Some(AcPaintMaterial {
         base: base.clone(),
         extension: AcPaint {
             params: AcPaintParams {
                 overlay: cols.map(Vec4::from),
                 camo_scale,
-                flags: Vec2::new(has_specular, 0.0),
+                flags: Vec2::new(has_specular, has_decal),
                 emission,
                 rim,
             },
@@ -234,6 +259,7 @@ pub fn material(
             camo_map,
             emission_map,
             specular_map,
+            decal_map,
         },
     })
 }
@@ -316,14 +342,14 @@ mod tests {
         // Standard AC armor mesh: binds normal map on base and specular map on AcPaint.
         let base = acvd_render::material(&disc, &meshes[0], &mut packs, &mut images, false, &mut missing);
         assert!(base.normal_map_texture.is_some(), "am0010 base should bind normal_map_texture");
-        let painted = material(&disc, &base, &meshes[0], "arms", &col, &mut packs, &mut images)
+        let painted = material(&disc, &base, &meshes[0], "arms", &col, None, &mut packs, &mut images)
             .expect("am0010 painted material");
         assert_eq!(painted.extension.params.flags.x, 1.0, "specular map bound");
         assert_eq!(painted.extension.params.rim, Vec4::ZERO, "non-rim mesh has zero rim");
 
         // Simulated `_Rim` MTD: uploads kojima * 10.0 (`RIM_INTENSITY`, 0x82008994 in 0x82bd8958).
         meshes[0].mtd = "ACParts_Rim_ex".into();
-        let rim_mat = material(&disc, &base, &meshes[0], "head", &col, &mut packs, &mut images)
+        let rim_mat = material(&disc, &base, &meshes[0], "head", &col, None, &mut packs, &mut images)
             .expect("rim painted material");
         let expected_rim = col.emission_col(0, RIM_INTENSITY);
         assert_eq!(rim_mat.extension.params.rim, Vec4::from(expected_rim));
