@@ -21,3 +21,6 @@ bevy = "0.19"
 
 [profile.dev.package."*"]
 opt-level = 3
+# External deps (Bevy/wgpu/naga/image) emit >4 GB of CodeView debug info on MSVC and trip
+# `LNK1318: Unexpected PDB error; LIMIT (12)`; keep full debug info on workspace crates only.
+debug = false
