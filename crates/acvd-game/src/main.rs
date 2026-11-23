@@ -112,6 +112,11 @@ pub struct Garage {
 #[derive(Component)]
 struct SortieDecor;
 
+/// Persistent TPF texture pack cache shared across AC rebuilds and the garage 3D part preview
+/// so swapping parts never re-reads or re-untiles already-decoded AC part textures from the ISO.
+#[derive(Resource, Default)]
+pub struct AcTexturePacks(pub acvd_render::Packs);
+
 /// The assembled AC; its parts are children.
 #[derive(Component)]
 struct Ac;
@@ -361,6 +366,7 @@ fn main() {
     .insert_resource(initial_mode)
     .insert_resource(garage::ModeSwitch::default())
     .insert_resource(garage_state)
+    .init_resource::<AcTexturePacks>()
     .init_resource::<garage_assemble::AssembleUiAssets>()
     .insert_resource(decal::DecalState::new(cli_decal))
     .insert_resource(decal::DecalMeshCache::default())
@@ -772,6 +778,7 @@ struct RenderAssets<'w> {
     paint_materials: ResMut<'w, Assets<paint::AcPaintMaterial>>,
     images: ResMut<'w, Assets<Image>>,
     bindposes: ResMut<'w, Assets<SkinnedMeshInverseBindposes>>,
+    ac_packs: ResMut<'w, AcTexturePacks>,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1162,7 +1169,7 @@ fn show(
         ))
         .id();
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    let (mut packs, mut missing) = (acvd_render::Packs::default(), 0);
+    let (packs, mut missing) = (&mut assets.ac_packs.0, 0);
     let mut problems = built.problems;
     let mut loaded = Vec::new();
     let mut known = vec![None; built.placements.len()];
@@ -1402,7 +1409,7 @@ fn show(
             let base = acvd_render::material(
                 &garage.disc,
                 &mesh,
-                &mut packs,
+                packs,
                 images,
                 garage.flat,
                 &mut missing,
@@ -1415,7 +1422,7 @@ fn show(
                     part.placement.column,
                     col,
                     decal_slot.map(|s| decals.slot_handle(s)),
-                    &mut packs,
+                    packs,
                     images,
                 )
             });

@@ -788,6 +788,11 @@ pub struct GarageState {
     pub assemble_detail_view: bool,
     /// Horizontal scroll offset for `@PartsCategoryList` (7 visible slot tabs).
     pub assemble_cat_scroll: usize,
+    /// Debounce timer (seconds) before triggering a full 3D AC rebuild (`garage.dirty = true`)
+    /// while scrolling through visible parts in `AssembleParts`.
+    pub ac_preview_debounce: Option<f32>,
+    /// True once a hovered preview actually triggered a 3D AC rebuild since entering the slot.
+    pub ac_preview_rebuilt: bool,
     /// Design snapshot before previewing parts/designs, restored on Cancel.
     pub saved_design: Option<AcAssemblyDesignSt>,
     pub saved_color: Option<Option<AcColor>>,
@@ -860,6 +865,8 @@ impl GarageState {
             assemble_dmg_filter: None,
             assemble_detail_view: false,
             assemble_cat_scroll: 0,
+            ac_preview_debounce: None,
+            ac_preview_rebuilt: false,
             saved_design: None,
             saved_color: None,
             saved_name: None,
@@ -1463,6 +1470,16 @@ pub fn handle_input(
         if *ttl <= 0.0 {
             state.banner = None;
             state.ui_dirty = true;
+        }
+    }
+
+    // Flush debounced 3D AC preview rebuild once the user pauses scrolling parts.
+    if let Some(ref mut rem) = state.ac_preview_debounce {
+        *rem -= time.delta_secs();
+        if *rem <= 0.0 {
+            state.ac_preview_debounce = None;
+            state.ac_preview_rebuilt = true;
+            garage.dirty = true;
         }
     }
 
@@ -2157,20 +2174,44 @@ fn switch_assemble_slot(
     state.ui_dirty = true;
 }
 
+/// Whether changing `slot` alters any visible 3D mesh on the assembled AC.
+/// Internal parts (FCS, Generator, Recon) have no mounted AC mesh so hovering/equipping them
+/// never needs to rebuild the 3D AC or re-bake decals.
+fn slot_has_visible_ac_model(slot: AssembleSlot) -> bool {
+    !matches!(
+        slot,
+        AssembleSlot::Fcs | AssembleSlot::Generator | AssembleSlot::Recon
+    )
+}
+
+/// True when two designs differ in any visible 3D AC part slot or coloring ID.
+fn visible_ac_design_differs(a: &AcAssemblyDesignSt, b: &AcAssemblyDesignSt) -> bool {
+    a.coloring_id != b.coloring_id
+        || AssembleSlot::ALL
+            .iter()
+            .any(|&s| slot_has_visible_ac_model(s) && s.get(a) != s.get(b))
+}
+
 fn revert_preview(state: &mut GarageState, garage: &mut crate::Garage) {
-    let mut changed = false;
+    state.ac_preview_debounce = None;
+    let was_rebuilt = std::mem::take(&mut state.ac_preview_rebuilt);
+    let mut visual_changed = false;
     if let Some(d) = state.saved_design.take() {
+        if visible_ac_design_differs(&garage.active_design, &d) && was_rebuilt {
+            visual_changed = true;
+        }
         garage.active_design = d;
-        changed = true;
     }
     if let Some(c) = state.saved_color.take() {
+        if garage.custom_color != c {
+            visual_changed = true;
+        }
         garage.custom_color = c;
-        changed = true;
     }
     if let Some(n) = state.saved_name.take() {
         garage.active_name = n;
     }
-    if changed {
+    if visual_changed {
         garage.dirty = true;
     }
 }
@@ -2186,7 +2227,9 @@ fn apply_cursor_preview(state: &mut GarageState, garage: &mut crate::Garage) {
             if let Some(&part_id) = parts.get(state.cursor) {
                 if slot.get(&garage.active_design) != part_id {
                     slot.set(&mut garage.active_design, part_id);
-                    garage.dirty = true;
+                    if slot_has_visible_ac_model(slot) {
+                        state.ac_preview_debounce = Some(0.18);
+                    }
                 }
             }
         }
@@ -2371,9 +2414,16 @@ fn trigger_confirm(
             let Some(&part_id) = parts.get(state.cursor) else {
                 return;
             };
+            let changed = slot.get(&garage.active_design) != part_id;
             slot.set(&mut garage.active_design, part_id);
-            garage.dirty = true;
-            state.saved_design = None;
+            let pending = state.ac_preview_debounce.take().is_some();
+            state.ac_preview_rebuilt = false;
+            if slot_has_visible_ac_model(slot) && (changed || pending) {
+                garage.dirty = true;
+            }
+            // Commit the newly equipped part as the active baseline while staying right in the
+            // retail `AssembleParts` screen (matching retail ACVD — no jump back to `AssembleSlots`).
+            state.saved_design = Some(garage.active_design);
             let cue = if part_id == 0 { CUE_UNEQUIP } else { CUE_EQUIP };
             sound::cue(commands, cues, audio_assets, cue);
             let pname = part_name(state.parts_fmg.as_ref(), slot.category(), part_id);
@@ -2381,9 +2431,6 @@ fn trigger_confirm(
                 format!("{}: {}", slot.label(), pname),
                 Color::srgb(0.45, 0.92, 0.62),
             );
-            state.screen = GarageScreen::AssembleSlots;
-            state.cursor = state.slot_cursor;
-            clamp_scroll(&mut state.scroll, state.cursor, AssembleSlot::ALL.len());
             state.ui_dirty = true;
         }
         GarageScreen::Paint => {

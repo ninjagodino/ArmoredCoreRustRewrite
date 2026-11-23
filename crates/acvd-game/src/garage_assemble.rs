@@ -72,6 +72,21 @@ pub struct PartPreviewPivot;
 #[derive(Component)]
 pub struct PartPreviewMesh;
 
+type PreviewKey = (u8, u16, bool, u64);
+
+#[derive(Clone)]
+pub enum PreviewMat {
+    Painted(Handle<paint::AcPaintMaterial>),
+    Std(Handle<StandardMaterial>),
+}
+
+#[derive(Clone)]
+pub struct CachedPreviewMesh {
+    pub mesh: Handle<Mesh>,
+    pub mat: PreviewMat,
+    pub transform: Transform,
+}
+
 /// Cached retail DRB layout, FMG text banks, per-part thumbnail handles, and 3D preview target.
 #[derive(Resource, Default)]
 pub struct AssembleUiAssets {
@@ -84,9 +99,13 @@ pub struct AssembleUiAssets {
     /// Offscreen RGBA8 render target for the 3D part preview camera.
     pub preview_image: Option<Handle<Image>>,
     /// Currently spawned `(category, part_id, slot_is_left, paint_rev)` in the 3D preview studio.
-    pub preview_loaded: Option<(u8, u16, bool, u64)>,
+    pub preview_loaded: Option<PreviewKey>,
+    /// Short debounce before loading an uncached 3D FLVER from disc while rapidly scrolling.
+    pub preview_pending: Option<(PreviewKey, f32)>,
+    /// Cached 3D preview meshes & materials per `(category, part_id, is_left, paint_rev)`.
+    pub preview_cache: HashMap<PreviewKey, Vec<CachedPreviewMesh>>,
     pub preview_yaw: f32,
-    /// Shared TPF pack cache for thumbnails and preview meshes.
+    /// Dedicated TPF pack cache for 128×64 part thumbnails.
     pub packs: Packs,
 }
 
@@ -1570,10 +1589,12 @@ fn fill_param_dialog(
 #[allow(clippy::too_many_arguments)]
 pub fn sync_part_preview(
     mut commands: Commands,
+    time: Res<Time>,
     mode: Res<Mode>,
     state: Res<GarageState>,
     garage: Res<crate::Garage>,
     mut assets: ResMut<AssembleUiAssets>,
+    mut ac_packs: ResMut<crate::AcTexturePacks>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut std_mats: ResMut<Assets<StandardMaterial>>,
     mut ac_mats: ResMut<Assets<paint::AcPaintMaterial>>,
@@ -1604,6 +1625,7 @@ pub fn sync_part_preview(
                 commands.entity(e).despawn();
             }
             assets.preview_loaded = None;
+            assets.preview_pending = None;
         }
         return;
     };
@@ -1677,8 +1699,28 @@ pub fn sync_part_preview(
         .unwrap_or(0);
     let want = (cat, sel_id, is_left, color_key);
     if assets.preview_loaded == Some(want) {
+        assets.preview_pending = None;
         return;
     }
+
+    // If not already cached (and not the very first preview frame or empty slot), debounce
+    // disc FLVER loading by 90 ms so rapid W/S scrolling stays 60 FPS.
+    let is_cached = sel_id == 0 || assets.preview_cache.contains_key(&want);
+    if !is_cached && assets.preview_loaded.is_some() {
+        match assets.preview_pending {
+            Some((k, ref mut rem)) if k == want => {
+                *rem -= time.delta_secs();
+                if *rem > 0.0 {
+                    return;
+                }
+            }
+            _ => {
+                assets.preview_pending = Some((want, 0.09));
+                return;
+            }
+        }
+    }
+    assets.preview_pending = None;
     assets.preview_loaded = Some(want);
 
     for e in &mesh_q {
@@ -1691,35 +1733,98 @@ pub fn sync_part_preview(
         return;
     }
 
-    let Some(part) = ac_part(cat, sel_id) else {
-        return;
-    };
-    let pref = slot.model_prefix();
-    let model_asset = pref
-        .and_then(|p| part.models.iter().find(|(k, _)| *k == p).map(|(_, a)| *a))
-        .or_else(|| part.models.first().map(|(_, a)| *a));
-    let Some(asset_path) = model_asset else {
-        return;
-    };
+    let cached_meshes = if let Some(cached) = assets.preview_cache.get(&want) {
+        cached.clone()
+    } else {
+        let Some(part) = ac_part(cat, sel_id) else {
+            return;
+        };
+        let pref = slot.model_prefix();
+        let model_asset = pref
+            .and_then(|p| part.models.iter().find(|(k, _)| *k == p).map(|(_, a)| *a))
+            .or_else(|| part.models.first().map(|(_, a)| *a));
+        let Some(asset_path) = model_asset else {
+            return;
+        };
 
-    let Ok(loaded) = acvd_render::model(&garage.disc, asset_path) else {
-        return;
-    };
-    if loaded.is_empty() {
-        return;
-    }
+        let Ok(loaded) = acvd_render::model(&garage.disc, asset_path) else {
+            return;
+        };
+        if loaded.is_empty() {
+            return;
+        }
 
-    // Compute combined AABB across all submeshes so the part centers and scales uniformly.
-    let mut bmin = Vec3::splat(f32::INFINITY);
-    let mut bmax = Vec3::splat(f32::NEG_INFINITY);
-    for lm in &loaded {
-        bmin = bmin.min(Vec3::from_array(lm.min));
-        bmax = bmax.max(Vec3::from_array(lm.max));
-    }
-    let center = (bmin + bmax) * 0.5;
-    let extent = (bmax - bmin).max(Vec3::splat(0.05));
-    let radius = (extent.length() * 0.5).max(0.1);
-    let fit_scale = 1.05 / radius;
+        // Compute combined AABB across all submeshes so the part centers and scales uniformly.
+        let mut bmin = Vec3::splat(f32::INFINITY);
+        let mut bmax = Vec3::splat(f32::NEG_INFINITY);
+        for lm in &loaded {
+            bmin = bmin.min(Vec3::from_array(lm.min));
+            bmax = bmax.max(Vec3::from_array(lm.max));
+        }
+        let center = (bmin + bmax) * 0.5;
+        let extent = (bmax - bmin).max(Vec3::splat(0.05));
+        let radius = (extent.length() * 0.5).max(0.1);
+        let fit_scale = 1.05 / radius;
+
+        let color: Option<AcColor> = garage
+            .custom_color
+            .clone()
+            .or_else(|| paint::load_accolor(&garage.disc, garage.active_design.coloring_id));
+        let column = match slot {
+            AssembleSlot::Head => "head",
+            AssembleSlot::Core => "core",
+            AssembleSlot::Arms => "arms",
+            AssembleSlot::Legs => "legs",
+            AssembleSlot::Booster => "booster",
+            AssembleSlot::ArmUnitR | AssembleSlot::HangerR => "arm_r",
+            AssembleSlot::ArmUnitL | AssembleSlot::HangerL => "arm_l",
+            AssembleSlot::Shoulder => "shoulder",
+            AssembleSlot::OveredWeapon => "back_r",
+            _ => "core",
+        };
+        let mut missing = 0usize;
+        let mut built = Vec::with_capacity(loaded.len());
+        for lm in loaded {
+            let base = acvd_render::material(
+                &garage.disc,
+                &lm,
+                &mut ac_packs.0,
+                &mut images,
+                garage.flat,
+                &mut missing,
+            );
+            let painted = color.as_ref().and_then(|col| {
+                paint::material(
+                    &garage.disc,
+                    &base,
+                    &lm,
+                    column,
+                    col,
+                    None,
+                    &mut ac_packs.0,
+                    &mut images,
+                )
+            });
+            let mesh_h = meshes.add(lm.mesh);
+            let child_xform = Transform {
+                translation: -center * fit_scale,
+                rotation: Quat::IDENTITY,
+                scale: Vec3::splat(fit_scale),
+            };
+            let mat = if let Some(mat) = painted {
+                PreviewMat::Painted(ac_mats.add(mat))
+            } else {
+                PreviewMat::Std(std_mats.add(base))
+            };
+            built.push(CachedPreviewMesh {
+                mesh: mesh_h,
+                mat,
+                transform: child_xform,
+            });
+        }
+        assets.preview_cache.insert(want, built.clone());
+        built
+    };
 
     let layer = RenderLayers::layer(PART_PREVIEW_LAYER);
     let pivot = commands
@@ -1731,69 +1836,28 @@ pub fn sync_part_preview(
         ))
         .id();
 
-    let color: Option<AcColor> = garage
-        .custom_color
-        .clone()
-        .or_else(|| paint::load_accolor(&garage.disc, garage.active_design.coloring_id));
-    let column = match slot {
-        AssembleSlot::Head => "head",
-        AssembleSlot::Core => "core",
-        AssembleSlot::Arms => "arms",
-        AssembleSlot::Legs => "legs",
-        AssembleSlot::Booster => "booster",
-        AssembleSlot::ArmUnitR | AssembleSlot::HangerR => "arm_r",
-        AssembleSlot::ArmUnitL | AssembleSlot::HangerL => "arm_l",
-        AssembleSlot::Shoulder => "shoulder",
-        AssembleSlot::OveredWeapon => "back_r",
-        _ => "core",
-    };
-    let mut missing = 0usize;
-
-    for lm in loaded {
-        let base = acvd_render::material(
-            &garage.disc,
-            &lm,
-            &mut assets.packs,
-            &mut images,
-            garage.flat,
-            &mut missing,
-        );
-        let painted = color.as_ref().and_then(|col| {
-            paint::material(
-                &garage.disc,
-                &base,
-                &lm,
-                column,
-                col,
-                None,
-                &mut assets.packs,
-                &mut images,
-            )
-        });
-        let mesh_h = meshes.add(lm.mesh);
-        let child_xform = Transform {
-            translation: -center * fit_scale,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::splat(fit_scale),
-        };
-        if let Some(mat) = painted {
-            commands.spawn((
-                PartPreviewMesh,
-                Mesh3d(mesh_h),
-                MeshMaterial3d(ac_mats.add(mat)),
-                child_xform,
-                layer.clone(),
-                ChildOf(pivot),
-            ));
-        } else {
-            commands.spawn((
-                PartPreviewMesh,
-                Mesh3d(mesh_h),
-                MeshMaterial3d(std_mats.add(base)),
-                child_xform,
-                layer.clone(),
-                ChildOf(pivot),
-            ));
+    for item in cached_meshes {
+        match item.mat {
+            PreviewMat::Painted(mat_h) => {
+                commands.spawn((
+                    PartPreviewMesh,
+                    Mesh3d(item.mesh),
+                    MeshMaterial3d(mat_h),
+                    item.transform,
+                    layer.clone(),
+                    ChildOf(pivot),
+                ));
+            }
+            PreviewMat::Std(mat_h) => {
+                commands.spawn((
+                    PartPreviewMesh,
+                    Mesh3d(item.mesh),
+                    MeshMaterial3d(mat_h),
+                    item.transform,
+                    layer.clone(),
+                    ChildOf(pivot),
+                ));
+            }
         }
     }
 }
