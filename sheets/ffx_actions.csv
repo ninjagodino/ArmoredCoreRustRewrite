@@ -1,13 +1,15 @@
 action,role,slots,status,evidence
 14,node container,param-37 nodes (top-level action or a node's children slot),inferred,"top-level action of f0000300/f0001218; also the children slot of 2101 [8]"
 79,node container,one param-37 node,inferred,"top-level action of f0000440; empty children slot of most 2101 nodes"
-2101,static node,"[0] life s (<0 = forever) [3] delay [4] appearance [5] transform [6] motion [8] children",inferred,"f0001218 node 2: life 0.0833 with model 61 / light 24 / sprite 107 / billboard 59 children"
-2102,static node,same as 2101,inferred,"same slot shapes as 2101 in the ffxbnd survey"
-2020,spawner,"[0] life [4] delay [5] emissions (-1 = forever) [6] interval (0 = once) [7] copies per emission [8] child node [9] emitter 4 [10]/[11] transform",done,"f0000120 ([5] 3, [6] 0.1667 s, [7] 1): the 360 keeps exactly three s1020 copies per emitter, born about 0.18 s apart, and spawns no more (private/xenia/glide_scale.txt / .jsonl, action 61 draw 0x82c711e0)"
-2024,spawner,"as 2020, [8] an action-14 container",inferred,ffxbnd survey
-2023,particle cluster,"[0] life [1] emission s [5] delay [6] count keys [8] interval [10] max (-1 = no cap) [11] appearance [12] emitter [13] motion 55 [14] transform [15] motion 1 [17] children",inferred,"f0000300 flames: 1-3 per 0.0333 s max 15; f0001218 sparks: 6 per 0.05 s for 0.2 s"
-2034,particle cluster,"[0] appearance [1] emitter [2] motion 55 [3] transform [4] motion 1 [8] delay [9] interval (85) [10] count keys [11] emission s (85) [14] max [16] life (85) [17] children",inferred,"f0000300 node 2 booster smoke: 1 per 0.0167 s for 0.5 s, max 200, life 2"
-2032,particle cluster,same as 2034,inferred,ffxbnd survey
+2101,static node,"[0] life s (<0 = forever) [1] stop_on_stop [3] delay [4] appearance [5] transform [6] motion [8] children",done,"0x83190798 -> 0x83190d60 (0x835): ends at age >= life (life >= 0) or stop_on_stop && stop; parent expiry stops structural children (f0000098 idle exhaust 1.0 s, f0001404 walk dust 0.083 s, f0001405 landing dust 0.167 s)"
+2102,static node,same as 2101,done,"0x83190798 -> 0x83190de0 (0x836); same slot shapes as 2101"
+2020,spawner,"[0] life [1] stop_on_stop [4] delay [5] emissions (-1 = forever) [6] interval (0 = once) [7] copies per emission [8] child node [9] emitter 4 [10]/[11] transform",done,"0x83190798 -> 0x831908fc (0x7e4); f0000120 ([5] 3, [6] 0.1667 s, [7] 1): the 360 keeps exactly three s1020 copies per emitter, born about 0.18 s apart, and spawns no more (private/xenia/glide_scale.txt / .jsonl, action 61 draw 0x82c711e0)"
+2024,spawner,"as 2020, [8] an action-14 container",done,"0x83190798 -> 0x831908fc (0x7e8); same lifecycle as 2020"
+2031,spawner,"[0] child container [1] emitter 4 [3] transform [6] emissions (79 IntPair) [7] delay [8] interval (85 TickPair) [9] life (85 TickPair) [10] copies per emission [11]/[12] stop flags",done,"0x83190798 -> 0x83190b70 (0x7ef); f0001404 walk dust rock debris (1-3 emissions every 0.05 s, life 0.5 s)"
+2035,spawner,same as 2031,done,"0x83190798 -> 0x83190b70 (0x7f3)"
+2023,particle cluster,"[0] life [1] emission s (>=0 finite, <0 infinite) [2] stop_kill [5] delay [6] count keys [7] emissions (-1 = unlimited) [8] interval [9] stop_emit [10] max (-1 = no cap) [11] appearance [12] emitter [13] motion 55 [14] transform [15] motion 1 [17] children",done,"0x83190798 -> 0x83190a14 (0x7e7): transitions to state 2 (end) at age >= life or stop_kill, state 4 (stop emitting) at age >= emission_s or emissions exhausted or stop_emit; f0000300 flames, f0000098 exhaust, f0001404/1405 dust"
+2034,particle cluster,"[0] appearance [1] emitter [2] motion 55 [3] transform [4] motion 1 [7] emissions (79 IntPair) [8] delay [9] interval (85 TickPair) [10] count keys [11] emission s (85 TickPair) [12] stop_kill [13] stop_emit [14] max [16] life (85 TickPair) [17] children",done,"0x83190798 -> 0x83190c50 (0x7f2): transitions to state 2 at age >= life, state 4 (stop emitting) at age >= emission_s; f0000300 node 2 booster smoke emits for 0.5 s ignition window only (life 2.0 s)"
+2032,particle cluster,same as 2034,done,"0x83190798 -> 0x83190c50 (0x7f0)"
 36,transform,"offset xyz, rotation xyz (degrees), offset random xyz, rotation random xyz",inferred,"f0000300 flash offsets z 0.15 / 1.35 along the nozzle; Euler order YXZ assumed"
 35,transform,"offset xyz, rotation xyz",inferred,f0001218 2023 [14]; f0000440 10003 nodes rotate x -90
 1,node motion,"[0] speed range (81) [1] acceleration keys",inferred,all zero on the effects played so far

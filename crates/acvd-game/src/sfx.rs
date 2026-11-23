@@ -114,9 +114,6 @@ struct Dir(Disc);
 #[derive(Component)]
 pub struct Sfx {
     pub id: i32,
-    /// Ground-dust clusters (action 71) keep emitting for the whole effect. f0000300's smoke
-    /// node is that dust; a 0.5 s emit window would stop it while the 360 keeps it on.
-    dust: bool,
     stopping: bool,
     run: Option<Run>,
 }
@@ -125,7 +122,6 @@ impl Sfx {
     pub fn new(id: i32) -> Self {
         Self {
             id,
-            dust: false,
             stopping: false,
             run: None,
         }
@@ -133,10 +129,6 @@ impl Sfx {
 
     pub fn stop(&mut self) {
         self.stopping = true;
-    }
-
-    pub fn dust(&mut self, dust: bool) {
-        self.dust = dust;
     }
 }
 
@@ -1004,9 +996,11 @@ impl Emitter {
 struct ClusterDef {
     /// Particles per emission over the node's age.
     count: Curve,
+    /// Maximum emissions (`< 0` = unlimited; `2023` `[7]` `0x83190afc`, `2032`/`2034` `[7]` `0x83190d28`).
+    emissions: i32,
     /// Seconds between emissions; zero emits once.
     interval: f32,
-    /// Seconds the node emits; negative while it lives.
+    /// Seconds the node emits; negative while it lives, `>= 0` finite (`0x83190ae8` / `0x83190d20`).
     emit_for: f32,
     max: usize,
     emitter: Emitter,
@@ -1063,6 +1057,10 @@ struct NodeDef {
     /// Seconds; negative never ends.
     life: f32,
     delay: f32,
+    /// Whether `stop` cuts a finite-life node short (`2101` `[1]` `0x83190db8`, `2020`/`2024` `[1]`
+    /// `0x83190964`, `2031`/`2035` `[11]` `0x83190bd8`, `2023` `[2]` `0x83190a7c`, `2032`/`2034`
+    /// `[12]` `0x83190cd0`). Infinite-life nodes (`life < 0`) always stop on `stop`.
+    stop_on_stop: bool,
     xf: Xf,
     look: Option<Look>,
     motion: Motion,
@@ -1096,6 +1094,7 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
     let mut n = NodeDef {
         life: -1.0,
         delay: 0.0,
+        stop_on_stop: false,
         xf: Xf::default(),
         look: None,
         motion: Motion::default(),
@@ -1105,6 +1104,7 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
     match id {
         2101 | 2102 => {
             (n.life, n.delay) = (tick(l, 0), tick(l, 3));
+            n.stop_on_stop = int(l, 1) != 0;
             match action(l, 4) {
                 Some((10003, a)) => n.kind = Kind::Cluster(Arc::new(sparks(a))),
                 Some((a, al)) => n.look = look(a, al),
@@ -1116,6 +1116,7 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
         }
         2020 | 2024 => {
             (n.life, n.delay) = (tick(l, 0), tick(l, 4));
+            n.stop_on_stop = int(l, 1) != 0;
             let angle = Emitter::read(action(l, 9)).angle;
             // f0000120's 2020 ([5] 3, [6] 1/6 s, [7] 1) keeps exactly three s1020 copies per
             // nozzle, born about 0.18 s apart, and spawns no more (`private/xenia/glide_scale.jsonl`).
@@ -1132,11 +1133,32 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
                     .or(action(l, 11)),
             );
         }
+        2031 | 2035 => {
+            // TickPair spawner (`0x83190b70`): e.g. f0001404 walk-dust rock debris.
+            (n.life, n.delay) = (pair(l, 9).0, tick(l, 7));
+            n.stop_on_stop = int(l, 11) != 0;
+            let angle = Emitter::read(action(l, 1)).angle;
+            let emis = pair(l, 6);
+            n.kind = Kind::Spawner {
+                count: int(l, 10).max(1) as u32,
+                emissions: ((emis.0 + emis.1) * 0.5).round() as i32,
+                interval: pair(l, 8).0,
+                angle,
+                child: children(l, 0),
+            };
+            n.xf = Xf::read(
+                action(l, 3)
+                    .filter(|a| matches!(a.0, 35 | 36))
+                    .or(action(l, 2)),
+            );
+        }
         2023 => {
             let look = action(l, 11).and_then(|(a, al)| particle_look(a, al))?;
             (n.life, n.delay) = (tick(l, 0), tick(l, 5));
+            n.stop_on_stop = int(l, 2) != 0 || int(l, 9) != 0;
             n.kind = Kind::Cluster(Arc::new(ClusterDef {
                 count: float_curve(p(6)),
+                emissions: int(l, 7),
                 interval: tick(l, 8),
                 emit_for: tick(l, 1),
                 max: cluster_max(int(l, 10)),
@@ -1152,8 +1174,10 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
         2032 | 2034 => {
             let look = action(l, 0).and_then(|(a, al)| particle_look(a, al))?;
             (n.life, n.delay) = (pair(l, 16).0, tick(l, 8));
+            n.stop_on_stop = int(l, 12) != 0 || int(l, 13) != 0;
             n.kind = Kind::Cluster(Arc::new(ClusterDef {
                 count: float_curve(p(10)),
+                emissions: pair(l, 7).0.round() as i32,
                 interval: pair(l, 9).0,
                 emit_for: pair(l, 11).0,
                 max: cluster_max(int(l, 14)),
@@ -1197,6 +1221,7 @@ fn sparks(l: &ParamList) -> ClusterDef {
     let width = float_curve(param(l, 3));
     ClusterDef {
         count: Curve::constant(int(l, 9) as f32),
+        emissions: 1,
         interval: 0.0,
         emit_for: -1.0,
         max: int(l, 5).max(int(l, 9)).max(1) as usize,
@@ -1522,13 +1547,12 @@ impl NodeRt {
     }
 
     /// Advances the node by `dt` under its parent's world transform; false once it and all its
-    /// children and particles are done.
+    /// children and particles are done (`0x83190798` node lifecycle state machine).
     fn step(
         &mut self,
         parent: Affine3A,
         dt: f32,
         stop: bool,
-        dust: bool,
         rng: &mut Rng,
         cx: &mut Cx,
     ) -> bool {
@@ -1540,13 +1564,12 @@ impl NodeRt {
         if t < 0.0 {
             return !stop;
         }
-        // A negative life runs until stop. Boost dust (action 71) keeps going for the whole
-        // boost; the glide-start flash is the finite ignition and is allowed to end.
-        let smoke = matches!(&def.kind, Kind::Cluster(c) if smoke_cluster(c));
-        let own = if self.life < 0.0 || (dust && smoke) {
+        // Negative life runs until stopped (`0x83190d60`, `0x83190a14`, `0x83190c50`).
+        // Finite life ends at `t >= life`, or early on `stop` if the node's stop flag is set.
+        let own = if self.life < 0.0 {
             !stop
         } else {
-            t < self.life
+            t < self.life && !(stop && def.stop_on_stop)
         };
         self.speed += def.motion.accel.at(t) * dt;
         self.travel += self.speed * dt;
@@ -1565,9 +1588,8 @@ impl NodeRt {
                 }
             }
         }
-        let mut alive = own;
-        match &def.kind {
-            Kind::Static => {}
+        let alive = match &def.kind {
+            Kind::Static => own,
             Kind::Spawner {
                 count,
                 emissions,
@@ -1575,7 +1597,8 @@ impl NodeRt {
                 angle,
                 child,
             } => {
-                if own && (*emissions < 0 || self.emissions < (*emissions).max(1)) {
+                let can_spawn = own && (*emissions < 0 || self.emissions < (*emissions).max(1));
+                if can_spawn {
                     self.emit -= dt;
                     if self.emit <= 0.0 {
                         self.emissions += 1;
@@ -1601,11 +1624,19 @@ impl NodeRt {
                         };
                     }
                 }
+                // Spawner stays alive while it still has emissions left (or spawned children live).
+                own && (*emissions < 0 || self.emissions < (*emissions).max(1))
             }
-            Kind::Cluster(c) => alive |= self.cluster(c, t, own, dust, world, dt, rng, cx),
-        }
+            Kind::Cluster(c) => self.cluster(c, t, own, world, dt, rng, cx),
+        };
+        // Structural children (`anchor.is_none()`) inherit parent expiry as `stop` so an
+        // infinite-life child cluster under a finite-life 2101 parent (e.g. f0000098 idle
+        // exhaust, f0001404 walk dust, f0001405 landing dust) stops emitting when the parent
+        // expires and lets its existing particles fade out. Spawned copies (`anchor.is_some()`)
+        // are independent world instances and only stop on effect-level `stop`.
         self.children.retain_mut(|c| {
-            let live = c.step(world, dt, stop, dust, rng, cx);
+            let child_stop = if c.anchor.is_some() { stop } else { stop || !own };
+            let live = c.step(world, dt, child_stop, rng, cx);
             if !live {
                 c.clear(cx);
             }
@@ -1786,17 +1817,22 @@ impl NodeRt {
         c: &ClusterDef,
         t: f32,
         own: bool,
-        dust: bool,
         world: Affine3A,
         dt: f32,
         rng: &mut Rng,
         cx: &mut Cx,
     ) -> bool {
-        let smoke = dust && smoke_cluster(c);
-        let emitting = own && (smoke || c.emit_for <= 0.0 || t < c.emit_for);
+        let has_emissions = c.emissions < 0 || self.emissions < c.emissions;
+        let in_window =
+            c.emit_for < 0.0 || t < c.emit_for || (c.emit_for == 0.0 && self.emissions == 0);
+        let emitting = own && has_emissions && in_window;
         if emitting {
             self.emit -= dt;
             while self.emit <= 0.0 {
+                if c.emissions >= 0 && self.emissions >= c.emissions {
+                    break;
+                }
+                self.emissions += 1;
                 let n = c.count.at(t).round().max(0.0) as usize;
                 let local_have = if c.look.follow {
                     self.particles.iter().filter(|p| !p.world).count()
@@ -1813,6 +1849,9 @@ impl NodeRt {
                 };
             }
         }
+        let still_emitting = own
+            && (c.emissions < 0 || self.emissions < c.emissions)
+            && (c.emit_for < 0.0 || t < c.emit_for);
         let scale = scale_of(world);
         let down_world = Vec3::NEG_Y * scale;
         let down_local = scale * world.inverse().transform_vector3(Vec3::NEG_Y);
@@ -1830,7 +1869,7 @@ impl NodeRt {
         }
         self.particles.retain(|p| p.age < p.life);
         self.draw_batch(c, world, cx);
-        emitting || !self.particles.is_empty()
+        still_emitting || !self.particles.is_empty()
     }
 
     fn particle(
@@ -2014,18 +2053,6 @@ impl NodeRt {
     }
 }
 
-/// Action 71: a world-space textured quad. On the main booster that is the ground dust.
-fn smoke_cluster(c: &ClusterDef) -> bool {
-    !c.look.follow
-        && matches!(
-            c.look.shape,
-            Shape::Quad {
-                texture: Some(_),
-                ..
-            }
-        )
-}
-
 /// Vertices of a particle batch, relative to the emitter.
 #[derive(Default)]
 struct Batch {
@@ -2136,7 +2163,6 @@ fn simulate(
     let dt = time.delta_secs().min(0.1);
     for (entity, mut sfx, at) in &mut effects {
         let stop = sfx.stopping;
-        let dust = sfx.dust;
         if sfx.run.is_none() {
             let Some(roots) = lib.effect(sfx.id) else {
                 commands.entity(entity).try_despawn();
@@ -2168,7 +2194,7 @@ fn simulate(
         let world = at.affine();
         let Run { nodes, rng } = run;
         nodes.retain_mut(|n| {
-            let live = n.step(world, dt, stop, dust, rng, &mut cx);
+            let live = n.step(world, dt, stop, rng, &mut cx);
             if !live {
                 n.clear(&mut cx);
             }
@@ -2202,12 +2228,10 @@ fn sweep(
     }
 }
 
-/// One effect the dispatcher wants on a dummy: id, uniform scale, and whether its smoke keeps
-/// emitting.
+/// One effect the dispatcher wants on a dummy: id and uniform scale.
 struct Play {
     id: i32,
     scale: f32,
-    dust: bool,
 }
 
 /// `0x82825918`: eight 45° sectors of the move stick. 0 is no stick. Values 6, 7 and 8 are the
@@ -2247,41 +2271,41 @@ fn booster_plays(
     let back = i32::from(row.ac_back_booster);
     let light = i32::from(row.ac_booster_light);
     let mut out = Vec::new();
-    let push = |out: &mut Vec<Play>, id: i32, scale: f32, dust: bool| {
+    let push = |out: &mut Vec<Play>, id: i32, scale: f32| {
         if id > 0 {
-            out.push(Play { id, scale, dust });
+            out.push(Play { id, scale });
         }
     };
     if MAIN_NOZZLES.contains(&id) {
         if glide {
             if rear_stick(stick) {
-                push(&mut out, main, 1.0, true);
+                push(&mut out, main, 1.0);
             }
             // Each glide frame `0x830e8ef8` leaves five effects at 0.6 and two at 1.0
             // (`private/xenia/glide_fxscale.jsonl`), the five 131 and two 120 starts.
-            push(&mut out, GLIDE_MAIN, glide_scale, false);
-            push(&mut out, GLIDE_FOOT, 1.0, false);
+            push(&mut out, GLIDE_MAIN, glide_scale);
+            push(&mut out, GLIDE_FOOT, 1.0);
         } else {
-            push(&mut out, main, 1.0, true);
+            push(&mut out, main, 1.0);
         }
     }
     if id == 41 {
-        push(&mut out, light, 1.0, false);
+        push(&mut out, light, 1.0);
     }
     if LEG_NOZZLES.contains(&id) && !glide {
-        push(&mut out, back, 1.0, true);
+        push(&mut out, back, 1.0);
     }
     if stick.x > SIDE_STICK && matches!(id, 11 | 12) {
-        push(&mut out, back, stick.x, true);
+        push(&mut out, back, stick.x);
     }
     if stick.x > SIDE_STICK && id == 42 {
-        push(&mut out, light, stick.x, false);
+        push(&mut out, light, stick.x);
     }
     if stick.x < -SIDE_STICK && matches!(id, 13 | 14) {
-        push(&mut out, back, -stick.x, true);
+        push(&mut out, back, -stick.x);
     }
     if stick.x < -SIDE_STICK && id == 43 {
-        push(&mut out, light, -stick.x, false);
+        push(&mut out, light, -stick.x);
     }
     out
 }
@@ -2416,6 +2440,55 @@ fn probe_shot(
     if shown == 0 {
         eprintln!("SHOT {} no booster effects playing", path.display());
     }
+    let mut all_fx = 0u32;
+    for (sfx, xf) in &effects {
+        all_fx += 1;
+        let at = xf.translation();
+        let body = sfx_probe(sfx);
+        eprintln!(
+            "SHOT {} active_sfx f{} at=({:.2},{:.2},{:.2}) {body}",
+            path.display(),
+            sfx.id,
+            at.x,
+            at.y,
+            at.z,
+        );
+        if let Some(run) = &sfx.run {
+            for (i, n) in run.nodes.iter().enumerate() {
+                let kind_desc = match &n.def.kind {
+                    Kind::Static => "Static".to_string(),
+                    Kind::Spawner {
+                        count,
+                        emissions,
+                        interval,
+                        ..
+                    } => format!(
+                        "Spawner(count={count} emis={}/{emissions} int={interval:.4} children={})",
+                        n.emissions,
+                        n.children.len()
+                    ),
+                    Kind::Cluster(c) => format!(
+                        "Cluster(emit_for={:.4} int={:.4} max={} parts={} follow={} p_life={:.3}..{:.3})",
+                        c.emit_for,
+                        c.interval,
+                        c.max,
+                        n.particles.len(),
+                        u8::from(c.look.follow),
+                        c.look.life.0,
+                        c.look.life.1
+                    ),
+                };
+                eprintln!(
+                    "SHOT {}   node[{i}] age={:.3} life={:.4} delay={:.4} {kind_desc}",
+                    path.display(),
+                    n.age,
+                    n.life,
+                    n.def.delay,
+                );
+            }
+        }
+    }
+    eprintln!("SHOT {} total_active_sfx={all_fx}", path.display());
 }
 
 /// Lights the booster effects. The groups and which state plays them are `0x828932a0`.
@@ -2462,9 +2535,6 @@ pub fn boosters(
                     s.stop();
                 }
             } else if let Some(w) = want.iter().find(|w| w.id == id) {
-                if let Ok(mut s) = effects.get_mut(fx) {
-                    s.dust(w.dust);
-                }
                 if (applied - w.scale).abs() > 0.001 {
                     if let Ok(mut t) = xforms.get_mut(fx) {
                         t.scale = Vec3::splat(w.scale.max(0.001));
@@ -2482,11 +2552,9 @@ pub fn boosters(
                 }
                 continue;
             }
-            let mut sfx = Sfx::new(w.id);
-            sfx.dust(w.dust);
             let fx = commands
                 .spawn((
-                    sfx,
+                    Sfx::new(w.id),
                     Transform::from_scale(Vec3::splat(w.scale.max(0.001))),
                     Visibility::default(),
                     ChildOf(e),
@@ -2999,6 +3067,151 @@ mod tests {
                 )
             }),
             "f0000116 kick dust must parse action 31 Sphere emitter"
+        );
+    }
+
+    #[test]
+    fn effect_timing_matches_360_node_lifecycle() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let Ok(disc) = acvd_formats::vfs::Disc::default_for(root) else {
+            return;
+        };
+        let load = |id: i32| {
+            let bytes = acvd_formats::vfs::open(&disc, &format!("{}|f{id:07}.ffx", super::EFFECTS))
+                .expect("ffx entry");
+            let eff = acvd_formats::ffx::read(&bytes).expect("parse ffx");
+            eff.states
+                .first()
+                .into_iter()
+                .flat_map(|s| &s.actions)
+                .flat_map(|a| super::nodes(&a.params))
+                .collect::<Vec<_>>()
+        };
+
+        // Helper that simulates a parsed FFX tree in a headless Bevy World for `secs` at 60 Hz,
+        // returning `(still_alive, active_particle_count)` per root node.
+        let run_for = |id: i32, secs: f32| -> (usize, usize) {
+            let roots = load(id);
+            let mut world = bevy::prelude::World::new();
+            world.insert_resource(Assets::<bevy::prelude::Mesh>::default());
+            world.insert_resource(Assets::<StandardMaterial>::default());
+            world.insert_resource(Assets::<Image>::default());
+            let mut lib = super::Library {
+                disc: disc.clone(),
+                effects: HashMap::new(),
+                textures: HashMap::new(),
+                models: HashMap::new(),
+                shared_materials: HashMap::new(),
+                packs: acvd_render::Packs::default(),
+                quad: world
+                    .resource_mut::<Assets<bevy::prelude::Mesh>>()
+                    .add(bevy::prelude::Rectangle::new(1.0, 1.0)),
+                haze: world
+                    .resource_mut::<Assets<bevy::prelude::Mesh>>()
+                    .add(bevy::prelude::Rectangle::new(1.0, 1.0)),
+                dot: world
+                    .resource_mut::<Assets<Image>>()
+                    .add(Image::default()),
+                seed: 0x2545_f491,
+            };
+            let mut rng = super::Rng(0x1234_5679);
+            let mut nodes: Vec<_> = roots
+                .iter()
+                .map(|d| super::NodeRt::new(d.clone(), &mut rng, bevy::prelude::Quat::IDENTITY))
+                .collect();
+            let owner = world.spawn_empty().id();
+            let steps = (secs * 60.0).round() as u32;
+            let dt = 1.0 / 60.0;
+            for _ in 0..steps {
+                let mut meshes = world.remove_resource::<Assets<bevy::prelude::Mesh>>().unwrap();
+                let mut materials = world.remove_resource::<Assets<StandardMaterial>>().unwrap();
+                let mut images = world.remove_resource::<Assets<Image>>().unwrap();
+                let mut commands = world.commands();
+                let mut cx = super::Cx {
+                    commands: &mut commands,
+                    lib: &mut lib,
+                    meshes: &mut meshes,
+                    materials: &mut materials,
+                    images: &mut images,
+                    camera: bevy::prelude::Vec3::ZERO,
+                    camera_rot: bevy::prelude::Quat::IDENTITY,
+                    owner,
+                    moves: Vec::new(),
+                };
+                nodes.retain_mut(|n| {
+                    let live = n.step(bevy::math::Affine3A::IDENTITY, dt, false, &mut rng, &mut cx);
+                    if !live {
+                        n.clear(&mut cx);
+                    }
+                    live
+                });
+                world.flush();
+                world.insert_resource(meshes);
+                world.insert_resource(materials);
+                world.insert_resource(images);
+            }
+            fn count_particles(n: &super::NodeRt) -> usize {
+                n.particles.len() + n.children.iter().map(count_particles).sum::<usize>()
+            }
+            let particles = nodes.iter().map(count_particles).sum();
+            (nodes.len(), particles)
+        };
+
+        // 1. f0000098 (idle exhaust puff): parent 2101 life=1.0s stops child 2023 smoke;
+        //    emits during [0.083s..1.0s] and finishes completely by 2.5s.
+        let (alive_mid, parts_mid) = run_for(98, 0.5);
+        assert!(alive_mid > 0 && parts_mid > 0, "f0000098 should emit smoke at 0.5s");
+        let (alive_end, parts_end) = run_for(98, 2.5);
+        assert_eq!(
+            (alive_end, parts_end),
+            (0, 0),
+            "f0000098 idle exhaust puff must stop when parent 2101 (1.0s) expires"
+        );
+
+        // 2. f0001404 (walk step dust): parent 2101 life=0.0833s stops child 2023 dust;
+        //    finishes completely by 2.0s instead of leaking forever.
+        let (walk_mid, walk_parts) = run_for(1404, 0.2);
+        assert!(walk_mid > 0 && walk_parts > 0, "f0001404 should have active dust at 0.2s");
+        let (walk_end, walk_parts_end) = run_for(1404, 2.0);
+        assert_eq!(
+            (walk_end, walk_parts_end),
+            (0, 0),
+            "f0001404 walk dust must finish after parent 2101 (0.083s) + particle life"
+        );
+
+        // 3. f0001405 (landing dust): parent 2101 life=0.1667s stops child 2023 dust;
+        //    finishes completely by 2.0s.
+        let (land_end, land_parts_end) = run_for(1405, 2.0);
+        assert_eq!(
+            (land_end, land_parts_end),
+            (0, 0),
+            "f0001405 landing dust must finish after parent 2101 (0.167s) + particle life"
+        );
+
+        // 4. f0000116 (wall-kick dust): finite emit_for on infinite-life 2023 must despawn.
+        let (kick_end, kick_parts_end) = run_for(116, 4.0);
+        assert_eq!(
+            (kick_end, kick_parts_end),
+            (0, 0),
+            "f0000116 wall-kick dust must finish instead of leaking"
+        );
+
+        // 5. f0000300 (main booster): Node(2034) smoke cluster has emit_for=0.5s, life=2.0s
+        //    (`0x83190c50`), so by 2.5s only the infinite booster flame/heat-haze nodes remain
+        //    and no action-71 smoke cluster is still alive.
+        let roots_300 = load(300);
+        assert!(
+            roots_300.iter().any(|n| matches!(&n.kind, super::Kind::Cluster(c) if (c.emit_for - 0.5).abs() < 0.01)),
+            "f0000300 should contain Node(2034) smoke cluster with emit_for=0.5s"
+        );
+        let (b_alive, _) = run_for(300, 2.5);
+        assert_eq!(
+            b_alive, 2,
+            "f0000300 at 2.5s should keep only its 2 infinite booster nodes (flame + haze), not the 0.5s smoke puff or 0.33s flash"
         );
     }
 }
