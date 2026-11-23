@@ -282,6 +282,11 @@ in order:
 
 ## Done
 
+- **Scalable ACVD Retail GUI Kit — Phase 1 (`acvd-render::ui_kit`, `acvd-viewer` `acvd-menu --kit`)**:
+  - Built `AcvdUiKit` (`crates/acvd-render/src/ui_kit.rs`) backed by retail disc chrome (`lang/en/menu/assemble.drb.dcx` + `assemble.tpf.dcx` + `font/fontdef.xml` CCM bitmap fonts 17/18/21 rendered through `GlyphNode` sharp-bilinear `glyph_sprite.wgsl` and `MenuSprite`).
+  - Added authentic retail palette tokens (`palette::*`), flexbox-compatible disc bitmap typography (`spawn_text`, `measure_text`), and scalable widgets: `spawn_panel` (`Tactical` with `Parts_01` `base_window_L` corner reticles & L-traces, `Framed` with `ACV_FE_Locksight_02` `Corner_Parts` brackets, `Bar`, `Subtle`), `spawn_header` (`Title_Plate` fade + `■` marker + `Help_Line_UP`), `spawn_trace` (`Simple` + `Stepped` using `ACV_frame` `LinePatrs_UP` diagonals), `spawn_button` (`Normal`/`Selected`/`Active`/`Disabled` with `Forcus` arrow & amber corner brackets), `spawn_stat_row` (`@ParamLine` alternating rows + `>` good/bad deltas), `spawn_gauge` (`@WeightBar` metallic gradient + `Gauge_parts` `I` marker + alert state), `spawn_badge`, and `spawn_arrow` (`Parts_01` nav arrows).
+  - Added `acvd-menu --kit` live showcase, verified with `cargo test -p acvd-render -- ui_kit` (1/1 passed against 360 disc) and `--shot` (`private/shots/ui_kit_showcase.png`). Phase 2 (migrating custom `garage.rs` screens onto `AcvdUiKit`) is ready to start next.
+
 - **3D-Projected Lock-Sight HUD & Rotating Rings (`hud::track_lock_sight`, `control::Pilot`, `sheets/tuning_fields.csv`)**:
   - Traced 360 HUD camera movement (`0x829d3a08` / `0x829d3a98` → `0x829d2120`, `0x829d1df0` mode 3, `0x829d2c08` / `0x829d2c48`) and verified live in Xenia (`private/xenia/hud_move.jsonl` + `private/xenia/shots/hud_{still,turn_right,pitch_up}.png`):
     - The Lock-Sight billboard is placed in 3D at `sight_origin + aim_dir * 700 m` (`StaticDrawParam` 51 `locksight_draw_offset_m` `+0xc8` = 700.0 m, 53 `ow_locksight_draw_offset_m` `+0xd0` = 700.0 m; `0x8287cdd0` → `0x8260f878`) and projected through the active camera so the reticle naturally lags/shifts off-center as the follow camera swings behind the AC, plus tilts with follow-camera roll (`FollowCam::roll` `0x82bfa708`).

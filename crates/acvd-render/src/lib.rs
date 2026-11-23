@@ -7,6 +7,7 @@
 pub mod app;
 pub mod menu;
 pub mod text;
+pub mod ui_kit;
 
 use std::collections::HashMap;
 
