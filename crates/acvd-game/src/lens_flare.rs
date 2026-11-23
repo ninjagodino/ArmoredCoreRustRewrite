@@ -533,7 +533,11 @@ fn update_lens_flare(
     ac_q: Query<&GlobalTransform, With<Ac>>,
     mut cam_q: Query<
         (&Camera, &GlobalTransform, Option<&mut ZoomBlur>),
-        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+        (
+            With<Camera3d>,
+            Without<crate::env::WaterReflectionCamera>,
+            Without<crate::garage_assemble::PartPreviewCamera>,
+        ),
     >,
     mut slots: Query<(
         &FlareSlot,

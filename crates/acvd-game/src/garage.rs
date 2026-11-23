@@ -129,6 +129,10 @@ pub enum UiAction {
     SortieMapStep(i8),
     SortieTargetStep(i8),
     LaunchSortie,
+    AssembleSelectSlot(AssembleSlot),
+    AssembleSubcat(Option<u8>),
+    AssembleDmgFilter(Option<u8>),
+    AssembleToggleDetail,
 }
 
 /// Active garage screen.
@@ -776,6 +780,14 @@ pub struct GarageState {
     pub scroll: usize,
     /// Saved slot cursor when diving into `AssembleParts`.
     pub slot_cursor: usize,
+    /// Active subcategory filter tab in `AssembleParts` (`None` = ALL).
+    pub assemble_subcat: Option<u8>,
+    /// Active damage-type filter in `AssembleParts` (`None` = ALL, `0` = KE, `6` = CE, `1` = TE).
+    pub assemble_dmg_filter: Option<u8>,
+    /// `Tab` toggle in `AssembleParts`: `false` = `@PartsNormal` + 3D preview, `true` = `@PartsDetail` + `@SpecDetail`.
+    pub assemble_detail_view: bool,
+    /// Horizontal scroll offset for `@PartsCategoryList` (7 visible slot tabs).
+    pub assemble_cat_scroll: usize,
     /// Design snapshot before previewing parts/designs, restored on Cancel.
     pub saved_design: Option<AcAssemblyDesignSt>,
     pub saved_color: Option<Option<AcColor>>,
@@ -844,6 +856,10 @@ impl GarageState {
             cursor: 0,
             scroll: 0,
             slot_cursor: 0,
+            assemble_subcat: None,
+            assemble_dmg_filter: None,
+            assemble_detail_view: false,
+            assemble_cat_scroll: 0,
             saved_design: None,
             saved_color: None,
             saved_name: None,
@@ -912,7 +928,14 @@ pub fn sync_room(
     mut sky_materials: ResMut<Assets<env::SkyMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut dir_lights: Query<(&mut DirectionalLight, &mut Transform)>,
-    cameras: Query<Entity, (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
+    cameras: Query<
+        Entity,
+        (
+            With<Camera3d>,
+            Without<crate::env::WaterReflectionCamera>,
+            Without<crate::garage_assemble::PartPreviewCamera>,
+        ),
+    >,
 ) {
     if *mode != Mode::Garage {
         if state.spawned_workshop.is_some() {
@@ -1303,7 +1326,11 @@ pub fn update_camera(
     mut state: ResMut<GarageState>,
     mut cams: Query<
         (&mut Transform, &mut Projection),
-        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+        (
+            With<Camera3d>,
+            Without<crate::env::WaterReflectionCamera>,
+            Without<crate::garage_assemble::PartPreviewCamera>,
+        ),
     >,
 ) {
     if *mode != Mode::Garage {
@@ -1317,12 +1344,23 @@ pub fn update_camera(
         return;
     };
 
-    let target = acsis_camera_pose(
+    let mut target = acsis_camera_pose(
         state.display_preset_id(),
         garage.bounds,
         &ws_row,
         state.screen == GarageScreen::ViewMode,
     );
+    // In `AssembleParts` Normal view, pull back to frame the full AC inside the right-hand
+    // `@AcLayout` (`ASSEMBLY VIEW`) window `[705..1213]` while preserving the slot's yaw angle.
+    if matches!(state.screen, GarageScreen::AssembleParts { .. }) && !state.assemble_detail_view {
+        let ac_height = (garage.bounds.1.y - garage.bounds.0.y).clamp(4.5, 9.5);
+        let max_dist = (ws_row.camera_dist_max as f32).max(18.0);
+        target.dist = (target.dist * 1.65)
+            .max(ac_height * 1.95)
+            .clamp(12.0, max_dist);
+        target.focus.y = garage.bounds.0.y + ac_height * 0.46;
+        target.pitch = target.pitch.clamp(-0.10, 0.22);
+    }
 
     if let Projection::Perspective(ref mut p) = *proj {
         p.fov = target.fov_deg.to_radians();
@@ -1373,11 +1411,19 @@ pub fn update_camera(
         state.cam_pitch.sin(),
         state.cam_yaw.cos() * state.cam_pitch.cos(),
     ) * state.cam_dist;
-    let mut eye = state.cam_focus + offset;
+    let mut focus = state.cam_focus;
+    // In `AssembleParts` Normal view, shift the camera aim slightly left so the 3D AC frames
+    // cleanly inside the right-hand `@AcLayout` (`ASSEMBLY VIEW`) window `[705..1213]`.
+    if matches!(state.screen, GarageScreen::AssembleParts { .. }) && !state.assemble_detail_view {
+        let forward = (-offset).normalize_or_zero();
+        let cam_right = forward.cross(Vec3::Y).normalize_or_zero();
+        focus -= cam_right * (state.cam_dist * 0.24);
+    }
+    let mut eye = focus + offset;
     if eye.y < min_y {
         eye.y = min_y;
     }
-    *xf = Transform::from_translation(eye).looking_at(state.cam_focus, Vec3::Y);
+    *xf = Transform::from_translation(eye).looking_at(focus, Vec3::Y);
 }
 
 fn shortest_angle(from: f32, to: f32) -> f32 {
@@ -1771,6 +1817,50 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::AssembleSelectSlot(new_slot) => {
+                switch_assemble_slot(
+                    &mut commands,
+                    &mut state,
+                    &mut garage,
+                    &mut cues,
+                    &mut audio_assets,
+                    new_slot,
+                );
+                return;
+            }
+            UiAction::AssembleSubcat(sub) => {
+                if let GarageScreen::AssembleParts { slot } = state.screen {
+                    if state.assemble_subcat != sub {
+                        state.assemble_subcat = sub;
+                        state.cursor = 0;
+                        state.scroll = 0;
+                        apply_cursor_preview(&mut state, &mut garage);
+                        sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CATEGORY);
+                        state.ui_dirty = true;
+                    }
+                    let _ = slot;
+                }
+                return;
+            }
+            UiAction::AssembleDmgFilter(dmg) => {
+                if let GarageScreen::AssembleParts { .. } = state.screen {
+                    if state.assemble_dmg_filter != dmg {
+                        state.assemble_dmg_filter = dmg;
+                        state.cursor = 0;
+                        state.scroll = 0;
+                        apply_cursor_preview(&mut state, &mut garage);
+                        sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CATEGORY);
+                        state.ui_dirty = true;
+                    }
+                }
+                return;
+            }
+            UiAction::AssembleToggleDetail => {
+                state.assemble_detail_view = !state.assemble_detail_view;
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CATEGORY);
+                state.ui_dirty = true;
+                return;
+            }
         }
     }
 
@@ -1807,6 +1897,38 @@ pub fn handle_input(
         return;
     }
 
+    // In `AssembleParts`, `Tab` toggles Normal View vs Detail Specs (`OnBtnAccel_ChangeView`),
+    // `A`/`D` or Left/Right switches slot tabs directly, and `Q`/`E` cycles subcategory tabs.
+    if let GarageScreen::AssembleParts { slot } = state.screen {
+        if keys.just_pressed(KeyCode::Tab) {
+            state.assemble_detail_view = !state.assemble_detail_view;
+            sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CATEGORY);
+            state.ui_dirty = true;
+            return;
+        }
+        if keys.just_pressed(KeyCode::KeyQ) || keys.just_pressed(KeyCode::KeyE) {
+            let subs = crate::garage_assemble::subcategories_for_slot(slot, None);
+            if !subs.is_empty() {
+                let mut opts: Vec<Option<u8>> = Vec::with_capacity(subs.len() + 1);
+                opts.push(None);
+                opts.extend(subs.into_iter().map(|(id, _)| Some(id)));
+                let cur_i = opts
+                    .iter()
+                    .position(|o| *o == state.assemble_subcat)
+                    .unwrap_or(0);
+                let delta: isize = if keys.just_pressed(KeyCode::KeyE) { 1 } else { -1 };
+                let next_i = (cur_i as isize + delta).rem_euclid(opts.len() as isize) as usize;
+                state.assemble_subcat = opts[next_i];
+                state.cursor = 0;
+                state.scroll = 0;
+                apply_cursor_preview(&mut state, &mut garage);
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CATEGORY);
+                state.ui_dirty = true;
+                return;
+            }
+        }
+    }
+
     // Paint tab switching via `Tab` (and `Q`/`E` outside the Decal editor).
     let tab_switch = keys.just_pressed(KeyCode::Tab)
         || (state.paint_tab != PaintTab::Decals
@@ -1838,6 +1960,28 @@ pub fn handle_input(
     let page_down = keys.just_pressed(KeyCode::PageDown);
     let confirm =
         keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) || gp_confirm;
+
+    // `AssembleParts` Left/Right switches directly between AC assembly slot tabs.
+    if let GarageScreen::AssembleParts { slot } = state.screen {
+        if left || right {
+            let delta: isize = if right { 1 } else { -1 };
+            let cur_i = AssembleSlot::ALL
+                .iter()
+                .position(|&s| s == slot)
+                .unwrap_or(0);
+            let n = AssembleSlot::ALL.len() as isize;
+            let next_slot = AssembleSlot::ALL[(cur_i as isize + delta).rem_euclid(n) as usize];
+            switch_assemble_slot(
+                &mut commands,
+                &mut state,
+                &mut garage,
+                &mut cues,
+                &mut audio_assets,
+                next_slot,
+            );
+            return;
+        }
+    }
 
     // Sortie screen Left/Right steps map or target directly.
     if state.screen == GarageScreen::SortieConfig && (left || right) {
@@ -1900,7 +2044,12 @@ pub fn handle_input(
     if step != 0 && count > 0 {
         let next_cursor = (state.cursor as isize + step).rem_euclid(count as isize) as usize;
         state.cursor = next_cursor;
-        clamp_scroll(&mut state.scroll, next_cursor, count);
+        let win = if matches!(state.screen, GarageScreen::AssembleParts { .. }) {
+            crate::garage_assemble::ASSEMBLE_THUMB_WINDOW
+        } else {
+            LIST_WINDOW
+        };
+        clamp_scroll_win(&mut state.scroll, next_cursor, count, win);
         state.cam_manual_orbit = false;
         if state.screen == GarageScreen::Paint && state.paint_tab == PaintTab::Custom && state.cursor < 7 {
             state.paint_channel = state.cursor;
@@ -1927,7 +2076,12 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
     match state.screen {
         GarageScreen::Top => TOP_ITEMS.len(),
         GarageScreen::AssembleSlots => AssembleSlot::ALL.len(),
-        GarageScreen::AssembleParts { slot } => parts_for_slot(slot).len(),
+        GarageScreen::AssembleParts { slot } => crate::garage_assemble::filtered_parts_for_slot(
+            slot,
+            state.assemble_subcat,
+            state.assemble_dmg_filter,
+        )
+        .len(),
         GarageScreen::Paint => match state.paint_tab {
             PaintTab::Presets => state.color_presets.len(),
             PaintTab::Custom => 8, // 7 channels + Camouflage
@@ -1940,17 +2094,67 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
     }
 }
 
-fn clamp_scroll(scroll: &mut usize, cursor: usize, count: usize) {
-    if count <= LIST_WINDOW {
+fn clamp_scroll_win(scroll: &mut usize, cursor: usize, count: usize, window: usize) {
+    if count <= window {
         *scroll = 0;
         return;
     }
     if cursor < *scroll {
         *scroll = cursor;
-    } else if cursor >= *scroll + LIST_WINDOW {
-        *scroll = cursor + 1 - LIST_WINDOW;
+    } else if cursor >= *scroll + window {
+        *scroll = cursor + 1 - window;
     }
-    *scroll = (*scroll).min(count.saturating_sub(LIST_WINDOW));
+    *scroll = (*scroll).min(count.saturating_sub(window));
+}
+
+fn clamp_scroll(scroll: &mut usize, cursor: usize, count: usize) {
+    clamp_scroll_win(scroll, cursor, count, LIST_WINDOW);
+}
+
+fn switch_assemble_slot(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    garage: &mut crate::Garage,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    new_slot: AssembleSlot,
+) {
+    revert_preview(state, garage);
+    if has_weapon_arms(&garage.active_design) && new_slot.blocked_by_weapon_arm() {
+        sound::cue(commands, cues, audio_assets, CUE_ERROR);
+        state.set_banner(
+            "LOCKED BY WEAPON ARMS — SWAP ARMS FIRST",
+            Color::srgb(0.95, 0.35, 0.30),
+        );
+        return;
+    }
+    let idx = AssembleSlot::ALL
+        .iter()
+        .position(|&s| s == new_slot)
+        .unwrap_or(0);
+    state.slot_cursor = idx;
+    clamp_scroll_win(
+        &mut state.assemble_cat_scroll,
+        idx,
+        AssembleSlot::ALL.len(),
+        crate::garage_assemble::ASSEMBLE_CAT_WINDOW,
+    );
+    state.assemble_subcat = None;
+    state.assemble_dmg_filter = None;
+    state.saved_design = Some(garage.active_design);
+    let parts = parts_for_slot(new_slot);
+    let equipped = new_slot.get(&garage.active_design);
+    state.cursor = parts.iter().position(|&id| id == equipped).unwrap_or(0);
+    clamp_scroll_win(
+        &mut state.scroll,
+        state.cursor,
+        parts.len(),
+        crate::garage_assemble::ASSEMBLE_THUMB_WINDOW,
+    );
+    state.screen = GarageScreen::AssembleParts { slot: new_slot };
+    state.cam_manual_orbit = false;
+    sound::cue(commands, cues, audio_assets, CUE_CATEGORY);
+    state.ui_dirty = true;
 }
 
 fn revert_preview(state: &mut GarageState, garage: &mut crate::Garage) {
@@ -1974,7 +2178,11 @@ fn revert_preview(state: &mut GarageState, garage: &mut crate::Garage) {
 fn apply_cursor_preview(state: &mut GarageState, garage: &mut crate::Garage) {
     match state.screen {
         GarageScreen::AssembleParts { slot } => {
-            let parts = parts_for_slot(slot);
+            let parts = crate::garage_assemble::filtered_parts_for_slot(
+                slot,
+                state.assemble_subcat,
+                state.assemble_dmg_filter,
+            );
             if let Some(&part_id) = parts.get(state.cursor) {
                 if slot.get(&garage.active_design) != part_id {
                     slot.set(&mut garage.active_design, part_id);
@@ -2019,9 +2227,9 @@ fn trigger_cancel(
         GarageScreen::Top => {}
         GarageScreen::AssembleParts { .. } => {
             revert_preview(state, garage);
-            state.screen = GarageScreen::AssembleSlots;
-            state.cursor = state.slot_cursor;
-            clamp_scroll(&mut state.scroll, state.cursor, AssembleSlot::ALL.len());
+            state.screen = GarageScreen::Top;
+            state.cursor = 0;
+            state.scroll = 0;
             state.cam_manual_orbit = false;
             sound::cue(commands, cues, audio_assets, CUE_CANCEL);
             state.ui_dirty = true;
@@ -2057,9 +2265,29 @@ fn trigger_confirm(
             state.cam_manual_orbit = false;
             match state.cursor {
                 0 => {
-                    state.screen = GarageScreen::AssembleSlots;
-                    state.cursor = state.slot_cursor;
-                    clamp_scroll(&mut state.scroll, state.cursor, AssembleSlot::ALL.len());
+                    let slot = AssembleSlot::ALL
+                        .get(state.slot_cursor)
+                        .copied()
+                        .unwrap_or(AssembleSlot::Head);
+                    clamp_scroll_win(
+                        &mut state.assemble_cat_scroll,
+                        state.slot_cursor,
+                        AssembleSlot::ALL.len(),
+                        crate::garage_assemble::ASSEMBLE_CAT_WINDOW,
+                    );
+                    state.assemble_subcat = None;
+                    state.assemble_dmg_filter = None;
+                    state.saved_design = Some(garage.active_design);
+                    let parts = parts_for_slot(slot);
+                    let equipped = slot.get(&garage.active_design);
+                    state.cursor = parts.iter().position(|&id| id == equipped).unwrap_or(0);
+                    clamp_scroll_win(
+                        &mut state.scroll,
+                        state.cursor,
+                        parts.len(),
+                        crate::garage_assemble::ASSEMBLE_THUMB_WINDOW,
+                    );
+                    state.screen = GarageScreen::AssembleParts { slot };
                 }
                 1 => {
                     state.saved_design = Some(garage.active_design);
@@ -2111,18 +2339,35 @@ fn trigger_confirm(
                 return;
             }
             state.slot_cursor = state.cursor;
+            clamp_scroll_win(
+                &mut state.assemble_cat_scroll,
+                state.cursor,
+                AssembleSlot::ALL.len(),
+                crate::garage_assemble::ASSEMBLE_CAT_WINDOW,
+            );
+            state.assemble_subcat = None;
+            state.assemble_dmg_filter = None;
             state.saved_design = Some(garage.active_design);
             let parts = parts_for_slot(slot);
             let equipped = slot.get(&garage.active_design);
             state.cursor = parts.iter().position(|&id| id == equipped).unwrap_or(0);
-            clamp_scroll(&mut state.scroll, state.cursor, parts.len());
+            clamp_scroll_win(
+                &mut state.scroll,
+                state.cursor,
+                parts.len(),
+                crate::garage_assemble::ASSEMBLE_THUMB_WINDOW,
+            );
             state.screen = GarageScreen::AssembleParts { slot };
             state.cam_manual_orbit = false;
             sound::cue(commands, cues, audio_assets, CUE_CATEGORY);
             state.ui_dirty = true;
         }
         GarageScreen::AssembleParts { slot } => {
-            let parts = parts_for_slot(slot);
+            let parts = crate::garage_assemble::filtered_parts_for_slot(
+                slot,
+                state.assemble_subcat,
+                state.assemble_dmg_filter,
+            );
             let Some(&part_id) = parts.get(state.cursor) else {
                 return;
             };
@@ -2322,13 +2567,16 @@ fn step_custom_camo(garage: &mut crate::Garage, delta: i8) {
 }
 
 /// Rebuilds the interactive ACVD Garage HUD whenever `GarageState::ui_dirty` is set.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_ui(
     mut commands: Commands,
     mode: Res<Mode>,
     mut state: ResMut<GarageState>,
     garage: Res<crate::Garage>,
     mut decals: ResMut<DecalState>,
+    mut assemble_assets: ResMut<crate::garage_assemble::AssembleUiAssets>,
     mut images: ResMut<Assets<Image>>,
+    window: Query<&Window, With<bevy::window::PrimaryWindow>>,
     existing: Query<Entity, With<GarageUi>>,
 ) {
     if *mode != Mode::Garage {
@@ -2350,6 +2598,56 @@ pub fn sync_ui(
     }
     for e in &existing {
         commands.entity(e).despawn();
+    }
+
+    // Authentic retail `lang/en/menu/assemble.drb.dcx` UI + real thumbnails + live 3D part preview.
+    if let GarageScreen::AssembleParts { slot } = state.screen {
+        // When launched directly into a part slot via CLI (`--garage-screen weapon_r`, etc.),
+        // snap the top category tab scroll and vertical part cursor to the currently equipped part.
+        if state.saved_design.is_none() {
+            state.saved_design = Some(garage.active_design);
+            let sidx = AssembleSlot::ALL
+                .iter()
+                .position(|&s| s == slot)
+                .unwrap_or(0);
+            state.slot_cursor = sidx;
+            clamp_scroll_win(
+                &mut state.assemble_cat_scroll,
+                sidx,
+                AssembleSlot::ALL.len(),
+                crate::garage_assemble::ASSEMBLE_CAT_WINDOW,
+            );
+            let parts = crate::garage_assemble::filtered_parts_for_slot(
+                slot,
+                state.assemble_subcat,
+                state.assemble_dmg_filter,
+            );
+            let equipped = slot.get(&garage.active_design);
+            if let Some(pos) = parts.iter().position(|&id| id == equipped) {
+                state.cursor = pos;
+                clamp_scroll_win(
+                    &mut state.scroll,
+                    pos,
+                    parts.len(),
+                    crate::garage_assemble::ASSEMBLE_THUMB_WINDOW,
+                );
+            }
+        }
+        let win_size = window
+            .single()
+            .map(|w| Vec2::new(w.width(), w.height()))
+            .unwrap_or(Vec2::new(1280.0, 720.0));
+        if crate::garage_assemble::spawn_assemble_ui(
+            &mut commands,
+            &mut assemble_assets,
+            &state,
+            &garage,
+            slot,
+            win_size,
+            &mut images,
+        ) {
+            return;
+        }
     }
 
     let bg_panel = Color::srgba(0.05, 0.07, 0.10, 0.86);

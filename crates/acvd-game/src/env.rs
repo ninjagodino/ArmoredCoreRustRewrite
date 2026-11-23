@@ -465,7 +465,14 @@ struct SkyDome {
 }
 
 fn follow_sky(
-    camera: Query<&Transform, (With<Camera3d>, Without<WaterReflectionCamera>)>,
+    camera: Query<
+        &Transform,
+        (
+            With<Camera3d>,
+            Without<WaterReflectionCamera>,
+            Without<crate::garage_assemble::PartPreviewCamera>,
+        ),
+    >,
     mut domes: Query<(&SkyDome, &mut Transform), Without<Camera3d>>,
 ) {
     let Ok(camera) = camera.single() else { return };
@@ -482,7 +489,14 @@ fn sync_water_reflection(
     mut commands: Commands,
     env: Option<Res<MapEnv>>,
     window: Query<&Window, With<PrimaryWindow>>,
-    main_cam: Query<(&Transform, &Projection), (With<Camera3d>, Without<WaterReflectionCamera>)>,
+    main_cam: Query<
+        (&Transform, &Projection),
+        (
+            With<Camera3d>,
+            Without<WaterReflectionCamera>,
+            Without<crate::garage_assemble::PartPreviewCamera>,
+        ),
+    >,
     mut refl_cam: Query<
         (Entity, &mut Transform, &mut Projection, &mut Camera),
         With<WaterReflectionCamera>,
@@ -584,7 +598,14 @@ pub(crate) fn apply_env_file(
     disc: &Disc,
     path: &str,
     lights: &mut Query<(&mut DirectionalLight, &mut Transform)>,
-    cameras: &Query<Entity, (With<Camera3d>, Without<WaterReflectionCamera>)>,
+    cameras: &Query<
+        Entity,
+        (
+            With<Camera3d>,
+            Without<WaterReflectionCamera>,
+            Without<crate::garage_assemble::PartPreviewCamera>,
+        ),
+    >,
 ) -> Option<Env> {
     let env = match vfs::open(disc, path).and_then(|d| env::read(&d)) {
         Ok(env) => env,
@@ -655,7 +676,14 @@ pub(crate) fn load_map_env(
     disc: &Disc,
     map: &str,
     lights: &mut Query<(&mut DirectionalLight, &mut Transform)>,
-    cameras: &Query<Entity, (With<Camera3d>, Without<WaterReflectionCamera>)>,
+    cameras: &Query<
+        Entity,
+        (
+            With<Camera3d>,
+            Without<WaterReflectionCamera>,
+            Without<crate::garage_assemble::PartPreviewCamera>,
+        ),
+    >,
     images: &mut Assets<Image>,
 ) {
     let path = env_path(map);
@@ -701,7 +729,14 @@ fn load(
     scene: Res<crate::Scene>,
     mode: Res<crate::garage::Mode>,
     mut lights: Query<(&mut DirectionalLight, &mut Transform)>,
-    cameras: Query<Entity, (With<Camera3d>, Without<WaterReflectionCamera>)>,
+    cameras: Query<
+        Entity,
+        (
+            With<Camera3d>,
+            Without<WaterReflectionCamera>,
+            Without<crate::garage_assemble::PartPreviewCamera>,
+        ),
+    >,
     mut images: ResMut<Assets<Image>>,
 ) {
     if *mode != crate::garage::Mode::Sortie {

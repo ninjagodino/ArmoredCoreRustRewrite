@@ -59,6 +59,7 @@ mod decal;
 mod env;
 mod fcs;
 mod garage;
+mod garage_assemble;
 mod hanger;
 mod hud;
 mod lens_flare;
@@ -360,6 +361,7 @@ fn main() {
     .insert_resource(initial_mode)
     .insert_resource(garage::ModeSwitch::default())
     .insert_resource(garage_state)
+    .init_resource::<garage_assemble::AssembleUiAssets>()
     .insert_resource(decal::DecalState::new(cli_decal))
     .insert_resource(decal::DecalMeshCache::default())
     .insert_resource(Garage {
@@ -404,6 +406,9 @@ fn main() {
             decal::handle_imports,
             garage::handle_input,
             garage::sync_ui,
+            garage_assemble::populate_drb_dialogs,
+            garage_assemble::sync_part_preview,
+            garage_assemble::rotate_part_preview,
             garage::update_camera,
         )
             .chain()
@@ -802,8 +807,22 @@ fn process_mode_switch(
     mut audio: AudioCtx,
     mut assets: RenderAssets,
     mut dir_lights: Query<(&mut DirectionalLight, &mut Transform)>,
-    mut cam_proj: Query<&mut Projection, (With<Camera3d>, Without<env::WaterReflectionCamera>)>,
-    cameras: Query<Entity, (With<Camera3d>, Without<env::WaterReflectionCamera>)>,
+    mut cam_proj: Query<
+        &mut Projection,
+        (
+            With<Camera3d>,
+            Without<env::WaterReflectionCamera>,
+            Without<garage_assemble::PartPreviewCamera>,
+        ),
+    >,
+    cameras: Query<
+        Entity,
+        (
+            With<Camera3d>,
+            Without<env::WaterReflectionCamera>,
+            Without<garage_assemble::PartPreviewCamera>,
+        ),
+    >,
     sortie_entities: Query<
         Entity,
         Or<(
