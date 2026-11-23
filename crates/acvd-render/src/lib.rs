@@ -376,14 +376,39 @@ fn vertex_joints(f: &flver::Flver, m: &flver::Mesh, v: &flver::Vertices, bones: 
         .unzip()
 }
 
-/// Strips sRGB from block-compressed formats so data textures (normal, specular, color mask,
-/// camo) sample in linear space.
+/// Strips sRGB from block-compressed or RGBA8 formats so data textures (normal, specular, color
+/// mask, camo) sample in linear space.
 pub fn to_linear(img: &mut Image) {
     img.texture_descriptor.format = match img.texture_descriptor.format {
         TextureFormat::Bc1RgbaUnormSrgb => TextureFormat::Bc1RgbaUnorm,
         TextureFormat::Bc3RgbaUnormSrgb => TextureFormat::Bc3RgbaUnorm,
+        TextureFormat::Rgba8UnormSrgb => TextureFormat::Rgba8Unorm,
         other => other,
     };
+}
+
+/// Best-resolution [`TextureRef`] for `name`: prefers high-res `*_gt.tpf.dcx` (360 garage
+/// showcase pack, `0x82b50540`) over combat `*.tpf.dcx` and low-LOD `*_l.tpf.dcx`, breaking ties
+/// by pixel area descending.
+pub fn best_texture_ref(name: &str) -> Option<&'static TextureRef> {
+    let rank = |t: &TextureRef| -> (u8, u64) {
+        let p = t.pack;
+        let tier = if p.ends_with("_gt.tpf.dcx") || p.ends_with("_gt.tpf") {
+            2
+        } else if p.ends_with("_l.tpf.dcx") || p.ends_with("_l.tpf") {
+            0
+        } else {
+            1
+        };
+        (tier, t.width as u64 * t.height as u64)
+    };
+    let mut best: Option<&'static TextureRef> = None;
+    for t in acvd_data::textures_named(name) {
+        if best.is_none_or(|b| rank(t) > rank(b)) {
+            best = Some(t);
+        }
+    }
+    best
 }
 
 /// The material for `part`: its diffuse and normal-map textures, or flat grey when it has none,
@@ -416,7 +441,7 @@ pub struct Packs(HashMap<String, Vec<u8>>);
 
 impl Packs {
     pub fn image(&mut self, disc: &Disc, name: &str) -> Result<Image> {
-        let t: &TextureRef = acvd_data::textures_named(name).next().with_context(|| format!("no texture named `{name}`"))?;
+        let t: &TextureRef = best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
         self.texture(disc, t)
     }
 
@@ -460,16 +485,23 @@ impl Packs {
         let tex = header.textures.get(index).context("texture index past the pack")?;
         let row = acvd_data::texture_format(tex.format);
         let is_ctx1 = matches!(row.map(|f| f.name), Some("ctx1"));
-        let format = match row.map(|f| f.name) {
-            Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,
-            Some("bc3") => TextureFormat::Bc3RgbaUnormSrgb,
-            // DXN is two BC4 blocks, x then y (sheets/texture_formats.csv code 23). Bevy treats
-            // Bc5RgUnorm as a two-component normal map.
-            Some("dxn") => TextureFormat::Bc5RgUnorm,
-            // CTX1 (sheets/texture_formats.csv codes 24 and 25) is CPU-expanded to Rg8Unorm,
-            // which Bevy also flags as TWO_COMPONENT_NORMAL_MAP.
-            Some("ctx1") => TextureFormat::Rg8Unorm,
-            other => bail!("texture `{name}` format {other:?}"),
+        // Format 33 (HT-BC3, `floats_unk == 1010`, `floats == [scale]`): normalized RGB * A *
+        // `FC_HTTextureRenge_0` (`Normal/Flver_ACColorDecalColDifSpcBumpIbl.fpo` insns 89-102).
+        let is_ht_bc3 = tex.format == 33;
+        let format = if is_ht_bc3 {
+            TextureFormat::Rgba8UnormSrgb
+        } else {
+            match row.map(|f| f.name) {
+                Some("bc1") => TextureFormat::Bc1RgbaUnormSrgb,
+                Some("bc3") => TextureFormat::Bc3RgbaUnormSrgb,
+                // DXN is two BC4 blocks, x then y (sheets/texture_formats.csv code 23). Bevy treats
+                // Bc5RgUnorm as a two-component normal map.
+                Some("dxn") => TextureFormat::Bc5RgUnorm,
+                // CTX1 (sheets/texture_formats.csv codes 24 and 25) is CPU-expanded to Rg8Unorm,
+                // which Bevy also flags as TWO_COMPONENT_NORMAL_MAP.
+                Some("ctx1") => TextureFormat::Rg8Unorm,
+                other => bail!("texture `{name}` format {other:?}"),
+            }
         };
         ensure!(tex.faces() == 1, "texture `{name}` is a cube map");
         let (width, height) = (tex.width, tex.height);
@@ -486,6 +518,9 @@ impl Packs {
         }
         let data = if is_ctx1 {
             tpf::decode_ctx1(&bytes[..end], width, height, levels, 1)?
+        } else if is_ht_bc3 {
+            let scale = tex.floats.first().copied().unwrap_or(1.0);
+            tpf::decode_bc3_ht(&bytes[..end], width, height, levels, 1, scale)?
         } else {
             bytes[..end].to_vec()
         };
@@ -498,6 +533,7 @@ impl Packs {
         image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
             address_mode_u: ImageAddressMode::Repeat,
             address_mode_v: ImageAddressMode::Repeat,
+            anisotropy_clamp: 8,
             ..ImageSamplerDescriptor::linear()
         });
         Ok(image)
@@ -628,5 +664,37 @@ mod tests {
         let min_a = colors.iter().map(|c| c[3]).fold(1.0f32, f32::min);
         let max_a = colors.iter().map(|c| c[3]).fold(0.0f32, f32::max);
         assert!(min_a < 0.1 && max_a > 0.9, "alpha range {min_a}..{max_a}");
+    }
+
+    #[test]
+    fn x360_best_texture_ref_prefers_gt_pack_and_decodes_ht_bc3() {
+        let iso = vfs::repo_root().join(vfs::X360_ISO);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        // AC frame parts should pick the high-res *_gt.tpf.dcx pack (0x82b50540) over combat/low-LOD.
+        let lg = best_texture_ref("lg0010").expect("lg0010");
+        assert!(lg.pack.ends_with("lg0010_gt.tpf.dcx"), "picked {}", lg.pack);
+        assert_eq!((lg.width, lg.height, lg.format), (1024, 512, 33));
+
+        // Format-33 HT-BC3 (hand weapon hl0110) must unpack rgb * alpha * floats[0] -> Rgba8UnormSrgb
+        // with real luminance contrast (raw RGB alone is flat ~147 grey).
+        let mut packs = Packs::default();
+        let img = packs.image(&disc, "hl0110").unwrap();
+        assert_eq!(img.texture_descriptor.format, TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(img.texture_descriptor.size.width, 1024);
+        assert_eq!(img.texture_descriptor.size.height, 512);
+        assert!(img.texture_descriptor.mip_level_count > 1);
+        let data = img.data.as_ref().unwrap();
+        let l0 = &data[..1024 * 512 * 4];
+        let mut min_r = 255u8;
+        let mut max_r = 0u8;
+        for px in l0.chunks_exact(4) {
+            assert_eq!(px[3], 255, "HT-BC3 output alpha must be opaque 255");
+            min_r = min_r.min(px[0]);
+            max_r = max_r.max(px[0]);
+        }
+        assert!(max_r - min_r > 80, "HT-BC3 decoded hl0110 should have real panel contrast, got {min_r}..{max_r}");
     }
 }

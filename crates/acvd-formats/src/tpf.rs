@@ -596,6 +596,78 @@ pub fn decode_bc3(linear: &[u8], width: u16, height: u16) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Decodes a linear HT-BC3 (format 33) mip chain into tightly packed RGBA8 bytes, applying the
+/// 360 `FC_HTTextureRenge_0` unpack (`rgb = tex.rgb * tex.a * scale`, `a = 255`) from
+/// `Normal/Flver_ACColorDecalColDifSpcBumpIbl.fpo` instructions 89, 91, 98, 100-102.
+///
+/// Format-33 textures (all 959 AC hand weapons, 14 boosters, 2 hanger racks, 907 `*_gt.tpf.dcx`
+/// garage textures, and 46 map/menu props) store normalized chromaticity in BC3 RGB and the
+/// brightness/range multiplier in BC3 A with `floats_unk == 1010` and `floats == [scale]`.
+pub fn decode_bc3_ht(
+    linear: &[u8],
+    width: u16,
+    height: u16,
+    levels: u32,
+    faces: u32,
+    scale: f32,
+) -> Result<Vec<u8>> {
+    let faces = faces.max(1);
+    let need = chain(width, height, levels, 16) * faces as u64;
+    ensure!(
+        linear.len() as u64 >= need,
+        "linear HT-BC3 {width}x{height} ({levels} levels, {faces} faces) is {} bytes, needs {need}",
+        linear.len()
+    );
+    let total_texels: usize = (0..levels)
+        .map(|m| {
+            let lw = (width as usize >> m).max(1);
+            let lh = (height as usize >> m).max(1);
+            lw * lh
+        })
+        .sum::<usize>()
+        * faces as usize;
+    let mut out = vec![0u8; total_texels * 4];
+    let mut src = 0usize;
+    let mut dst_level = 0usize;
+    let factor = scale / 255.0;
+    for _ in 0..faces {
+        for m in 0..levels {
+            let lw = (width as usize >> m).max(1);
+            let lh = (height as usize >> m).max(1);
+            let bw = lw.div_ceil(4);
+            let bh = lh.div_ceil(4);
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let block: &[u8; 16] = linear[src..src + 16].try_into().unwrap();
+                    src += 16;
+                    let texels = decode_bc3_block(block);
+                    for ly in 0..4 {
+                        let y = by * 4 + ly;
+                        if y >= lh {
+                            break;
+                        }
+                        for lx in 0..4 {
+                            let x = bx * 4 + lx;
+                            if x >= lw {
+                                break;
+                            }
+                            let at = dst_level + (y * lw + x) * 4;
+                            let p = texels[ly * 4 + lx];
+                            let k = p[3] as f32 * factor;
+                            out[at] = (p[0] as f32 * k).round().clamp(0.0, 255.0) as u8;
+                            out[at + 1] = (p[1] as f32 * k).round().clamp(0.0, 255.0) as u8;
+                            out[at + 2] = (p[2] as f32 * k).round().clamp(0.0, 255.0) as u8;
+                            out[at + 3] = 255;
+                        }
+                    }
+                }
+            }
+            dst_level += lw * lh * 4;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

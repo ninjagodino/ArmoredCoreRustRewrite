@@ -102,7 +102,7 @@ pub fn load_accolor(disc: &Disc, coloring_id: u16) -> Option<AcColor> {
 /// format so the pixel shader reads the exact 5-bit `R` channel index and `G` weight.
 pub fn load_color_map(disc: &Disc, packs: &mut Packs, diffuse: &str) -> Option<Image> {
     let mask_name = format!("{diffuse}_c");
-    let mut img = if let Some(d_ref) = acvd_data::textures_named(diffuse).next() {
+    let mut img = if let Some(d_ref) = acvd_render::best_texture_ref(diffuse) {
         let idx = packs.find(disc, d_ref.pack, &mask_name).ok().flatten();
         idx.and_then(|i| packs.texture_at(disc, d_ref.pack, i, &mask_name).ok())
     } else {
@@ -110,11 +110,7 @@ pub fn load_color_map(disc: &Disc, packs: &mut Packs, diffuse: &str) -> Option<I
     }
     .or_else(|| packs.image(disc, &mask_name).ok())?;
 
-    img.texture_descriptor.format = match img.texture_descriptor.format {
-        TextureFormat::Bc1RgbaUnormSrgb => TextureFormat::Bc1RgbaUnorm,
-        TextureFormat::Bc3RgbaUnormSrgb => TextureFormat::Bc3RgbaUnorm,
-        other => other,
-    };
+    acvd_render::to_linear(&mut img);
     Some(img)
 }
 
