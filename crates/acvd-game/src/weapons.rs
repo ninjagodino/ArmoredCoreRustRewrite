@@ -954,6 +954,10 @@ pub struct WeaponAnims {
     rigs: Vec<WeaponRig>,
     /// Arm `a00` clips, posed over locomotion while the weapon on that side is deployed.
     arms: Vec<WeaponRig>,
+    /// Weapon-arm `am*_a.bnd.dcx` player (`0x824793c8`, `0x82882d28`, `0x8284cecc`), driving all
+    /// non-root bones (`*_armwepunit_*`, `*_armroot`, `*_arm01..*_armhand`) for stowed, deploy,
+    /// combat-idle, ready, fire, and stow states.
+    weapon_arm: Option<WeaponArmRig>,
     recoil_bones: Vec<RecoilBone>,
     /// Right, left.
     aim: [ArmAim; 2],
@@ -1931,6 +1935,7 @@ pub fn fire(
     };
     if arms.weapon_arm {
         let want_wa = want[0] || want[1];
+        let mut wa_fired = false;
         // Collect weapon-arm muzzle effect points (even IDs 102/104/106/108 = right arm,
         // odd IDs 101/103/105/107 = left arm), interleaved right-then-left.
         let mut right_muzzles: Vec<(u8, Entity, Vec3)> = Vec::new();
@@ -1997,6 +2002,7 @@ pub fn fire(
                         hit_hi_se: gun.hit_se.hi,
                     };
                     if pilot.start_blade(launch) {
+                        wa_fired = true;
                         let _ = pilot.try_drain_en(gun.en_drain);
                         if !blade.infinite_ammo {
                             gun.remaining = gun.remaining.saturating_sub(1);
@@ -2050,6 +2056,7 @@ pub fn fire(
                     }
                 }
                 if !arms.arm_salvo.is_empty() {
+                    wa_fired = true;
                     arms.arm_salvo_timer = 0.0;
                     arms.arm_salvo_index = 0;
                     arms.hands[0].cooldown = arms.hands[0].reload_time.max(1.0);
@@ -2141,13 +2148,8 @@ pub fn fire(
                 && gun.remaining > 0
                 && gun.cooldown <= 0.0
                 && pilot.en >= gun.en_drain;
-            if let Some(anims) = body.anims.as_mut() {
-                for arm in &mut anims.arms {
-                    arm.playback.tick(want_wa, false, frames);
-                    arm.apply(&mut posed);
-                }
-            }
             if want_wa && can && pilot.try_drain_en(gun.en_drain) {
+                wa_fired = true;
                 if gun.stance {
                     pilot.trigger_impact_shake(220.0);
                     pilot.trigger_rumble_shake(0.14, Vec2::new(0.06, 0.12), Vec2::new(0.02, 0.02));
@@ -2272,6 +2274,10 @@ pub fn fire(
             }
         }
         if let Some(anims) = body.anims.as_mut() {
+            if let Some(wa) = anims.weapon_arm.as_mut() {
+                wa.tick(!pilot.scan_mode, want_wa, wa_fired, frames);
+                wa.apply(&mut posed);
+            }
             for (i, hand) in [Hand::Right, Hand::Left].into_iter().enumerate() {
                 let muzzle = if hand == Hand::Right {
                     right_muzzles.first().or_else(|| left_muzzles.first()).map(|m| m.1)
@@ -4746,6 +4752,270 @@ struct WeaponRig {
     clips: [Option<ani::Anim>; 4],
 }
 
+/// Base clip ID inside a weapon arm's `am*_a.bnd.dcx` for `leg_type` (360 `0x82882d28`):
+/// biped (`0..=2`) -> `0`, reverse joint (`3..=4`) -> `10`, quad (`5`) -> `20`, tank (`6`) -> `30`.
+pub(crate) fn weapon_arm_clip_base(leg_type: u8) -> u32 {
+    match leg_type {
+        0..=2 => 0,
+        3..=4 => 10,
+        5 => 20,
+        6 => 30,
+        _ => 0,
+    }
+}
+
+/// Playback phase of a weapon arm's `am*_a.bnd.dcx` rig (360 `WeaponArmCtrl` `0x820930e8`,
+/// `0x8284cecc`, `0x82847fc8`, `0x8289d890`, `0x8289d908`, `0x8289da68`, `0x8289dab8`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeaponArmPhase {
+    /// Folded / stowed (`base + 0`: `a00_000` / `010` / `020` / `030`). Garage & Scan Mode.
+    Stowed,
+    /// Transforming from folded to combat-ready (`base + 4`: `a00_004` / `014` / `024` / `034`).
+    Deploying,
+    /// Combat-ready idle (`base + 1`: `a00_001` / `011` / `021` / `031`).
+    Deployed,
+    /// Holding trigger / aiming (`base + 3`: `a00_003` / `013` / `023` / `033`).
+    Ready,
+    /// Firing / recoil (`base + 2`: `a00_002` / `012` / `022` / `032`, optional).
+    Firing,
+    /// Transforming from combat-ready back to folded (`base + 5`: `a00_005` / `015` / `025` / `035`).
+    Stowing,
+}
+
+/// Dedicated animation rig for weapon arms (`acvparts` cat-2 `+0x13c == 1`, 360 `0x824793c8`).
+/// Unlike standard arms (whose `*_arm01..*_armhand` follow the body locomotion clip), weapon arms
+/// drive ALL non-root bones (`*_armwepunit_*`, `*_armroot`, `*_arm01..*_armhand`, `*_armhandu*`)
+/// directly from `am*_a.bnd.dcx`, leaving only the shoulder roots (`l_kata`, `r_kata`) on the core.
+struct WeaponArmRig {
+    joints: Vec<(Entity, usize)>,
+    skeleton: ani::Anim,
+    stowed: ani::Anim,
+    deploy: Option<ani::Anim>,
+    stow: Option<ani::Anim>,
+    deployed: Option<ani::Anim>,
+    fire: Option<ani::Anim>,
+    ready: Option<ani::Anim>,
+    phase: WeaponArmPhase,
+    frame: f32,
+}
+
+impl WeaponArmRig {
+    fn load(
+        disc: &Disc,
+        placement: &Placement,
+        rig: &Rig,
+        joints: &[Entity],
+        leg_type: u8,
+    ) -> Option<Self> {
+        let binder = anim_binder(placement.model.path)?;
+        let assets: Vec<_> = acvd_data::generated::assets::ALL
+            .iter()
+            .flat_map(|g| g.iter())
+            .filter(|a| a.binder == binder && a.ext == ".ani")
+            .collect();
+        let skel_asset = assets.iter().find(|a| a.entry == "a00_000.ani")?;
+        let skeleton = ani::read(&vfs::open(disc, &skel_asset.path()).ok()?).ok()?;
+        if skeleton.bones.iter().all(|b| b.rest.is_none()) {
+            return None;
+        }
+        let load_clip = |id: u32, fallback: Option<u32>| -> Option<ani::Anim> {
+            let try_id = |cid: u32| -> Option<ani::Anim> {
+                let entry = format!("a00_{cid:03}.ani");
+                let asset = assets.iter().find(|a| a.entry == entry)?;
+                let clip = ani::read(&vfs::open(disc, &asset.path()).ok()?).ok()?;
+                (clip.bones.len() == skeleton.bones.len() && clip.frames > 0).then_some(clip)
+            };
+            try_id(id).or_else(|| fallback.and_then(try_id))
+        };
+        let base = weapon_arm_clip_base(leg_type);
+        let stowed = load_clip(base, Some(0)).unwrap_or_else(|| skeleton.clone());
+        let deployed = load_clip(base + 1, Some(1));
+        let fire = load_clip(base + 2, Some(2));
+        let ready = load_clip(base + 3, Some(3));
+        let deploy = load_clip(base + 4, Some(4));
+        let stow = load_clip(base + 5, Some(5));
+
+        // Bind every non-root FLVER bone (`l_kata` and `r_kata` stay mounted on `core`).
+        let mut pairs = Vec::new();
+        for (i, bone) in skeleton.bones.iter().enumerate() {
+            let Some(name) = bone.rest.as_ref().map(|r| r.name.as_str()) else {
+                continue;
+            };
+            let Some(b) = rig.bones.iter().position(|x| x.name == name) else {
+                continue;
+            };
+            if rig.bones[b].parent.is_none() {
+                continue;
+            }
+            if let Some(&entity) = joints.get(b) {
+                pairs.push((entity, i));
+            }
+        }
+        if pairs.is_empty() {
+            return None;
+        }
+        Some(Self {
+            joints: pairs,
+            skeleton,
+            stowed,
+            deploy,
+            stow,
+            deployed,
+            fire,
+            ready,
+            phase: WeaponArmPhase::Stowed,
+            frame: 0.0,
+        })
+    }
+
+    fn active_clip(&self) -> &ani::Anim {
+        match self.phase {
+            WeaponArmPhase::Stowed => &self.stowed,
+            WeaponArmPhase::Deploying => self.deploy.as_ref().unwrap_or(&self.stowed),
+            WeaponArmPhase::Deployed => self.deployed.as_ref().unwrap_or(&self.stowed),
+            WeaponArmPhase::Ready => self
+                .ready
+                .as_ref()
+                .or(self.deployed.as_ref())
+                .unwrap_or(&self.stowed),
+            WeaponArmPhase::Firing => self
+                .fire
+                .as_ref()
+                .or(self.ready.as_ref())
+                .or(self.deployed.as_ref())
+                .unwrap_or(&self.stowed),
+            WeaponArmPhase::Stowing => self.stow.as_ref().unwrap_or(&self.stowed),
+        }
+    }
+
+    /// Advances the weapon arm state machine by `frames` 60 Hz ticks.
+    fn tick(&mut self, combat_mode: bool, want_fire: bool, fired: bool, frames: f32) {
+        if !combat_mode {
+            match self.phase {
+                WeaponArmPhase::Stowed => {
+                    let len = self.stowed.frames.max(1) as f32;
+                    self.frame = (self.frame + frames) % len;
+                }
+                WeaponArmPhase::Stowing => {
+                    let len = self.stow.as_ref().map_or(1, |c| c.frames.max(1)) as f32;
+                    self.frame += frames * 2.0;
+                    if self.frame >= len - 1.0 {
+                        self.phase = WeaponArmPhase::Stowed;
+                        self.frame = 0.0;
+                    }
+                }
+                _ => {
+                    if self.stow.is_some() {
+                        self.phase = WeaponArmPhase::Stowing;
+                        self.frame = 0.0;
+                    } else {
+                        self.phase = WeaponArmPhase::Stowed;
+                        self.frame = 0.0;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Combat mode: unfold via `base+4`, then hold `base+1`, ready `base+3`, fire `base+2`.
+        if fired && !matches!(self.phase, WeaponArmPhase::Deploying) {
+            if self.fire.is_some() {
+                self.phase = WeaponArmPhase::Firing;
+                self.frame = 0.0;
+            } else if self.ready.is_some() {
+                self.phase = WeaponArmPhase::Ready;
+                self.frame = 0.0;
+            }
+        }
+        match self.phase {
+            WeaponArmPhase::Stowed | WeaponArmPhase::Stowing => {
+                if self.deploy.is_some() {
+                    self.phase = WeaponArmPhase::Deploying;
+                    self.frame = 0.0;
+                } else {
+                    self.phase = WeaponArmPhase::Deployed;
+                    self.frame = 0.0;
+                }
+            }
+            WeaponArmPhase::Deploying => {
+                let len = self.deploy.as_ref().map_or(1, |c| c.frames.max(1)) as f32;
+                let speed = if want_fire || fired { 3.0 } else { 2.0 };
+                self.frame += frames * speed;
+                if self.frame >= len - 1.0 {
+                    self.phase = WeaponArmPhase::Deployed;
+                    self.frame = 0.0;
+                }
+            }
+            WeaponArmPhase::Firing => {
+                let len = self.active_clip().frames.max(1) as f32;
+                self.frame += frames;
+                if self.frame >= len - 1.0 {
+                    self.phase = if want_fire && self.ready.is_some() {
+                        WeaponArmPhase::Ready
+                    } else {
+                        WeaponArmPhase::Deployed
+                    };
+                    self.frame = 0.0;
+                }
+            }
+            WeaponArmPhase::Ready => {
+                let len = self.active_clip().frames.max(1) as f32;
+                self.frame = (self.frame + frames).min(len - 1.0);
+                if !want_fire {
+                    self.phase = WeaponArmPhase::Deployed;
+                    self.frame = 0.0;
+                }
+            }
+            WeaponArmPhase::Deployed => {
+                if want_fire && self.ready.is_some() {
+                    self.phase = WeaponArmPhase::Ready;
+                    self.frame = 0.0;
+                } else {
+                    let len = self.active_clip().frames.max(1) as f32;
+                    self.frame = (self.frame + frames) % len;
+                }
+            }
+        }
+    }
+
+    fn sample_joint(&self, clip: &ani::Anim, bone: usize) -> Transform {
+        let rest = self.skeleton.bones.get(bone).and_then(|b| b.rest.as_ref());
+        let track = clip.bones.get(bone).map(|b| &b.track);
+        let rotation = track
+            .and_then(|t| t.rotation(self.frame))
+            .or_else(|| rest.map(|r| ani::euler_quat(r.euler)))
+            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let translation = track
+            .and_then(|t| t.translation(self.frame))
+            .unwrap_or(rest.map(|r| r.translation).unwrap_or([0.0; 3]));
+        let scale = track
+            .and_then(|t| t.scale(self.frame))
+            .unwrap_or(rest.map(|r| r.scale).unwrap_or([1.0; 3]));
+        pose::to_transform(
+            Vec3::from(translation),
+            Quat::from_array(rotation),
+            Vec3::from(scale),
+        )
+    }
+
+    fn sample(&self) -> Vec<(Entity, Transform)> {
+        let clip = self.active_clip();
+        self.joints
+            .iter()
+            .map(|&(entity, bone)| (entity, self.sample_joint(clip, bone)))
+            .collect()
+    }
+
+    fn apply(&self, posed: &mut Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>) {
+        let clip = self.active_clip();
+        for &(entity, bone) in &self.joints {
+            if let Ok((mut current, _)) = posed.get_mut(entity) {
+                *current = self.sample_joint(clip, bone);
+            }
+        }
+    }
+}
+
 impl SniperStance {
     fn update(&mut self, want: Option<Hand>, motion: &mut Motion, disc: &Disc, pilot: &mut Pilot) {
         match want {
@@ -4883,8 +5153,19 @@ impl WeaponAnims {
     }
 
     /// Loads hand and bay `a00` clips, the arm deploy clips on that side, and the rifle kick bones.
-    pub fn load(&mut self, disc: &Disc, placement: &Placement, rig: &Rig, joints: &[Entity]) {
+    pub fn load(
+        &mut self,
+        disc: &Disc,
+        placement: &Placement,
+        rig: &Rig,
+        joints: &[Entity],
+        leg_type: u8,
+    ) {
         let arm = placement.column == "arms";
+        if arm && part_field(placement.part as i64, 2, "is_weapon_arm") != 0.0 {
+            self.weapon_arm = WeaponArmRig::load(disc, placement, rig, joints, leg_type);
+            return;
+        }
         let placed = placement_place(placement.column);
         let hands: &[Hand] = if arm {
             &[Hand::Right, Hand::Left]
@@ -5088,12 +5369,21 @@ impl WeaponAnims {
             .iter()
             .chain(&self.arms)
             .flat_map(|r| r.joints.iter().map(|(entity, _)| *entity))
+            .chain(
+                self.weapon_arm
+                    .iter()
+                    .flat_map(|r| r.joints.iter().map(|(entity, _)| *entity)),
+            )
             .chain(self.recoil_bones.iter().map(|b| b.entity))
     }
 
     /// Stowed pose, applied once at spawn so the first frame is not the bind pose.
     pub fn rest_pose(&self) -> Vec<(Entity, Transform)> {
-        self.rigs.iter().flat_map(WeaponRig::sample).collect()
+        self.rigs
+            .iter()
+            .flat_map(WeaponRig::sample)
+            .chain(self.weapon_arm.iter().flat_map(WeaponArmRig::sample))
+            .collect()
     }
 }
 
@@ -6332,5 +6622,82 @@ mod tests {
             "ballistic rifle must populate cartridge_sfx_id (got {})",
             rifle.fx.cartridge
         );
+    }
+
+    #[test]
+    fn weapon_arm_rig_loads_all_nonroot_bones_and_transitions_phases() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+
+        assert_eq!(weapon_arm_clip_base(0), 0);
+        assert_eq!(weapon_arm_clip_base(2), 0);
+        assert_eq!(weapon_arm_clip_base(3), 10);
+        assert_eq!(weapon_arm_clip_base(4), 10);
+        assert_eq!(weapon_arm_clip_base(5), 20);
+        assert_eq!(weapon_arm_clip_base(6), 30);
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+
+        // Design 6009 uses weapon arms 7420 (`am7420.flv`, 54 bones: 2 roots `l_kata`/`r_kata`
+        // + 52 child bones, with full 25-clip `am7420_a.bnd.dcx` including fire clip `a00_002`).
+        let design = &find(PARAM_ACASSEMBLYDRAWING_BIN, 6009)
+            .expect("design 6009")
+            .data;
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
+        let arms_pl = built
+            .placements
+            .iter()
+            .find(|p| p.column == "arms")
+            .expect("arms placement");
+        let (_, rig) =
+            acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| assemble::place_of(&[], None))
+                .expect("rigged_model");
+        let mut world = World::new();
+        let joints: Vec<Entity> = (0..rig.bones.len()).map(|_| world.spawn_empty().id()).collect();
+        let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
+
+        let mut anims = WeaponAnims::default();
+        anims.load(&disc, arms_pl, &rig, &joints, leg_type);
+        assert!(anims.arms.is_empty(), "weapon arm must not load normal-arm rigs");
+        assert!(anims.recoil_bones.is_empty(), "weapon arm must not hook normal-arm recoil");
+        let wa = anims.weapon_arm.as_ref().expect("weapon_arm rig loaded");
+        assert_eq!(wa.phase, WeaponArmPhase::Stowed);
+        let joint_count = wa.joints.len();
+        assert_eq!(
+            joint_count,
+            rig.bones.iter().filter(|b| b.parent.is_some()).count(),
+            "every non-root weapon arm bone must be driven"
+        );
+        // `rest_pose()` must pose the weapon arm into its folded stowed clip for the garage.
+        let rest = anims.rest_pose();
+        assert_eq!(rest.len(), joint_count);
+
+        // Combat mode: Stowed -> Deploying -> Deployed -> Firing -> Deployed -> Stowing -> Stowed.
+        let wa = anims.weapon_arm.as_mut().unwrap();
+        wa.tick(true, false, false, 1.0);
+        assert_eq!(wa.phase, WeaponArmPhase::Deploying);
+        for _ in 0..200 {
+            wa.tick(true, false, false, 1.0);
+        }
+        assert_eq!(wa.phase, WeaponArmPhase::Deployed);
+        wa.tick(true, true, true, 1.0);
+        assert_eq!(wa.phase, WeaponArmPhase::Firing);
+        for _ in 0..70 {
+            wa.tick(true, false, false, 1.0);
+        }
+        assert_eq!(wa.phase, WeaponArmPhase::Deployed);
+        // Scan mode: Deployed -> Stowing -> Stowed.
+        wa.tick(false, false, false, 1.0);
+        assert_eq!(wa.phase, WeaponArmPhase::Stowing);
+        for _ in 0..200 {
+            wa.tick(false, false, false, 1.0);
+        }
+        assert_eq!(wa.phase, WeaponArmPhase::Stowed);
     }
 }

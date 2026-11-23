@@ -888,12 +888,27 @@ pub fn build(disc: &Disc, parts: &[Loaded]) -> Result<Built> {
         let pi = first.iter().rposition(|&f| f <= j).unwrap_or(0);
         &parts[pi].rig.bones[j - first[pi]].name
     };
+    // Weapon arms (`acvparts` cat-2 `+0x13c == 1`, 360 `0x824793c8`) animate all of their
+    // non-root bones (`*_armwepunit_*`, `*_armroot`, `*_arm01..*_armhand`) via their own
+    // `am*_a.bnd.dcx` clips (`0x8284cecc`, `0x82882d28`). Only their shoulder roots (`l_kata`,
+    // `r_kata`, `parent.is_none()`) follow the AC body clip; letting the body clip overwrite
+    // `*_arm01..*_armhand` twists them against `*_armwepunit_*` / `*_armroot` (e.g. `am7420`'s
+    // 180-degree `r_armroot` bind rotation).
+    let is_weapon_arm_child = |j: usize| -> bool {
+        let pi = first.iter().rposition(|&f| f <= j).unwrap_or(0);
+        let p = &parts[pi];
+        p.placement.column == "arms"
+            && acvd_data::part_field(p.placement.part as i64, 2, "is_weapon_arm") != 0.0
+            && p.rig.bones[j - first[pi]].parent.is_some()
+    };
 
     // Each clip bone claims the first part bone of its name, or becomes a joint of its own.
     let part_joints = joints.len();
     let mut of_bone: Vec<usize> = Vec::with_capacity(rest.len());
     for (i, r) in rest.iter().enumerate() {
-        match (0..part_joints).find(|&j| joints[j].bone.is_none() && name(j) == r.name) {
+        match (0..part_joints).find(|&j| {
+            joints[j].bone.is_none() && !is_weapon_arm_child(j) && name(j) == r.name
+        }) {
             Some(j) => {
                 joints[j].bone = Some(i);
                 of_bone.push(j);
@@ -1883,5 +1898,70 @@ mod tests {
             .local_for_reattach(ow_li, b60, stowed, deployed, arms_li, arm_bone)
             .expect("local_for_reattach");
         assert!(local.translation.is_finite() && local.rotation.is_finite());
+    }
+
+    #[test]
+    fn weapon_arm_child_bones_are_not_driven_by_body_clip() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        // Design 6009 uses weapon arms 7420 (`am7420.flv`), whose `r_armroot` has a 180-deg bind
+        // rotation and whose `*_arm01..*_armhand` are driven by `am7420_a.bnd.dcx`, not `a01_000`.
+        let design = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 6009)
+            .expect("design 6009");
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design.data);
+        let mut loaded = Vec::new();
+        let mut known = vec![None; built.placements.len()];
+        for (index, p) in built.placements.iter().enumerate() {
+            let places = assemble::root_places(p, &built.placements, &known);
+            let (meshes, rig) = acvd_render::rigged_model(&disc, p.model.path, &|root| {
+                assemble::place_of(&places, root)
+            })
+            .expect("rigged_model");
+            known[index] = Some(assemble::Stored {
+                places,
+                frames: rig.frames.clone(),
+            });
+            loaded.push(Loaded {
+                index,
+                placement: p,
+                meshes,
+                rig,
+            });
+        }
+        let rig = build(&disc, &loaded).expect("pose::build");
+        let arms_li = loaded
+            .iter()
+            .position(|l| l.placement.column == "arms")
+            .expect("arms");
+        let first = rig.parts[arms_li].0;
+        let mut roots_driven = 0usize;
+        for (b, bone) in loaded[arms_li].rig.bones.iter().enumerate() {
+            let spec = &rig.joints[first + b];
+            if bone.parent.is_none() && (bone.name == "l_kata" || bone.name == "r_kata") {
+                assert!(
+                    spec.bone.is_some(),
+                    "weapon arm shoulder root {} must stay driven by body clip",
+                    bone.name
+                );
+                roots_driven += 1;
+            } else if bone.parent.is_some() {
+                assert!(
+                    spec.bone.is_none(),
+                    "weapon arm child bone {} must not be claimed by body clip",
+                    bone.name
+                );
+            }
+        }
+        assert_eq!(roots_driven, 2, "expected both l_kata and r_kata roots driven");
     }
 }

@@ -1474,7 +1474,8 @@ fn show(
                 );
             }
         }
-        weapon_anims.load(&garage.disc, part.placement, &part.rig, &joints);
+        let leg_type = acvd_data::part_field(design_data.legs as i64, 3, "leg_type") as u8;
+        weapon_anims.load(&garage.disc, part.placement, &part.rig, &joints, leg_type);
         sfx::effect_points(&mut commands, &part.rig, &joints, part.placement.column);
         for mesh in part.meshes {
             min = min.min(Vec3::from(mesh.min));
