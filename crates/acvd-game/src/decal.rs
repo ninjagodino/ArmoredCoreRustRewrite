@@ -1731,6 +1731,7 @@ pub fn sync_bakes(
     mut decals: ResMut<DecalState>,
     cache: Res<DecalMeshCache>,
     mut images: ResMut<Assets<Image>>,
+    mut paint_materials: ResMut<Assets<crate::paint::AcPaintMaterial>>,
 ) {
     decals.init_assets(&mut images);
 
@@ -1819,43 +1820,55 @@ pub fn sync_bakes(
             if let Some(mut img) = images.get_mut(&handle) {
                 *img = crate::paint::empty_decal_image();
             }
-            continue;
-        }
-
-        // Snapshot assets needed for this slot so `bake_slot_pixels` stays pure.
-        let mut local_assets: HashMap<String, DecalAsset> = HashMap::new();
-        for l in &decals.layers {
-            if !local_assets.contains_key(&l.image_key) {
-                if let Some(a) = decals.peek_asset(&l.image_key) {
-                    local_assets.insert(l.image_key.clone(), a.clone());
+        } else {
+            // Snapshot assets needed for this slot so `bake_slot_pixels` stays pure.
+            let mut local_assets: HashMap<String, DecalAsset> = HashMap::new();
+            for l in &decals.layers {
+                if !local_assets.contains_key(&l.image_key) {
+                    if let Some(a) = decals.peek_asset(&l.image_key) {
+                        local_assets.insert(l.image_key.clone(), a.clone());
+                    }
                 }
             }
-        }
-        let pixels = bake_slot_pixels(slot, res, &cache, &decals.layers, &mut |k| {
-            local_assets.get(k).cloned()
-        });
-        if let Some(mut img) = images.get_mut(&handle) {
-            let mut updated = Image::new(
-                Extent3d {
-                    width: res,
-                    height: res,
-                    depth_or_array_layers: 1,
-                },
-                TextureDimension::D2,
-                pixels,
-                // Stored as premultiplied raw sRGB so `ac_paint.wgsl` blends in sRGB space
-                // identically to 360 `Flver_ACColorDecalColDifSpcBumpIbl.fpo` instructions 131-132.
-                TextureFormat::Rgba8Unorm,
-                RenderAssetUsages::default(),
-            );
-            updated.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-                address_mode_u: ImageAddressMode::ClampToEdge,
-                address_mode_v: ImageAddressMode::ClampToEdge,
-                mag_filter: ImageFilterMode::Linear,
-                min_filter: ImageFilterMode::Linear,
-                ..default()
+            let pixels = bake_slot_pixels(slot, res, &cache, &decals.layers, &mut |k| {
+                local_assets.get(k).cloned()
             });
-            *img = updated;
+            if let Some(mut img) = images.get_mut(&handle) {
+                let mut updated = Image::new(
+                    Extent3d {
+                        width: res,
+                        height: res,
+                        depth_or_array_layers: 1,
+                    },
+                    TextureDimension::D2,
+                    pixels,
+                    // Stored as premultiplied raw sRGB so `ac_paint.wgsl` blends in sRGB space
+                    // identically to 360 `Flver_ACColorDecalColDifSpcBumpIbl.fpo` instructions 131-132.
+                    TextureFormat::Rgba8Unorm,
+                    RenderAssetUsages::default(),
+                );
+                updated.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                    address_mode_u: ImageAddressMode::ClampToEdge,
+                    address_mode_v: ImageAddressMode::ClampToEdge,
+                    mag_filter: ImageFilterMode::Linear,
+                    min_filter: ImageFilterMode::Linear,
+                    ..default()
+                });
+                *img = updated;
+            }
+        }
+
+        // Notify Bevy's MaterialPlugin to rebuild the AcPaint BindGroup on this exact frame so
+        // placing, dragging, resizing, rotating, mirroring, or clearing decals updates live.
+        let matching_mats: Vec<AssetId<crate::paint::AcPaintMaterial>> = paint_materials
+            .iter()
+            .filter_map(|(id, mat)| (mat.extension.decal_map == handle).then_some(id))
+            .collect();
+        let active_flag = if has_any { 1.0 } else { 0.0 };
+        for id in matching_mats {
+            if let Some(mut mat) = paint_materials.get_mut(id) {
+                mat.extension.params.flags.y = active_flag;
+            }
         }
     }
 }
