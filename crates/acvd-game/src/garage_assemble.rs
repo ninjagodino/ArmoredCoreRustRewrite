@@ -572,8 +572,8 @@ pub fn spawn_assemble_ui(
 
     let scale = (window_size.x / SCREEN_W).min(window_size.y / SCREEN_H).max(0.5);
     let origin = Vec2::new(
-        (window_size.x - SCREEN_W * scale) * 0.5,
-        (window_size.y - SCREEN_H * scale) * 0.5,
+        ((window_size.x - SCREEN_W * scale) * 0.5).round(),
+        ((window_size.y - SCREEN_H * scale) * 0.5).round(),
     );
 
     let parts = filtered_parts_for_slot(slot, state.assemble_subcat, state.assemble_dmg_filter);

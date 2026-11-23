@@ -25,14 +25,14 @@ use bevy::asset::{embedded_asset, Asset, Assets, Handle};
 use bevy::color::{Color, LinearRgba};
 use bevy::image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::math::{Rect, Rot2, Vec2, Vec4};
-use bevy::prelude::{App, BackgroundColor, BorderColor, Changed, ChildOf, Children, Commands, Component, Entity, ImageNode, Node, Plugin, PositionType, PostUpdate, Query, ResMut, TypePath};
+use bevy::prelude::{App, BackgroundColor, BorderColor, Changed, ChildOf, Children, Commands, Component, Entity, ImageNode, IntoScheduleConfigs, Node, Plugin, PositionType, PostUpdate, Query, ResMut, TypePath};
 use bevy::render::render_resource::{AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, RenderPipelineDescriptor};
 use bevy::shader::ShaderRef;
 use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient, UiRect, UiTransform};
 use bevy::ui_render::prelude::{MaterialNode, UiMaterial, UiMaterialPlugin};
 use bevy::ui_render::ui_material::UiMaterialKey;
 
-use crate::text::{self, Font};
+use crate::text::{self, Font, GlyphNode};
 use crate::Packs;
 
 /// A parsed layout plus one GPU image per `IXET` texture (None when the pack lacks it), the
@@ -260,6 +260,34 @@ impl UiMaterial for GaugeSprite {
     }
 }
 
+/// Sharp-bilinear CCM bitmap font glyph material (`glyph_sprite.wgsl`).
+#[derive(AsBindGroup, Asset, TypePath, Clone)]
+pub struct GlyphSprite {
+    #[uniform(0)]
+    tint: LinearRgba,
+    #[uniform(1)]
+    rect: Vec4,
+    #[texture(2)]
+    #[sampler(3)]
+    image: Handle<Image>,
+}
+
+impl From<&GlyphNode> for GlyphSprite {
+    fn from(g: &GlyphNode) -> Self {
+        Self {
+            tint: g.color.into(),
+            rect: Vec4::new(g.rect.min.x, g.rect.min.y, g.rect.max.x, g.rect.max.y),
+            image: g.image.clone(),
+        }
+    }
+}
+
+impl UiMaterial for GlyphSprite {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://acvd_render/glyph_sprite.wgsl".into()
+    }
+}
+
 /// A runtime `Text` object's box; game code sets `text` and [`MenuPlugin`] re-lays the glyphs.
 #[derive(Component, Clone)]
 pub struct MenuText {
@@ -271,15 +299,34 @@ pub struct MenuText {
     scale: f32,
 }
 
-/// Draws [`MenuSprite`]s, [`MenuGauge`]s and [`MenuText`]s; layouts need it in the app.
+/// Draws [`MenuSprite`]s, [`MenuGauge`]s, [`MenuText`]s and [`GlyphNode`]s; layouts need it in the app.
 pub struct MenuPlugin;
 
 impl Plugin for MenuPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "additive_sprite.wgsl");
         embedded_asset!(app, "gauge_sprite.wgsl");
-        app.add_plugins((UiMaterialPlugin::<AdditiveSprite>::default(), UiMaterialPlugin::<GaugeSprite>::default()))
-            .add_systems(PostUpdate, (draw_sprites, draw_gauges, draw_texts));
+        embedded_asset!(app, "glyph_sprite.wgsl");
+        app.add_plugins((
+            UiMaterialPlugin::<AdditiveSprite>::default(),
+            UiMaterialPlugin::<GaugeSprite>::default(),
+            UiMaterialPlugin::<GlyphSprite>::default(),
+        ))
+        .add_systems(PostUpdate, (draw_sprites, draw_gauges, (draw_texts, draw_glyphs).chain()));
+    }
+}
+
+fn draw_glyphs(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<GlyphSprite>>,
+    glyphs: Query<(Entity, &GlyphNode, Option<&MaterialNode<GlyphSprite>>), Changed<GlyphNode>>,
+) {
+    for (e, g, material) in &glyphs {
+        if let Some(mut m) = material.and_then(|m| materials.get_mut(&m.0)) {
+            *m = GlyphSprite::from(g);
+            continue;
+        }
+        commands.entity(e).insert(MaterialNode(materials.add(GlyphSprite::from(g))));
     }
 }
 
@@ -315,7 +362,7 @@ fn write_glyphs(commands: &mut Commands, boxed: Entity, f: &Font, string: &str, 
         4 => size.y - extent.y,
         _ => 0.0,
     };
-    text::spawn_glyphs(commands, f, &quads, Vec2::new(x, y), boxed, color);
+    text::spawn_glyphs(commands, f, &quads, Vec2::new(x.round(), y.round()), boxed, color);
 }
 
 fn draw_sprites(
@@ -351,6 +398,19 @@ fn node(rect: [i16; 4], scale: f32) -> Node {
         top: px(y0 * scale),
         width: px((x1 - x0) * scale),
         height: px((y1 - y0) * scale),
+        ..Default::default()
+    }
+}
+
+fn snapped_node(rect: [i16; 4], scale: f32) -> Node {
+    let (x0, x1) = (rect[0].min(rect[2]) as f32, rect[0].max(rect[2]) as f32);
+    let (y0, y1) = (rect[1].min(rect[3]) as f32, rect[1].max(rect[3]) as f32);
+    Node {
+        position_type: PositionType::Absolute,
+        left: px((x0 * scale).round()),
+        top: px((y0 * scale).round()),
+        width: px(((x1 - x0) * scale).round()),
+        height: px(((y1 - y0) * scale).round()),
         ..Default::default()
     }
 }
@@ -456,7 +516,7 @@ fn spawn_dialog(commands: &mut Commands, layout: &Layout, index: usize, parent: 
                             string = "000".into();
                         }
                         let text = MenuText { text: string, color: rgba(*color), font: f.clone(), align: *align, size, scale };
-                        commands.entity(parent).with_child((node(*rect, scale), text, MenuObject(o.name.clone())));
+                        commands.entity(parent).with_child((snapped_node(*rect, scale), text, MenuObject(o.name.clone())));
                         continue;
                     }
                     _ => layout.placeholders.then(|| o.name.clone()),
@@ -465,12 +525,12 @@ fn spawn_dialog(commands: &mut Commands, layout: &Layout, index: usize, parent: 
                 if layout.placeholders && string == o.name && string.encode_utf16().any(|c| f.ccm.glyph(c).is_none()) {
                     string = "000".into();
                 }
-                let boxed = commands.spawn((node(*rect, scale), ChildOf(parent))).id();
+                let boxed = commands.spawn((snapped_node(*rect, scale), ChildOf(parent))).id();
                 write_glyphs(commands, boxed, f, &string, *align, size, scale, rgba(*color));
                 boxed
             }
             &Shape::Dialog { rect, dialog: Some(d), color, .. } => {
-                let child = commands.spawn((node(rect, scale), ChildOf(parent))).id();
+                let child = commands.spawn((snapped_node(rect, scale), ChildOf(parent))).id();
                 spawn_dialog(commands, layout, d as usize, child, scale, modulate(color, tint), depth + 1);
                 child
             }

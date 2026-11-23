@@ -11,10 +11,19 @@ use bevy::asset::{Assets, Handle};
 use bevy::color::Color;
 use bevy::image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::math::{Rect, Vec2};
-use bevy::prelude::{ChildOf, Commands, Component, Entity, ImageNode, Node, PositionType};
+use bevy::prelude::{ChildOf, Commands, Component, Entity, Node, PositionType};
 use bevy::ui::px;
 
 use crate::Packs;
+
+/// A single laid-out font glyph; [`crate::menu::MenuPlugin`] draws it with the sharp-bilinear
+/// [`crate::menu::GlyphSprite`] shader so 720p CCM bitmap fonts stay crisp when upscaled.
+#[derive(Component, Clone)]
+pub struct GlyphNode {
+    pub image: Handle<Image>,
+    pub rect: Rect,
+    pub color: Color,
+}
 
 /// A loaded CCM and one GPU image per texture index.
 #[derive(Clone)]
@@ -86,8 +95,8 @@ pub fn layout(ccm: &Ccm, sheet_size: &[[u16; 2]], text: &str, scale: f32) -> (Ve
         let [tw, th] = sheet_size.get(tex).copied().filter(|s| s[0] > 0 && s[1] > 0).or_else(|| (ccm.tex_width > 0).then_some([ccm.tex_width as u16, ccm.tex_height as u16])).unwrap_or([1, 1]);
         let (tw, th) = (tw as f32, th as f32);
         let uv = Rect::new(g.uv0[0] * tw, g.uv0[1] * th, g.uv1[0] * tw, g.uv1[1] * th);
-        let w = (g.width as f32).max(uv.width()) * scale;
-        let h = uv.height().max(ccm.line_height as f32) * scale;
+        let w = if uv.width() > 0.0 { uv.width() } else { g.width as f32 } * scale;
+        let h = if uv.height() > 0.0 { uv.height() } else { ccm.line_height as f32 } * scale;
         if w > 0.0 {
             quads.push(GlyphQuad { texture: tex, pos: Vec2::new(x + g.pre_space as f32 * scale, y), size: Vec2::new(w, h), uv });
         }
@@ -108,10 +117,10 @@ pub fn spawn(commands: &mut Commands, font: &Font, text: &str, origin: Vec2, sca
             Label,
             Node {
                 position_type: PositionType::Absolute,
-                left: px(origin.x),
-                top: px(origin.y),
-                width: px(size.x),
-                height: px(size.y),
+                left: px(origin.x.round()),
+                top: px(origin.y.round()),
+                width: px(size.x.round()),
+                height: px(size.y.round()),
                 ..Default::default()
             },
         ))
@@ -127,13 +136,13 @@ pub fn spawn_glyphs(commands: &mut Commands, font: &Font, quads: &[GlyphQuad], o
         commands.spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: px(origin.x + q.pos.x),
-                top: px(origin.y + q.pos.y),
-                width: px(q.size.x),
-                height: px(q.size.y),
+                left: px((origin.x + q.pos.x).round()),
+                top: px((origin.y + q.pos.y).round()),
+                width: px(q.size.x.round().max(1.0)),
+                height: px(q.size.y.round().max(1.0)),
                 ..Default::default()
             },
-            ImageNode { image, color, rect: Some(q.uv), ..Default::default() },
+            GlyphNode { image, rect: q.uv, color },
             ChildOf(parent),
         ));
     }
@@ -169,5 +178,31 @@ mod tests {
         assert_eq!(quads[1].pos.x, 24.0);
         assert_eq!(quads[2].pos, Vec2::new(2.0, 40.0));
         assert_eq!(size, Vec2::new(42.0, 80.0));
+    }
+
+    #[test]
+    fn does_not_stretch_glyph_past_uv_rect() {
+        let ccm = Ccm {
+            version: 0x10001,
+            line_height: 16,
+            tex_width: 128,
+            tex_height: 128,
+            unk0e: 32,
+            texture_count: 1,
+            groups: vec![CodeGroup { first: b'1' as i32, last: b'1' as i32, glyph: 0 }],
+            glyphs: vec![Glyph {
+                uv0: [0.40625, 0.0078125],
+                uv1: [0.4453125, 0.1328125], // 5x16 texels
+                pre_space: 2,
+                width: 9, // wider than 5-texel UV in e16_ext
+                advance: 9,
+                texture: 0,
+                unk: None,
+            }],
+        };
+        let (quads, _) = layout(&ccm, &[[128, 128]], "1", 1.0);
+        assert_eq!(quads.len(), 1);
+        assert!((quads[0].size.x - 5.0).abs() < 1e-4, "got width {}", quads[0].size.x);
+        assert!((quads[0].size.y - 16.0).abs() < 1e-4, "got height {}", quads[0].size.y);
     }
 }
