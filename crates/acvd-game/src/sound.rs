@@ -14,7 +14,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_formats::vfs::Disc;
 use acvd_formats::{env, fev, fsb};
-use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings, Volume};
+use bevy::audio::{
+    AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, GlobalVolume, PlaybackSettings, Volume,
+};
 use bevy::prelude::*;
 
 use crate::control::{Pilot, Piloting};
@@ -181,7 +183,16 @@ pub fn cue(commands: &mut Commands, cues: &mut Cues, assets: &mut Assets<AudioSo
 }
 
 /// Default BGM volume (keeps SFX clearly audible over music).
-const BGM_VOLUME: f32 = 0.35;
+pub(crate) const BGM_VOLUME: f32 = 0.35;
+
+/// Absolute BGM sink volume for the current mute + master-volume pair.
+pub(crate) fn bgm_playback_volume(muted: bool, master: f32) -> Volume {
+    if muted {
+        Volume::Linear(0.0)
+    } else {
+        Volume::Linear(BGM_VOLUME * master.clamp(0.0, 1.0))
+    }
+}
 
 pub struct SoundPlugin {
     pub disc: Disc,
@@ -274,6 +285,10 @@ fn resolve_bgm_wave(disc: &Disc, map: Option<&str>) -> Option<(String, fev::Wave
 }
 
 impl BgmState {
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
     fn spawn_decode(disc: &Disc, map: Option<&str>) -> Self {
         let Some((cue, wave)) = resolve_bgm_wave(disc, map) else {
             return Self {
@@ -316,8 +331,10 @@ fn bgm_update(
     mut assets: ResMut<Assets<AudioSource>>,
     mut bgm: ResMut<BgmState>,
     keys: Res<ButtonInput<KeyCode>>,
+    global: Res<GlobalVolume>,
     mut sinks: Query<&mut AudioSink, With<BgmPlayer>>,
 ) {
+    let master = global.volume.to_linear();
     if let Some(rx) = bgm.rx.as_ref() {
         let received = rx.lock().ok().and_then(|r| r.try_recv().ok());
         if let Some(wav) = received {
@@ -325,6 +342,7 @@ fn bgm_update(
             let handle = assets.add(AudioSource {
                 bytes: Arc::<[u8]>::from(wav),
             });
+            // Sink creation multiplies by `GlobalVolume`, so keep the relative BGM level here.
             let volume = if bgm.muted {
                 Volume::Linear(0.0)
             } else {
@@ -339,12 +357,9 @@ fn bgm_update(
     }
     if keys.just_pressed(KeyCode::F9) {
         bgm.muted = !bgm.muted;
+        let vol = bgm_playback_volume(bgm.muted, master);
         for mut sink in &mut sinks {
-            sink.set_volume(if bgm.muted {
-                Volume::Linear(0.0)
-            } else {
-                Volume::Linear(BGM_VOLUME)
-            });
+            sink.set_volume(vol);
         }
     }
 }

@@ -67,6 +67,7 @@ mod map;
 mod paint;
 mod pose;
 mod scan;
+mod settings;
 mod sfx;
 mod sound;
 mod targets;
@@ -84,7 +85,7 @@ use acvd_formats::vfs::{self, Disc};
 use acvd_render::app::{orbit, take_shot, Orbit, Shot};
 use acvd_render::menu::MenuRoot;
 use acvd_render::text::{self, Font};
-use bevy::audio::AudioSource;
+use bevy::audio::{AudioSource, GlobalVolume};
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
@@ -344,10 +345,18 @@ fn main() {
     garage_state.paint_tab = garage_paint_tab;
 
     let enemy_parts = weapons::EnemyParts::load(&disc);
+    let game_settings = settings::GameSettings::load();
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "acvd-game".into(),
+            mode: if game_settings.fullscreen {
+                bevy::window::WindowMode::BorderlessFullscreen(
+                    bevy::window::MonitorSelection::Current,
+                )
+            } else {
+                bevy::window::WindowMode::Windowed
+            },
             ..default()
         }),
         ..default()
@@ -366,6 +375,10 @@ fn main() {
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
     .add_plugins(lens_flare::LensFlarePlugin { disc: disc.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))
+    .insert_resource(GlobalVolume::new(bevy::audio::Volume::Linear(
+        game_settings.volume.clamp(0.0, 1.0),
+    )))
+    .insert_resource(game_settings)
     .insert_resource(enemy_parts)
     .insert_resource(initial_mode)
     .insert_resource(garage::ModeSwitch::default())

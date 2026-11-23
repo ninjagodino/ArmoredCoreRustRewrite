@@ -282,6 +282,9 @@ in order:
 
 ## Done
 
+- **Garage Options Menu (Fullscreen + Master Volume)** (`acvd-game::settings`, `garage`, `sound`, `main`):
+  - Added `OPTIONS` to the garage top menu (`GarageScreen::Options`, `--garage-screen options`) with borderless fullscreen toggle and 5% master-volume steps (Left/Right / Enter / click). Settings persist in local `settings.json` (gitignored); volume drives Bevy `GlobalVolume` and re-scales already-playing sinks (including BGM, respecting F9 mute). Verified by `cargo test -p acvd-game -- settings garage` and `--shot` (`private/shots/garage_options.png`).
+
 - **Garage Assemble Mouse-Wheel Strips (`garage::handle_input` / `update_camera`, `garage_assemble::hovered_scroll_strip`)**:
   - Wheel over `@PartsCategoryList` (horizontal slot tabs) or `@PartsList` (vertical part thumbnails) now scrolls that strip instead of zooming the AC camera; zoom still works when the cursor is elsewhere. Verified by `garage_assemble::tests::hovered_scroll_strip_maps_category_and_parts_rects`.
 

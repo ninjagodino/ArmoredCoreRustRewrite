@@ -10,6 +10,9 @@
 # User-uploaded garage decal images and saved decal layouts.
 /decals/
 
+# Local player options (fullscreen / master volume).
+/settings.json
+
 /target/
 *.gpr
 *.rep/

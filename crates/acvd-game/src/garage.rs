@@ -15,8 +15,9 @@
 //!   `lang/en/text/partsname_en.fmg`), live `AcCtrlParam` spec telemetry with green/red preview
 //!   deltas and Overweight / EN Shortage warnings, Paint (200+ `param/accolor/colorXXXX.bin`
 //!   presets + live 7-channel customizer + `ca0001..ca0011` camouflage), Preset Designs, Garage
-//!   Custom (all 13 workshops live), View Mode, and seamless AC TEST sortie transition with real
-//!   `sound/acv2_se_menu.fev` cues and `acv2_bgm_menu_bgm_menu.fev` `grg` BGM.
+//!   Custom (all 13 workshops live), Options (fullscreen + master volume via `settings.json`),
+//!   View Mode, and seamless AC TEST sortie transition with real `sound/acv2_se_menu.fev` cues
+//!   and `acv2_bgm_menu_bgm_menu.fev` `grg` BGM.
 
 use std::collections::BTreeSet;
 use std::f32::consts::PI;
@@ -35,8 +36,9 @@ use acvd_formats::accolor::{
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
 use acvd_render::Packs;
-use bevy::audio::AudioSource;
+use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
 use bevy::camera::Exposure;
+use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
 use bevy::ui::px;
@@ -44,7 +46,8 @@ use bevy::ui::px;
 use crate::decal::{self, DecalLibraryTab, DecalState, DECAL_TINTS};
 use crate::env;
 use crate::paint;
-use crate::sound::{self, Cues};
+use crate::settings::{self, GameSettings};
+use crate::sound::{self, BgmPlayer, BgmState, Cues};
 
 /// Default ACVD garage workshop row ID in `param/customgarage.bin` (`id: 5` = Underpass `menu1000`).
 pub const DEFAULT_GARAGE_ID: u32 = 5;
@@ -135,6 +138,8 @@ pub enum UiAction {
     AssembleSubcat(Option<u8>),
     AssembleDmgFilter(Option<u8>),
     AssembleToggleDetail,
+    ToggleFullscreen,
+    VolumeStep(i8),
 }
 
 /// Active garage screen.
@@ -147,6 +152,7 @@ pub enum GarageScreen {
     Design,
     GarageCustom,
     SortieConfig,
+    Options,
     ViewMode,
 }
 
@@ -174,6 +180,7 @@ impl GarageScreen {
             "design" => Some(Self::Design),
             "custom" | "workshops" => Some(Self::GarageCustom),
             "sortie" | "actest" => Some(Self::SortieConfig),
+            "options" | "settings" => Some(Self::Options),
             "view" => Some(Self::ViewMode),
             _ => None,
         }
@@ -195,6 +202,7 @@ const TOP_ITEMS: &[(&str, &str)] = &[
     ("GARAGE CUSTOM", "Switch between all 13 3D ACVD workshops"),
     ("AC TEST", "Configure targets & sortie into combat test"),
     ("VIEW MODE", "Hide HUD and inspect AC freely (V)"),
+    ("OPTIONS", "Fullscreen toggle and master volume"),
 ];
 
 /// AC TEST target layer presets (`m4000_actest.msb`, `LAYER_PARAM_ST`).
@@ -898,9 +906,10 @@ impl GarageState {
 
     pub fn display_preset_id(&self) -> u32 {
         match self.screen {
-            GarageScreen::Top | GarageScreen::GarageCustom | GarageScreen::SortieConfig => {
-                DISPLAY_ACSIS_TOP
-            }
+            GarageScreen::Top
+            | GarageScreen::GarageCustom
+            | GarageScreen::SortieConfig
+            | GarageScreen::Options => DISPLAY_ACSIS_TOP,
             GarageScreen::ViewMode => DISPLAY_ACSIS_TOP,
             GarageScreen::AssembleSlots => AssembleSlot::ALL
                 .get(self.cursor)
@@ -1466,6 +1475,17 @@ fn shortest_angle(from: f32, to: f32) -> f32 {
     d
 }
 
+/// Bundles Options-menu resources so `handle_input` stays within Bevy's SystemParam limit.
+#[derive(SystemParam)]
+pub struct OptionsCtx<'w, 's> {
+    settings: ResMut<'w, GameSettings>,
+    global_volume: ResMut<'w, GlobalVolume>,
+    bgm: Res<'w, BgmState>,
+    sinks: Query<'w, 's, (Entity, &'static mut AudioSink)>,
+    bgm_players: Query<'w, 's, Entity, With<BgmPlayer>>,
+    windows: Query<'w, 's, &'static mut Window, With<bevy::window::PrimaryWindow>>,
+}
+
 /// Handles keyboard, gamepad, and mouse-button interaction in the 3D Garage.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_input(
@@ -1475,9 +1495,9 @@ pub fn handle_input(
     keys: Res<ButtonInput<KeyCode>>,
     scroll: Res<AccumulatedMouseScroll>,
     gamepads: Query<&Gamepad>,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut state: ResMut<GarageState>,
     mut garage: ResMut<crate::Garage>,
+    mut options: OptionsCtx,
     mut decals: ResMut<DecalState>,
     mut images: ResMut<Assets<Image>>,
     mut cues: ResMut<Cues>,
@@ -1859,6 +1879,27 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::ToggleFullscreen => {
+                toggle_fullscreen_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                );
+                return;
+            }
+            UiAction::VolumeStep(delta) => {
+                step_volume_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
             UiAction::AssembleSelectSlot(new_slot) => {
                 switch_assemble_slot(
                     &mut commands,
@@ -1963,6 +2004,7 @@ pub fn handle_input(
                 &mut commands,
                 &mut state,
                 &mut garage,
+                &mut options,
                 &mut cues,
                 &mut audio_assets,
                 &mut mode_switch,
@@ -1973,7 +2015,7 @@ pub fn handle_input(
 
     // Mouse-wheel over `@PartsCategoryList` / `@PartsList` scrolls those strips instead of zooming.
     if matches!(state.screen, GarageScreen::AssembleParts { .. }) && scroll.delta.y.abs() > 0.0 {
-        if let Ok(window) = windows.single() {
+        if let Ok(window) = options.windows.single() {
             if let Some(cursor) = window.cursor_position() {
                 let strip = crate::garage_assemble::hovered_scroll_strip(
                     Vec2::new(window.width(), window.height()),
@@ -2164,6 +2206,35 @@ pub fn handle_input(
         }
     }
 
+    // Options screen: Left/Right toggles fullscreen or nudges master volume.
+    if state.screen == GarageScreen::Options && (left || right) {
+        let delta: i8 = if right { 1 } else { -1 };
+        match state.cursor {
+            0 => {
+                toggle_fullscreen_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                );
+                return;
+            }
+            1 => {
+                step_volume_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Custom Paint screen Left/Right adjusts swatches or camo directly.
     if state.screen == GarageScreen::Paint && state.paint_tab == PaintTab::Custom && (left || right) {
         let delta: i8 = if right { 1 } else { -1 };
@@ -2224,6 +2295,7 @@ pub fn handle_input(
             &mut commands,
             &mut state,
             &mut garage,
+            &mut options,
             &mut cues,
             &mut audio_assets,
             &mut mode_switch,
@@ -2249,8 +2321,58 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::Design => garage.designs.len(),
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
+        GarageScreen::Options => 2, // Fullscreen, Volume
         GarageScreen::ViewMode => 0,
     }
+}
+
+fn toggle_fullscreen_setting(
+    commands: &mut Commands,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    state: &mut GarageState,
+) {
+    options.settings.fullscreen = !options.settings.fullscreen;
+    if let Ok(mut window) = options.windows.single_mut() {
+        settings::apply_fullscreen(&mut window, options.settings.fullscreen);
+    }
+    options.settings.save();
+    sound::cue(commands, cues, audio_assets, CUE_OK);
+    state.set_banner(
+        if options.settings.fullscreen {
+            "FULLSCREEN: ON"
+        } else {
+            "FULLSCREEN: OFF"
+        },
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+}
+
+fn step_volume_setting(
+    commands: &mut Commands,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    state: &mut GarageState,
+    delta: i8,
+) {
+    options.settings.step_volume(delta);
+    settings::apply_volume(
+        &options.settings,
+        &options.bgm,
+        &mut options.global_volume,
+        &mut options.sinks,
+        &options.bgm_players,
+    );
+    options.settings.save();
+    sound::cue(commands, cues, audio_assets, CUE_MOVE);
+    state.set_banner(
+        format!("VOLUME: {}%", options.settings.volume_percent()),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
 }
 
 fn clamp_scroll_win(scroll: &mut usize, cursor: usize, count: usize, window: usize) {
@@ -2424,6 +2546,7 @@ fn trigger_cancel(
         | GarageScreen::Design
         | GarageScreen::GarageCustom
         | GarageScreen::SortieConfig
+        | GarageScreen::Options
         | GarageScreen::ViewMode => {
             revert_preview(state, garage);
             state.screen = GarageScreen::Top;
@@ -2440,6 +2563,7 @@ fn trigger_confirm(
     commands: &mut Commands,
     state: &mut GarageState,
     garage: &mut crate::Garage,
+    options: &mut OptionsCtx,
     cues: &mut Cues,
     audio_assets: &mut Assets<AudioSource>,
     mode_switch: &mut ModeSwitch,
@@ -2506,6 +2630,11 @@ fn trigger_confirm(
                 }
                 5 => {
                     state.screen = GarageScreen::ViewMode;
+                }
+                6 => {
+                    state.screen = GarageScreen::Options;
+                    state.cursor = 0;
+                    state.scroll = 0;
                 }
                 _ => {}
             }
@@ -2660,6 +2789,15 @@ fn trigger_confirm(
                 );
             }
         },
+        GarageScreen::Options => match state.cursor {
+            0 => {
+                toggle_fullscreen_setting(commands, options, cues, audio_assets, state);
+            }
+            1 => {
+                step_volume_setting(commands, options, cues, audio_assets, state, 1);
+            }
+            _ => {}
+        },
         GarageScreen::ViewMode => {}
     }
 }
@@ -2762,6 +2900,7 @@ pub fn sync_ui(
     mode: Res<Mode>,
     mut state: ResMut<GarageState>,
     garage: Res<crate::Garage>,
+    settings: Res<GameSettings>,
     mut decals: ResMut<DecalState>,
     mut assemble_assets: ResMut<crate::garage_assemble::AssembleUiAssets>,
     mut images: ResMut<Assets<Image>>,
@@ -2922,6 +3061,7 @@ pub fn sync_ui(
                 GarageScreen::Design => "AC DESIGN PRESETS",
                 GarageScreen::GarageCustom => "GARAGE CUSTOM",
                 GarageScreen::SortieConfig => "AC TEST SORTIE",
+                GarageScreen::Options => "OPTIONS",
                 GarageScreen::ViewMode => "VIEW MODE",
             };
             top.spawn((
@@ -4079,6 +4219,160 @@ pub fn sync_ui(
 
                     spawn_back_btn(panel, "< BACK TO TOP (Esc)", bg_row, fg_cyan);
                 }
+                GarageScreen::Options => {
+                    let fs_label = if settings.fullscreen { "ON" } else { "OFF" };
+                    let vol_label = format!("{}%", settings.volume_percent());
+
+                    let sel0 = state.cursor == 0;
+                    panel
+                        .spawn((
+                            Button,
+                            UiRow(0),
+                            Node {
+                                width: Val::Percent(100.0),
+                                padding: UiRect::axes(px(10.0), px(8.0)),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: px(3.0),
+                                ..default()
+                            },
+                            BackgroundColor(if sel0 { bg_sel } else { bg_row }),
+                        ))
+                        .with_children(|r| {
+                            r.spawn((
+                                Text::new("FULLSCREEN (Enter / Left / Right)"),
+                                TextFont {
+                                    font_size: FontSize::Px(11.0),
+                                    ..default()
+                                },
+                                TextColor(if sel0 { fg_dark } else { fg_cyan }),
+                            ));
+                            r.spawn((
+                                Text::new(fs_label),
+                                TextFont {
+                                    font_size: FontSize::Px(14.0),
+                                    ..default()
+                                },
+                                TextColor(if sel0 { fg_dark } else { fg_text }),
+                            ));
+                        });
+
+                    panel
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            column_gap: px(6.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            row.spawn((
+                                Button,
+                                UiAction::ToggleFullscreen,
+                                Node {
+                                    flex_grow: 1.0,
+                                    padding: UiRect::axes(px(8.0), px(4.0)),
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(bg_row),
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("TOGGLE FULLSCREEN"),
+                                    TextFont {
+                                        font_size: FontSize::Px(11.0),
+                                        ..default()
+                                    },
+                                    TextColor(fg_cyan),
+                                ));
+                            });
+                        });
+
+                    let sel1 = state.cursor == 1;
+                    panel
+                        .spawn((
+                            Button,
+                            UiRow(1),
+                            Node {
+                                width: Val::Percent(100.0),
+                                padding: UiRect::axes(px(10.0), px(8.0)),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: px(3.0),
+                                margin: UiRect::top(px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(if sel1 { bg_sel } else { bg_row }),
+                        ))
+                        .with_children(|r| {
+                            r.spawn((
+                                Text::new("MASTER VOLUME (Left / Right)"),
+                                TextFont {
+                                    font_size: FontSize::Px(11.0),
+                                    ..default()
+                                },
+                                TextColor(if sel1 { fg_dark } else { fg_cyan }),
+                            ));
+                            r.spawn((
+                                Text::new(vol_label),
+                                TextFont {
+                                    font_size: FontSize::Px(14.0),
+                                    ..default()
+                                },
+                                TextColor(if sel1 { fg_dark } else { fg_text }),
+                            ));
+                        });
+
+                    panel
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            column_gap: px(6.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            row.spawn((
+                                Button,
+                                UiAction::VolumeStep(-1),
+                                Node {
+                                    flex_grow: 1.0,
+                                    padding: UiRect::axes(px(8.0), px(4.0)),
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(bg_row),
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("< VOL -5%"),
+                                    TextFont {
+                                        font_size: FontSize::Px(11.0),
+                                        ..default()
+                                    },
+                                    TextColor(fg_cyan),
+                                ));
+                            });
+                            row.spawn((
+                                Button,
+                                UiAction::VolumeStep(1),
+                                Node {
+                                    flex_grow: 1.0,
+                                    padding: UiRect::axes(px(8.0), px(4.0)),
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(bg_row),
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("VOL +5% >"),
+                                    TextFont {
+                                        font_size: FontSize::Px(11.0),
+                                        ..default()
+                                    },
+                                    TextColor(fg_cyan),
+                                ));
+                            });
+                        });
+
+                    spawn_back_btn(panel, "< BACK TO TOP (Esc)", bg_row, fg_cyan);
+                }
                 GarageScreen::ViewMode => {}
             }
         });
@@ -4625,6 +4919,8 @@ pub fn sync_ui(
         // Bottom key-guide footer.
         let footer_text = if in_decal_mode {
             "L-Drag AC: Place/Move  |  R-Drag: Orbit  |  Shift+Wheel/[-][+]: Size  |  Ctrl+Wheel/R/T: Rotate  |  M: Mirror  |  F: Flip  |  Del: Remove  |  Drop PNG: Upload"
+        } else if state.screen == GarageScreen::Options {
+            "W/S: Navigate   |   Left/Right or Enter: Adjust   |   Esc: Back   |   Right-Drag: Orbit   |   F9: Mute BGM"
         } else {
             "W/S or Up/Dn: Navigate   |   Enter / Click: Select   |   Esc: Back   |   Right-Drag: Orbit   |   Wheel: Zoom   |   V: View Mode   |   F9: Mute BGM"
         };
