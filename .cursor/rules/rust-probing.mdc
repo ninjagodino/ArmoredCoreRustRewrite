@@ -1,0 +1,28 @@
+---
+description: Probe the running Rust scene (telemetry + --shot + headless World stepping) for tracing and debugging, just like Xenia probes
+alwaysApply: true
+---
+
+# Rust scene probing for tracing & debugging
+
+When tracing a bug, timing issue, VFX/animation mismatch, or unexpected runtime behavior in the
+rewrite, **probe the running Rust scene directly** (the same way you probe the 360 build in Xenia)
+before doing long static hunts:
+
+1. **Live scene probes (`--shot` + `SHOT` telemetry)**:
+   - Run `acvd-game` with `--shot private\shots\<name>.png --wait <sec>` (plus scenario flags like
+     `--hold w`, `--hold w,shift`, `--garage`, `--water <y>`, `--sfx <id>`) and filter `SHOT `
+     output to see exact live entities, states, timers, active `Sfx` nodes/particles, velocities,
+     and transforms on that frame, then read the PNG.
+   - If the subsystem under investigation does not yet log to `SHOT` on `ShotMark`, add a concise
+     `SHOT` probe dump for it (like `sfx::probe_shot`) so the scene reports ground truth directly.
+2. **Headless Bevy `World` / disc-asset probes (`cargo test`)**:
+   - To step a system over many frames or inspect raw disc assets (`.ffx`, `.tae`, `.ani`, `.msb`,
+     `.hmd`, params) at exact timestamps, write a focused test in the relevant crate and run
+     `cargo test -p acvd-game -- <name> --nocapture`. This runs in seconds and works even when the
+     user has `target\debug\acvd-game.exe` open.
+3. **Close the loop against 360 truth**:
+   - Use the Rust probe to pinpoint the exact entity/ID/state behaving unexpectedly, then check that
+     specific path in `acvd-index` / `ghidra-cli` / Xenia probes.
+   - Keep a permanent unit test asserting the traced invariant and verify the fix with a before/after
+     `--shot` probe.

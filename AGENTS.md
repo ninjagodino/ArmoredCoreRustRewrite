@@ -17,9 +17,10 @@ the owned 360 disc image. `README.md` covers the legal boundary and the sheet pi
   disc file, or breakpoint). Code reads sheets or generated data; don't hard-code constants
   without a sheet row or a comment citing the 360 address.
 - Static RE uses the Xbox 360 build (see `.cursor/rules/decompile-view.mdc`). Runtime questions
- ("does this path fire?") go to the project's Xenia probes on that same 360 build
- (`tools/xenia/run.ps1`), not long static hunts. **`docs/xenia-probes.md` is the full probe
- how-to for any model** (probe syntax, unattended recipes, reading logs, pitfalls). The PS3 executable is never read or cited.
+  on the 360 ("does this path fire?") go to the project's Xenia probes (`tools/xenia/run.ps1`,
+  full guide in `docs/xenia-probes.md`); runtime tracing on the rewrite goes to Rust scene probes
+  first (see `.cursor/rules/rust-probing.mdc`: `--shot` + `SHOT` telemetry and headless Bevy
+  `World` / disc-asset tests). The PS3 executable is never read or cited.
 - Before any `cargo` command, set `CARGO_TARGET_DIR` (see `.cursor/rules/cargo-target.mdc`).
 
 ## Layout
