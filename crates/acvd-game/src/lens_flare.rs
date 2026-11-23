@@ -531,7 +531,10 @@ fn update_lens_flare(
     garage: Option<Res<Garage>>,
     shot_mark: Option<Res<acvd_render::app::ShotMark>>,
     ac_q: Query<&GlobalTransform, With<Ac>>,
-    mut cam_q: Query<(&Camera, &GlobalTransform, Option<&mut ZoomBlur>), With<Camera3d>>,
+    mut cam_q: Query<
+        (&Camera, &GlobalTransform, Option<&mut ZoomBlur>),
+        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+    >,
     mut slots: Query<(
         &FlareSlot,
         &mut Node,

@@ -2107,7 +2107,14 @@ fn simulate(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    cameras: Query<&GlobalTransform, (With<Camera3d>, Without<SfxVisual>)>,
+    cameras: Query<
+        &GlobalTransform,
+        (
+            With<Camera3d>,
+            Without<SfxVisual>,
+            Without<crate::env::WaterReflectionCamera>,
+        ),
+    >,
     mut effects: Query<(Entity, &mut Sfx, &GlobalTransform)>,
     mut visuals: Query<
         (
@@ -2325,7 +2332,7 @@ fn probe_shot(
     points: Query<(&EffectPoint, &GlobalTransform)>,
     effects: Query<(&Sfx, &GlobalTransform)>,
     visuals: Query<(&SfxVisual, &Transform)>,
-    cameras: Query<&GlobalTransform, With<Camera3d>>,
+    cameras: Query<&GlobalTransform, (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
 ) {
     let Some(mut mark) = mark else { return };
     let Some(path) = mark.path.take() else { return };

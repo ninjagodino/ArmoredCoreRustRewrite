@@ -755,7 +755,7 @@ fn spawn_lod(
 /// The classifier's `> 15` return is not a world-distance cull: at the actest camera that
 /// reading hid 481 of 550 parts, the small objects, and left the ground under the AC.
 pub fn lod(
-    camera: Query<&Transform, With<Camera3d>>,
+    camera: Query<&Transform, (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
     parts: Query<(&MapLod, Option<&DestructibleProp>)>,
     mut vis: Query<&mut Visibility>,
     mut logged: Local<bool>,

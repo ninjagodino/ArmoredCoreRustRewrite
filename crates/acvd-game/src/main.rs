@@ -83,7 +83,7 @@ use acvd_render::app::{orbit, take_shot, Orbit, Shot};
 use acvd_render::menu::MenuRoot;
 use acvd_render::text::{self, Font};
 use bevy::audio::AudioSource;
-use bevy::camera::visibility::NoFrustumCulling;
+use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -786,8 +786,8 @@ fn process_mode_switch(
     mut audio: AudioCtx,
     mut assets: RenderAssets,
     mut dir_lights: Query<(&mut DirectionalLight, &mut Transform)>,
-    mut cam_proj: Query<&mut Projection, With<Camera3d>>,
-    cameras: Query<Entity, With<Camera3d>>,
+    mut cam_proj: Query<&mut Projection, (With<Camera3d>, Without<env::WaterReflectionCamera>)>,
+    cameras: Query<Entity, (With<Camera3d>, Without<env::WaterReflectionCamera>)>,
     sortie_entities: Query<
         Entity,
         Or<(
@@ -933,6 +933,7 @@ fn setup(
 ) {
     commands.spawn((
         Camera3d::default(),
+        RenderLayers::from_layers(&[0, env::WATER_RENDER_LAYER]),
         Projection::Perspective(PerspectiveProjection {
             far: VIEW_FAR,
             ..default()

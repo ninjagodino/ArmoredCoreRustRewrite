@@ -1126,7 +1126,7 @@ pub fn panels(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn scan_hud(
     hud: Option<Res<Sortie>>,
-    cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    cameras: Query<(&Camera, &GlobalTransform), (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
     scan_q: Query<&ScanState>,
     mut combat_sight: Query<
         &mut Visibility,
@@ -1399,7 +1399,7 @@ pub fn scan_hud(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn recon_hud(
     hud: Option<Res<Sortie>>,
-    cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    cameras: Query<(&Camera, &GlobalTransform), (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
     scan_q: Query<&ScanState>,
     recons: Query<(&ReconUnit, &Transform)>,
     mut ammo_q: Query<
@@ -1610,7 +1610,7 @@ pub fn recon_hud(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn lock_cursor(
     hud: Option<Res<Sortie>>,
-    cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    cameras: Query<(&Camera, &GlobalTransform), (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
     fcs_q: Query<&Fcs>,
     mut wings: Query<
         (Entity, &LockCursorWing, &mut Node, &mut Visibility),
