@@ -10,7 +10,7 @@
 //!   uses a `NewAcBehavior +0x454` (`13.0°`) half-angle scan cone out to `head.camera_ability`
 //!   (`+0x140`, `0x824791d8`, 508–812 m). Scanning a target in the cone advances `elapsed` toward
 //!   `scan_complete_secs = scanCompleteFrame / 60` (Lua param 148 = `120 * (1 + (100 - head.scan_performance) / 100)`).
-//!   Holding `F` / LMB / `R2` in Scan Mode completes and displays `ACV_Scan_Cur_EnemyParamInfo`
+//!   Holding `F` / RMB / `R2` in Scan Mode completes and displays `ACV_Scan_Cur_EnemyParamInfo`
 //!   (AP, KE/CE/TE defense thresholds) for `scan_display_secs` (`NewAcBehavior` field 279 = `10.0` s).
 //! - **Recon deployment** (`0x828bca28`, `0x82a0d698`, `bullet/bulletrecon.bin`, `manual.fmg` 20406):
 //!   press `B` / `GamepadButton::East` (○) to deploy a recon unit from `AcAssemblyDesignSt::ob`
@@ -426,7 +426,7 @@ pub fn update(
     let mut toggle_scan = keys.just_pressed(KeyCode::KeyZ);
     let mut deploy_recon = keys.just_pressed(KeyCode::KeyB);
     let mut scan_trigger = keys.pressed(KeyCode::KeyF)
-        || mouse.pressed(MouseButton::Left)
+        || mouse.pressed(MouseButton::Right)
         || held.0.contains(&KeyCode::KeyF);
     for pad in &pads {
         toggle_scan |=
@@ -610,7 +610,7 @@ pub fn update(
     let ready = candidate.complete();
     scan.candidate = Some(candidate);
 
-    // Holding / pressing Target Scan (`F` / LMB / `R2`) populates `ACV_Scan_Cur_EnemyParamInfo`
+    // Holding / pressing Target Scan (`F` / RMB / `R2`) populates `ACV_Scan_Cur_EnemyParamInfo`
     // once scan progress reaches 100% (`0x825a7c10` at `0x825a8184..0x825a81c8`, `manual.fmg` 20502).
     if scan_trigger && ready {
         scan.scanned = Some(ScannedTarget {

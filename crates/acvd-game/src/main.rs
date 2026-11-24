@@ -7,11 +7,11 @@
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, V boost mode, Space jump,
 //! Shift high boost (quick boost) / hold Shift (or K, gamepad □ + HOLD) Boost Charge Kick, Ctrl glide boost while boosting on the ground
 //! (air clips once it leaves the ground);
-//! F / left mouse / R2 fire the right arm weapon (guns or melee blades/piles), C / right mouse / L2 the left,
+//! F / right mouse / R2 fire the right arm weapon (guns or melee blades/piles), C / left mouse / L2 the left,
 //! G / X / Tab / R1 fire the shoulder weapon / locked missile salvo (see `weapons`).
 //! Z / Select / R3 toggles Scan Mode (`AC + 0xdb0`, `scan`): reduces passive EN drain for faster
 //! recharge, disables weapon fire, switches the HUD lock sight to `ACV_ScanModeLockSight`, and
-//! turns F / left mouse / R2 into Target Scan (populating `ACV_Scan_Cur_EnemyParamInfo` with
+//! turns F / right mouse / R2 into Target Scan (populating `ACV_Scan_Cur_EnemyParamInfo` with
 //! AP and KE/CE/TE defenses). B / East (○) deploys a Recon unit from the design's category-13
 //! `ob` slot (`bullet/bulletrecon.bin`), marking targets inside its `effective_range`.
 //! Hold R (△ / gamepad North) and press that fire button to bay-shift: the hand weapon trades
@@ -19,7 +19,7 @@
 //! because it cannot sit on the bay.
 //! If the design equips an Overed Weapon (`back_r`, category 11: designs `9002`, `9003`, `9004`,
 //! `9999`), hold U (or hold R / △ without pressing fire for 1 s) to arm it and purge the left-arm
-//! weapon, then hold F / left mouse / R2 to charge and release at full charge to fire (auto-purges
+//! weapon, then hold F / right mouse / R2 to charge and release at full charge to fire (auto-purges
 //! into EN/FCS lockout when the limit gauge drains).
 //! Hand weapons support full-auto, simultaneous multi-pellet spread (shotguns/pulse guns),
 //! sequential multi-round bursts (burst rifles/handguns), and hold-to-charge / release-to-fire

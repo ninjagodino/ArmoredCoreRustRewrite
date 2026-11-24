@@ -84,12 +84,12 @@ impl Press<'_, '_> {
         let (key, click, trigger) = match hand {
             Hand::Right => (
                 KeyCode::KeyF,
-                MouseButton::Left,
+                MouseButton::Right,
                 GamepadButton::RightTrigger2,
             ),
             Hand::Left => (
                 KeyCode::KeyC,
-                MouseButton::Right,
+                MouseButton::Left,
                 GamepadButton::LeftTrigger2,
             ),
         };

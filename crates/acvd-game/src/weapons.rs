@@ -1861,8 +1861,8 @@ pub fn fire(
     }
     let down = |k: KeyCode| keys.pressed(k) || held.0.contains(&k);
     let mut want = [
-        down(KeyCode::KeyF) || mouse.pressed(MouseButton::Left),
-        down(KeyCode::KeyC) || mouse.pressed(MouseButton::Right),
+        down(KeyCode::KeyF) || mouse.pressed(MouseButton::Right),
+        down(KeyCode::KeyC) || mouse.pressed(MouseButton::Left),
     ];
     let mut want_shoulder = down(KeyCode::KeyG) || down(KeyCode::KeyX) || down(KeyCode::Tab);
     // Manual (lang/en/text/menu/manual.fmg): R2 right arm weapon, L2 left, R1 shoulder weapon.
@@ -2811,7 +2811,7 @@ fn apply_missile_impact_blast(
 /// through its 360 state machine (`0x82885c40..0x82886948`):
 /// - Hold `U` (or hold `R` / `△` with no fire button held for `ow_mode_hold_frames` = 60 ticks,
 ///   `manual.fmg` 20405) to arm OW and purge/stow the left-arm weapon.
-/// - Hold `F` / LMB / `R2` to charge `charge_en` at `ow_en_output`; release at full charge to fire.
+/// - Hold `F` / RMB / `R2` to charge `charge_en` at `ow_en_output`; release at full charge to fire.
 /// - Drains limit gauge and applies periodic overload AP self-damage (`ow_overload_dmg`,
 ///   `ow_dmgtime_min..max`) while armed; auto-purges OW meshes and enters `lockout_secs` EN/FCS
 ///   lockout when limit hits zero (`0x828861d0`).
@@ -2886,8 +2886,8 @@ pub fn step_overed_weapon(
     };
 
     let down = |k: KeyCode| keys.pressed(k) || held.0.contains(&k);
-    let mut fire_held = down(KeyCode::KeyF) || mouse.pressed(MouseButton::Left);
-    let mut left_fire = down(KeyCode::KeyC) || mouse.pressed(MouseButton::Right);
+    let mut fire_held = down(KeyCode::KeyF) || mouse.pressed(MouseButton::Right);
+    let mut left_fire = down(KeyCode::KeyC) || mouse.pressed(MouseButton::Left);
     let mut tri_held = down(KeyCode::KeyR);
     for pad in pads {
         fire_held |= pad.pressed(GamepadButton::RightTrigger2);
