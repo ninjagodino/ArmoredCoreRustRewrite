@@ -1090,8 +1090,10 @@ pub struct GarageState {
     pub paint_hsv_synced_channel: Option<usize>,
     /// Active mouse click-drag target in `PAINT -> PALETTE`.
     pub paint_drag: Option<PaintDragTarget>,
-    /// Active click/drag target on any horizontal slider gauge bar (`SliderTrack`).
-    pub slider_drag: Option<SliderTrackTarget>,
+    /// Active click/drag target on any horizontal slider gauge bar (`SliderTrack`), along with
+    /// the track's captured `(center_phys, size_phys)` rect at drag start so UI rebuilds never
+    /// read a zero-sized un-laid-out `ComputedNode` or jitter while resizing (`UI SCALE`).
+    pub slider_drag: Option<(SliderTrackTarget, Vec2, Vec2)>,
     /// Session-scoped undo/redo stack for the Paint menu (cleared when leaving `GarageScreen::Paint`).
     pub paint_history: PaintUndoHistory,
     /// Set to `true` on frames where a garage UI slider/strip consumed the mouse wheel so
@@ -4364,6 +4366,9 @@ pub fn handle_paint_color_drag(
     let Some((_, computed, tf)) = tracks.iter().find(|(t, _, _)| t.0 == active_target) else {
         return;
     };
+    if computed.size().x <= 1.0 || computed.size().y <= 1.0 {
+        return;
+    }
     let (uv, _) = normalize_track_point(tf.translation, computed.size(), cursor_phys);
 
     let prev_rgba = active_rgba(&garage, &decals, &settings, state.paint_channel);
@@ -4478,21 +4483,22 @@ pub fn handle_slider_track_drag(
     if just_pressed {
         state.slider_drag = None;
         for (track, computed, tf) in &tracks {
-            let (_, inside) = normalize_track_point(tf.translation, computed.size(), cursor_phys);
+            let size = computed.size();
+            if size.x <= 1.0 || size.y <= 1.0 {
+                continue;
+            }
+            let (_, inside) = normalize_track_point(tf.translation, size, cursor_phys);
             if inside {
-                state.slider_drag = Some(track.0);
+                state.slider_drag = Some((track.0, tf.translation, size));
                 break;
             }
         }
     }
 
-    let Some(active_target) = state.slider_drag else {
+    let Some((active_target, center_phys, size_phys)) = state.slider_drag else {
         return;
     };
-    let Some((_, computed, tf)) = tracks.iter().find(|(t, _, _)| t.0 == active_target) else {
-        return;
-    };
-    let (uv, _) = normalize_track_point(tf.translation, computed.size(), cursor_phys);
+    let (uv, _) = normalize_track_point(center_phys, size_phys, cursor_phys);
     let fill = uv.x;
 
     let mut changed = false;
