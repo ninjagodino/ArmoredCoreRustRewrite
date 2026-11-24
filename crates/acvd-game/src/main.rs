@@ -220,6 +220,7 @@ fn main() {
         None::<String>,
     );
     let mut start_pause: Option<pause::PauseScreen> = None;
+    let mut start_options_tab = settings::OptionsTab::Graphics;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -299,6 +300,16 @@ fn main() {
                         garage_screen = garage::GarageScreen::Paint;
                         garage_paint_tab = garage::PaintTab::Custom;
                         garage_paint_picker_mode = garage::PaintPickerMode::Rgb;
+                    } else if raw.trim().eq_ignore_ascii_case("options-graphics")
+                        || raw.trim().eq_ignore_ascii_case("options_graphics")
+                    {
+                        garage_screen = garage::GarageScreen::Options;
+                        start_options_tab = settings::OptionsTab::Graphics;
+                    } else if raw.trim().eq_ignore_ascii_case("options-sound")
+                        || raw.trim().eq_ignore_ascii_case("options_sound")
+                    {
+                        garage_screen = garage::GarageScreen::Options;
+                        start_options_tab = settings::OptionsTab::Sound;
                     } else if let Some(s) = garage::GarageScreen::from_cli(&raw) {
                         garage_screen = s;
                     }
@@ -315,6 +326,10 @@ fn main() {
             }
             "--pause-options" => {
                 start_pause = Some(pause::PauseScreen::Options);
+            }
+            "--pause-options-sound" => {
+                start_pause = Some(pause::PauseScreen::Options);
+                start_options_tab = settings::OptionsTab::Sound;
             }
             _ => wanted = a.parse::<u32>().ok(),
         }
@@ -413,12 +428,14 @@ fn main() {
     );
     garage_state.paint_tab = garage_paint_tab;
     garage_state.paint_picker_mode = garage_paint_picker_mode;
+    garage_state.options_tab = start_options_tab;
 
     let enemy_parts = weapons::EnemyParts::load(&disc);
     let mut pause_state = pause::PauseState::default();
     if initial_mode == garage::Mode::Sortie {
         if let Some(screen) = start_pause {
             pause_state.open_menu(screen);
+            pause_state.options_tab = start_options_tab;
         }
     }
     let game_settings = settings::GameSettings::load();

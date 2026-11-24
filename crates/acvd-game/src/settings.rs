@@ -14,10 +14,59 @@ pub const VOLUME_STEP_PCT: i8 = 5;
 
 /// Left/Right UI scale nudge in Options menus (5% steps).
 pub const UI_SCALE_STEP_PCT: i8 = 5;
-/// Minimum UI scale multiplier (75%).
-pub const UI_SCALE_MIN: f32 = 0.75;
+/// Minimum UI scale multiplier (50%).
+pub const UI_SCALE_MIN: f32 = 0.50;
 /// Maximum UI scale multiplier (150%).
 pub const UI_SCALE_MAX: f32 = 1.50;
+
+/// Category tabs inside the Garage and Pause Options menus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OptionsTab {
+    #[default]
+    Graphics,
+    Sound,
+}
+
+impl OptionsTab {
+    pub const ALL: [Self; 2] = [Self::Graphics, Self::Sound];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Graphics => "GRAPHICS",
+            Self::Sound => "SOUND",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Graphics => Self::Sound,
+            Self::Sound => Self::Graphics,
+        }
+    }
+}
+
+/// Row identity for focusable Options controls across Graphics and Sound tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionRow {
+    Fullscreen,
+    UiScale,
+    HudSway,
+    Volume(AudioChannel),
+}
+
+impl OptionRow {
+    pub fn cursor_index(self) -> usize {
+        match self {
+            Self::Fullscreen => 0,
+            Self::UiScale => 1,
+            Self::HudSway => 2,
+            Self::Volume(AudioChannel::Master) => 0,
+            Self::Volume(AudioChannel::Music) => 1,
+            Self::Volume(AudioChannel::Sfx) => 2,
+            Self::Volume(AudioChannel::Ui) => 3,
+        }
+    }
+}
 
 /// Individual audio mixer sliders exposed in the Options menus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +78,8 @@ pub enum AudioChannel {
 }
 
 impl AudioChannel {
+    pub const ALL: [Self; 4] = [Self::Master, Self::Music, Self::Sfx, Self::Ui];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Master => "MASTER VOLUME",
@@ -52,7 +103,7 @@ impl AudioChannel {
 #[serde(default)]
 pub struct GameSettings {
     pub fullscreen: bool,
-    /// UI & HUD scale multiplier in `0.75..=1.50` (75–150%, default 100%).
+    /// UI & HUD scale multiplier in `0.50..=1.50` (50–150%, default 100%).
     pub ui_scale: f32,
     /// Crosshair / lock-sight HUD sway intensity in `0.0..=1.0` (0–100%, default 100%).
     pub hud_sway: f32,
@@ -272,13 +323,13 @@ mod tests {
         assert_eq!(s.ui_scale_percent(), 100);
         assert!((s.ui_scale_fill() - GameSettings::ui_scale_default_mark()).abs() < 1e-4);
 
-        for _ in 0..10 {
+        for _ in 0..15 {
             s.step_ui_scale(-1);
         }
-        assert_eq!(s.ui_scale_percent(), 75);
+        assert_eq!(s.ui_scale_percent(), 50);
         assert_eq!(s.ui_scale_fill(), 0.0);
 
-        for _ in 0..20 {
+        for _ in 0..25 {
             s.step_ui_scale(1);
         }
         assert_eq!(s.ui_scale_percent(), 150);
@@ -314,5 +365,19 @@ mod tests {
         assert_eq!(parsed.channel_percent(AudioChannel::Music), 100);
         assert_eq!(parsed.channel_percent(AudioChannel::Sfx), 100);
         assert_eq!(parsed.channel_percent(AudioChannel::Ui), 100);
+    }
+
+    #[test]
+    fn options_tabs_and_row_indices() {
+        assert_eq!(OptionsTab::default(), OptionsTab::Graphics);
+        assert_eq!(OptionsTab::Graphics.toggle(), OptionsTab::Sound);
+        assert_eq!(OptionsTab::Sound.toggle(), OptionsTab::Graphics);
+        assert_eq!(OptionRow::Fullscreen.cursor_index(), 0);
+        assert_eq!(OptionRow::UiScale.cursor_index(), 1);
+        assert_eq!(OptionRow::HudSway.cursor_index(), 2);
+        assert_eq!(OptionRow::Volume(AudioChannel::Master).cursor_index(), 0);
+        assert_eq!(OptionRow::Volume(AudioChannel::Music).cursor_index(), 1);
+        assert_eq!(OptionRow::Volume(AudioChannel::Sfx).cursor_index(), 2);
+        assert_eq!(OptionRow::Volume(AudioChannel::Ui).cursor_index(), 3);
     }
 }

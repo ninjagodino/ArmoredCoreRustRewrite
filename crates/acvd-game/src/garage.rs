@@ -51,7 +51,7 @@ use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient};
 use crate::decal::{self, DecalLibraryTab, DecalState, DECAL_TINTS};
 use crate::env;
 use crate::paint;
-use crate::settings::{self, AudioChannel, GameSettings};
+use crate::settings::{self, AudioChannel, GameSettings, OptionRow, OptionsTab};
 use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
 
 /// Default ACVD garage workshop row ID in `param/customgarage.bin` (`id: 5` = Underpass `menu1000`).
@@ -169,8 +169,9 @@ pub enum UiAction {
     AssembleSubcat(Option<u8>),
     AssembleDmgFilter(Option<u8>),
     AssembleToggleDetail,
+    OptionsTab(OptionsTab),
     ToggleFullscreen,
-    SelectOptionRow(usize),
+    SelectOptionRow(OptionRow),
     UiScaleStep(i8),
     HudSwayStep(i8),
     VolumeStep(AudioChannel, i8),
@@ -197,13 +198,15 @@ impl UiAction {
     /// Maps a hovered `UiAction` widget to its mouse-wheel adjustable target, if any.
     pub fn wheel_adjust(self) -> Option<WheelAdjust> {
         match self {
-            Self::SelectOptionRow(1) | Self::UiScaleStep(_) => Some(WheelAdjust::UiScale),
-            Self::SelectOptionRow(2) | Self::HudSwayStep(_) => Some(WheelAdjust::HudSway),
-            Self::SelectOptionRow(row) => GARAGE_OPTION_CHANNELS
-                .iter()
-                .find(|&&(r, _)| r == row)
-                .map(|&(_, ch)| WheelAdjust::Volume(ch)),
-            Self::VolumeStep(ch, _) => Some(WheelAdjust::Volume(ch)),
+            Self::SelectOptionRow(OptionRow::UiScale) | Self::UiScaleStep(_) => {
+                Some(WheelAdjust::UiScale)
+            }
+            Self::SelectOptionRow(OptionRow::HudSway) | Self::HudSwayStep(_) => {
+                Some(WheelAdjust::HudSway)
+            }
+            Self::SelectOptionRow(OptionRow::Volume(ch)) | Self::VolumeStep(ch, _) => {
+                Some(WheelAdjust::Volume(ch))
+            }
             Self::PaintRgbDelta(comp, _) => Some(WheelAdjust::PaintRgb(comp)),
             Self::PaintCamoDelta(_) => Some(WheelAdjust::PaintCamo),
             Self::PaintCamoScaleStep(_) => Some(WheelAdjust::PaintCamoScale),
@@ -448,28 +451,31 @@ const TOP_ITEMS: &[(&str, &str, &str)] = &[
     ("GARAGE CUSTOM", "BAY", "Switch between all 13 retail\n3D ACVD workshops."),
     ("AC TEST", "SORTIE", "Configure targets and sortie\ninto live combat test."),
     ("VIEW MODE", "V", "Hide HUD and inspect your AC\nfreely from any angle."),
-    ("OPTIONS", "ESC", "Toggle fullscreen display and\nadjust master volume."),
+    ("OPTIONS", "ESC", "Configure graphics, HUD, and\nsound settings."),
 ];
 
-/// Helpline descriptions for [`GarageScreen::Options`] rows.
-const OPTIONS_ROW_DESCS: [&str; 9] = [
-    "Toggle fullscreen or windowed\ndisplay mode.",
-    "Scale HUD and menu size\n(75% - 150%, default 100%).",
-    "Adjust crosshair HUD sway\nintensity (0% - 100%).",
-    "Adjust master audio volume\nacross all sound channels.",
-    "Adjust background music volume\nin Garage and Sortie.",
-    "Adjust weapon, booster, and\ncombat sound effects volume.",
-    "Adjust menu navigation and\nUI feedback sound volume.",
-    "Return to the Garage main menu.",
-    "Exit the game and return\nto the desktop.",
-];
-
-const GARAGE_OPTION_CHANNELS: [(usize, AudioChannel); 4] = [
-    (3, AudioChannel::Master),
-    (4, AudioChannel::Music),
-    (5, AudioChannel::Sfx),
-    (6, AudioChannel::Ui),
-];
+/// Helpline descriptions for [`GarageScreen::Options`] rows per active [`OptionsTab`].
+fn options_row_desc(tab: OptionsTab, cursor: usize) -> &'static str {
+    match tab {
+        OptionsTab::Graphics => match cursor {
+            0 => "Toggle fullscreen or windowed\ndisplay mode.",
+            1 => "Scale HUD and menu size\n(75% - 150%, default 100%).",
+            2 => "Adjust crosshair HUD sway\nintensity (0% - 100%).",
+            3 => "Return to the Garage main menu.",
+            4 => "Exit the game and return\nto the desktop.",
+            _ => "",
+        },
+        OptionsTab::Sound => match cursor {
+            0 => "Adjust master audio volume\nacross all sound channels.",
+            1 => "Adjust background music volume\nin Garage and Sortie.",
+            2 => "Adjust weapon, booster, and\ncombat sound effects volume.",
+            3 => "Adjust menu navigation and\nUI feedback sound volume.",
+            4 => "Return to the Garage main menu.",
+            5 => "Exit the game and return\nto the desktop.",
+            _ => "",
+        },
+    }
+}
 
 /// AC TEST target layer presets (`m4000_actest.msb`, `LAYER_PARAM_ST`).
 pub const SORTIE_TARGETS: &[(&str, &str)] = &[
@@ -1080,6 +1086,7 @@ pub struct GarageState {
     pub spawned_workshop: Option<u16>,
     /// Available `param/accolor/colorXXXX.bin` IDs.
     pub color_presets: Vec<u16>,
+    pub options_tab: OptionsTab,
     pub paint_tab: PaintTab,
     pub paint_channel: usize,
     pub paint_picker_mode: PaintPickerMode,
@@ -1179,6 +1186,7 @@ impl GarageState {
             workshop_idx,
             spawned_workshop: None,
             color_presets,
+            options_tab: OptionsTab::Graphics,
             paint_tab: PaintTab::Presets,
             paint_channel: CH_BASE,
             paint_picker_mode: PaintPickerMode::Hsv,
@@ -1922,6 +1930,7 @@ pub fn handle_input(
     let mut gp_cancel = false;
     let mut gp_view = false;
     let mut gp_start = false;
+    let mut gp_tab = false;
     for gp in &gamepads {
         gp_up |= gp.just_pressed(GamepadButton::DPadUp);
         gp_down |= gp.just_pressed(GamepadButton::DPadDown);
@@ -1931,6 +1940,8 @@ pub fn handle_input(
         gp_cancel |= gp.just_pressed(GamepadButton::East);
         gp_view |= gp.just_pressed(GamepadButton::North);
         gp_start |= gp.just_pressed(GamepadButton::Start);
+        gp_tab |= gp.just_pressed(GamepadButton::LeftTrigger)
+            || gp.just_pressed(GamepadButton::RightTrigger);
     }
 
     // View mode toggle (`V` or Gamepad North).
@@ -2090,7 +2101,9 @@ pub fn handle_input(
                 return;
             }
             UiAction::PaintRgbDelta(comp, delta) => {
-                if state.screen == GarageScreen::Options {
+                if state.screen == GarageScreen::Options
+                    && state.options_tab == OptionsTab::Graphics
+                {
                     options.settings.hud_color[comp] =
                         (options.settings.hud_color[comp] as i16 + delta).clamp(0, 255) as u8;
                     options.settings.save();
@@ -2506,8 +2519,17 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::OptionsTab(tab) => {
+                if state.options_tab != tab {
+                    state.options_tab = tab;
+                    state.cursor = 0;
+                    state.ui_dirty = true;
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CATEGORY);
+                }
+                return;
+            }
             UiAction::ToggleFullscreen => {
-                state.cursor = 0;
+                state.cursor = OptionRow::Fullscreen.cursor_index();
                 toggle_fullscreen_setting(
                     &mut commands,
                     &mut options,
@@ -2518,11 +2540,11 @@ pub fn handle_input(
                 return;
             }
             UiAction::SelectOptionRow(row) => {
-                fallback_select_row = Some(row);
+                fallback_select_row = Some(row.cursor_index());
                 continue;
             }
             UiAction::UiScaleStep(delta) => {
-                state.cursor = 1;
+                state.cursor = OptionRow::UiScale.cursor_index();
                 step_ui_scale_setting(
                     &mut commands,
                     &mut options,
@@ -2534,7 +2556,7 @@ pub fn handle_input(
                 return;
             }
             UiAction::HudSwayStep(delta) => {
-                state.cursor = 2;
+                state.cursor = OptionRow::HudSway.cursor_index();
                 step_hud_sway_setting(
                     &mut commands,
                     &mut options,
@@ -2546,10 +2568,7 @@ pub fn handle_input(
                 return;
             }
             UiAction::VolumeStep(channel, delta) => {
-                if let Some((row, _)) = GARAGE_OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel)
-                {
-                    state.cursor = *row;
-                }
+                state.cursor = OptionRow::Volume(channel).cursor_index();
                 step_volume_setting(
                     &mut commands,
                     &mut options,
@@ -2767,7 +2786,7 @@ pub fn handle_input(
             let delta = wheel_step_direction(scroll.delta.y);
             match target {
                 WheelAdjust::UiScale => {
-                    state.cursor = 1;
+                    state.cursor = OptionRow::UiScale.cursor_index();
                     step_ui_scale_setting(
                         &mut commands,
                         &mut options,
@@ -2778,7 +2797,7 @@ pub fn handle_input(
                     );
                 }
                 WheelAdjust::HudSway => {
-                    state.cursor = 2;
+                    state.cursor = OptionRow::HudSway.cursor_index();
                     step_hud_sway_setting(
                         &mut commands,
                         &mut options,
@@ -2789,11 +2808,7 @@ pub fn handle_input(
                     );
                 }
                 WheelAdjust::Volume(channel) => {
-                    if let Some((row, _)) =
-                        GARAGE_OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel)
-                    {
-                        state.cursor = *row;
-                    }
+                    state.cursor = OptionRow::Volume(channel).cursor_index();
                     step_volume_setting(
                         &mut commands,
                         &mut options,
@@ -2805,7 +2820,9 @@ pub fn handle_input(
                     );
                 }
                 WheelAdjust::PaintRgb(comp) => {
-                    if state.screen == GarageScreen::Options {
+                    if state.screen == GarageScreen::Options
+                        && state.options_tab == OptionsTab::Graphics
+                    {
                         options.settings.hud_color[comp] =
                             (options.settings.hud_color[comp] as i16 + delta as i16 * 8)
                                 .clamp(0, 255) as u8;
@@ -3001,6 +3018,19 @@ pub fn handle_input(
         }
     }
 
+    // Options tab switching via `Tab`, `Q`/`E`, or Gamepad LB/RB.
+    let options_tab_switch = keys.just_pressed(KeyCode::Tab)
+        || keys.just_pressed(KeyCode::KeyQ)
+        || keys.just_pressed(KeyCode::KeyE)
+        || gp_tab;
+    if state.screen == GarageScreen::Options && options_tab_switch {
+        state.options_tab = state.options_tab.toggle();
+        state.cursor = 0;
+        sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CATEGORY);
+        state.ui_dirty = true;
+        return;
+    }
+
     // Paint tab switching via `Tab` (and `Q`/`E` outside the Decal editor).
     let tab_switch = keys.just_pressed(KeyCode::Tab)
         || (state.paint_tab != PaintTab::Decals
@@ -3081,8 +3111,8 @@ pub fn handle_input(
     // Options screen: Left/Right toggles fullscreen or nudges UI scale / audio sliders.
     if state.screen == GarageScreen::Options && (left || right) {
         let delta: i8 = if right { 1 } else { -1 };
-        match state.cursor {
-            0 => {
+        match (state.options_tab, state.cursor) {
+            (OptionsTab::Graphics, 0) => {
                 toggle_fullscreen_setting(
                     &mut commands,
                     &mut options,
@@ -3092,7 +3122,7 @@ pub fn handle_input(
                 );
                 return;
             }
-            1 => {
+            (OptionsTab::Graphics, 1) => {
                 step_ui_scale_setting(
                     &mut commands,
                     &mut options,
@@ -3103,7 +3133,7 @@ pub fn handle_input(
                 );
                 return;
             }
-            2 => {
+            (OptionsTab::Graphics, 2) => {
                 step_hud_sway_setting(
                     &mut commands,
                     &mut options,
@@ -3114,7 +3144,7 @@ pub fn handle_input(
                 );
                 return;
             }
-            3 => {
+            (OptionsTab::Sound, 0) => {
                 step_volume_setting(
                     &mut commands,
                     &mut options,
@@ -3126,7 +3156,7 @@ pub fn handle_input(
                 );
                 return;
             }
-            4 => {
+            (OptionsTab::Sound, 1) => {
                 step_volume_setting(
                     &mut commands,
                     &mut options,
@@ -3138,7 +3168,7 @@ pub fn handle_input(
                 );
                 return;
             }
-            5 => {
+            (OptionsTab::Sound, 2) => {
                 step_volume_setting(
                     &mut commands,
                     &mut options,
@@ -3150,7 +3180,7 @@ pub fn handle_input(
                 );
                 return;
             }
-            6 => {
+            (OptionsTab::Sound, 3) => {
                 step_volume_setting(
                     &mut commands,
                     &mut options,
@@ -3252,7 +3282,10 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::Design => garage.designs.len(),
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
-        GarageScreen::Options => 9, // Fullscreen, UI Scale, HUD Sway, Master, Music, SFX, Menu/UI, Back, Quit to Desktop
+        GarageScreen::Options => match state.options_tab {
+            OptionsTab::Graphics => 5, // Fullscreen, UI Scale, HUD Sway, Back, Quit to Desktop
+            OptionsTab::Sound => 6,    // Master, Music, SFX, Menu/UI, Back, Quit to Desktop
+        },
         GarageScreen::ViewMode => 0,
     }
 }
@@ -3861,17 +3894,23 @@ fn trigger_confirm(
                 );
             }
         },
-        GarageScreen::Options => match state.cursor {
-            0 => {
+        GarageScreen::Options => match (state.options_tab, state.cursor) {
+            (OptionsTab::Graphics, 0) => {
                 toggle_fullscreen_setting(commands, options, cues, audio_assets, state);
             }
-            1 => {
+            (OptionsTab::Graphics, 1) => {
                 step_ui_scale_setting(commands, options, cues, audio_assets, state, 1);
             }
-            2 => {
+            (OptionsTab::Graphics, 2) => {
                 step_hud_sway_setting(commands, options, cues, audio_assets, state, 1);
             }
-            3 => {
+            (OptionsTab::Graphics, 3) => {
+                trigger_cancel(commands, state, garage, cues, audio_assets);
+            }
+            (OptionsTab::Graphics, 4) => {
+                options.app_exit.write(AppExit::Success);
+            }
+            (OptionsTab::Sound, 0) => {
                 step_volume_setting(
                     commands,
                     options,
@@ -3882,7 +3921,7 @@ fn trigger_confirm(
                     1,
                 );
             }
-            4 => {
+            (OptionsTab::Sound, 1) => {
                 step_volume_setting(
                     commands,
                     options,
@@ -3893,7 +3932,7 @@ fn trigger_confirm(
                     1,
                 );
             }
-            5 => {
+            (OptionsTab::Sound, 2) => {
                 step_volume_setting(
                     commands,
                     options,
@@ -3904,7 +3943,7 @@ fn trigger_confirm(
                     1,
                 );
             }
-            6 => {
+            (OptionsTab::Sound, 3) => {
                 step_volume_setting(
                     commands,
                     options,
@@ -3915,10 +3954,10 @@ fn trigger_confirm(
                     1,
                 );
             }
-            7 => {
+            (OptionsTab::Sound, 4) => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
             }
-            8 => {
+            (OptionsTab::Sound, 5) => {
                 options.app_exit.write(AppExit::Success);
             }
             _ => {}
@@ -4234,10 +4273,13 @@ pub fn handle_paint_color_drag(
     mut picker_assets: ResMut<PaintPickerAssets>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let in_hud_options = (*mode == Mode::Garage && state.screen == GarageScreen::Options)
+    let in_hud_options = (*mode == Mode::Garage
+        && state.screen == GarageScreen::Options
+        && state.options_tab == OptionsTab::Graphics)
         || (*mode == Mode::Sortie
             && pause_state.open
-            && pause_state.screen == crate::pause::PauseScreen::Options);
+            && pause_state.screen == crate::pause::PauseScreen::Options
+            && pause_state.options_tab == OptionsTab::Graphics);
     let in_decal_tab = !in_hud_options && state.paint_tab == PaintTab::Decals;
     if !in_hud_options
         && (*mode != Mode::Garage
@@ -4547,18 +4589,12 @@ pub fn handle_slider_track_drag(
                     &options.audio_buses,
                 );
                 options.settings.save();
-                if let Some((row, _)) =
-                    GARAGE_OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel)
-                {
-                    if in_pause_options {
-                        pause_state.cursor = *row;
-                    } else {
-                        state.cursor = *row;
-                    }
-                }
+                let row = OptionRow::Volume(channel).cursor_index();
                 if in_pause_options {
+                    pause_state.cursor = row;
                     pause_state.dirty = true;
                 } else {
+                    state.cursor = row;
                     state.ui_dirty = true;
                 }
                 changed = true;
@@ -4775,7 +4811,7 @@ pub fn sync_ui(
     assemble_assets.ensure_loaded(&garage.disc, &mut images);
     let kit = assemble_assets.kit.clone();
     let scale = ((win_size.x / 1280.0).min(win_size.y / 720.0) * settings.ui_scale)
-        .clamp(0.55, 2.2);
+        .clamp(0.35, 2.2);
 
     let bg_row = Color::srgba(0.09, 0.12, 0.16, 0.65);
     let bg_sel = Color::srgba(0.88, 0.58, 0.14, 0.92);
@@ -4828,12 +4864,14 @@ pub fn sync_ui(
     if state.screen == GarageScreen::Top {
         spawn_garage_top_menu(&mut commands, root, &kit, state.cursor, scale);
     } else if state.screen == GarageScreen::Options {
-        if state.paint_hsv_synced_channel != Some(usize::MAX - 1) {
-            let c = settings.hud_color;
-            state.paint_hsv = paint::rgb_to_hsv([c[0], c[1], c[2], 255]);
-            state.paint_hsv_synced_channel = Some(usize::MAX - 1);
+        if state.options_tab == OptionsTab::Graphics {
+            if state.paint_hsv_synced_channel != Some(usize::MAX - 1) {
+                let c = settings.hud_color;
+                state.paint_hsv = paint::rgb_to_hsv([c[0], c[1], c[2], 255]);
+                state.paint_hsv_synced_channel = Some(usize::MAX - 1);
+            }
+            picker_assets.ensure_loaded(state.paint_hsv[0], &mut images);
         }
-        picker_assets.ensure_loaded(state.paint_hsv[0], &mut images);
         spawn_garage_options_menu(
             &mut commands,
             root,
@@ -5409,7 +5447,7 @@ pub fn sync_ui(
     } else if state.screen == GarageScreen::Paint && state.paint_tab == PaintTab::Custom {
         "L-DRAG COLOR PICKER   W/S CHANNEL   TAB NEXT TAB   R-DRAG ORBIT   WHEEL ZOOM   ESC BACK"
     } else if state.screen == GarageScreen::Options {
-        "W/S NAVIGATE   ENTER/LEFT/RIGHT ADJUST   ESC CLOSE   R-DRAG ORBIT   F9 MUTE BGM"
+        "W/S NAVIGATE   A/D ADJUST   TAB SWITCH TAB   ESC CLOSE   R-DRAG ORBIT   F9 MUTE BGM"
     } else if state.screen == GarageScreen::Top {
         "W/S NAVIGATE   ENTER SELECT   ESC OPTIONS   R-DRAG ORBIT   WHEEL ZOOM   V VIEW MODE   F9 MUTE BGM"
     } else {
@@ -5837,7 +5875,48 @@ fn spawn_garage_options_menu(
         scale,
     );
 
-    kit.spawn_header(commands, panel, "OPTIONS", Some("SETTINGS"), scale);
+    kit.spawn_header(
+        commands,
+        panel,
+        "OPTIONS",
+        Some(state.options_tab.label()),
+        scale,
+    );
+
+    // Top tab strip: GRAPHICS | SOUND
+    let tab_bar = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                column_gap: px((4.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(panel),
+        ))
+        .id();
+    for tab in OptionsTab::ALL {
+        let btn_state = if state.options_tab == tab {
+            ButtonState::Selected
+        } else {
+            ButtonState::Normal
+        };
+        let b = spawn_kit_pill(
+            commands,
+            kit,
+            tab_bar,
+            tab.label(),
+            btn_state,
+            1.0,
+            6.0,
+            4.5,
+            0.90,
+            scale,
+        );
+        commands.entity(b).insert((Button, UiAction::OptionsTab(tab)));
+    }
+
+    kit.spawn_trace(commands, panel, TraceStyle::Simple, scale);
 
     let list = commands
         .spawn((
@@ -5852,143 +5931,152 @@ fn spawn_garage_options_menu(
         ))
         .id();
 
-    kit.spawn_text(
-        commands,
-        list,
-        FontRole::Small,
-        "DISPLAY",
-        scale * 0.9,
-        palette::TEXT_MUTED,
-    );
+    let (back_row, quit_row) = match state.options_tab {
+        OptionsTab::Graphics => {
+            kit.spawn_text(
+                commands,
+                list,
+                FontRole::Small,
+                "DISPLAY & UI",
+                scale * 0.9,
+                palette::TEXT_MUTED,
+            );
 
-    // Row 0: Fullscreen toggle
-    let fs_tag = if settings.fullscreen { "ON" } else { "OFF" };
-    let fs_state = if cursor == 0 {
-        ButtonState::Selected
-    } else {
-        ButtonState::Normal
+            // Row 0: Fullscreen toggle
+            let fs_tag = if settings.fullscreen { "ON" } else { "OFF" };
+            let fs_state = if cursor == 0 {
+                ButtonState::Selected
+            } else {
+                ButtonState::Normal
+            };
+            let fs_btn =
+                kit.spawn_button(commands, list, "FULLSCREEN", Some(fs_tag), fs_state, scale);
+            commands
+                .entity(fs_btn)
+                .insert((Button, UiAction::ToggleFullscreen));
+
+            // Row 1: UI Scale slider (75% - 150%, I marker at 100%)
+            let ui_scale_txt = format!("{}%", settings.ui_scale_percent());
+            let ui_slider = kit.spawn_slider_row(
+                commands,
+                list,
+                "UI SCALE",
+                &ui_scale_txt,
+                settings.ui_scale_fill(),
+                Some(GameSettings::ui_scale_default_mark()),
+                cursor == 1,
+                104.0,
+                scale,
+            );
+            commands
+                .entity(ui_slider.row)
+                .insert((Button, UiAction::SelectOptionRow(OptionRow::UiScale)));
+            commands
+                .entity(ui_slider.track)
+                .insert(SliderTrack(SliderTrackTarget::UiScale));
+            commands
+                .entity(ui_slider.dec_btn)
+                .insert((Button, UiAction::UiScaleStep(-1)));
+            commands
+                .entity(ui_slider.inc_btn)
+                .insert((Button, UiAction::UiScaleStep(1)));
+
+            // Row 2: Crosshair HUD Sway slider (0% - 100%)
+            let sway_txt = format!("{}%", settings.hud_sway_percent());
+            let sway_slider = kit.spawn_slider_row(
+                commands,
+                list,
+                "HUD SWAY",
+                &sway_txt,
+                settings.hud_sway.clamp(0.0, 1.0),
+                None,
+                cursor == 2,
+                104.0,
+                scale,
+            );
+            commands
+                .entity(sway_slider.row)
+                .insert((Button, UiAction::SelectOptionRow(OptionRow::HudSway)));
+            commands
+                .entity(sway_slider.track)
+                .insert(SliderTrack(SliderTrackTarget::HudSway));
+            commands
+                .entity(sway_slider.dec_btn)
+                .insert((Button, UiAction::HudSwayStep(-1)));
+            commands
+                .entity(sway_slider.inc_btn)
+                .insert((Button, UiAction::HudSwayStep(1)));
+
+            // Combat HUD Color HSV / RGB picker
+            kit.spawn_text(
+                commands,
+                list,
+                FontRole::Small,
+                "COMBAT HUD COLOR",
+                scale * 0.86,
+                palette::TEXT_MUTED,
+            );
+            let hc = settings.hud_color;
+            spawn_color_picker_card(
+                commands,
+                list,
+                kit,
+                state.paint_picker_mode,
+                [hc[0], hc[1], hc[2], 255],
+                state.paint_hsv,
+                picker_assets,
+                64.0,
+                scale * 0.88,
+            );
+
+            (3, 4)
+        }
+        OptionsTab::Sound => {
+            kit.spawn_text(
+                commands,
+                list,
+                FontRole::Small,
+                "AUDIO MIXER",
+                scale * 0.9,
+                palette::TEXT_MUTED,
+            );
+
+            for channel in AudioChannel::ALL {
+                let row_idx = OptionRow::Volume(channel).cursor_index();
+                let pct_txt = format!("{}%", settings.channel_percent(channel));
+                let slider = kit.spawn_slider_row(
+                    commands,
+                    list,
+                    channel.short_label(),
+                    &pct_txt,
+                    settings.channel_volume(channel),
+                    None,
+                    cursor == row_idx,
+                    104.0,
+                    scale,
+                );
+                commands
+                    .entity(slider.row)
+                    .insert((Button, UiAction::SelectOptionRow(OptionRow::Volume(channel))));
+                commands
+                    .entity(slider.track)
+                    .insert(SliderTrack(SliderTrackTarget::Volume(channel)));
+                commands
+                    .entity(slider.dec_btn)
+                    .insert((Button, UiAction::VolumeStep(channel, -1)));
+                commands
+                    .entity(slider.inc_btn)
+                    .insert((Button, UiAction::VolumeStep(channel, 1)));
+            }
+
+            (4, 5)
+        }
     };
-    let fs_btn = kit.spawn_button(commands, list, "FULLSCREEN", Some(fs_tag), fs_state, scale);
-    commands
-        .entity(fs_btn)
-        .insert((Button, UiAction::ToggleFullscreen));
-
-    // Row 1: UI Scale slider (75% - 150%, I marker at 100%)
-    let ui_scale_txt = format!("{}%", settings.ui_scale_percent());
-    let ui_slider = kit.spawn_slider_row(
-        commands,
-        list,
-        "UI SCALE",
-        &ui_scale_txt,
-        settings.ui_scale_fill(),
-        Some(GameSettings::ui_scale_default_mark()),
-        cursor == 1,
-        104.0,
-        scale,
-    );
-    commands
-        .entity(ui_slider.row)
-        .insert((Button, UiAction::SelectOptionRow(1)));
-    commands
-        .entity(ui_slider.track)
-        .insert(SliderTrack(SliderTrackTarget::UiScale));
-    commands
-        .entity(ui_slider.dec_btn)
-        .insert((Button, UiAction::UiScaleStep(-1)));
-    commands
-        .entity(ui_slider.inc_btn)
-        .insert((Button, UiAction::UiScaleStep(1)));
-
-    // Row 2: Crosshair HUD Sway slider (0% - 100%)
-    let sway_txt = format!("{}%", settings.hud_sway_percent());
-    let sway_slider = kit.spawn_slider_row(
-        commands,
-        list,
-        "HUD SWAY",
-        &sway_txt,
-        settings.hud_sway.clamp(0.0, 1.0),
-        None,
-        cursor == 2,
-        104.0,
-        scale,
-    );
-    commands
-        .entity(sway_slider.row)
-        .insert((Button, UiAction::SelectOptionRow(2)));
-    commands
-        .entity(sway_slider.track)
-        .insert(SliderTrack(SliderTrackTarget::HudSway));
-    commands
-        .entity(sway_slider.dec_btn)
-        .insert((Button, UiAction::HudSwayStep(-1)));
-    commands
-        .entity(sway_slider.inc_btn)
-        .insert((Button, UiAction::HudSwayStep(1)));
-
-    // Combat HUD Color HSV / RGB picker
-    kit.spawn_text(
-        commands,
-        list,
-        FontRole::Small,
-        "COMBAT HUD COLOR",
-        scale * 0.86,
-        palette::TEXT_MUTED,
-    );
-    let hc = settings.hud_color;
-    spawn_color_picker_card(
-        commands,
-        list,
-        kit,
-        state.paint_picker_mode,
-        [hc[0], hc[1], hc[2], 255],
-        state.paint_hsv,
-        picker_assets,
-        64.0,
-        scale * 0.88,
-    );
 
     kit.spawn_trace(commands, list, TraceStyle::Simple, scale);
 
-    kit.spawn_text(
-        commands,
-        list,
-        FontRole::Small,
-        "SOUND SETTINGS",
-        scale * 0.9,
-        palette::TEXT_MUTED,
-    );
-
-    for &(row_idx, channel) in &GARAGE_OPTION_CHANNELS {
-        let pct_txt = format!("{}%", settings.channel_percent(channel));
-        let slider = kit.spawn_slider_row(
-            commands,
-            list,
-            channel.short_label(),
-            &pct_txt,
-            settings.channel_volume(channel),
-            None,
-            cursor == row_idx,
-            104.0,
-            scale,
-        );
-        commands
-            .entity(slider.row)
-            .insert((Button, UiAction::SelectOptionRow(row_idx)));
-        commands
-            .entity(slider.track)
-            .insert(SliderTrack(SliderTrackTarget::Volume(channel)));
-        commands
-            .entity(slider.dec_btn)
-            .insert((Button, UiAction::VolumeStep(channel, -1)));
-        commands
-            .entity(slider.inc_btn)
-            .insert((Button, UiAction::VolumeStep(channel, 1)));
-    }
-
-    kit.spawn_trace(commands, list, TraceStyle::Simple, scale);
-
-    // Row 7: Back to Garage Top
-    let back_state = if cursor == 7 {
+    // Back to Garage Top
+    let back_state = if cursor == back_row {
         ButtonState::Selected
     } else {
         ButtonState::Normal
@@ -6003,8 +6091,8 @@ fn spawn_garage_options_menu(
     );
     commands.entity(back_btn).insert((Button, UiAction::Back));
 
-    // Row 8: Quit to Desktop
-    let quit_state = if cursor == 8 {
+    // Quit to Desktop
+    let quit_state = if cursor == quit_row {
         ButtonState::Selected
     } else {
         ButtonState::Normal
@@ -6024,7 +6112,7 @@ fn spawn_garage_options_menu(
     kit.spawn_trace(commands, panel, TraceStyle::Stepped, scale);
 
     // Retail-style helpline card explaining the currently focused option.
-    let active_desc = OPTIONS_ROW_DESCS.get(cursor).copied().unwrap_or("");
+    let active_desc = options_row_desc(state.options_tab, cursor);
     let help = kit.spawn_panel(
         commands,
         Some(panel),
@@ -6057,7 +6145,7 @@ fn spawn_garage_options_menu(
 }
 
 /// Compact UI-kit shaded pill button (used for tabs, sub-tabs, mode toggles, and compact actions).
-fn spawn_kit_pill(
+pub(crate) fn spawn_kit_pill(
     commands: &mut Commands,
     kit: &AcvdUiKit,
     parent: Entity,
@@ -7390,7 +7478,11 @@ pub(crate) fn spawn_color_picker_card(
                 .id();
             if let Some(sv_img) = &picker_assets.sv_image {
                 commands.spawn((
-                    ImageNode::new(sv_img.clone()),
+                    ImageNode {
+                        image: sv_img.clone(),
+                        image_mode: bevy::ui::widget::NodeImageMode::Stretch,
+                        ..default()
+                    },
                     Node {
                         position_type: PositionType::Absolute,
                         left: px(0.0),
@@ -7457,7 +7549,11 @@ pub(crate) fn spawn_color_picker_card(
                 .id();
             if let Some(hue_img) = &picker_assets.hue_image {
                 commands.spawn((
-                    ImageNode::new(hue_img.clone()),
+                    ImageNode {
+                        image: hue_img.clone(),
+                        image_mode: bevy::ui::widget::NodeImageMode::Stretch,
+                        ..default()
+                    },
                     Node {
                         position_type: PositionType::Absolute,
                         left: px(0.0),
@@ -8716,13 +8812,17 @@ mod tests {
                 sz.x
             );
         }
-        for (i, desc) in OPTIONS_ROW_DESCS.iter().enumerate() {
-            let sz = kit.measure_text(FontRole::Small, desc, 0.86);
-            assert!(
-                sz.x <= max_inner_w,
-                "OPTIONS_ROW_DESCS[{i}] overflows helpline box: {:.1}px > {max_inner_w}px ({desc:?})",
-                sz.x
-            );
+        for (tab, count) in [(OptionsTab::Graphics, 5usize), (OptionsTab::Sound, 6usize)] {
+            for i in 0..count {
+                let desc = options_row_desc(tab, i);
+                assert!(!desc.is_empty(), "options_row_desc({tab:?}, {i}) is empty");
+                let sz = kit.measure_text(FontRole::Small, desc, 0.86);
+                assert!(
+                    sz.x <= max_inner_w,
+                    "options_row_desc({tab:?}, {i}) overflows helpline box: {:.1}px > {max_inner_w}px ({desc:?})",
+                    sz.x
+                );
+            }
         }
     }
 
@@ -8755,7 +8855,7 @@ mod tests {
         assert_eq!(wheel_step_direction(0.0), 0);
 
         assert_eq!(
-            UiAction::SelectOptionRow(1).wheel_adjust(),
+            UiAction::SelectOptionRow(OptionRow::UiScale).wheel_adjust(),
             Some(WheelAdjust::UiScale)
         );
         assert_eq!(
@@ -8763,7 +8863,7 @@ mod tests {
             Some(WheelAdjust::UiScale)
         );
         assert_eq!(
-            UiAction::SelectOptionRow(2).wheel_adjust(),
+            UiAction::SelectOptionRow(OptionRow::HudSway).wheel_adjust(),
             Some(WheelAdjust::HudSway)
         );
         assert_eq!(
@@ -8771,7 +8871,7 @@ mod tests {
             Some(WheelAdjust::HudSway)
         );
         assert_eq!(
-            UiAction::SelectOptionRow(3).wheel_adjust(),
+            UiAction::SelectOptionRow(OptionRow::Volume(AudioChannel::Master)).wheel_adjust(),
             Some(WheelAdjust::Volume(AudioChannel::Master))
         );
         assert_eq!(
@@ -8814,7 +8914,7 @@ mod tests {
     fn test_slider_track_set_from_fill() {
         let mut s = GameSettings::default();
         s.set_ui_scale_from_fill(0.0);
-        assert_eq!(s.ui_scale_percent(), 75);
+        assert_eq!(s.ui_scale_percent(), 50);
         s.set_ui_scale_from_fill(1.0);
         assert_eq!(s.ui_scale_percent(), 150);
         s.set_ui_scale_from_fill(GameSettings::ui_scale_default_mark());
