@@ -2539,8 +2539,8 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
     match dir {
         Some(d) if p.boost => ("dash", Some(d)),
         Some(d) => ("walk", Some(d)),
-        None if input.turn > 0.0 => ("turn_left", None),
-        None if input.turn < 0.0 => ("turn_right", None),
+        None if input.turn > 0.05 => ("turn_left", None),
+        None if input.turn < -0.05 => ("turn_right", None),
         // Same as the air case: keyboard direction changes zero the stick for a frame.
         // Dropping to idle restarts the clip, which is the strafe twitch.
         None if current.0 == "dash"
@@ -2555,6 +2555,8 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
 
 /// Computes the Core Control target `(yaw, pitch)` in AC-local radians (360 `0x8289e730`).
 ///
+/// Bevy AC local axes: forward is `-Z` (`FORWARD`), left is `-X`, up is `+Y`; positive yaw
+/// turns left (`+Y` rotation) and positive pitch looks up (`+X` rotation).
 /// When an FCS target is locked, aims the upper body directly at `locked_pos`; otherwise tracks
 /// camera aim (`cam_yaw_off`, `cam_pitch`) plus turn lead (`turn`) and sideways strafe
 /// counter-twist (`strafe_x`) so the torso stays squared to the aim while legs strafe/dash.
@@ -2571,17 +2573,14 @@ pub fn core_aim_angles(
         let to_target = target - (ac_pos + Vec3::Y * 5.0);
         if to_target.length_squared() > 1e-4 {
             let local = Quat::from_rotation_y(-body_yaw) * to_target;
-            let yaw = local.x.atan2(local.z);
+            let yaw = (-local.x).atan2(-local.z);
             let horiz = Vec2::new(local.x, local.z).length().max(1e-4);
-            let pitch = (-local.y).atan2(horiz);
+            let pitch = local.y.atan2(horiz);
             return (yaw, pitch);
         }
     }
-    let strafe_counter = if cam_yaw_off.abs() < 1e-3 {
-        strafe_x.clamp(-1.0, 1.0) * 18.0_f32.to_radians()
-    } else {
-        0.0
-    };
+    let strafe_blend = 1.0 - (cam_yaw_off.abs() / 0.25).min(1.0);
+    let strafe_counter = strafe_x.clamp(-1.0, 1.0) * 18.0_f32.to_radians() * strafe_blend;
     let turn_lead = turn.clamp(-1.0, 1.0) * 26.0_f32.to_radians();
     (cam_yaw_off + strafe_counter + turn_lead, cam_pitch)
 }
@@ -2814,6 +2813,16 @@ pub fn pilot(
         }
         p.cam.accel = (p.velocity - before).with_y(0.0).length() * TICK_TO_KMH;
     }
+    // Keep mouselook `input.turn` consistent on render frames where the 60 Hz accumulator did not
+    // tick (e.g. >60 FPS monitors), so `state()` doesn't flap between `turn_*` and `idle`.
+    if *mouselook {
+        let per_tick = (p.ctrl.turn_rate / TICK_RATE).max(1e-4);
+        input.turn = if p.cam.yaw_off.abs() > 0.03 {
+            (p.cam.yaw_off / per_tick).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+    }
     p.area_zone = area_bounds
         .as_deref()
         .map_or(crate::map::AreaZone::Inside, |b| {
@@ -2960,7 +2969,7 @@ pub fn pilot(
         p.cam.yaw_off,
         p.cam.pitch,
         body.stick.x,
-        input.turn,
+        if *mouselook { 0.0 } else { input.turn },
         fcs.and_then(|f| f.locked.as_ref()).map(|l| l.world_pos),
     );
     motion.core_ctrl.enabled = core_allowed;
@@ -3681,7 +3690,21 @@ mod tests {
 
     #[test]
     fn core_aim_angles_tracks_fcs_lock_and_strafe() {
-        // Locked target 100 m forward (+Z) and 100 m left (+X) at AC torso height (+5 Y) -> +45 deg yaw, 0 pitch.
+        // Bevy AC forward is -Z, left is -X, up is +Y.
+        // Target straight ahead (0, 5, -100) -> 0 deg yaw, 0 deg pitch.
+        let (yaw0, pitch0) = core_aim_angles(
+            0.0,
+            Vec3::ZERO,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            Some(Vec3::new(0.0, 5.0, -100.0)),
+        );
+        assert!(yaw0.abs() < 1e-4, "straight-ahead yaw={}", yaw0.to_degrees());
+        assert!(pitch0.abs() < 1e-4, "straight-ahead pitch={}", pitch0.to_degrees());
+
+        // Locked target 100 m forward (-Z) and 100 m left (-X) at AC torso height (+5 Y) -> +45 deg yaw, 0 pitch.
         let (yaw, pitch) = core_aim_angles(
             0.0,
             Vec3::ZERO,
@@ -3689,10 +3712,25 @@ mod tests {
             0.0,
             0.0,
             0.0,
-            Some(Vec3::new(100.0, 5.0, 100.0)),
+            Some(Vec3::new(-100.0, 5.0, -100.0)),
         );
         assert!((yaw.to_degrees() - 45.0).abs() < 0.1, "yaw={}", yaw.to_degrees());
         assert!(pitch.abs() < 0.01);
+
+        // Locked target ahead-right (+X, -Z) and above (+Y) -> -45 deg yaw, positive pitch,
+        // and the resulting aim ray points directly at the target even when the AC is rotated.
+        let body_yaw = 0.7_f32;
+        let target = Vec3::new(60.0, 45.0, -80.0);
+        let (ryaw, rpitch) = core_aim_angles(body_yaw, Vec3::ZERO, 0.0, 0.0, 0.0, 0.0, Some(target));
+        let aim_dir =
+            Quat::from_rotation_y(body_yaw + ryaw) * Quat::from_rotation_x(rpitch) * FORWARD;
+        let expected = (target - Vec3::Y * 5.0).normalize();
+        assert!(
+            aim_dir.dot(expected) > 0.9999,
+            "aim_dir={aim_dir:?} expected={expected:?} (yaw={} pitch={})",
+            ryaw.to_degrees(),
+            rpitch.to_degrees()
+        );
 
         // Unlocked strafe right (stick.x = +1) counter-twists torso left (+yaw) to hold forward aim.
         let (syaw, spitch) = core_aim_angles(0.0, Vec3::ZERO, 0.0, -0.1, 1.0, 0.0, None);

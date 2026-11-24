@@ -195,6 +195,9 @@ pub struct Driven {
     pub upper: bool,
     pub core_bone: CoreBone,
     group: usize,
+    /// Last pre-Core-Control animated pose, captured by crossfade transitions so procedural
+    /// `CoreControl` rotation never compounds across clip changes.
+    base: Transform,
     from: Transform,
     generation: u32,
     upper_from: Transform,
@@ -270,7 +273,8 @@ pub fn is_upper_body(rest: &[ani::Rest], bone: usize) -> bool {
 pub fn core_bone_of(rest: &[ani::Rest], bone: usize) -> CoreBone {
     match rest.get(bone).map(|r| r.name.as_str()) {
         Some("core") => CoreBone::Core,
-        Some("head_01" | "head") => CoreBone::Head,
+        Some("head_01") => CoreBone::Head,
+        Some("head") if !rest.iter().any(|r| r.name == "head_01") => CoreBone::Head,
         _ => CoreBone::None,
     }
 }
@@ -1058,6 +1062,7 @@ pub fn spawn(
                 upper: built.upper.get(bone).copied().unwrap_or(false),
                 core_bone: built.core_bones.get(bone).copied().unwrap_or_default(),
                 group: built.groups.get(bone).copied().unwrap_or(0),
+                base: transform,
                 from: transform,
                 generation: 0,
                 upper_from: transform,
@@ -1216,6 +1221,7 @@ pub fn spawn_npc(
                     upper: built.upper.get(bone).copied().unwrap_or(false),
                     core_bone: built.core_bones.get(bone).copied().unwrap_or_default(),
                     group: built.groups.get(bone).copied().unwrap_or(0),
+                    base: transform,
                     from: transform,
                     generation: 0,
                     upper_from: transform,
@@ -1279,7 +1285,7 @@ pub fn animate_npcs(
                 continue;
             };
             if d.generation != fade.generation {
-                (d.from, d.generation) = (*transform, fade.generation);
+                (d.from, d.generation) = (d.base, fade.generation);
             }
             let Some(bone) = m.clip.bones.get(d.bone) else {
                 continue;
@@ -1310,7 +1316,7 @@ pub fn animate_npcs(
             } else {
                 1.0
             };
-            *transform = if w >= 1.0 {
+            d.base = if w >= 1.0 {
                 target
             } else {
                 Transform {
@@ -1319,6 +1325,7 @@ pub fn animate_npcs(
                     scale: d.from.scale.lerp(target.scale, w),
                 }
             };
+            *transform = d.base;
             if cc.weight > 1e-4 {
                 match d.core_bone {
                     CoreBone::Core => {
@@ -1535,7 +1542,7 @@ pub fn animate(
         };
         if let Some((u, ubone)) = upper_pose {
             if d.upper_gen != u.fade.generation {
-                (d.upper_from, d.upper_gen) = (*transform, u.fade.generation);
+                (d.upper_from, d.upper_gen) = (d.base, u.fade.generation);
             }
             let rotation = Quat::from_array(
                 ubone
@@ -1557,7 +1564,7 @@ pub fn animate(
             } else {
                 1.0
             };
-            *transform = if w >= 1.0 {
+            d.base = if w >= 1.0 {
                 target
             } else {
                 Transform {
@@ -1566,13 +1573,14 @@ pub fn animate(
                     scale: d.upper_from.scale.lerp(target.scale, w),
                 }
             };
+            *transform = d.base;
         } else {
             if d.generation != fade.generation {
-                (d.from, d.generation) = (*transform, fade.generation);
+                (d.from, d.generation) = (d.base, fade.generation);
             }
             let returning_upper = d.upper && return_fade.generation != 0 && d.upper_gen != return_fade.generation;
             if returning_upper {
-                (d.upper_from, d.upper_gen) = (*transform, return_fade.generation);
+                (d.upper_from, d.upper_gen) = (d.base, return_fade.generation);
             }
             let Some(bone) = m.clip.bones.get(d.bone) else {
                 continue;
@@ -1618,16 +1626,17 @@ pub fn animate(
             };
             // Smooth crossfade back from a recently cleared upper-body clip.
             let ret_secs = return_fade.secs[d.group];
-            if d.upper && return_fade.generation != 0 && ret_secs > 0.0 && return_fade.t < ret_secs {
+            d.base = if d.upper && return_fade.generation != 0 && ret_secs > 0.0 && return_fade.t < ret_secs {
                 let rw = (return_fade.t / ret_secs).clamp(0.0, 1.0);
-                *transform = Transform {
+                Transform {
                     translation: d.upper_from.translation.lerp(base.translation, rw),
                     rotation: d.upper_from.rotation.slerp(base.rotation, rw),
                     scale: d.upper_from.scale.lerp(base.scale, rw),
-                };
+                }
             } else {
-                *transform = base;
-            }
+                base
+            };
+            *transform = d.base;
         }
 
         // Apply Core Control rotation to `core` (and a subtle lead to `head_01`).
@@ -1963,5 +1972,114 @@ mod tests {
             }
         }
         assert_eq!(roots_driven, 2, "expected both l_kata and r_kata roots driven");
+    }
+
+    #[test]
+    fn core_control_does_not_compound_across_clip_transitions() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let design = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 6007)
+            .expect("design 6007");
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design.data);
+        let mut loaded = Vec::new();
+        let mut known = vec![None; built.placements.len()];
+        for (index, p) in built.placements.iter().enumerate() {
+            let places = assemble::root_places(p, &built.placements, &known);
+            let (meshes, rig) = acvd_render::rigged_model(&disc, p.model.path, &|root| {
+                assemble::place_of(&places, root)
+            })
+            .expect("rigged_model");
+            known[index] = Some(assemble::Stored {
+                places,
+                frames: rig.frames.clone(),
+            });
+            loaded.push(Loaded {
+                index,
+                placement: p,
+                meshes,
+                rig,
+            });
+        }
+        let rig = build(&disc, &loaded).expect("pose::build");
+        let mut motion = rig.motion.expect("motion");
+        let core_bone = motion
+            .skeleton
+            .bones
+            .iter()
+            .position(|b| b.rest.as_ref().is_some_and(|r| r.name == "core"))
+            .expect("core bone");
+        let rest_q = {
+            let r = motion.skeleton.bones[core_bone].rest.as_ref().unwrap();
+            to_transform(
+                Vec3::from(r.translation),
+                Quat::from_array(ani::euler_quat(r.euler)),
+                Vec3::from(r.scale),
+            )
+            .rotation
+        };
+
+        motion.core_ctrl.yaw = 45.0_f32.to_radians();
+        motion.core_ctrl.pitch = -10.0_f32.to_radians();
+        motion.core_ctrl.target_yaw = motion.core_ctrl.yaw;
+        motion.core_ctrl.target_pitch = motion.core_ctrl.pitch;
+        motion.core_ctrl.weight = 1.0;
+        motion.fade.secs = [0.2; 8];
+
+        let mut world = World::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
+        world.insert_resource(time);
+        world.insert_resource(motion);
+        let joint = world
+            .spawn((
+                Transform::from_rotation(rest_q),
+                Driven {
+                    bone: core_bone,
+                    absolute: false,
+                    bind: Vec3::ZERO,
+                    upper: true,
+                    core_bone: CoreBone::Core,
+                    group: 0,
+                    base: Transform::from_rotation(rest_q),
+                    from: Transform::from_rotation(rest_q),
+                    generation: 0,
+                    upper_from: Transform::from_rotation(rest_q),
+                    upper_gen: 0,
+                },
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(animate);
+
+        // Trigger 20 consecutive clip transitions mid-fade (as happens during rapid state changes).
+        for gen in 1..=20u32 {
+            {
+                let mut m = world.resource_mut::<Motion>();
+                m.fade.generation = gen;
+                m.fade.t = 0.0;
+            }
+            schedule.run(&mut world);
+        }
+
+        let rot = world.get::<Transform>(joint).unwrap().rotation;
+        let expected = Quat::from_rotation_y(45.0_f32.to_radians())
+            * Quat::from_rotation_x(-10.0_f32.to_radians())
+            * rest_q;
+        let angle_err = rot.angle_between(expected).to_degrees();
+        assert!(
+            angle_err < 1.0,
+            "CoreControl compounded across clip transitions: err={angle_err:.2} deg"
+        );
     }
 }
