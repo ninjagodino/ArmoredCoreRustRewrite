@@ -27,10 +27,14 @@
 //! `Gauge_APEffect`, the conditional warnings of `ACV_FE_Normal`. AP stays full until damage
 //! exists; EN is driven live from `Pilot::en` / `Pilot::en_max`.
 
+use std::collections::HashMap;
+
 use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
 use acvd_formats::vfs::Disc;
 use acvd_render::app::ShotMark;
 use acvd_render::menu::{self, Layout, MenuGauge, MenuObject, MenuRoot, MenuSprite, MenuText};
+use acvd_render::Packs;
+use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::ui::{px, UiTransform};
 use bevy::window::PrimaryWindow;
@@ -38,7 +42,7 @@ use bevy::window::PrimaryWindow;
 use crate::control::Pilot;
 use crate::damage::PlayerHealth;
 use crate::fcs::Fcs;
-use crate::scan::{ReconUnit, ScanState, MAX_RECON_SLOTS};
+use crate::scan::{ReconUnit, ScanPortrait, ScanState, MAX_RECON_SLOTS};
 use crate::weapons::{Armament, Gun, Kind, OwPhase};
 
 const LAYOUT: &str = "lang/en/menu/sortie.drb.dcx";
@@ -151,6 +155,9 @@ pub struct Sortie {
     low: [f32; 5],
     /// Trailing AP lag bar and damage-blink state (`0x8258c808` + `0x829d0b30`).
     pub ap_effect: ApEffectState,
+    /// Cached Scan Mode enemy thumbnails (`image/enethumbnail/e%04d.tpf`, `0x827b29e0`) and AC
+    /// emblems (`image/emblem/im%04d.tpf`, `0x823861d0`), with their texel `(width, height)`.
+    scan_portraits: HashMap<ScanPortrait, Option<(Handle<Image>, Vec2)>>,
 }
 
 impl Sortie {
@@ -159,6 +166,36 @@ impl Sortie {
     pub fn reset_layout(&mut self) {
         self.size = Vec2::ZERO;
         self.show = 0.0;
+    }
+
+    /// Loads and caches a Scan Mode target portrait (`0x827b29e0` / `0x823861d0`).
+    fn scan_portrait(
+        &mut self,
+        portrait: ScanPortrait,
+        disc: &Disc,
+        images: &mut Assets<Image>,
+    ) -> Option<(Handle<Image>, Vec2)> {
+        if let Some(cached) = self.scan_portraits.get(&portrait) {
+            return cached.clone();
+        }
+        let path = portrait.asset_path();
+        let loaded = match Packs::default().texture_at(disc, &path, 0, &path) {
+            Ok(mut image) => {
+                let size = Vec2::new(image.width() as f32, image.height() as f32);
+                image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                    address_mode_u: ImageAddressMode::ClampToEdge,
+                    address_mode_v: ImageAddressMode::ClampToEdge,
+                    ..ImageSamplerDescriptor::linear()
+                });
+                Some((images.add(image), size))
+            }
+            Err(e) => {
+                warn!("scan portrait `{path}`: {e:#}");
+                None
+            }
+        };
+        self.scan_portraits.insert(portrait, loaded.clone());
+        loaded
     }
 }
 
@@ -171,6 +208,7 @@ pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
         show: 0.0,
         low: [0.0; 5],
         ap_effect: ApEffectState::default(),
+        scan_portraits: HashMap::new(),
     })
 }
 
@@ -1251,7 +1289,9 @@ pub fn panels(
 /// (`0x825a26a0`, `0x825a5978`, `0x825a4460`).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn scan_hud(
-    hud: Option<Res<Sortie>>,
+    hud: Option<ResMut<Sortie>>,
+    garage: Option<Res<crate::Garage>>,
+    mut images: ResMut<Assets<Image>>,
     cameras: Query<(&Camera, &GlobalTransform), (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
     scan_q: Query<&ScanState>,
     mut combat_sight: Query<
@@ -1317,6 +1357,7 @@ pub fn scan_hud(
             &mut Visibility,
             Option<&mut MenuText>,
             Option<&mut MenuGauge>,
+            Option<&mut MenuSprite>,
         ),
         (
             Without<CombatSightRoot>,
@@ -1327,7 +1368,7 @@ pub fn scan_hud(
         ),
     >,
 ) {
-    let Some(hud) = hud else { return };
+    let Some(mut hud) = hud else { return };
     let scale = hud.scale;
     let size = hud.size;
     let scan = scan_q.single().ok();
@@ -1367,7 +1408,7 @@ pub fn scan_hud(
         node.left = px(vp.x - 20.0 * scale);
         node.top = px(vp.y - 20.0 * scale);
         for child in children.iter_descendants(root) {
-            let Ok((obj, _, _, text, _)) = objects.get_mut(child) else {
+            let Ok((obj, _, _, text, _, _)) = objects.get_mut(child) else {
                 continue;
             };
             match obj.0.as_str() {
@@ -1408,7 +1449,7 @@ pub fn scan_hud(
         node.top = px(size.y * 0.62);
         let prog = cand.progress();
         for child in children.iter_descendants(root) {
-            let Ok((obj, mut cnode, _, text, _)) = objects.get_mut(child) else {
+            let Ok((obj, mut cnode, _, text, _, _)) = objects.get_mut(child) else {
                 continue;
             };
             match obj.0.as_str() {
@@ -1452,8 +1493,13 @@ pub fn scan_hud(
         let max_y = (size.y - 200.0 * scale).max(min_y);
         node.left = px((vp.x - 305.0 * scale).clamp(min_x, max_x));
         node.top = px((vp.y - 205.0 * scale).clamp(min_y, max_y));
+        let loaded_portrait = info.portrait.and_then(|p| {
+            let g = garage.as_deref()?;
+            hud.scan_portrait(p, &g.disc, &mut images)
+                .map(|(handle, tex_size)| (p.is_enemy(), handle, tex_size))
+        });
         for child in children.iter_descendants(root) {
-            let Ok((obj, _, mut cvis, text, gauge)) = objects.get_mut(child) else {
+            let Ok((obj, _, mut cvis, text, gauge, sprite)) = objects.get_mut(child) else {
                 continue;
             };
             match obj.0.as_str() {
@@ -1501,15 +1547,54 @@ pub fn scan_hud(
                         g.fill = 1.0;
                     }
                 }
-                // Runtime texture slot 14 is a blank placeholder without dynamic portrait rendering.
-                "EmblemPic" | "EnemyPic" => {
-                    if text.is_none() && gauge.is_none() {
-                        // Only hide the inner Sprite (not the outer EnemyPic Dialog container).
-                        // The inner Sprite has no children, whereas the Dialog container does.
-                        if children.get(child).is_err() {
+                // `0x825a5040`: `tex_id >= 30000` (`Enemy(id)` -> `image/enethumbnail/e%04d.tpf`)
+                // shows `EnemyPic` + `Enemy_BG` and hides `EmblemPic` + `Emblem_BG`; `< 30000`
+                // (`Emblem(id)` -> `image/emblem/im%04d.tpf`) does the opposite and sets the sprite
+                // texel rect to `(0, 0, w, h)`. The outer `EnemyPic` Dialog container has no
+                // `MenuSprite` and must stay visible.
+                "EnemyPic" => {
+                    if let Some(mut s) = sprite {
+                        if let Some((true, ref handle, tex_size)) = loaded_portrait {
+                            let rect = Rect::from_corners(Vec2::ZERO, tex_size);
+                            if s.image != *handle || s.rect != rect {
+                                s.image = handle.clone();
+                                s.rect = rect;
+                            }
+                            cvis.set_if_neq(Visibility::Inherited);
+                        } else {
                             cvis.set_if_neq(Visibility::Hidden);
                         }
                     }
+                }
+                "Enemy_BG" => {
+                    let show = matches!(loaded_portrait, Some((true, _, _)));
+                    cvis.set_if_neq(if show {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    });
+                }
+                "EmblemPic" => {
+                    if let Some(mut s) = sprite {
+                        if let Some((false, ref handle, tex_size)) = loaded_portrait {
+                            let rect = Rect::from_corners(Vec2::ZERO, tex_size);
+                            if s.image != *handle || s.rect != rect {
+                                s.image = handle.clone();
+                                s.rect = rect;
+                            }
+                            cvis.set_if_neq(Visibility::Inherited);
+                        } else {
+                            cvis.set_if_neq(Visibility::Hidden);
+                        }
+                    }
+                }
+                "Emblem_BG" => {
+                    let show = matches!(loaded_portrait, Some((false, _, _)));
+                    cvis.set_if_neq(if show {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    });
                 }
                 _ => {}
             }
@@ -2081,6 +2166,79 @@ mod tests {
             d.dialog("rocksight_out_rotationInv").unwrap().size,
             [402, 402]
         );
+    }
+
+    #[test]
+    fn scan_enemy_param_info_pic_subdialog_and_portraits() {
+        let iso = acvd_formats::vfs::default_disc(std::path::Path::new("../.."));
+        if !iso.exists() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let d = acvd_formats::drb::read(&disc.asset(LAYOUT).unwrap()).unwrap();
+        let root = d.dialog("ACV_Scan_Cur_EnemyParamInfo").unwrap();
+        let pic_dlg_idx = root
+            .objects
+            .iter()
+            .find_map(|o| match o.shape {
+                acvd_formats::drb::Shape::Dialog { dialog: Some(idx), .. }
+                    if o.name == "EnemyPic" =>
+                {
+                    Some(idx as usize)
+                }
+                _ => None,
+            })
+            .expect("EnemyPic dialog in ACV_Scan_Cur_EnemyParamInfo");
+        let pic_dlg = &d.dialogs[pic_dlg_idx];
+        assert_eq!(pic_dlg.name, "scan_enemy_pic");
+
+        let find_obj = |name: &str| {
+            pic_dlg
+                .objects
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("missing `{name}` in scan_enemy_pic"))
+        };
+        assert!(matches!(
+            find_obj("EnemyPic").shape,
+            acvd_formats::drb::Shape::Sprite { flags: 2, .. }
+        ));
+        assert!(matches!(
+            find_obj("EmblemPic").shape,
+            acvd_formats::drb::Shape::Sprite { flags: 1, .. }
+        ));
+        assert!(matches!(
+            find_obj("Enemy_BG").shape,
+            acvd_formats::drb::Shape::MonoRect { .. }
+        ));
+        assert!(matches!(
+            find_obj("Emblem_BG").shape,
+            acvd_formats::drb::Shape::MonoRect { .. }
+        ));
+
+        // AC TEST enemy thumbnails (`0x828e41c0` / `0x827b29e0` / `0x82572000`): 128x128 BC1.
+        let mut packs = Packs::default();
+        for model in ["e0010", "e0110", "e0210", "e1020", "e2030"] {
+            let p = ScanPortrait::for_target(model, None).expect(model);
+            assert!(p.is_enemy());
+            let path = p.asset_path();
+            let img = packs
+                .texture_at(&disc, &path, 0, &path)
+                .unwrap_or_else(|e| panic!("decoding `{path}`: {e:#}"));
+            assert_eq!((img.width(), img.height()), (128, 128), "{path}");
+        }
+
+        // AC TEST AC designs 5011..5014 (`0x823861d0` / `0x825a5040`): 256x256 BC3 emblems.
+        for (design_id, expected_emblem) in [(5011, 119), (5012, 119), (5013, 119), (5014, 276)] {
+            let p = ScanPortrait::for_target("a0000", Some(design_id)).unwrap();
+            assert_eq!(p, ScanPortrait::Emblem(expected_emblem));
+            assert!(!p.is_enemy());
+            let path = p.asset_path();
+            let img = packs
+                .texture_at(&disc, &path, 0, &path)
+                .unwrap_or_else(|e| panic!("decoding `{path}`: {e:#}"));
+            assert_eq!((img.width(), img.height()), (256, 256), "{path}");
+        }
     }
 
     #[test]

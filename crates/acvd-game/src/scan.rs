@@ -206,6 +206,50 @@ impl ScanCandidate {
     }
 }
 
+/// Target portrait shown in `ACV_Scan_Cur_EnemyParamInfo` (`0x825a5040`):
+/// - [`Self::Enemy`] (`tex_id = 30000 + id >= 30000`, `0x828e41c0` / `0x827b29e0` / `0x82572000`):
+///   loads `image/enethumbnail/e%04d.tpf` into `EnemyPic` (`Enemy_BG` shown, `EmblemPic` hidden).
+/// - [`Self::Emblem`] (`tex_id < 30000`, `0x823861d0` / `0x82305d98`, `AcAssemblyDesignSt.emblem_id`):
+///   loads `image/emblem/im%04d.tpf` into `EmblemPic` (`Emblem_BG` shown, `EnemyPic` hidden).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScanPortrait {
+    Enemy(u32),
+    Emblem(u16),
+}
+
+impl ScanPortrait {
+    /// Resolves the 360 disc portrait for a target (`0x828e41f4` `sscanf(model, "e%04d")`
+    /// for enemies; `AcAssemblyDesignSt.emblem_id` for AC designs).
+    pub fn for_target(model: &str, ac_design_id: Option<u16>) -> Option<Self> {
+        if let Some(design_id) = ac_design_id {
+            let emblem_id = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+                .iter()
+                .flat_map(|(_, rows)| rows.iter())
+                .find(|r| r.id == u32::from(design_id))
+                .map(|r| r.data.emblem_id)
+                .filter(|&id| id > 0)?;
+            return Some(Self::Emblem(emblem_id));
+        }
+        let digits = model.strip_prefix('e').or_else(|| model.strip_prefix('E'))?;
+        let id = digits.parse::<u32>().ok()?;
+        Some(Self::Enemy(id))
+    }
+
+    /// Disc asset path (`0x827b2a4c` / `0x8238622c` / `0x8238626c`).
+    pub fn asset_path(self) -> String {
+        match self {
+            Self::Enemy(id) => format!("image/enethumbnail/e{id:04}.tpf"),
+            Self::Emblem(id) => format!("image/emblem/im{id:04}.tpf"),
+        }
+    }
+
+    /// True when this portrait uses the `EnemyPic` + `Enemy_BG` slot (`tex_id >= 30000` at
+    /// `0x825a5064`), false when it uses `EmblemPic` + `Emblem_BG`.
+    pub fn is_enemy(self) -> bool {
+        matches!(self, Self::Enemy(_))
+    }
+}
+
 /// Completed Target Scan readout displayed in `ACV_Scan_Cur_EnemyParamInfo` (`0x825a4460`).
 #[derive(Clone, Debug)]
 pub struct ScannedTarget {
@@ -213,6 +257,7 @@ pub struct ScannedTarget {
     #[allow(dead_code)]
     pub name: String,
     pub model: String,
+    pub portrait: Option<ScanPortrait>,
     pub world_pos: Vec3,
     #[allow(dead_code)]
     pub distance: f32,
@@ -551,7 +596,7 @@ pub fn update(
     let datum_back = pilot.ctrl.fcs_datum_back.max(0.0);
     let cur_entity = scan.candidate.as_ref().map(|c| c.entity);
 
-    let mut best: Option<(f32, Entity, String, String, Vec3, f32, &TargetHealth)> = None;
+    let mut best: Option<(f32, Entity, String, String, Option<u16>, Vec3, f32, &TargetHealth)> = None;
     for (entity, target, health, t_tf) in &targets {
         if health.destroyed {
             continue;
@@ -580,6 +625,7 @@ pub fn update(
                 entity,
                 target.name.clone(),
                 target.model.clone(),
+                target.ac_design_id,
                 center,
                 dist,
                 health,
@@ -587,7 +633,7 @@ pub fn update(
         }
     }
 
-    let Some((_, entity, name, model, world_pos, distance, health)) = best else {
+    let Some((_, entity, name, model, ac_design_id, world_pos, distance, health)) = best else {
         scan.candidate = None;
         return;
     };
@@ -613,10 +659,12 @@ pub fn update(
     // Holding / pressing Target Scan (`F` / RMB / `R2`) populates `ACV_Scan_Cur_EnemyParamInfo`
     // once scan progress reaches 100% (`0x825a7c10` at `0x825a8184..0x825a81c8`, `manual.fmg` 20502).
     if scan_trigger && ready {
+        let portrait = ScanPortrait::for_target(&model, ac_design_id);
         scan.scanned = Some(ScannedTarget {
             entity,
             name,
             model,
+            portrait,
             world_pos,
             distance,
             ap: health.ap,
