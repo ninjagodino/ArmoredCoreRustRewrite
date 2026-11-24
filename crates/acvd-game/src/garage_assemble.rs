@@ -2644,8 +2644,12 @@ pub fn sync_ac_preview(
             .bindposes
             .add(SkinnedMeshInverseBindposes::from(binds));
         for mesh in part.meshes {
-            let decal_slot =
-                DecalSlot::from_mesh(part.placement.column, mesh.root.as_deref());
+            let center_x = 0.5 * (mesh.min[0] + mesh.max[0]);
+            let decal_slot = DecalSlot::from_mesh_bounds(
+                part.placement.column,
+                mesh.root.as_deref(),
+                Some(center_x),
+            );
             let base = acvd_render::material(
                 &garage.disc,
                 &mesh,

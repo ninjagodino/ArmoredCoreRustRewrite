@@ -1573,9 +1573,11 @@ fn show(
         for mesh in part.meshes {
             min = min.min(Vec3::from(mesh.min));
             max = max.max(Vec3::from(mesh.max));
-            let decal_slot = decal::DecalSlot::from_mesh(
+            let center_x = 0.5 * (mesh.min[0] + mesh.max[0]);
+            let decal_slot = decal::DecalSlot::from_mesh_bounds(
                 part.placement.column,
                 mesh.root.as_deref(),
+                Some(center_x),
             );
             if let Some(slot) = decal_slot {
                 if let Some(cached) = decal::CachedPartMesh::from_mesh(

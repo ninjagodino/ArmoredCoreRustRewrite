@@ -18,8 +18,21 @@
 //! - **Paint Shader Composite (`Flver_ACColorDecalColDifSpcBumpIbl.fpo` instructions 107, 110,
 //!   131–132)**: samples `g_AC_DecalMap` (`s3`) at UV1 (`r5.zw`) and composites premultiplied sRGB
 //!   over the painted diffuse: `final_srgb = painted * (1.0 - decal.a) + decal.rgb`.
-//! - **Built-in Retail Emblems (`image/emblem/im*.tpf`, `0x823861d0`)**: 306 retail 256×256 BC3
-//!   emblems on the 360 disc, browsable alongside user-uploaded PNG/JPG/WebP/BMP/GIF images.
+//! - **Built-in Retail Emblems (`image/emblem/im*.tpf`, `0x823861d0` / `0x82305d98`)**: 306 retail
+//!   256×256 BC3 emblems on the 360 disc (`image:/emblem/im%04d.tpf`), browsable alongside
+//!   user-uploaded PNG/JPG/WebP/BMP/GIF images as freestyle decal brushes **and** as the AC's
+//!   single Emblem (separate from freestyle Decals — see below).
+//! - **AC Emblem (one per AC, not a Decal layer)**:
+//!   - Design field `AcAssemblyDesignSt.emblem_id` at `+0x50` (`EMBLEM_ID`, loaded by
+//!     `0x82331b18`) selects the retail `imXXXX` default.
+//!   - Runtime texture slot `assembly_data + 0x5e98` / paint slot `0xa` (`0x824669d8`) holds the
+//!     live emblem; freestyle Decals live in the five `g_AC_DecalMap` slots (`0..4`) and never
+//!     share that slot.
+//!   - Baked as entry `#32` on Left Arm (`0x82b50b10` → `0x82b502e0` → `0x82b4f150`, projector
+//!     from `acvparts` cat-2 `+0x28..+0x40` / `+0x117..+0x118`).
+//!   - Garage workshop FLVER materials `"emblem"` / `"im999"` / `"im9999"` are overridden with
+//!     the live emblem (`0x825d3978`).
+//!   - Scan HUD AC portraits also use `emblem_id` → `image/emblem/im%04d.tpf` (`0x825a5040`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,7 +52,8 @@ use bevy::window::{FileDragAndDrop, PrimaryWindow};
 use serde::{Deserialize, Serialize};
 
 use crate::garage::{
-    GarageScreen, GarageState, Mode, PaintTab, CUE_CANCEL, CUE_EQUIP, CUE_ERROR, CUE_MOVE, CUE_OK,
+    GarageEmblemBanner, GarageScreen, GarageState, Mode, PaintTab, CUE_CANCEL, CUE_EQUIP, CUE_ERROR,
+    CUE_MOVE, CUE_OK,
 };
 use crate::sound::{self, Cues};
 
@@ -110,20 +124,38 @@ impl DecalSlot {
 
     /// Maps an assembled AC part column + mesh root bone to its 360 decal slot (`0x82464ac8` +
     /// `0x82b4d618` splitting shared `arms` FLVER by `r_kata` / `l_kata`).
+    #[cfg(test)]
     pub fn from_mesh(column: &str, root: Option<&str>) -> Option<Self> {
+        Self::from_mesh_bounds(column, root, None)
+    }
+
+    /// Like `from_mesh`, but falls back to the mesh's Bevy X center (`< 0` = Left Arm, `>= 0` =
+    /// Right Arm) for arm sub-meshes whose `default_bone` is a neutral break/armor bone such as
+    /// `bklv2_03` (e.g. `am0410`'s left outer shoulder plate).
+    pub fn from_mesh_bounds(
+        column: &str,
+        root: Option<&str>,
+        center_x_bevy: Option<f32>,
+    ) -> Option<Self> {
         match column {
             "head" => Some(Self::Head),
             "core" => Some(Self::Core),
             "arms" => {
-                let is_left = root.is_some_and(|r| {
+                if let Some(r) = root {
                     let lo = r.to_ascii_lowercase();
-                    lo.starts_with("l_") || lo.contains("left")
-                });
-                if is_left {
-                    Some(Self::LeftArm)
-                } else {
-                    Some(Self::RightArm)
+                    if lo.starts_with("l_") || lo.contains("left") {
+                        return Some(Self::LeftArm);
+                    }
+                    if lo.starts_with("r_") || lo.contains("right") {
+                        return Some(Self::RightArm);
+                    }
                 }
+                if let Some(cx) = center_x_bevy {
+                    if cx < 0.0 {
+                        return Some(Self::LeftArm);
+                    }
+                }
+                Some(Self::RightArm)
             }
             "legs" => Some(Self::Legs),
             _ => None,
@@ -219,7 +251,200 @@ impl PlacedDecal {
 #[derive(Serialize, Deserialize)]
 struct SavedDesignDecals {
     version: u32,
+    #[serde(default)]
+    emblem_key: Option<String>,
+    #[serde(default)]
+    emblem_override: bool,
     decals: Vec<PlacedDecal>,
+}
+
+/// 360 Left Arm shoulder emblem projector (`0x82b50b10` -> `0x82b502e0` -> `0x82b4f150`,
+/// `0x82495dc0`, `0x82495928`), baked as entry `#32` on [`DecalSlot::LeftArm`].
+#[derive(Clone, Copy, Debug)]
+pub struct ShoulderEmblemProjector {
+    pub origin: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+    pub forward: Vec3,
+    pub half_w: f32,
+    pub half_h: f32,
+    pub depth: f32,
+}
+
+/// Builds the 360 Left Arm shoulder emblem projector in AC rest space from `param/acvparts.bin`
+/// Category 2 (`0x82b4f150`: `+0x28..+0x40` pos/rot/ortho, `+0x117..+0x118` u8 scales) and the
+/// `l_kata` bone's rest-pose transform (`inverse_bindpose.inverse()`).
+///
+/// Verified against live Xenia traces of `0x82495dc0` / `0x82465600` (`arm_id = 311, 5110`):
+/// - `M_local` is D3DX row-vector `RotX(rx) * RotZ(rz) * RotY(ry)` with row 3 `(px, py, pz, 1)`.
+/// - `M_world = inv(l_kata) * M_local`, `M_view = Translation(0, 0, +10)`, `M_proj = OrthoLH(ortho, ortho, 0.1, 100)`.
+/// - In column-vector math, `p_proj = (Ry(ry) * Rz(rz) * Rx(rx)) * p_lkata + pos`.
+/// - `scale_x = (sx_u8 + 1) / 256.0`, `scale_y = (sy_u8 + 1) / 256.0` (`0x82495928`).
+pub fn build_shoulder_emblem_projector(
+    arms_id: i16,
+    l_kata_rest: Mat4,
+    left_arm_meshes: &[&CachedPartMesh],
+) -> Option<ShoulderEmblemProjector> {
+    if arms_id <= 0 {
+        return None;
+    }
+    let id = arms_id as i64;
+    let ortho = acvd_data::part_field(id, 2, "emblem_ortho") as f32;
+    if ortho <= 0.01 {
+        return None;
+    }
+    let pos = Vec3::new(
+        acvd_data::part_field(id, 2, "emblem_pos_x") as f32,
+        acvd_data::part_field(id, 2, "emblem_pos_y") as f32,
+        acvd_data::part_field(id, 2, "emblem_pos_z") as f32,
+    );
+    let rx = acvd_data::part_field(id, 2, "emblem_rot_x") as f32;
+    let ry = acvd_data::part_field(id, 2, "emblem_rot_y") as f32;
+    let rz = acvd_data::part_field(id, 2, "emblem_rot_z") as f32;
+    let sx_u8 = acvd_data::part_field(id, 2, "emblem_scale_x") as u8;
+    let sy_u8 = acvd_data::part_field(id, 2, "emblem_scale_y") as u8;
+
+    // 360 `0x82495928`: scale = (byte + 1) * 0.00390625 (1/256), applied to `ortho`.
+    let scale_x = (sx_u8 as f32 + 1.0) / 256.0;
+    let scale_y = (sy_u8 as f32 + 1.0) / 256.0;
+    let half_w = (ortho * scale_x * 0.5).max(0.05);
+    let half_h = (ortho * scale_y * 0.5).max(0.05);
+
+    // 360 `0x82495dc0` / `0x82465600`: D3DX row-vector `M_local = RotX(rx) * RotZ(rz) * RotY(ry)`
+    // with row 3 = `(px, py, pz, 1)`. Since D3DX LH rotation by `+a` equals glam RH rotation by
+    // `-a`, `m_local = Rx(-rx) * Rz(-rz) * Ry(-ry)` is the exact 3x3 of `M_local`.
+    // In `v_proj = v_lkata * M_local + pos`, the projector's (u, v) axes in unmirrored FLVER
+    // `l_kata`-local space are columns 0 and 1 of `M_local`, and the center ray `v_proj.xy = 0`
+    // passes through `u_flver * (-pos.x) + v_flver * (-pos.y)`.
+    let m_local =
+        Mat3::from_rotation_x(-rx) * Mat3::from_rotation_z(-rz) * Mat3::from_rotation_y(-ry);
+    let u_flver = (m_local * Vec3::X).normalize_or(Vec3::X);
+    let v_flver = (m_local * Vec3::Y).normalize_or(Vec3::Y);
+    // In 360 `0x82465600`, `M_proj` is `OrthoLH` (+Z into screen, camera looking along `+w_flver`),
+    // so the outward surface normal facing the projector camera is `-w_flver` (`-Z` front for
+    // `ry = 0°`, `+X` outer left for `ry = +90°`, `+Z` back for `ry = 180°`).
+    let fwd_flver = (-(m_local * Vec3::Z)).normalize_or(Vec3::NEG_Z);
+    let center_flver = u_flver * (-pos.x) + v_flver * (-pos.y);
+
+    // Regular arm FLVERs (`is_weapon_arm == 0`) are authored horizontal in bind pose (hand along
+    // `-Z`, shoulder top along `+Z`, front along `+Y`); in standing/garage pose the arm rotates
+    // `Rx(-90°)` around `l_kata` so `-Z` hangs down to `-Y` and `+Y` faces front (`-Z`). Since
+    // `CachedPartMesh` stores bind-pose vertices, rotate the upright projector by the inverse
+    // `Rx(+90°)` about `l_kata` into bind pose. Most weapon arms (`is_weapon_arm != 0`) are
+    // already upright in bind pose, except horizontal weapon arms like `am7420` (`7410`/`7420`):
+    // probe `IDENTITY` first and fall back to `Rx(+90°)` if no front-facing UV1 triangle is hit.
+    let is_weapon_arm = acvd_data::part_field(id, 2, "is_weapon_arm") != 0.0;
+    let mirror = |v: Vec3| Vec3::new(-v.x, v.y, v.z);
+    let build_for = |to_bind: Mat3| -> (ShoulderEmblemProjector, bool) {
+        let center_rest = l_kata_rest.transform_point3(to_bind * mirror(center_flver));
+        let forward = l_kata_rest
+            .transform_vector3(to_bind * mirror(fwd_flver))
+            .normalize_or(Vec3::Z);
+        let up_raw = l_kata_rest
+            .transform_vector3(to_bind * mirror(v_flver))
+            .normalize_or(Vec3::Y);
+        let right = up_raw.cross(forward).normalize_or(Vec3::X);
+        let up = forward.cross(right).normalize_or(Vec3::Y);
+
+        let ray_start = center_rest + forward * 5.0;
+        let ray_dir = -forward;
+        let mut best_t = f32::INFINITY;
+        let mut hit_uv1 = false;
+        for mesh in left_arm_meshes {
+            for tri in mesh.indices.chunks_exact(3) {
+                let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                let (n0, n1, n2) = (mesh.normals[i0], mesh.normals[i1], mesh.normals[i2]);
+                if n0.dot(forward) <= 0.08 && n1.dot(forward) <= 0.08 && n2.dot(forward) <= 0.08 {
+                    continue;
+                }
+                let v0 = mesh.positions[i0];
+                let v1 = mesh.positions[i1];
+                let v2 = mesh.positions[i2];
+                if let Some((t, _, _)) = ray_triangle(ray_start, ray_dir, v0, v1, v2) {
+                    if t > 0.1 && t < best_t {
+                        best_t = t;
+                        let (u0, u1, u2) = (mesh.uv1[i0], mesh.uv1[i1], mesh.uv1[i2]);
+                        let area = ((u1.x - u0.x) * (u2.y - u0.y)
+                            - (u2.x - u0.x) * (u1.y - u0.y))
+                        .abs();
+                        hit_uv1 = area > 1e-6;
+                    }
+                }
+            }
+        }
+
+        let (origin, depth) = if best_t.is_finite() && best_t < 20.0 {
+            (ray_start + ray_dir * best_t, 0.55)
+        } else {
+            // Center ray hit a seam/gap: take the frontmost front-facing vertex depth inside the
+            // ortho frustum, projected onto the center ray so lateral (u, v) stays exact.
+            let mut front_t = f32::INFINITY;
+            for mesh in left_arm_meshes {
+                for (&p, &n) in mesh.positions.iter().zip(mesh.normals.iter()) {
+                    if n.dot(forward) < 0.08 {
+                        continue;
+                    }
+                    let rel = p - ray_start;
+                    let depth_along = rel.dot(ray_dir);
+                    if depth_along <= 0.1 || depth_along > 20.0 {
+                        continue;
+                    }
+                    let u = rel.dot(right).abs();
+                    let v = rel.dot(up).abs();
+                    if u <= half_w * 1.25 && v <= half_h * 1.25 && depth_along < front_t {
+                        front_t = depth_along;
+                    }
+                }
+            }
+            if front_t.is_finite() {
+                (ray_start + ray_dir * front_t, 0.65)
+            } else {
+                let mut any_t = f32::INFINITY;
+                for mesh in left_arm_meshes {
+                    for (&p, &n) in mesh.positions.iter().zip(mesh.normals.iter()) {
+                        if n.dot(forward) < 0.08 {
+                            continue;
+                        }
+                        let depth_along = (p - ray_start).dot(ray_dir);
+                        if depth_along > 0.1 && depth_along < any_t {
+                            any_t = depth_along;
+                        }
+                    }
+                }
+                if any_t.is_finite() {
+                    (ray_start + ray_dir * any_t, 1.0)
+                } else {
+                    (center_rest, 2.0)
+                }
+            }
+        };
+
+        (
+            ShoulderEmblemProjector {
+                origin,
+                right,
+                up,
+                forward,
+                half_w,
+                half_h,
+                depth,
+            },
+            hit_uv1,
+        )
+    };
+
+    let rx90 = Mat3::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    if is_weapon_arm {
+        let (proj_id, hit_id) = build_for(Mat3::IDENTITY);
+        if hit_id {
+            Some(proj_id)
+        } else {
+            let (proj_rot, hit_rot) = build_for(rx90);
+            Some(if hit_rot { proj_rot } else { proj_id })
+        }
+    } else {
+        Some(build_for(rx90).0)
+    }
 }
 
 /// Cached rest-pose + skinning data for one AC mesh so we can raycast against the live animated AC
@@ -299,9 +524,11 @@ impl CachedPartMesh {
 #[derive(Resource, Default)]
 pub struct DecalMeshCache {
     pub meshes: Vec<CachedPartMesh>,
+    /// 360 Left Arm shoulder emblem projector (`0x82b4f150`), rebuilt when `main::show` spawns the AC.
+    pub shoulder_emblem: Option<ShoulderEmblemProjector>,
 }
 
-/// Persistent Decal Editor & Runtime State (shared seamlessly between Garage and AC TEST Sortie).
+/// Persistent Decal & AC Emblem Editor / Runtime State (shared between Garage and AC TEST Sortie).
 #[derive(Resource)]
 pub struct DecalState {
     /// Per-slot GPU `g_AC_DecalMap` handles (`0..5`, bound into `AcPaint::decal_map`).
@@ -320,7 +547,20 @@ pub struct DecalState {
     pub place_new_mode: bool,
     /// Active brush image key (`custom:...` or `emblem:...`).
     pub active_image_key: Option<String>,
-    /// Active library tab in the Garage Decal panel (`Custom` vs `360 Emblems`).
+    /// Active AC Emblem (`assembly_data + 0x5e98`, slot `0xa` = 10, `0x82331b18` / `0x824669d8`),
+    /// separate from user decals: projected onto Left Arm shoulder (`0x82b50b10` entry #32) and
+    /// displayed on the 3D Garage Workshop banner (`0x825d3978`, `"emblem"` / `"im999"` / `"im9999"`).
+    pub ac_emblem_key: Option<String>,
+    /// Default retail 360 emblem key from `AcAssemblyDesignSt.emblem_id` (`+0x50`).
+    pub default_emblem_key: Option<String>,
+    /// True when the user explicitly overrode the design's default emblem (including clearing it).
+    pub emblem_override: bool,
+    /// Live GPU texture for the active AC Emblem (UI preview + 3D garage `mtd="emblem"` banners).
+    /// Image-top = row 0. Hangar FLVER UVs match this convention (verified on `menu1000`).
+    pub emblem_texture: Handle<Image>,
+    /// True when `emblem_texture` needs uploading after an emblem change.
+    pub emblem_texture_dirty: bool,
+    /// Active library tab in the Garage Decal/Emblem panel (`Custom` vs `360 Emblems`).
     pub library_tab: DecalLibraryTab,
     /// Scroll page in the emblem/custom thumbnail grid.
     pub library_page: usize,
@@ -339,6 +579,8 @@ pub struct DecalState {
     pub loaded_design_id: Option<u32>,
     /// Optional CLI `--decal <path>` queued to auto-stamp on first AC spawn (for testing / `--shot`).
     pub cli_decal: Option<PathBuf>,
+    /// Optional CLI `--emblem <path|emblem:imXXXX|none>` queued to set on first AC spawn.
+    pub cli_emblem: Option<String>,
     /// True once GPU slot textures and user `decals/` folder have been initialized.
     initialized: bool,
     /// Pending async result from the native OS file picker thread.
@@ -364,7 +606,7 @@ pub struct SurfaceHit {
 }
 
 impl DecalState {
-    pub fn new(cli_decal: Option<PathBuf>) -> Self {
+    pub fn new(cli_decal: Option<PathBuf>, cli_emblem: Option<String>) -> Self {
         let mut disc_emblems: Vec<DiscEmblemEntry> = acvd_data::generated::textures::IMAGE
             .iter()
             .filter(|t| t.pack.starts_with("image/emblem/"))
@@ -386,6 +628,11 @@ impl DecalState {
             dragging: false,
             place_new_mode: false,
             active_image_key: None,
+            ac_emblem_key: None,
+            default_emblem_key: None,
+            emblem_override: false,
+            emblem_texture: Handle::default(),
+            emblem_texture_dirty: true,
             library_tab: DecalLibraryTab::Custom,
             library_page: 0,
             custom_assets: Vec::new(),
@@ -397,6 +644,7 @@ impl DecalState {
             brush_tint: [255, 255, 255, 255],
             loaded_design_id: None,
             cli_decal,
+            cli_emblem,
             initialized: false,
             picker_rx: None,
             last_hover: None,
@@ -411,6 +659,8 @@ impl DecalState {
         self.initialized = true;
         self.slot_textures =
             std::array::from_fn(|_| images.add(crate::paint::empty_decal_image()));
+        self.emblem_texture = images.add(blank_emblem_image());
+        self.emblem_texture_dirty = true;
         self.scan_user_dir(images);
         if self.active_image_key.is_none() {
             if let Some(first) = self.custom_assets.first() {
@@ -420,6 +670,37 @@ impl DecalState {
                 self.library_tab = DecalLibraryTab::Emblems;
             }
         }
+    }
+
+    /// Sets the active AC Emblem (`assembly_data + 0x5e98`, separate from user decals), marks
+    /// `DecalSlot::LeftArm` and the 3D Garage Workshop emblem texture dirty, and persists if asked.
+    pub fn set_ac_emblem(&mut self, key: Option<String>, save: bool) {
+        self.ac_emblem_key = key;
+        self.emblem_override = true;
+        self.emblem_texture_dirty = true;
+        self.mark_slot_dirty(DecalSlot::LeftArm, true);
+        if save {
+            if let Some(did) = self.loaded_design_id {
+                self.save_for_design(did);
+            }
+        }
+    }
+
+    /// Resets the AC's emblem back to the current design's retail 360 `AcAssemblyDesignSt.emblem_id`.
+    pub fn reset_ac_emblem_to_default(&mut self) {
+        self.emblem_override = false;
+        self.ac_emblem_key = self.default_emblem_key.clone();
+        self.emblem_texture_dirty = true;
+        self.mark_slot_dirty(DecalSlot::LeftArm, true);
+        if let Some(did) = self.loaded_design_id {
+            self.save_for_design(did);
+        }
+    }
+
+    /// Returns the already-loaded [`DecalAsset`] for the active AC Emblem, if any.
+    pub fn active_emblem_asset(&self) -> Option<&DecalAsset> {
+        let key = self.ac_emblem_key.as_deref()?;
+        self.peek_asset(key)
     }
 
     pub fn slot_handle(&self, slot: DecalSlot) -> Handle<Image> {
@@ -662,19 +943,22 @@ impl DecalState {
         true
     }
 
-    /// Saves the current design's decal layers to `decals/layouts/design_{id}.json`.
+    /// Saves the current design's decal layers and custom emblem choice to
+    /// `decals/layouts/design_{id}.json`.
     pub fn save_for_design(&self, design_id: u32) {
         let dir = Path::new(USER_DECAL_DIR).join("layouts");
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
         let path = dir.join(format!("design_{design_id}.json"));
-        if self.layers.is_empty() {
+        if self.layers.is_empty() && !self.emblem_override {
             let _ = std::fs::remove_file(&path);
             return;
         }
         let payload = SavedDesignDecals {
-            version: 1,
+            version: 2,
+            emblem_key: self.ac_emblem_key.clone(),
+            emblem_override: self.emblem_override,
             decals: self.layers.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&payload) {
@@ -682,12 +966,21 @@ impl DecalState {
         }
     }
 
-    /// Loads saved decal layers for `design_id` if present.
-    pub fn load_for_design(&mut self, design_id: u32) {
+    /// Loads saved decal layers and AC emblem for `design_id`, falling back to the design's
+    /// retail 360 `AcAssemblyDesignSt.emblem_id` (`+0x50`, `0x82331b18`) when not overridden.
+    pub fn load_for_design(&mut self, design_id: u32, default_emblem_id: u16) {
         self.loaded_design_id = Some(design_id);
         self.layers.clear();
         self.selected_id = None;
         self.dragging = false;
+
+        let default_key = (default_emblem_id > 0)
+            .then(|| format!("emblem:im{default_emblem_id:04}"))
+            .filter(|k| self.disc_emblems.iter().any(|e| &e.key == k));
+        self.default_emblem_key = default_key.clone();
+        self.ac_emblem_key = default_key;
+        self.emblem_override = false;
+
         let path = Path::new(USER_DECAL_DIR)
             .join("layouts")
             .join(format!("design_{design_id}.json"));
@@ -696,8 +989,13 @@ impl DecalState {
                 self.next_id = saved.decals.iter().map(|d| d.id).max().unwrap_or(0) + 1;
                 self.layers = saved.decals;
                 self.selected_id = self.layers.last().map(|d| d.id);
+                if saved.emblem_override {
+                    self.emblem_override = true;
+                    self.ac_emblem_key = saved.emblem_key;
+                }
             }
         }
+        self.emblem_texture_dirty = true;
         self.mark_all_dirty(true);
     }
 
@@ -736,6 +1034,13 @@ fn rgba_to_ui_image(pixels: &[u8], width: u32, height: u32) -> Image {
         ..default()
     });
     img
+}
+
+/// Stable blank AC Emblem GPU image (`Rgba8UnormSrgb`, 256×256). Must match
+/// [`rgba_to_ui_image`] so in-place updates of `DecalState::emblem_texture` never change format
+/// (Bevy can keep the old 1×1 `Rgba8Unorm` render asset if the format flips on first write).
+fn blank_emblem_image() -> Image {
+    rgba_to_ui_image(&vec![0u8; 256 * 256 * 4], 256, 256)
 }
 
 fn load_disc_emblem(
@@ -1118,12 +1423,14 @@ fn rasterize_projector_into_uv1(
     }
 }
 
-/// Bakes all decals affecting `slot` into a premultiplied sRGB RGBA8 texture buffer (`size × size`).
+/// Bakes all decals affecting `slot` (plus the 360 Left Arm shoulder emblem entry `#32` when
+/// `slot == DecalSlot::LeftArm`) into a premultiplied sRGB RGBA8 texture buffer (`size × size`).
 pub fn bake_slot_pixels(
     slot: DecalSlot,
     size: u32,
     cache: &DecalMeshCache,
     layers: &[PlacedDecal],
+    shoulder_emblem: Option<(&ShoulderEmblemProjector, &DecalAsset)>,
     resolve: &mut dyn FnMut(&str) -> Option<DecalAsset>,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; (size * size * 4) as usize];
@@ -1191,6 +1498,42 @@ pub fn bake_slot_pixels(
                 decal.opacity,
                 decal.tint,
                 !decal.flip_h,
+            );
+        }
+    }
+
+    // 360 `0x82b50b10` -> `0x82b502e0` -> `0x82b4f150` / `0x82465600` (entry #32 on slot 3):
+    // project the AC's active Emblem onto the Left Arm shoulder after user decals `0..31`.
+    if slot == DecalSlot::LeftArm {
+        if let Some((proj, asset)) = shoulder_emblem {
+            let aspect = asset.aspect();
+            let (half_w, half_h) = if aspect >= 1.0 {
+                (proj.half_w, (proj.half_h / aspect).max(0.03))
+            } else {
+                ((proj.half_w * aspect).max(0.03), proj.half_h)
+            };
+            stamp_id = stamp_id.wrapping_add(1).max(1);
+            // 360 entry `#32`: keep projector `up` (do not negate). Disc probe on am0410 /
+            // design 5001 (`probe_shoulder_emblem_orientation_on_real_arms`) shows image-top
+            // correlates with `+plate_up` only when `up` is left unflipped; `-up` is upside-down
+            // on the shoulder plate. Hangar `mtd="emblem"` binds `emblem_texture` as-is.
+            rasterize_projector_into_uv1(
+                &mut buf,
+                &mut stamped,
+                stamp_id,
+                size,
+                &slot_meshes,
+                asset,
+                proj.origin,
+                proj.right,
+                proj.up,
+                proj.forward,
+                half_w,
+                half_h,
+                proj.depth,
+                1.0,
+                [255, 255, 255, 255],
+                false,
             );
         }
     }
@@ -1391,20 +1734,31 @@ pub fn handle_imports(
                 let name = decals
                     .peek_asset(&key)
                     .map(|a| a.label.clone())
-                    .unwrap_or(key);
-                if garage_state.screen != GarageScreen::Paint
-                    || garage_state.paint_tab != PaintTab::Decals
+                    .unwrap_or_else(|| key.clone());
+                if garage_state.screen == GarageScreen::Paint
+                    && garage_state.paint_tab == PaintTab::Emblem
                 {
-                    garage_state.screen = GarageScreen::Paint;
-                    garage_state.paint_tab = PaintTab::Decals;
-                    garage_state.cam_manual_orbit = false;
+                    decals.set_ac_emblem(Some(key), true);
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_OK);
+                    garage_state.set_banner(
+                        format!("SET CUSTOM EMBLEM \"{name}\" ON AC & GARAGE!"),
+                        Color::srgb(0.45, 0.92, 0.62),
+                    );
+                } else {
+                    if garage_state.screen != GarageScreen::Paint
+                        || garage_state.paint_tab != PaintTab::Decals
+                    {
+                        garage_state.screen = GarageScreen::Paint;
+                        garage_state.paint_tab = PaintTab::Decals;
+                        garage_state.cam_manual_orbit = false;
+                    }
+                    decals.place_new_mode = true;
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_OK);
+                    garage_state.set_banner(
+                        format!("IMPORTED DECAL \"{name}\" — click & drag on AC to place!"),
+                        Color::srgb(0.45, 0.92, 0.62),
+                    );
                 }
-                decals.place_new_mode = true;
-                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_OK);
-                garage_state.set_banner(
-                    format!("IMPORTED DECAL \"{name}\" — click & drag on AC to place!"),
-                    Color::srgb(0.45, 0.92, 0.62),
-                );
             }
             Err(e) => {
                 warn!("decal import failed: {e:#}");
@@ -1757,8 +2111,10 @@ pub fn interact_and_gizmo(
     }
 }
 
-/// System: rebakes any dirty `g_AC_DecalMap` slot textures and handles optional CLI `--decal`
-/// auto-stamping (for automated visual verification via `--shot`).
+/// System: rebakes any dirty `g_AC_DecalMap` slot textures, updates the active AC Emblem
+/// (`assembly_data + 0x5e98`, Left Arm shoulder #32 + Garage Workshop `mtd="emblem"` banner),
+/// and handles optional CLI `--decal` / `--emblem` overrides (for testing / `--shot`).
+#[allow(clippy::too_many_arguments)]
 pub fn sync_bakes(
     garage: Res<crate::Garage>,
     mut garage_state: ResMut<GarageState>,
@@ -1766,18 +2122,58 @@ pub fn sync_bakes(
     cache: Res<DecalMeshCache>,
     mut images: ResMut<Assets<Image>>,
     mut paint_materials: ResMut<Assets<crate::paint::AcPaintMaterial>>,
+    mut env_materials: ResMut<Assets<crate::env::EnvMaterial>>,
+    mut std_materials: ResMut<Assets<StandardMaterial>>,
+    emblem_banners: Query<
+        (
+            Option<&MeshMaterial3d<crate::env::EnvMaterial>>,
+            Option<&MeshMaterial3d<StandardMaterial>>,
+        ),
+        With<GarageEmblemBanner>,
+    >,
+    shot: Option<Res<acvd_render::app::ShotMark>>,
+    mut emblem_shot_logged: Local<bool>,
 ) {
     decals.init_assets(&mut images);
 
-    // Load saved decals whenever the active design changes.
-    let design_id = garage
+    // Load saved decals & AC emblem whenever the active design changes.
+    let (design_id, default_emblem_id) = garage
         .designs
         .get(garage.current)
-        .map(|r| r.id)
-        .unwrap_or(0);
+        .map(|r| (r.id, r.data.emblem_id))
+        .unwrap_or((0, 0));
     if decals.loaded_design_id != Some(design_id) && !cache.meshes.is_empty() {
-        decals.load_for_design(design_id);
+        decals.load_for_design(design_id, default_emblem_id);
         garage_state.ui_dirty = true;
+    }
+
+    // Handle `--emblem <path|emblem:imXXXX|none>` CLI override once meshes are ready.
+    if let Some(cli_emblem) = decals.cli_emblem.take() {
+        if !cache.meshes.is_empty() {
+            let trimmed = cli_emblem.trim();
+            if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("clear") {
+                decals.set_ac_emblem(None, false);
+                garage_state.ui_dirty = true;
+            } else if let Some(emblem_name) = trimmed.strip_prefix("emblem:") {
+                let key = format!("emblem:{emblem_name}");
+                if decals.ensure_emblem(&garage.disc, &key, &mut images).is_some() {
+                    decals.set_ac_emblem(Some(key), false);
+                    garage_state.ui_dirty = true;
+                } else {
+                    warn!("--emblem unknown 360 emblem `{emblem_name}`");
+                }
+            } else {
+                match decals.import_image_file(Path::new(trimmed), &mut images) {
+                    Ok(key) => {
+                        decals.set_ac_emblem(Some(key), false);
+                        garage_state.ui_dirty = true;
+                    }
+                    Err(e) => warn!("--emblem {trimmed}: {e:#}"),
+                }
+            }
+        } else {
+            decals.cli_emblem = Some(cli_emblem);
+        }
     }
 
     // Handle `--decal <path>` CLI auto-stamp onto the AC Core chest once meshes are ready.
@@ -1830,6 +2226,81 @@ pub fn sync_bakes(
         }
     }
 
+    // Resolve the active AC Emblem asset and update the shared 3D Garage Workshop emblem texture
+    // (`0x825d3978`: overrides `"emblem"` / `"im999"` / `"im9999"` on `menuXXXX.flv`).
+    let active_emblem_asset = if let Some(key) = decals.ac_emblem_key.clone() {
+        decals.resolve_asset(&garage.disc, &key, &mut images)
+    } else {
+        None
+    };
+
+    if decals.emblem_texture_dirty {
+        decals.emblem_texture_dirty = false;
+        let emblem_handle = decals.emblem_texture.clone();
+        if let Some(mut img) = images.get_mut(&emblem_handle) {
+            *img = match &active_emblem_asset {
+                Some(asset) => rgba_to_ui_image(&asset.rgba, asset.width, asset.height),
+                None => blank_emblem_image(),
+            };
+        }
+        // Prefer tagged hangar banner entities (`GarageEmblemBanner`) so a custom upload always
+        // rebinds even when the workshop was first drawn against a blank/default handle.
+        let mut rebound = 0usize;
+        for (env_mat, std_mat) in &emblem_banners {
+            if let Some(MeshMaterial3d(handle)) = env_mat {
+                if let Some(mut m) = env_materials.get_mut(handle) {
+                    m.base.base_color_texture = Some(emblem_handle.clone());
+                    rebound += 1;
+                }
+            }
+            if let Some(MeshMaterial3d(handle)) = std_mat {
+                if let Some(mut m) = std_materials.get_mut(handle) {
+                    m.base_color_texture = Some(emblem_handle.clone());
+                    rebound += 1;
+                }
+            }
+        }
+        if rebound == 0 {
+            // Workshop not spawned yet (or spawned before this marker existed) — force respawn.
+            garage_state.spawned_workshop = None;
+        }
+        garage_state.ui_dirty = true;
+    }
+
+    // Live `--shot` probe: emblem key + shoulder projector basis (filter `SHOT emblem`).
+    if !*emblem_shot_logged {
+        if let Some(mark) = shot.as_ref() {
+            if mark.path.is_some() {
+                *emblem_shot_logged = true;
+                let proj = cache.shoulder_emblem.as_ref();
+                eprintln!(
+                    "SHOT emblem key={} override={} banners={} proj={}",
+                    decals.ac_emblem_key.as_deref().unwrap_or("-"),
+                    decals.emblem_override,
+                    emblem_banners.iter().count(),
+                    proj
+                        .map(|p| {
+                            format!(
+                                "o=({:.2},{:.2},{:.2}) up=({:.2},{:.2},{:.2}) fwd=({:.2},{:.2},{:.2}) half=({:.2},{:.2})",
+                                p.origin.x,
+                                p.origin.y,
+                                p.origin.z,
+                                p.up.x,
+                                p.up.y,
+                                p.up.z,
+                                p.forward.x,
+                                p.forward.y,
+                                p.forward.z,
+                                p.half_w,
+                                p.half_h
+                            )
+                        })
+                        .unwrap_or_else(|| "none".into())
+                );
+            }
+        }
+    }
+
     if cache.meshes.is_empty() {
         return;
     }
@@ -1844,10 +2315,19 @@ pub fn sync_bakes(
         let Some(res) = decals.dirty_slots[slot.index()].take() else {
             continue;
         };
-        let has_any = decals
-            .layers
-            .iter()
-            .any(|l| l.slot == slot || (l.mirror_x && l.slot.mirrored_slot() == slot));
+        let shoulder_emblem = if slot == DecalSlot::LeftArm {
+            cache
+                .shoulder_emblem
+                .as_ref()
+                .zip(active_emblem_asset.as_ref())
+        } else {
+            None
+        };
+        let has_any = shoulder_emblem.is_some()
+            || decals
+                .layers
+                .iter()
+                .any(|l| l.slot == slot || (l.mirror_x && l.slot.mirrored_slot() == slot));
 
         let handle = decals.slot_textures[slot.index()].clone();
         if !has_any {
@@ -1864,9 +2344,14 @@ pub fn sync_bakes(
                     }
                 }
             }
-            let pixels = bake_slot_pixels(slot, res, &cache, &decals.layers, &mut |k| {
-                local_assets.get(k).cloned()
-            });
+            let pixels = bake_slot_pixels(
+                slot,
+                res,
+                &cache,
+                &decals.layers,
+                shoulder_emblem,
+                &mut |k| local_assets.get(k).cloned(),
+            );
             if let Some(mut img) = images.get_mut(&handle) {
                 let mut updated = Image::new(
                     Extent3d {
@@ -1978,6 +2463,415 @@ mod tests {
                 joints: Vec::new(),
                 inverse_bindposes: Vec::new(),
             }],
+            shoulder_emblem: None,
+        }
+    }
+
+    #[test]
+    fn shoulder_emblem_bakes_as_left_arm_entry_after_user_decals() {
+        let mut cache = test_quad_cache(DecalSlot::LeftArm);
+        cache.shoulder_emblem = Some(ShoulderEmblemProjector {
+            origin: Vec3::ZERO,
+            right: Vec3::X,
+            up: Vec3::Y,
+            forward: Vec3::Z,
+            half_w: 0.35,
+            half_h: 0.35,
+            depth: 0.5,
+        });
+        let emblem = solid_asset("emblem:im0001", [20, 220, 60, 255]);
+        let buf = bake_slot_pixels(
+            DecalSlot::LeftArm,
+            64,
+            &cache,
+            &[],
+            cache
+                .shoulder_emblem
+                .as_ref()
+                .map(|p| (p, &emblem)),
+            &mut |_| None,
+        );
+        let mid = ((32 * 64 + 32) * 4) as usize;
+        assert!(
+            buf[mid + 1] > 180 && buf[mid + 3] > 200,
+            "expected green shoulder emblem at LeftArm UV1 center, got {:?}",
+            &buf[mid..mid + 4]
+        );
+    }
+
+    /// Red-top / blue-bottom 2×2 for orientation probes.
+    fn red_top_blue_bottom_asset() -> DecalAsset {
+        DecalAsset {
+            key: "custom:rb".into(),
+            label: "rb".into(),
+            width: 2,
+            height: 2,
+            rgba: Arc::new(vec![
+                255, 0, 0, 255, // top-left
+                255, 0, 0, 255, // top-right
+                0, 0, 255, 255, // bottom-left
+                0, 0, 255, 255, // bottom-right
+            ]),
+            thumb: Handle::default(),
+        }
+    }
+
+    /// Loads Left Arm UV1 meshes + `l_kata` rest for an arms part id / design, matching `main::show`.
+    fn load_left_arm_cache(
+        disc: &Disc,
+        design_id: u32,
+    ) -> Option<(i16, Mat4, DecalMeshCache, ShoulderEmblemProjector)> {
+        let row = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == design_id)?;
+        let built = crate::assemble::assemble(
+            acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS,
+            &row.data,
+        );
+        let arm_place = built.placements.iter().find(|p| p.column == "arms")?;
+        let flv_bytes = acvd_formats::vfs::open(disc, arm_place.model.path).ok()?;
+        let flver = acvd_formats::flver::read(&flv_bytes).ok()?;
+        let l_kata = flver
+            .bones
+            .iter()
+            .position(|b| b.name.eq_ignore_ascii_case("l_kata"))?;
+        let t = flver.bones[l_kata].translation;
+        let l_kata_rest = Mat4::from_translation(Vec3::new(-t[0], t[1], t[2]));
+        let world = flver.bone_transforms().ok()?;
+        let mut cache = DecalMeshCache::default();
+        for mesh in &flver.meshes {
+            let root_name = flver
+                .bones
+                .get(mesh.default_bone as usize)
+                .map(|b| b.name.as_str());
+            let Ok(mut verts) = flver.vertices(&flv_bytes, mesh) else {
+                continue;
+            };
+            let bones = flver.vertex_bones(mesh, &verts);
+            flver.to_model_space(mesh, &mut verts, &bones, &world);
+            let mut min_x = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            for p in &verts.positions {
+                let bx = -p[0];
+                min_x = min_x.min(bx);
+                max_x = max_x.max(bx);
+            }
+            let center_x = if min_x.is_finite() {
+                Some(0.5 * (min_x + max_x))
+            } else {
+                None
+            };
+            let Some(slot) = DecalSlot::from_mesh_bounds("arms", root_name, center_x) else {
+                continue;
+            };
+            if slot != DecalSlot::LeftArm {
+                continue;
+            }
+            let Some(uv1) = verts.uvs.get(1).filter(|u| u.len() == verts.positions.len()) else {
+                continue;
+            };
+            let Some(&fs_idx) = mesh.face_sets.first() else {
+                continue;
+            };
+            let Ok(tris) = flver.triangles(&flv_bytes, &flver.face_sets[fs_idx]) else {
+                continue;
+            };
+            if tris.is_empty() {
+                continue;
+            }
+            let positions: Vec<Vec3> = verts
+                .positions
+                .iter()
+                .map(|p| Vec3::new(-p[0], p[1], p[2]))
+                .collect();
+            let normals: Vec<Vec3> = if verts.normals.len() == verts.positions.len() {
+                verts
+                    .normals
+                    .iter()
+                    .map(|n| Vec3::new(-n[0], n[1], n[2]).normalize_or(Vec3::Y))
+                    .collect()
+            } else {
+                vec![Vec3::Y; positions.len()]
+            };
+            cache.meshes.push(CachedPartMesh {
+                slot,
+                positions,
+                normals,
+                uv1: uv1.iter().copied().map(Vec2::from).collect(),
+                indices: tris.into_iter().flat_map(|t| t).collect(),
+                joint_indices: None,
+                joint_weights: None,
+                joints: Vec::new(),
+                inverse_bindposes: Vec::new(),
+            });
+        }
+        if cache.meshes.is_empty() {
+            return None;
+        }
+        let left: Vec<&CachedPartMesh> = cache.meshes.iter().collect();
+        let proj = build_shoulder_emblem_projector(row.data.arms, l_kata_rest, &left)?;
+        Some((row.data.arms, l_kata_rest, cache, proj))
+    }
+
+    /// Mean `world · plate_up` for UV1 texels that baked red (image-top) vs blue (image-bottom).
+    /// Reconstructs world position via UV barycentrics on each triangle (vertices alone miss the
+    /// stamp). Positive `red_mean - blue_mean` ⇒ image-top toward plate `+up`.
+    fn correlate_bake_color_with_plate_up(
+        cache: &DecalMeshCache,
+        buf: &[u8],
+        size: u32,
+        plate_up: Vec3,
+    ) -> (f32, f32, usize, usize, usize) {
+        let mut red_dots = Vec::new();
+        let mut blue_dots = Vec::new();
+        let mut opaque = 0usize;
+        let sf = size as f32;
+        let max_i = (size - 1) as i32;
+        for mesh in &cache.meshes {
+            for tri in mesh.indices.chunks_exact(3) {
+                let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                let (p0, p1, p2) = (mesh.positions[i0], mesh.positions[i1], mesh.positions[i2]);
+                let (uv0, uv1, uv2) = (mesh.uv1[i0], mesh.uv1[i1], mesh.uv1[i2]);
+                let (x0, y0) = (uv0.x * sf, uv0.y * sf);
+                let (x1, y1) = (uv1.x * sf, uv1.y * sf);
+                let (x2, y2) = (uv2.x * sf, uv2.y * sf);
+                let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+                if area.abs() < 1e-5 {
+                    continue;
+                }
+                let inv_area = 1.0 / area;
+                let min_x = (x0.min(x1).min(x2).floor() as i32).clamp(0, max_i);
+                let max_x = (x0.max(x1).max(x2).ceil() as i32).clamp(0, max_i);
+                let min_y = (y0.min(y1).min(y2).floor() as i32).clamp(0, max_i);
+                let max_y = (y0.max(y1).max(y2).ceil() as i32).clamp(0, max_i);
+                for py in min_y..=max_y {
+                    for px in min_x..=max_x {
+                        let at = ((py as u32 * size + px as u32) * 4) as usize;
+                        if at + 3 >= buf.len() || buf[at + 3] < 200 {
+                            continue;
+                        }
+                        let fx = px as f32 + 0.5;
+                        let fy = py as f32 + 0.5;
+                        let w0 = ((x1 - fx) * (y2 - fy) - (x2 - fx) * (y1 - fy)) * inv_area;
+                        let w1 = ((x2 - fx) * (y0 - fy) - (x0 - fx) * (y2 - fy)) * inv_area;
+                        let w2 = 1.0 - w0 - w1;
+                        if w0 < -0.01 || w1 < -0.01 || w2 < -0.01 {
+                            continue;
+                        }
+                        opaque += 1;
+                        let pos = p0 * w0 + p1 * w1 + p2 * w2;
+                        let dot = pos.dot(plate_up);
+                        let r = buf[at] as i16;
+                        let b = buf[at + 2] as i16;
+                        if r > b + 40 {
+                            red_dots.push(dot);
+                        } else if b > r + 40 {
+                            blue_dots.push(dot);
+                        }
+                    }
+                }
+            }
+        }
+        let mean = |v: &[f32]| {
+            if v.is_empty() {
+                f32::NAN
+            } else {
+                v.iter().sum::<f32>() / v.len() as f32
+            }
+        };
+        (
+            mean(&red_dots),
+            mean(&blue_dots),
+            red_dots.len(),
+            blue_dots.len(),
+            opaque,
+        )
+    }
+
+    /// Disc probe: on real am0410 / am0120 Left Arm UV1, measure whether the current emblem bake
+    /// puts image-top toward plate `+up` (upright) or toward `−up` (upside-down). Also probes
+    /// garage `menu1000` emblem UV0 V vs world Y.
+    #[test]
+    fn x360_disc_all_arms_shoulder_emblem_coverage() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let iso = acvd_formats::vfs::default_disc(&root);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).expect("open 360 disc");
+        let mut seen_arms = std::collections::BTreeSet::new();
+        let mut ok_count = 0usize;
+        let mut low_count = 0usize;
+        let mut zero_count = 0usize;
+        let emblem = red_top_blue_bottom_asset();
+        for &(_, rows) in acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES {
+            for r in rows {
+                if !seen_arms.insert(r.data.arms) {
+                    continue;
+                }
+                let Some((aid, _rest, mut cache, proj)) = load_left_arm_cache(&disc, r.id) else {
+                    continue;
+                };
+                cache.shoulder_emblem = Some(proj);
+                let buf = bake_slot_pixels(
+                    DecalSlot::LeftArm,
+                    128,
+                    &cache,
+                    &[],
+                    cache.shoulder_emblem.as_ref().map(|p| (p, &emblem)),
+                    &mut |_| None,
+                );
+                let opaque = buf.chunks_exact(4).filter(|px| px[3] >= 200).count();
+                let is_wa = acvd_data::part_field(aid as i64, 2, "is_weapon_arm") != 0.0;
+                if opaque >= 50 {
+                    ok_count += 1;
+                } else if opaque > 0 {
+                    low_count += 1;
+                    println!("  LOW  arm={aid:4} wa={is_wa} design={:4} opaque={opaque:4} origin={:?}", r.id, proj.origin);
+                } else {
+                    zero_count += 1;
+                    println!("  ZERO arm={aid:4} wa={is_wa} design={:4} opaque=   0 origin={:?}", r.id, proj.origin);
+                }
+            }
+        }
+        println!("ALL-ARMS SWEEP: ok(>=50)={ok_count} low(1..49)={low_count} zero={zero_count}");
+        assert_eq!(zero_count, 0, "every arm in preset designs should bake non-zero emblem coverage");
+        assert!(ok_count >= 50, "expected >=50 arms to bake >=50 emblem texels, got {ok_count}");
+    }
+
+    #[test]
+    fn probe_shoulder_emblem_orientation_on_real_arms() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let iso = acvd_formats::vfs::default_disc(&root);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let emblem = red_top_blue_bottom_asset();
+        let size = 256u32;
+
+        for &design_id in &[6007u32, 5001, 5011] {
+            let Some((arms_id, _rest, mut cache, proj)) = load_left_arm_cache(&disc, design_id)
+            else {
+                println!("design {design_id}: skip (no left arm cache)");
+                continue;
+            };
+            println!(
+                "design {design_id} arms={arms_id}: origin={:?} up={:?} right={:?} fwd={:?} half=({:.3},{:.3})",
+                proj.origin, proj.up, proj.right, proj.forward, proj.half_w, proj.half_h
+            );
+            let plate_up = proj.up;
+            // A) current bake path (`proj.up` as-is)
+            cache.shoulder_emblem = Some(proj);
+            let buf_cur = bake_slot_pixels(
+                DecalSlot::LeftArm,
+                size,
+                &cache,
+                &[],
+                cache.shoulder_emblem.as_ref().map(|p| (p, &emblem)),
+                &mut |_| None,
+            );
+            let (r_cur, b_cur, nr, nb, op_cur) =
+                correlate_bake_color_with_plate_up(&cache, &buf_cur, size, plate_up);
+            println!(
+                "  bake with +up (current): opaque={op_cur} red_mean_up={r_cur:.4} blue_mean_up={b_cur:.4} n=({nr},{nb}) delta_red_minus_blue={:.4}",
+                r_cur - b_cur
+            );
+
+            // B) force −up to confirm the opposite sign
+            let mut proj_flip = proj;
+            proj_flip.up = -proj.up;
+            cache.shoulder_emblem = Some(proj_flip);
+            let buf_neg = bake_slot_pixels(
+                DecalSlot::LeftArm,
+                size,
+                &cache,
+                &[],
+                cache.shoulder_emblem.as_ref().map(|p| (p, &emblem)),
+                &mut |_| None,
+            );
+            let (r_neg, b_neg, nr2, nb2, op_neg) =
+                correlate_bake_color_with_plate_up(&cache, &buf_neg, size, plate_up);
+            println!(
+                "  bake with −up (control): opaque={op_neg} red_mean_up={r_neg:.4} blue_mean_up={b_neg:.4} n=({nr2},{nb2}) delta_red_minus_blue={:.4}",
+                r_neg - b_neg
+            );
+
+            // Upright on the plate = image-top (red) toward +plate_up ⇒ delta > 0.
+            // am0120 (design 5011) often only catches one image half (narrow plate vs ortho),
+            // so the red/blue split may be one-sided — lock orientation on am0410 (5001).
+            let delta_cur = r_cur - b_cur;
+            let delta_neg = r_neg - b_neg;
+            assert!(
+                op_cur > 20 && op_neg > 20,
+                "design {design_id}: expected opaque LeftArm UV1 coverage (cur/neg={op_cur}/{op_neg})"
+            );
+            println!(
+                "  upright needs delta>0: current_+up_ok={} control_-up_ok={} (red/blue n cur=({nr},{nb}) neg=({nr2},{nb2}))",
+                delta_cur > 0.0,
+                delta_neg > 0.0
+            );
+            if nr > 5 && nb > 5 && nr2 > 5 && nb2 > 5 {
+                assert!(
+                    delta_cur > 0.0,
+                    "design {design_id}: current emblem +up bake is UPSIDE-DOWN on the plate \
+                     (delta={delta_cur:.4}); control −up delta={delta_neg:.4}"
+                );
+                assert!(
+                    delta_neg < 0.0,
+                    "design {design_id}: expected −up control to be the upside-down case"
+                );
+            } else {
+                println!(
+                    "  skip ±up assert (partial frustum coverage); am0410/5001 is the lock"
+                );
+            }
+        }
+
+        // Garage hangar `mtd=emblem` UV0: does V increase toward world +Y or −Y?
+        let flv_path = "model/menu/menu1000/menu1000_m.bnd.dcx|menu1000.flv";
+        if let Ok(flv_bytes) = acvd_formats::vfs::open(&disc, flv_path) {
+            if let Ok(flver) = acvd_formats::flver::read(&flv_bytes) {
+                let world = flver.bone_transforms().unwrap_or_default();
+                for (mi, mat) in flver.materials.iter().enumerate() {
+                    if mat.mtd.to_ascii_lowercase() != "emblem" {
+                        continue;
+                    }
+                    for mesh in flver.meshes.iter().filter(|m| m.material as usize == mi) {
+                        let Ok(mut verts) = flver.vertices(&flv_bytes, mesh) else {
+                            continue;
+                        };
+                        let bones = flver.vertex_bones(mesh, &verts);
+                        flver.to_model_space(mesh, &mut verts, &bones, &world);
+                        let Some(uv0) = verts.uvs.first().filter(|u| u.len() == verts.positions.len())
+                        else {
+                            continue;
+                        };
+                        let mut low_v_y = Vec::new();
+                        let mut high_v_y = Vec::new();
+                        for (p, uv) in verts.positions.iter().zip(uv0.iter()) {
+                            let y = p[1]; // FLVER Y before Bevy mirror (X only flips)
+                            if uv[1] < 0.25 {
+                                low_v_y.push(y);
+                            } else if uv[1] > 0.75 {
+                                high_v_y.push(y);
+                            }
+                        }
+                        if low_v_y.is_empty() || high_v_y.is_empty() {
+                            continue;
+                        }
+                        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+                        let lo = mean(&low_v_y);
+                        let hi = mean(&high_v_y);
+                        println!(
+                            "garage menu1000 emblem mat[{mi}]: UV0 v≈0 meanY={lo:.3} v≈1 meanY={hi:.3} \
+                             (v0_higher_in_world={})",
+                            lo > hi
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2037,7 +2931,7 @@ mod tests {
             mirror_x: true,
             flip_h: false,
         };
-        let buf = bake_slot_pixels(DecalSlot::Core, 64, &cache, &[decal], &mut |_| {
+        let buf = bake_slot_pixels(DecalSlot::Core, 64, &cache, &[decal], None, &mut |_| {
             Some(red.clone())
         });
         // Right side (x = +0.25 -> u = 0.75 -> px = 48, py = 32) should be red.
@@ -2088,7 +2982,7 @@ mod tests {
                 flip_h: false,
             },
         ];
-        let buf = bake_slot_pixels(DecalSlot::Head, 32, &cache, &layers, &mut |k| match k {
+        let buf = bake_slot_pixels(DecalSlot::Head, 32, &cache, &layers, None, &mut |k| match k {
             "blue" => Some(blue.clone()),
             "white" => Some(white_half.clone()),
             _ => None,
@@ -2108,7 +3002,7 @@ mod tests {
             return;
         }
         let disc = Disc::open(&iso).unwrap();
-        let state = DecalState::new(None);
+        let state = DecalState::new(None, None);
         assert!(
             state.disc_emblems.len() >= 300,
             "expected ~306 retail 360 emblems, got {}",
@@ -2194,7 +3088,7 @@ mod tests {
             mirror_x: false,
             flip_h: false,
         };
-        let buf = bake_slot_pixels(DecalSlot::Core, 256, &cache, &[layer], &mut |_| {
+        let buf = bake_slot_pixels(DecalSlot::Core, 256, &cache, &[layer], None, &mut |_| {
             Some(asset.clone())
         });
         let opaque_texels = buf.chunks_exact(4).filter(|px| px[3] > 200).count();
@@ -2202,5 +3096,292 @@ mod tests {
             opaque_texels > 150,
             "expected baked UV1 emblem coverage on cr0001 core, got only {opaque_texels} texels"
         );
+    }
+
+    #[test]
+    fn x360_disc_left_arm_bakes_design_shoulder_emblem() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let iso = acvd_formats::vfs::default_disc(&root);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let row = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5011)
+            .expect("design 5011");
+        assert_eq!(row.data.emblem_id, 119);
+        let built = crate::assemble::assemble(
+            acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS,
+            &row.data,
+        );
+        let arm_place = built
+            .placements
+            .iter()
+            .find(|p| p.column == "arms")
+            .expect("arms");
+        let flv_bytes = acvd_formats::vfs::open(&disc, arm_place.model.path).unwrap();
+        let flver = acvd_formats::flver::read(&flv_bytes).unwrap();
+        let l_kata = flver
+            .bones
+            .iter()
+            .position(|b| b.name.eq_ignore_ascii_case("l_kata"))
+            .expect("l_kata");
+        // Root `l_kata` rest in Bevy (X-mirrored) matches `main::show`'s bindpose.inverse() for a
+        // parentless bone with identity rotation.
+        let t = flver.bones[l_kata].translation;
+        let l_kata_rest = Mat4::from_translation(Vec3::new(-t[0], t[1], t[2]));
+
+        let world = flver.bone_transforms().expect("arm bone transforms");
+        let mut cache = DecalMeshCache::default();
+        for mesh in &flver.meshes {
+            let root_name = flver
+                .bones
+                .get(mesh.default_bone as usize)
+                .map(|b| b.name.as_str());
+            let Ok(mut verts) = flver.vertices(&flv_bytes, mesh) else {
+                continue;
+            };
+            let bones = flver.vertex_bones(mesh, &verts);
+            flver.to_model_space(mesh, &mut verts, &bones, &world);
+            let mut min_x = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            for p in &verts.positions {
+                let bx = -p[0];
+                min_x = min_x.min(bx);
+                max_x = max_x.max(bx);
+            }
+            let center_x = if min_x.is_finite() {
+                Some(0.5 * (min_x + max_x))
+            } else {
+                None
+            };
+            let Some(slot) = DecalSlot::from_mesh_bounds("arms", root_name, center_x) else {
+                continue;
+            };
+            if slot != DecalSlot::LeftArm {
+                continue;
+            }
+            let Some(uv1) = verts.uvs.get(1).filter(|u| u.len() == verts.positions.len()) else {
+                continue;
+            };
+            let Some(&fs_idx) = mesh.face_sets.first() else {
+                continue;
+            };
+            let Ok(tris) = flver.triangles(&flv_bytes, &flver.face_sets[fs_idx]) else {
+                continue;
+            };
+            if tris.is_empty() {
+                continue;
+            }
+            // Match `acvd-render::load_from_flver`: model-space then X-mirror into Bevy.
+            let positions: Vec<Vec3> = verts
+                .positions
+                .iter()
+                .map(|p| Vec3::new(-p[0], p[1], p[2]))
+                .collect();
+            let normals: Vec<Vec3> = if verts.normals.len() == verts.positions.len() {
+                verts
+                    .normals
+                    .iter()
+                    .map(|n| Vec3::new(-n[0], n[1], n[2]).normalize_or(Vec3::Y))
+                    .collect()
+            } else {
+                vec![Vec3::Y; positions.len()]
+            };
+            cache.meshes.push(CachedPartMesh {
+                slot,
+                positions,
+                normals,
+                uv1: uv1.iter().copied().map(Vec2::from).collect(),
+                indices: tris.into_iter().flat_map(|t| t).collect(),
+                joint_indices: None,
+                joint_weights: None,
+                joints: Vec::new(),
+                inverse_bindposes: Vec::new(),
+            });
+        }
+        assert!(!cache.meshes.is_empty(), "expected LeftArm UV1 meshes");
+        let left: Vec<&CachedPartMesh> = cache.meshes.iter().collect();
+        let proj = build_shoulder_emblem_projector(row.data.arms, l_kata_rest, &left)
+            .expect("shoulder projector");
+        // Origin must land on/near the Left Arm mesh, not float above it.
+        let mut nearest = f32::INFINITY;
+        for mesh in &cache.meshes {
+            for &p in &mesh.positions {
+                nearest = nearest.min(p.distance(proj.origin));
+            }
+        }
+        assert!(
+            nearest < 0.50,
+            "shoulder projector origin should land on the Left Arm mesh, nearest={nearest:.3}"
+        );
+        cache.shoulder_emblem = Some(proj);
+
+        let state = DecalState::new(None, None);
+        let entry = state
+            .disc_emblems
+            .iter()
+            .find(|e| e.name == "im0119")
+            .expect("im0119");
+        let mut images = Assets::<Image>::default();
+        let asset = load_disc_emblem(&disc, entry, &mut images).expect("decode im0119");
+        let buf = bake_slot_pixels(
+            DecalSlot::LeftArm,
+            256,
+            &cache,
+            &[],
+            cache.shoulder_emblem.as_ref().map(|p| (p, &asset)),
+            &mut |_| None,
+        );
+        let opaque = buf.chunks_exact(4).filter(|px| px[3] > 160).count();
+        assert!(
+            opaque > 20,
+            "expected design 5011 LeftArm shoulder emblem coverage from im0119, got {opaque} texels"
+        );
+    }
+
+    #[test]
+    fn probe_arm_shoulder_emblem_and_garage_emblem_meshes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let iso = acvd_formats::vfs::default_disc(&root);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+
+        // 1. Inspect design 5001 and a few others for emblem_id + arms id
+        for &did in &[5001u32, 5002, 5003, 5011, 5014, 9999] {
+            if let Some(row) = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+                .iter()
+                .flat_map(|(_, rows)| rows.iter())
+                .find(|r| r.id == did)
+            {
+                println!(
+                    "Design {did}: arms={} coloring_id={} emblem_id={} decal_id={}",
+                    row.data.arms, row.data.coloring_id, row.data.emblem_id, row.data.decal_id
+                );
+            }
+        }
+
+        // 2. Inspect acvparts.bin category 2 (Arms) shoulder emblem projector fields (+0x28..+0x40, +0x117..+0x118)
+        let bytes = disc.asset("param/acvparts.bin").unwrap();
+        let parts = acvd_formats::acv_parts::read(&bytes, acvd_formats::acv_parts::record_size).unwrap();
+        let mut shown = 0;
+        for rec in parts.records.iter().filter(|r| r.category == 2) {
+            let d = rec.data;
+            let f = |off: usize| f32::from_be_bytes(d[off..off + 4].try_into().unwrap());
+            let b2 = d[0x117];
+            let b3 = d[0x118];
+            let pos = [f(0x28), f(0x2c), f(0x30)];
+            let rot = [f(0x34), f(0x38), f(0x3c)];
+            let ortho = f(0x40);
+            if shown < 10 || rec.id == 100 || rec.id == 110 || rec.id == 210 {
+                println!(
+                    "Arm id={:4} model={:4} | pos=({:6.3}, {:6.3}, {:6.3}) rot=({:6.3}, {:6.3}, {:6.3}) ortho={:6.3} scale_u8=({},{}) -> ({:.3},{:.3})",
+                    rec.id, rec.model_id,
+                    pos[0], pos[1], pos[2],
+                    rot[0], rot[1], rot[2],
+                    ortho, b2, b3,
+                    (b2 as f32 + 1.0) / 256.0,
+                    (b3 as f32 + 1.0) / 256.0
+                );
+                shown += 1;
+            }
+        }
+
+        // 3. Inspect garage FLVERs for emblem / im999 / im9999 textures & MTDs (+ mesh AABBs)
+        for model_id in [300u16, 310, 1000] {
+            let flv_path = format!(
+                "model/menu/menu{model_id:04}/menu{model_id:04}_m.bnd.dcx|menu{model_id:04}.flv"
+            );
+            if let Ok(flv_bytes) = acvd_formats::vfs::open(&disc, &flv_path) {
+                if let Ok(flver) = acvd_formats::flver::read(&flv_bytes) {
+                    let world = flver.bone_transforms().unwrap_or_default();
+                    println!("=== Garage menu{model_id:04} emblem materials ===");
+                    for (mi, mat) in flver.materials.iter().enumerate() {
+                        let mtd = mat.mtd.to_ascii_lowercase();
+                        let s = mat.texture_index.max(0) as usize;
+                        let e = (s + mat.texture_count.max(0) as usize).min(flver.textures.len());
+                        let texs = &flver.textures[s..e];
+                        let has_emblem = mtd.contains("emblem")
+                            || texs.iter().any(|t| {
+                                let lo = t.path.to_ascii_lowercase();
+                                lo.contains("emblem") || lo.contains("im999")
+                            });
+                        if !has_emblem {
+                            continue;
+                        }
+                        println!(
+                            "  mat[{mi}] name={:?} mtd={:?} textures={:?}",
+                            mat.name,
+                            mat.mtd,
+                            texs.iter().map(|t| (&t.kind, &t.path)).collect::<Vec<_>>()
+                        );
+                        for (mesh_i, mesh) in flver.meshes.iter().enumerate() {
+                            if mesh.material as usize != mi {
+                                continue;
+                            }
+                            let Ok(mut verts) = flver.vertices(&flv_bytes, mesh) else {
+                                continue;
+                            };
+                            let bones = flver.vertex_bones(mesh, &verts);
+                            flver.to_model_space(mesh, &mut verts, &bones, &world);
+                            let mut mn = Vec3::splat(f32::INFINITY);
+                            let mut mx = Vec3::splat(f32::NEG_INFINITY);
+                            for p in &verts.positions {
+                                let v = Vec3::new(-p[0], p[1], p[2]);
+                                mn = mn.min(v);
+                                mx = mx.max(v);
+                            }
+                            println!(
+                                "    mesh[{mesh_i}] verts={} aabb=({:.2},{:.2},{:.2})..({:.2},{:.2},{:.2}) size={:.2}x{:.2}x{:.2}",
+                                verts.positions.len(),
+                                mn.x, mn.y, mn.z, mx.x, mx.y, mx.z,
+                                mx.x - mn.x, mx.y - mn.y, mx.z - mn.z
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Inspect design 5001 (am0410) & design 5011 (am0120) Left Arm bounds + l_kata bone
+        for &did in &[5001u32, 5011] {
+            let row = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+                .iter()
+                .flat_map(|(_, rows)| rows.iter())
+                .find(|r| r.id == did)
+                .unwrap();
+            let built = crate::assemble::assemble(
+                acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS,
+                &row.data,
+            );
+            let arm_place = built.placements.iter().find(|p| p.column == "arms").unwrap();
+            let flv_bytes = acvd_formats::vfs::open(&disc, arm_place.model.path).unwrap();
+            let flver = acvd_formats::flver::read(&flv_bytes).unwrap();
+            println!("=== Design {did} arms ({}) ===", arm_place.model.path);
+            for (bi, b) in flver.bones.iter().enumerate() {
+                if b.name.contains("kata") || bi < 4 {
+                    println!("  bone[{bi}] {:?} parent={} t={:?} r={:?}", b.name, b.parent, b.translation, b.rotation);
+                }
+            }
+            let mut min_v = Vec3::splat(f32::INFINITY);
+            let mut max_v = Vec3::splat(f32::NEG_INFINITY);
+            for mesh in &flver.meshes {
+                let root_name = flver.bones.get(mesh.default_bone as usize).map(|b| b.name.as_str()).unwrap_or("");
+                if root_name.to_ascii_lowercase().starts_with("l_") {
+                    if let Ok(verts) = flver.vertices(&flv_bytes, mesh) {
+                        for p in &verts.positions {
+                            let v = Vec3::from(*p);
+                            min_v = min_v.min(v);
+                            max_v = max_v.max(v);
+                        }
+                    }
+                }
+            }
+            println!("  LeftArm FLVER rest bounds: min={min_v:?} max={max_v:?}");
+        }
     }
 }
