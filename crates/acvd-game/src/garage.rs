@@ -1749,6 +1749,7 @@ pub fn update_camera(
     scroll: Res<AccumulatedMouseScroll>,
     gamepads: Query<&Gamepad>,
     garage: Res<crate::Garage>,
+    cam_override: Option<Res<crate::StartAim>>,
     mut state: ResMut<GarageState>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     action_buttons: Query<(&Interaction, &UiAction)>,
@@ -1862,11 +1863,23 @@ pub fn update_camera(
     }
 
     if !state.cam_initialized {
-        state.cam_yaw = target.yaw;
-        state.cam_pitch = target.pitch;
+        state.cam_yaw = cam_override
+            .as_ref()
+            .and_then(|c| c.yaw)
+            .unwrap_or(target.yaw);
+        state.cam_pitch = cam_override
+            .as_ref()
+            .and_then(|c| c.pitch)
+            .unwrap_or(target.pitch);
         state.cam_dist = target.dist;
         state.cam_focus = desired_focus;
         state.cam_initialized = true;
+        if cam_override
+            .as_ref()
+            .is_some_and(|c| c.yaw.is_some() || c.pitch.is_some())
+        {
+            state.cam_manual_orbit = true;
+        }
     } else if !state.cam_manual_orbit {
         let t = 1.0 - (-8.0 * time.delta_secs()).exp();
         let dyaw = shortest_angle(state.cam_yaw, target.yaw);

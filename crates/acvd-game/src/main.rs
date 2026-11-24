@@ -151,11 +151,11 @@ struct Hud {
 #[derive(Resource)]
 struct StartYaw(f32);
 
-/// Optional explicit gameplay camera overrides (`--yaw` / `--pitch` in radians).
+/// Optional explicit camera overrides (`--yaw` / `--pitch` in radians).
 #[derive(Resource, Default, Clone, Copy)]
-struct StartAim {
-    yaw: Option<f32>,
-    pitch: Option<f32>,
+pub struct StartAim {
+    pub yaw: Option<f32>,
+    pub pitch: Option<f32>,
 }
 
 /// The map whose models are drawn (`None`: draw the hit meshes or the floor plane).
@@ -224,6 +224,8 @@ fn main() {
     let mut start_pause: Option<pause::PauseScreen> = None;
     let mut start_options_tab = settings::OptionsTab::Graphics;
     let mut shadow_dist_override: Option<settings::ShadowDistance> = None;
+    let mut hanger_r_override: Option<i16> = None;
+    let mut hanger_l_override: Option<i16> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -283,6 +285,12 @@ fn main() {
             "--sfx" => preview = args.next().and_then(|s| s.parse::<i32>().ok()),
             "--burst" => burst = args.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1),
             "--no-hud" => no_hud = true,
+            "--hanger-r" => {
+                hanger_r_override = args.next().and_then(|s| s.parse::<i16>().ok());
+            }
+            "--hanger-l" => {
+                hanger_l_override = args.next().and_then(|s| s.parse::<i16>().ok());
+            }
             "--garage" => start_garage = true,
             "--garage-id" => {
                 start_garage = true;
@@ -428,7 +436,13 @@ fn main() {
         eprintln!("no design {id}; starting at the first");
     }
     let initial_row = designs[current];
-    let initial_design = initial_row.data;
+    let mut initial_design = initial_row.data;
+    if let Some(id) = hanger_r_override {
+        initial_design.hanger_r = id;
+    }
+    if let Some(id) = hanger_l_override {
+        initial_design.hanger_l = id;
+    }
     let initial_name = garage::display_design_name(initial_row.id, initial_row.name);
     let initial_color = (!flat)
         .then(|| paint::load_accolor(&disc, initial_design.coloring_id))
@@ -1619,11 +1633,12 @@ fn show(
                 rack_bones[hand as usize].as_ref().and_then(
                     |(rack_i, rack_joints, front, back)| {
                         let _ = (rack_i, rig.local_against(loaded_i, root_bone, *rack_i, *front));
-                        // Attach the bay weapon directly onto the prong joint (`*_hg_f` / `*_hg_b`):
-                        // `a00_011`/`a00_021` already orient the prongs so their +Z/+Y axes match
-                        // `r_armhand`/`l_armhand` at f=40 and f=150, and the prong bone itself sits
-                        // at the rack clamp (avoiding the ~1 m floating offset from un-parented d87).
-                        let local = Transform::IDENTITY;
+                        // Attach the bay weapon onto the prong joint (`*_hg_f` / `*_hg_b`) with
+                        // the FLVER dummy 87/88/85/86 flag-4 orientation (`fwd = [0, +1, 0]`,
+                        // `sheets/assembly_slots.csv`), zeroing the un-parented d87 translation
+                        // so the weapon sits cleanly at the rack clamp while pure `a00_011`/`a00_021`
+                        // drives the carousel with zero extra pitch/roll hacks.
+                        let local = Transform::from_rotation(hanger::prong_weapon_rotation());
                         let parent = *rack_joints.get(*front)?;
                         let alt_parent = back.and_then(|b| rack_joints.get(b).copied());
                         Some((parent, alt_parent, local))

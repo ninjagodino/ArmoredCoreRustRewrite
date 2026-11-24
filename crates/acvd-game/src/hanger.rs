@@ -24,6 +24,10 @@ struct Rack {
     /// Current racked weapon's `hanger_pose` (`0..=4`).
     #[allow(dead_code)]
     pose: u8,
+    /// Phase 0 idle stowed pose (`a00_000.ani`, f=0: stowed on `*_hg_b` at ~52° down-back).
+    idle_0: ani::Anim,
+    /// Phase 1 idle stowed pose (`a00_031.ani`, f=0: stowed on `*_hg_f` at ~51° down-back).
+    idle_1: ani::Anim,
     /// Phase `0 -> 1` carousel clip (`a00_011.ani`, 180 frames).
     swing_01: ani::Anim,
     /// Phase `1 -> 0` carousel clip (`a00_021.ani`, 180 frames).
@@ -51,13 +55,28 @@ impl HangerPose {
                 continue;
             };
             let n_bones = skeleton.bones.len();
+            let Ok(idle_0) = open(disc, path, "a00_030.ani") else {
+                continue;
+            };
+            let idle1_name = if hand == Hand::Right {
+                "a00_031.ani"
+            } else {
+                "a00_032.ani"
+            };
+            let Ok(idle_1) = open(disc, path, idle1_name) else {
+                continue;
+            };
             let Ok(swing_01) = open(disc, path, "a00_011.ani") else {
                 continue;
             };
             let Ok(swing_10) = open(disc, path, "a00_021.ani") else {
                 continue;
             };
-            if swing_01.bones.len() != n_bones || swing_10.bones.len() != n_bones {
+            if idle_0.bones.len() != n_bones
+                || idle_1.bones.len() != n_bones
+                || swing_01.bones.len() != n_bones
+                || swing_10.bones.len() != n_bones
+            {
                 continue;
             }
             let joints = skeleton
@@ -71,6 +90,8 @@ impl HangerPose {
             out.push(Rack {
                 hand,
                 pose: pose.min(4),
+                idle_0,
+                idle_1,
                 swing_01,
                 swing_10,
                 joints,
@@ -98,14 +119,24 @@ fn bevy_quat(q: [f32; 4]) -> Quat {
     Quat::from_xyzw(q[0], -q[1], -q[2], q[3])
 }
 
-/// Idle stowed shoulder pitch on `*_hg01` (bone 1): with the arm's `r_kata`/`l_kata` socket
-/// `root_rotation` preserved on bone 0, `a00_011`/`a00_021` f=0 leaves the stowed prong pitched
-/// up-back (+66° above horizontal). Adding +120° around parent X settles both left and right
-/// stowed weapons symmetrically at ~53° down-back behind the shoulders (muzzle down-back `↘`,
-/// stock up-forward `↖`, grip/magazine up-back `↗` — matching retail 360 Workshop captures),
-/// and blends smoothly to 0° during `f=20..150` so `f=40` (seat) and `f=150` (grab) align with
-/// `*_armhand`.
-const STOW_PITCH_X: f32 = 120.0_f32.to_radians();
+/// FLVER dummy `87`/`88` (`r_hg_f`/`r_hg_b`) and `85`/`86` (`l_hg_f`/`l_hg_b`) mount basis:
+/// `sheets/assembly_slots.csv` `acattachinfo` flag 4 (`0x8288a058`) with dummy forward `[0, 1, 0]`
+/// plus a constant 180° roll around local `Z` (weapon long axis) so the top rail faces
+/// down-forward and the magazine/underside faces up-back — matching retail 360 Workshop captures
+/// with pure `a00_011`/`a00_021` carousel motion and zero animated pitch/roll offsets.
+pub fn prong_weapon_rotation() -> Quat {
+    let cols = crate::assemble::orient_basis(4, [0.0, 1.0, 0.0]);
+    Quat::from_mat3(&Mat3::from_cols_array_2d(&cols)) * Quat::from_rotation_z(std::f32::consts::PI)
+}
+
+fn sample_quat(clip: &ani::Anim, bone: usize, frame: f32) -> Quat {
+    bevy_quat(
+        clip.bones
+            .get(bone)
+            .and_then(|b| b.track.rotation(frame))
+            .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+    )
+}
 
 pub fn pose(
     shift: Option<Res<Shift>>,
@@ -117,56 +148,39 @@ pub fn pose(
     };
     for rack in &mut hanger.racks {
         let side = rack.hand as usize;
-        let (carousel_clip, carousel_frame, shift_blend) = match shift.as_deref() {
-            Some(s) => match s.hands[side].as_ref() {
-                Some(hs) if !hs.purge => {
-                    let clip = if hs.phase == 0 {
-                        &rack.swing_01
-                    } else {
-                        &rack.swing_10
-                    };
-                    let max_f = clip.frames.saturating_sub(1) as f32;
-                    let f = hs.rack_frame.clamp(0.0, max_f);
-                    let w = if f < 20.0 {
-                        f / 20.0
-                    } else if f <= 150.0 {
-                        1.0
-                    } else {
-                        ((180.0 - f) / 30.0).clamp(0.0, 1.0)
-                    };
-                    (clip, f, w)
-                }
-                _ => {
-                    if s.phase[side] == 0 {
-                        (&rack.swing_01, 0.0, 0.0)
-                    } else {
-                        (
-                            &rack.swing_01,
-                            rack.swing_01.frames.saturating_sub(1) as f32,
-                            0.0,
-                        )
-                    }
-                }
-            },
-            None => (&rack.swing_01, 0.0, 0.0),
+        let n_bones = rack.idle_0.bones.len();
+        let quats: Vec<Quat> = match shift.as_deref().and_then(|s| s.hands[side].as_ref()) {
+            Some(hs) if !hs.purge => {
+                let (clip, start_idle, end_idle) = if hs.phase == 0 {
+                    (&rack.swing_01, &rack.idle_0, &rack.idle_1)
+                } else {
+                    (&rack.swing_10, &rack.idle_1, &rack.idle_0)
+                };
+                let max_f = clip.frames.saturating_sub(1) as f32;
+                let f = hs.rack_frame.clamp(0.0, max_f);
+                (0..n_bones)
+                    .map(|i| {
+                        let q = sample_quat(clip, i, f);
+                        if f < 15.0 {
+                            sample_quat(start_idle, i, 0.0).slerp(q, f / 15.0)
+                        } else if f > max_f - 15.0 {
+                            q.slerp(sample_quat(end_idle, i, 0.0), (f - (max_f - 15.0)) / 15.0)
+                        } else {
+                            q
+                        }
+                    })
+                    .collect()
+            }
+            _ => {
+                let phase = shift.as_deref().map_or(0, |s| s.phase[side]);
+                let idle = if phase == 0 {
+                    &rack.idle_0
+                } else {
+                    &rack.idle_1
+                };
+                (0..n_bones).map(|i| sample_quat(idle, i, 0.0)).collect()
+            }
         };
-
-        let quats: Vec<Quat> = (0..carousel_clip.bones.len())
-            .map(|i| {
-                let q = bevy_quat(
-                    carousel_clip
-                        .bones
-                        .get(i)
-                        .and_then(|b| b.track.rotation(carousel_frame))
-                        .unwrap_or([0.0, 0.0, 0.0, 1.0]),
-                );
-                if i == 1 {
-                    let stow_q = Quat::from_rotation_x(STOW_PITCH_X * (1.0 - shift_blend));
-                    return stow_q * q;
-                }
-                q
-            })
-            .collect();
         if rack.translation.len() != rack.joints.len() {
             rack.translation.resize(rack.joints.len(), None);
         }
@@ -291,9 +305,10 @@ mod tests {
                 sh_r * q[0] * q[1] * q[4] * q[5]
             };
             let barrel_dot = (hand_r * Vec3::Z).dot(prong_r * Vec3::Z);
+            let top_dot = (hand_r * Vec3::Y).dot(prong_r * Vec3::Y);
             assert!(
-                barrel_dot > 0.9,
-                "f={f}: prong +Z should match r_armhand +Z (dot={barrel_dot:.3})"
+                barrel_dot > 0.9 && top_dot > 0.7,
+                "f={f}: prong +Z/+Y should match r_armhand +Z/+Y (barrel={barrel_dot:.3}, top={top_dot:.3})"
             );
         }
     }
@@ -350,8 +365,6 @@ mod tests {
         let l_idx = loaded.iter().position(|p| p.placement.column == "rack_l").unwrap();
         let r_joints = skins[r_idx].0.clone();
         let l_joints = skins[l_idx].0.clone();
-        let c01_r = open(&disc, RIGHT, "a00_011.ani").unwrap();
-        let c01_l = open(&disc, LEFT, "a00_011.ani").unwrap();
         let r_base0 = world.get::<Transform>(r_joints[0]).unwrap().rotation;
         let l_base0 = world.get::<Transform>(l_joints[0]).unwrap().rotation;
 
@@ -380,41 +393,42 @@ mod tests {
         let hand_fwd = world_of(&world, skins[arm_idx].0[hand_bi]).rotation() * (-Vec3::Z);
         assert!(hand_fwd.z < -0.5, "AC front should face -Z, got {hand_fwd}");
 
-        // Verify both phase 0 (stowed on `*_hg_b`, f=0) and phase 1 (stowed on `*_hg_f`, f=179)
-        // settle symmetrically at ~53° down-back (-Y, +Z) with top facing down-forward (-Y, -Z).
-        let stow_q = Quat::from_rotation_x(STOW_PITCH_X);
-        for (phase, frame, prong_bone) in [(0u8, 0.0f32, 5usize), (1u8, 179.0f32, 3usize)] {
-            for (side_name, jts, c01, base0) in [
-                ("R", &r_joints, &c01_r, r_base0),
-                ("L", &l_joints, &c01_l, l_base0),
+        // Verify both phase 0 (`a00_030` f=0, stowed on `*_hg_b`) and phase 1 (`a00_031` f=0,
+        // stowed on `*_hg_f`) using FLVER dummy flag-4 `prong_weapon_rotation()` (zero pitch/roll
+        // hacks) settle symmetrically at ~51° down-back (-Y, +Z) with top facing up-back (+Y, +Z).
+        let idle0_r = open(&disc, RIGHT, "a00_030.ani").unwrap();
+        let idle1_r = open(&disc, RIGHT, "a00_031.ani").unwrap();
+        let idle0_l = open(&disc, LEFT, "a00_030.ani").unwrap();
+        let idle1_l = open(&disc, LEFT, "a00_032.ani").unwrap();
+        let q4 = prong_weapon_rotation();
+        for (phase, clip_r, clip_l, prong_bone) in [
+            (0u8, &idle0_r, &idle0_l, 5usize),
+            (1u8, &idle1_r, &idle1_l, 3usize),
+        ] {
+            for (side_name, jts, clip, base0) in [
+                ("R", &r_joints, clip_r, r_base0),
+                ("L", &l_joints, clip_l, l_base0),
             ] {
                 for i in 0..6 {
-                    let q = bevy_quat(
-                        c01.bones[i]
-                            .track
-                            .rotation(frame)
-                            .unwrap_or([0.0, 0.0, 0.0, 1.0]),
-                    );
+                    let q = sample_quat(clip, i, 0.0);
                     let mut tf = world.get_mut::<Transform>(jts[i]).unwrap();
                     tf.rotation = if i == 0 {
                         (base0 * q).normalize()
-                    } else if i == 1 {
-                        stow_q * q
                     } else {
                         q
                     };
                 }
-                let g = world_of(&world, jts[prong_bone]);
-                let muzzle = g.rotation() * (-Vec3::Z);
-                let top = g.rotation() * Vec3::Y;
+                let g = world_of(&world, jts[prong_bone]).rotation() * q4;
+                let muzzle = g * (-Vec3::Z);
+                let top = g * Vec3::Y;
                 let down_deg = (-muzzle.y).atan2(muzzle.z).to_degrees();
                 assert!(
-                    muzzle.y < -0.65 && muzzle.z > 0.45 && (45.0..=65.0).contains(&down_deg),
-                    "{side_name} phase {phase} stowed muzzle must point ~53° down-back, got {muzzle} ({down_deg:.1}°)"
+                    muzzle.y < -0.7 && muzzle.z > 0.55 && (45.0..=58.0).contains(&down_deg),
+                    "{side_name} phase {phase} stowed muzzle must point ~51° down-back, got {muzzle} ({down_deg:.1}°)"
                 );
                 assert!(
-                    top.y < -0.4 && top.z < -0.5,
-                    "{side_name} phase {phase} stowed top(+Y) must face down-forward (grip up-back), got {top}"
+                    top.y < -0.55 && top.z < -0.7,
+                    "{side_name} phase {phase} stowed top(+Y) must face down-forward (magazine/underside up-back, matching 360), got {top}"
                 );
             }
         }
