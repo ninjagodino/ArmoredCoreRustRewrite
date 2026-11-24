@@ -98,6 +98,13 @@ pub struct ModeSwitch {
 #[derive(Component)]
 pub struct GarageWorld;
 
+/// Marker for garage workshop meshes that display the player's live AC Emblem
+/// (`0x825d3978`: `mtd="emblem"` / diffuse `"im999"` / `"im9999"`). Lets
+/// `decal::sync_bakes` rebind `DecalState::emblem_texture` after custom uploads
+/// without relying on handle-identity scans of every `EnvMaterial`.
+#[derive(Component)]
+pub struct GarageEmblemBanner;
+
 /// Marker for the garage UI root hierarchy.
 #[derive(Component)]
 pub struct GarageUi;
@@ -149,6 +156,7 @@ pub enum UiAction {
     SelectOptionRow(usize),
     UiScaleStep(i8),
     VolumeStep(AudioChannel, i8),
+    QuitToDesktop,
 }
 
 /// Active garage screen.
@@ -217,7 +225,7 @@ const TOP_ITEMS: &[(&str, &str, &str)] = &[
 ];
 
 /// Helpline descriptions for [`GarageScreen::Options`] rows.
-const OPTIONS_ROW_DESCS: [&str; 7] = [
+const OPTIONS_ROW_DESCS: [&str; 8] = [
     "Toggle fullscreen or windowed\ndisplay mode.",
     "Scale HUD and menu size\n(75% - 150%, default 100%).",
     "Adjust master audio volume\nacross all sound channels.",
@@ -225,6 +233,7 @@ const OPTIONS_ROW_DESCS: [&str; 7] = [
     "Adjust weapon, booster, and\ncombat sound effects volume.",
     "Adjust menu navigation and\nUI feedback sound volume.",
     "Return to the Garage main menu.",
+    "Exit the game and return\nto the desktop.",
 ];
 
 const GARAGE_OPTION_CHANNELS: [(usize, AudioChannel); 4] = [
@@ -1090,9 +1099,8 @@ pub fn sync_room(
                     || diff_low == "im9999";
                 let diffuse = if is_garage_emblem && !garage.flat {
                     // 360 `0x825d3978`: overrides `"emblem"`, `"im999"`, `"im9999"` in the garage
-                    // FLVER with the player's live AC Emblem texture (V-flipped world copy —
-                    // hangar UVs are authored with V=0 at the bottom).
-                    Some(decals.emblem_world_texture.clone())
+                    // FLVER with the player's live AC Emblem texture.
+                    Some(decals.emblem_texture.clone())
                 } else {
                     part.diffuse
                         .as_deref()
@@ -1207,12 +1215,15 @@ pub fn sync_room(
                         true,
                         emissive_boost,
                     );
-                    commands.spawn((
+                    let mut entity = commands.spawn((
                         Mesh3d(meshes.add(part.mesh)),
                         MeshMaterial3d(env_materials.add(env_mat)),
                         Transform::IDENTITY,
                         ChildOf(root),
                     ));
+                    if is_garage_emblem {
+                        entity.insert(GarageEmblemBanner);
+                    }
                 } else {
                     let mat = StandardMaterial {
                         base_color: if diffuse.is_some() {
@@ -1227,12 +1238,15 @@ pub fn sync_room(
                         metallic: 0.12,
                         ..default()
                     };
-                    commands.spawn((
+                    let mut entity = commands.spawn((
                         Mesh3d(meshes.add(part.mesh)),
                         MeshMaterial3d(materials.add(mat)),
                         Transform::IDENTITY,
                         ChildOf(root),
                     ));
+                    if is_garage_emblem {
+                        entity.insert(GarageEmblemBanner);
+                    }
                 }
                 drawn += 1;
             }
@@ -1549,6 +1563,7 @@ pub struct OptionsCtx<'w, 's> {
     bgm_players: Query<'w, 's, Entity, With<BgmPlayer>>,
     audio_buses: Query<'w, 's, &'static AudioBus>,
     windows: Query<'w, 's, &'static mut Window, With<bevy::window::PrimaryWindow>>,
+    app_exit: MessageWriter<'w, AppExit>,
 }
 
 /// Handles keyboard, gamepad, and mouse-button interaction in the 3D Garage.
@@ -2052,6 +2067,10 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::QuitToDesktop => {
+                options.app_exit.write(AppExit::Success);
+                return;
+            }
             UiAction::AssembleSelectSlot(new_slot) => {
                 switch_assemble_slot(
                     &mut commands,
@@ -2532,7 +2551,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::Design => garage.designs.len(),
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
-        GarageScreen::Options => 7, // Fullscreen, UI Scale, Master, Music, SFX, Menu/UI, Back
+        GarageScreen::Options => 8, // Fullscreen, UI Scale, Master, Music, SFX, Menu/UI, Back, Quit to Desktop
         GarageScreen::ViewMode => 0,
     }
 }
@@ -3120,6 +3139,9 @@ fn trigger_confirm(
             }
             6 => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
+            }
+            7 => {
+                options.app_exit.write(AppExit::Success);
             }
             _ => {}
         },
@@ -5656,6 +5678,24 @@ fn spawn_garage_options_menu(
         scale,
     );
     commands.entity(back_btn).insert((Button, UiAction::Back));
+
+    // Row 7: Quit to Desktop
+    let quit_state = if cursor == 7 {
+        ButtonState::Selected
+    } else {
+        ButtonState::Normal
+    };
+    let quit_btn = kit.spawn_button(
+        commands,
+        list,
+        "QUIT TO DESKTOP",
+        None,
+        quit_state,
+        scale,
+    );
+    commands
+        .entity(quit_btn)
+        .insert((Button, UiAction::QuitToDesktop));
 
     kit.spawn_trace(commands, panel, TraceStyle::Stepped, scale);
 
