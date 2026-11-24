@@ -30,6 +30,8 @@
 //! also plays its body stance until that clip ends, then fires; a sniper rifle does not. Rifles kick
 //! the arm on each shot. Other weapons fire on the press and play their fire clip when they have one.
 //! M toggles mouselook (mouse turns and pitches, cursor grabbed);
+//! Esc / Gamepad Start opens the sortie pause menu (`pause`, `--pause` / `--pause-options` to start
+//! paused: Resume, Options for fullscreen/volume, and Return to Garage in the AC TEST arena);
 //! P switches to the clip browser: Up/Down previous/next clip, Space pause. Left/Right: previous/next design,
 //! drag left mouse: orbit, wheel: zoom, R: reframe. `--clip`/`--frame` start in the browser,
 //! `--frame` paused on that frame. `--hold w,shift,space,f` holds keys for the whole run, and
@@ -65,6 +67,7 @@ mod hud;
 mod lens_flare;
 mod map;
 mod paint;
+mod pause;
 mod pose;
 mod scan;
 mod settings;
@@ -156,17 +159,37 @@ struct StartAim {
 
 /// The map whose models are drawn (`None`: draw the hit meshes or the floor plane).
 #[derive(Resource)]
-struct Scene {
-    map: Option<String>,
-    layout: Option<String>,
-    test: targets::TestMode,
-    plane: bool,
-    hits: bool,
-    water: Option<f32>,
+pub struct Scene {
+    pub map: Option<String>,
+    pub layout: Option<String>,
+    pub test: targets::TestMode,
+    pub plane: bool,
+    pub hits: bool,
+    pub water: Option<f32>,
+    /// True when the sortie was launched from the 3D Garage AC TEST flow.
+    pub from_garage: bool,
+}
+
+impl Scene {
+    /// Returns true when the current sortie is the AC TEST arena (either `m4000`/`actest`
+    /// or a sortie launched from the Garage AC TEST launcher).
+    pub fn is_test_arena(&self) -> bool {
+        self.from_garage
+            || self.layout.as_deref() == Some("actest")
+            || self.map.as_deref() == Some("m4000")
+    }
 }
 
 fn in_sortie(mode: Res<garage::Mode>) -> bool {
     *mode == garage::Mode::Sortie
+}
+
+fn in_active_sortie(mode: Res<garage::Mode>, pause: Res<pause::PauseState>) -> bool {
+    *mode == garage::Mode::Sortie && !pause.open
+}
+
+fn not_paused_in_sortie(mode: Res<garage::Mode>, pause: Res<pause::PauseState>) -> bool {
+    *mode != garage::Mode::Sortie || !pause.open
 }
 
 fn main() {
@@ -181,6 +204,7 @@ fn main() {
     let (mut preview, mut burst, mut no_hud) = (None, 1, false);
     let (mut start_garage, mut garage_id, mut garage_screen, mut garage_paint_tab, mut cli_decal) =
         (false, None, garage::GarageScreen::Top, garage::PaintTab::Presets, None::<PathBuf>);
+    let mut start_pause: Option<pause::PauseScreen> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -252,6 +276,12 @@ fn main() {
             }
             "--decal" => {
                 cli_decal = args.next().map(PathBuf::from);
+            }
+            "--pause" => {
+                start_pause = Some(pause::PauseScreen::Main);
+            }
+            "--pause-options" => {
+                start_pause = Some(pause::PauseScreen::Options);
             }
             _ => wanted = a.parse::<u32>().ok(),
         }
@@ -351,6 +381,12 @@ fn main() {
     garage_state.paint_tab = garage_paint_tab;
 
     let enemy_parts = weapons::EnemyParts::load(&disc);
+    let mut pause_state = pause::PauseState::default();
+    if initial_mode == garage::Mode::Sortie {
+        if let Some(screen) = start_pause {
+            pause_state.open_menu(screen);
+        }
+    }
     let game_settings = settings::GameSettings::load();
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -389,6 +425,7 @@ fn main() {
     .insert_resource(initial_mode)
     .insert_resource(garage::ModeSwitch::default())
     .insert_resource(garage_state)
+    .insert_resource(pause_state)
     .init_resource::<AcTexturePacks>()
     .init_resource::<garage_assemble::AssembleUiAssets>()
     .insert_resource(decal::DecalState::new(cli_decal))
@@ -420,6 +457,7 @@ fn main() {
         plane,
         hits,
         water,
+        from_garage: false,
     })
     .insert_resource(collision)
     .insert_resource(control::Piloting(piloting))
@@ -430,7 +468,9 @@ fn main() {
         Update,
         (
             sortie_garage_hotkey,
+            pause::handle_input,
             process_mode_switch,
+            pause::sync_ui,
             garage::sync_room,
             decal::handle_imports,
             garage::handle_input,
@@ -447,38 +487,38 @@ fn main() {
         Update,
         (
             (
-                browse.run_if(in_sortie),
+                browse.run_if(in_active_sortie),
                 show,
                 garage_assemble::sync_part_hologram,
-                clips.run_if(in_sortie),
-                control::pilot.run_if(in_sortie),
-                scan::update.run_if(in_sortie),
-                fcs::update.run_if(in_sortie),
+                clips.run_if(in_active_sortie),
+                control::pilot.run_if(in_active_sortie),
+                scan::update.run_if(in_active_sortie),
+                fcs::update.run_if(in_active_sortie),
                 map::lod.run_if(in_sortie),
-                pose::animate,
-                boost::pose,
-                boost::hide,
-                hanger::pose,
+                pose::animate.run_if(not_paused_in_sortie),
+                boost::pose.run_if(not_paused_in_sortie),
+                boost::hide.run_if(not_paused_in_sortie),
+                hanger::pose.run_if(not_paused_in_sortie),
             )
                 .chain(),
             (decal::interact_and_gizmo, decal::sync_bakes)
                 .chain()
                 .after(hanger::pose),
             (
-                bay::shift.run_if(in_sortie),
-                weapons::fire.run_if(in_sortie),
-                weapons::step_overed_weapon.run_if(in_sortie),
-                weapons::step_melee.run_if(in_sortie),
-                ai::update.run_if(in_sortie),
-                targets::animate_enemies.run_if(in_sortie),
-                pose::animate_npcs.run_if(in_sortie),
-                weapons::step_projectiles.run_if(in_sortie),
-                weapons::step_missiles.run_if(in_sortie),
-                weapons::tick_player_health.run_if(in_sortie),
-                targets::tick.run_if(in_sortie),
-                map::step_destructibles.run_if(in_sortie),
-                orbit.run_if(in_sortie),
-                reframe.run_if(in_sortie),
+                bay::shift.run_if(in_active_sortie),
+                weapons::fire.run_if(in_active_sortie),
+                weapons::step_overed_weapon.run_if(in_active_sortie),
+                weapons::step_melee.run_if(in_active_sortie),
+                ai::update.run_if(in_active_sortie),
+                targets::animate_enemies.run_if(in_active_sortie),
+                pose::animate_npcs.run_if(in_active_sortie),
+                weapons::step_projectiles.run_if(in_active_sortie),
+                weapons::step_missiles.run_if(in_active_sortie),
+                weapons::tick_player_health.run_if(in_active_sortie),
+                targets::tick.run_if(in_active_sortie),
+                map::step_destructibles.run_if(in_active_sortie),
+                orbit.run_if(in_active_sortie),
+                reframe.run_if(in_active_sortie),
             )
                 .chain(),
         )
@@ -487,20 +527,23 @@ fn main() {
     .add_systems(
         Update,
         (
-            hud::layout,
-            hud::tick,
-            hud::track_lock_sight,
-            hud::readouts,
-            hud::panels,
-            hud::lock_cursor,
-            hud::scan_hud,
-            hud::recon_hud,
-            hud::stagger_hud,
-            hud::ow_hud,
-            hud::area_warning_hud,
+            hud::layout.run_if(in_sortie),
+            (
+                hud::tick,
+                hud::track_lock_sight,
+                hud::readouts,
+                hud::panels,
+                hud::lock_cursor,
+                hud::scan_hud,
+                hud::recon_hud,
+                hud::stagger_hud,
+                hud::ow_hud,
+                hud::area_warning_hud,
+            )
+                .chain()
+                .run_if(in_active_sortie),
         )
             .chain()
-            .run_if(in_sortie)
             .after(reframe),
     );
     if let Some(id) = preview {
@@ -857,9 +900,11 @@ fn spawn_sortie_world(
 fn sortie_garage_hotkey(
     mode: Res<garage::Mode>,
     keys: Res<ButtonInput<KeyCode>>,
+    mut pause: ResMut<pause::PauseState>,
     mut switch: ResMut<garage::ModeSwitch>,
 ) {
     if *mode == garage::Mode::Sortie && keys.just_pressed(KeyCode::F1) {
+        pause.close();
         switch.target = Some(garage::Mode::Garage);
     }
 }
@@ -901,12 +946,14 @@ fn process_mode_switch(
     mut commands: Commands,
     mut mode: ResMut<garage::Mode>,
     mut switch: ResMut<garage::ModeSwitch>,
+    mut pause_state: ResMut<pause::PauseState>,
     mut garage_state: ResMut<garage::GarageState>,
     mut garage: ResMut<Garage>,
     mut sortie: SortieResources,
     mut audio: AudioCtx,
     mut assets: RenderAssets,
     mut dir_lights: Query<(&mut DirectionalLight, &mut Transform)>,
+    mut cursor_opts: Query<&mut bevy::window::CursorOptions, With<bevy::window::PrimaryWindow>>,
     mut cam_proj: Query<
         &mut Projection,
         (
@@ -934,6 +981,7 @@ fn process_mode_switch(
             With<scan::ReconUnit>,
             With<MenuRoot>,
             With<hud::AreaWarningHud>,
+            With<pause::PauseUi>,
             With<text::Label>,
         )>,
     >,
@@ -945,10 +993,15 @@ fn process_mode_switch(
     if *mode == target {
         return;
     }
+    pause_state.close();
     match target {
         garage::Mode::Garage => {
             for e in &sortie_entities {
                 commands.entity(e).despawn();
+            }
+            if let Ok(mut c) = cursor_opts.single_mut() {
+                c.grab_mode = bevy::window::CursorGrabMode::None;
+                c.visible = true;
             }
             env::clear_map_env(&mut commands);
             sortie.piloting.0 = false;
@@ -980,6 +1033,7 @@ fn process_mode_switch(
                 commands.entity(e).despawn();
             }
             garage_state.spawned_workshop = None;
+            sortie.scene.from_garage = true;
             if let Some(m) = switch.sortie_map.take() {
                 sortie.scene.map = Some(m);
             } else if sortie.scene.map.is_none() && !sortie.scene.plane && !sortie.scene.hits {

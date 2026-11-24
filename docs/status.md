@@ -282,6 +282,10 @@ in order:
 
 ## Done
 
+- **Sortie / AC TEST Pause Menu (`acvd-game::pause`, `main`)**:
+  - Added an `AcvdUiKit` tactical pause overlay toggled via `Esc` / Gamepad `Start` (`--pause` / `--pause-options` CLI flags), freezing gameplay simulation, animations, AI, weapons, and HUD ticks (`in_active_sortie` / `not_paused_in_sortie`) and unlocking/showing the cursor while open.
+  - Supports **RESUME**, inline **OPTIONS** (borderless fullscreen toggle + 5% master volume gauge saved to `settings.json`), and **RETURN TO GARAGE** when in the AC TEST arena (`Scene::is_test_arena()`). Verified with `cargo test -p acvd-game -- pause` (3/3 passed), `cargo clippy -p acvd-game`, and `--shot` (`private/shots/pause_main.png`, `private/shots/pause_options.png`).
+
 - **Scalable ACVD Retail GUI Kit — Phase 1 (`acvd-render::ui_kit`, `acvd-viewer` `acvd-menu --kit`)**:
   - Built `AcvdUiKit` (`crates/acvd-render/src/ui_kit.rs`) backed by retail disc chrome (`lang/en/menu/assemble.drb.dcx` + `assemble.tpf.dcx` + `font/fontdef.xml` CCM bitmap fonts 17/18/21 rendered through `GlyphNode` sharp-bilinear `glyph_sprite.wgsl` and `MenuSprite`).
   - Added authentic retail palette tokens (`palette::*`), flexbox-compatible disc bitmap typography (`spawn_text`, `measure_text`), and scalable widgets: `spawn_panel` (`Tactical` with `Parts_01` `base_window_L` corner reticles & L-traces, `Framed` with `ACV_FE_Locksight_02` `Corner_Parts` brackets, `Bar`, `Subtle`), `spawn_header` (`Title_Plate` fade + `■` marker + `Help_Line_UP`), `spawn_trace` (`Simple` + `Stepped` using `ACV_frame` `LinePatrs_UP` diagonals), `spawn_button` (`Normal`/`Selected`/`Active`/`Disabled` with `Forcus` arrow & amber corner brackets), `spawn_stat_row` (`@ParamLine` alternating rows + `>` good/bad deltas), `spawn_gauge` (`@WeightBar` metallic gradient + `Gauge_parts` `I` marker + alert state), `spawn_badge`, and `spawn_arrow` (`Parts_01` nav arrows).
