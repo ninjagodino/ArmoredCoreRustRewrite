@@ -51,7 +51,7 @@ use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient};
 use crate::decal::{self, DecalLibraryTab, DecalState, DECAL_TINTS};
 use crate::env;
 use crate::paint;
-use crate::settings::{self, AudioChannel, GameSettings, OptionRow, OptionsTab};
+use crate::settings::{self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab};
 use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
 
 /// Default ACVD garage workshop row ID in `param/customgarage.bin` (`id: 5` = Underpass `menu1000`).
@@ -174,6 +174,7 @@ pub enum UiAction {
     SelectOptionRow(OptionRow),
     UiScaleStep(i8),
     HudSwayStep(i8),
+    DisplayParamStep(DisplayParam, i8),
     VolumeStep(AudioChannel, i8),
     QuitToDesktop,
 }
@@ -183,6 +184,7 @@ pub enum UiAction {
 pub enum WheelAdjust {
     UiScale,
     HudSway,
+    DisplayParam(DisplayParam),
     Volume(AudioChannel),
     PaintRgb(usize),
     PaintCamo,
@@ -203,6 +205,9 @@ impl UiAction {
             }
             Self::SelectOptionRow(OptionRow::HudSway) | Self::HudSwayStep(_) => {
                 Some(WheelAdjust::HudSway)
+            }
+            Self::SelectOptionRow(OptionRow::DisplayParam(p)) | Self::DisplayParamStep(p, _) => {
+                Some(WheelAdjust::DisplayParam(p))
             }
             Self::SelectOptionRow(OptionRow::Volume(ch)) | Self::VolumeStep(ch, _) => {
                 Some(WheelAdjust::Volume(ch))
@@ -316,6 +321,7 @@ pub struct ColorPickerTrack(pub PaintDragTarget);
 pub enum SliderTrackTarget {
     UiScale,
     HudSway,
+    DisplayParam(DisplayParam),
     Volume(AudioChannel),
     PaintCamoScale,
     DecalScale,
@@ -459,10 +465,13 @@ fn options_row_desc(tab: OptionsTab, cursor: usize) -> &'static str {
     match tab {
         OptionsTab::Graphics => match cursor {
             0 => "Toggle fullscreen or windowed\ndisplay mode.",
-            1 => "Scale HUD and menu size\n(75% - 150%, default 100%).",
+            1 => "Scale HUD and menu size\n(50% - 150%, default 100%).",
             2 => "Adjust crosshair HUD sway\nintensity (0% - 100%).",
-            3 => "Return to the Garage main menu.",
-            4 => "Exit the game and return\nto the desktop.",
+            3 => "Adjust midtone gamma curve\n(50% - 150%, default 100%).",
+            4 => "Adjust overall screen brightness\n(50% - 150%, default 100%).",
+            5 => "Adjust light/dark contrast\n(50% - 150%, default 100%).",
+            6 => "Return to the Garage main menu.",
+            7 => "Exit the game and return\nto the desktop.",
             _ => "",
         },
         OptionsTab::Sound => match cursor {
@@ -2567,6 +2576,19 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::DisplayParamStep(param, delta) => {
+                state.cursor = OptionRow::DisplayParam(param).cursor_index();
+                step_display_param_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    param,
+                    delta,
+                );
+                return;
+            }
             UiAction::VolumeStep(channel, delta) => {
                 state.cursor = OptionRow::Volume(channel).cursor_index();
                 step_volume_setting(
@@ -2804,6 +2826,18 @@ pub fn handle_input(
                         &mut cues,
                         &mut audio_assets,
                         &mut state,
+                        delta,
+                    );
+                }
+                WheelAdjust::DisplayParam(param) => {
+                    state.cursor = OptionRow::DisplayParam(param).cursor_index();
+                    step_display_param_setting(
+                        &mut commands,
+                        &mut options,
+                        &mut cues,
+                        &mut audio_assets,
+                        &mut state,
+                        param,
                         delta,
                     );
                 }
@@ -3144,6 +3178,42 @@ pub fn handle_input(
                 );
                 return;
             }
+            (OptionsTab::Graphics, 3) => {
+                step_display_param_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    DisplayParam::Gamma,
+                    delta,
+                );
+                return;
+            }
+            (OptionsTab::Graphics, 4) => {
+                step_display_param_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    DisplayParam::Brightness,
+                    delta,
+                );
+                return;
+            }
+            (OptionsTab::Graphics, 5) => {
+                step_display_param_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    DisplayParam::Contrast,
+                    delta,
+                );
+                return;
+            }
             (OptionsTab::Sound, 0) => {
                 step_volume_setting(
                     &mut commands,
@@ -3283,7 +3353,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
         GarageScreen::Options => match state.options_tab {
-            OptionsTab::Graphics => 5, // Fullscreen, UI Scale, HUD Sway, Back, Quit to Desktop
+            OptionsTab::Graphics => 8, // Fullscreen, UI Scale, HUD Sway, Gamma, Brightness, Contrast, Back, Quit
             OptionsTab::Sound => 6,    // Master, Music, SFX, Menu/UI, Back, Quit to Desktop
         },
         GarageScreen::ViewMode => 0,
@@ -3345,6 +3415,29 @@ fn step_hud_sway_setting(
     sound::cue(commands, cues, audio_assets, CUE_MOVE);
     state.set_banner(
         format!("HUD SWAY: {}%", options.settings.hud_sway_percent()),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+}
+
+fn step_display_param_setting(
+    commands: &mut Commands,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    state: &mut GarageState,
+    param: DisplayParam,
+    delta: i8,
+) {
+    options.settings.step_display_param(param, delta);
+    options.settings.save();
+    sound::cue(commands, cues, audio_assets, CUE_MOVE);
+    state.set_banner(
+        format!(
+            "{}: {}%",
+            param.label(),
+            options.settings.display_param_percent(param)
+        ),
         Color::srgb(0.45, 0.92, 0.62),
     );
     state.ui_dirty = true;
@@ -3905,9 +3998,42 @@ fn trigger_confirm(
                 step_hud_sway_setting(commands, options, cues, audio_assets, state, 1);
             }
             (OptionsTab::Graphics, 3) => {
-                trigger_cancel(commands, state, garage, cues, audio_assets);
+                step_display_param_setting(
+                    commands,
+                    options,
+                    cues,
+                    audio_assets,
+                    state,
+                    DisplayParam::Gamma,
+                    1,
+                );
             }
             (OptionsTab::Graphics, 4) => {
+                step_display_param_setting(
+                    commands,
+                    options,
+                    cues,
+                    audio_assets,
+                    state,
+                    DisplayParam::Brightness,
+                    1,
+                );
+            }
+            (OptionsTab::Graphics, 5) => {
+                step_display_param_setting(
+                    commands,
+                    options,
+                    cues,
+                    audio_assets,
+                    state,
+                    DisplayParam::Contrast,
+                    1,
+                );
+            }
+            (OptionsTab::Graphics, 6) => {
+                trigger_cancel(commands, state, garage, cues, audio_assets);
+            }
+            (OptionsTab::Graphics, 7) => {
                 options.app_exit.write(AppExit::Success);
             }
             (OptionsTab::Sound, 0) => {
@@ -4566,10 +4692,26 @@ pub fn handle_slider_track_drag(
             if options.settings.hud_sway_percent() != prev || just_pressed {
                 options.settings.save();
                 if in_pause_options {
-                    pause_state.cursor = 2;
+                    pause_state.cursor = OptionRow::HudSway.cursor_index();
                     pause_state.dirty = true;
                 } else {
-                    state.cursor = 2;
+                    state.cursor = OptionRow::HudSway.cursor_index();
+                    state.ui_dirty = true;
+                }
+                changed = true;
+            }
+        }
+        SliderTrackTarget::DisplayParam(param) => {
+            let prev = options.settings.display_param_percent(param);
+            options.settings.set_display_param_from_fill(param, fill);
+            if options.settings.display_param_percent(param) != prev || just_pressed {
+                options.settings.save();
+                let row = OptionRow::DisplayParam(param).cursor_index();
+                if in_pause_options {
+                    pause_state.cursor = row;
+                    pause_state.dirty = true;
+                } else {
+                    state.cursor = row;
                     state.ui_dirty = true;
                 }
                 changed = true;
@@ -6007,6 +6149,35 @@ fn spawn_garage_options_menu(
                 .entity(sway_slider.inc_btn)
                 .insert((Button, UiAction::HudSwayStep(1)));
 
+            // Rows 3..=5: Gamma, Brightness, Contrast sliders (50% - 150%, I marker at 100%)
+            for param in DisplayParam::ALL {
+                let row_idx = OptionRow::DisplayParam(param).cursor_index();
+                let pct_txt = format!("{}%", settings.display_param_percent(param));
+                let slider = kit.spawn_slider_row(
+                    commands,
+                    list,
+                    param.label(),
+                    &pct_txt,
+                    settings.display_param_fill(param),
+                    Some(GameSettings::display_param_default_mark()),
+                    cursor == row_idx,
+                    104.0,
+                    scale,
+                );
+                commands
+                    .entity(slider.row)
+                    .insert((Button, UiAction::SelectOptionRow(OptionRow::DisplayParam(param))));
+                commands
+                    .entity(slider.track)
+                    .insert(SliderTrack(SliderTrackTarget::DisplayParam(param)));
+                commands
+                    .entity(slider.dec_btn)
+                    .insert((Button, UiAction::DisplayParamStep(param, -1)));
+                commands
+                    .entity(slider.inc_btn)
+                    .insert((Button, UiAction::DisplayParamStep(param, 1)));
+            }
+
             // Combat HUD Color HSV / RGB picker
             kit.spawn_text(
                 commands,
@@ -6029,7 +6200,7 @@ fn spawn_garage_options_menu(
                 scale * 0.88,
             );
 
-            (3, 4)
+            (6, 7)
         }
         OptionsTab::Sound => {
             kit.spawn_text(
@@ -8812,7 +8983,7 @@ mod tests {
                 sz.x
             );
         }
-        for (tab, count) in [(OptionsTab::Graphics, 5usize), (OptionsTab::Sound, 6usize)] {
+        for (tab, count) in [(OptionsTab::Graphics, 8usize), (OptionsTab::Sound, 6usize)] {
             for i in 0..count {
                 let desc = options_row_desc(tab, i);
                 assert!(!desc.is_empty(), "options_row_desc({tab:?}, {i}) is empty");
@@ -8869,6 +9040,18 @@ mod tests {
         assert_eq!(
             UiAction::HudSwayStep(-1).wheel_adjust(),
             Some(WheelAdjust::HudSway)
+        );
+        assert_eq!(
+            UiAction::SelectOptionRow(OptionRow::DisplayParam(DisplayParam::Gamma)).wheel_adjust(),
+            Some(WheelAdjust::DisplayParam(DisplayParam::Gamma))
+        );
+        assert_eq!(
+            UiAction::DisplayParamStep(DisplayParam::Brightness, 1).wheel_adjust(),
+            Some(WheelAdjust::DisplayParam(DisplayParam::Brightness))
+        );
+        assert_eq!(
+            UiAction::DisplayParamStep(DisplayParam::Contrast, -1).wheel_adjust(),
+            Some(WheelAdjust::DisplayParam(DisplayParam::Contrast))
         );
         assert_eq!(
             UiAction::SelectOptionRow(OptionRow::Volume(AudioChannel::Master)).wheel_adjust(),

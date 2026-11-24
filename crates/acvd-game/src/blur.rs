@@ -65,6 +65,9 @@ pub struct ZoomBlur {
     /// Garage menu blurred bokeh + `+` reticle grid backdrop:
     /// `(blur_strength, dim_factor, grid_alpha, grid_spacing_720p)`.
     pub menu_backdrop: Vec4,
+    /// Player display tone adjustments from `GameSettings`:
+    /// `(gamma, brightness, contrast, 0.0)`. Defaults to `(1.0, 1.0, 1.0, 0.0)` (no-op).
+    pub display_adjust: Vec4,
 }
 
 impl Default for ZoomBlur {
@@ -77,6 +80,7 @@ impl Default for ZoomBlur {
             god_ray: crate::lens_flare::GodRayFilter::default(),
             tonemap: TONEMAP_PASSTHROUGH,
             menu_backdrop: Vec4::ZERO,
+            display_adjust: Vec4::new(1.0, 1.0, 1.0, 0.0),
         }
     }
 }
@@ -115,11 +119,17 @@ impl FullscreenMaterial for ZoomBlur {
 fn sync_tonemap(
     active: Res<ActiveToneMap>,
     backdrop: Res<ActiveMenuBackdrop>,
+    settings: Option<Res<crate::settings::GameSettings>>,
     mut cams: Query<&mut ZoomBlur>,
 ) {
+    let display_adjust = settings
+        .as_deref()
+        .map(|s| Vec4::new(s.gamma, s.brightness, s.contrast, 0.0))
+        .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 0.0));
     for mut blur in &mut cams {
         blur.tonemap = active.0;
         blur.menu_backdrop = backdrop.0;
+        blur.display_adjust = display_adjust;
     }
 }
 

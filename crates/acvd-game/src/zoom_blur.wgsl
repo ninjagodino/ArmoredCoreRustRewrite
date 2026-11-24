@@ -37,6 +37,8 @@ struct ZoomBlur {
     // Garage menu blurred bokeh + `+` reticle grid backdrop:
     // `(blur_strength, dim_factor, grid_alpha, grid_spacing_720p)`.
     menu_backdrop: vec4<f32>,
+    // Player display tone adjustments: `(gamma, brightness, contrast, 0.0)`.
+    display_adjust: vec4<f32>,
 }
 
 @group(0) @binding(0) var screen: texture_2d<f32>;
@@ -104,6 +106,35 @@ fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
     let lo = clamped / 12.92;
     let hi = pow((clamped + 0.055) / 1.055, vec3<f32>(2.4));
     return select(hi, lo, clamped <= vec3<f32>(0.04045));
+}
+
+fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
+    let clamped = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = clamped * 12.92;
+    let hi = 1.055 * pow(clamped, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, clamped <= vec3<f32>(0.0031308));
+}
+
+fn apply_display_adjust(linear_rgb: vec3<f32>, adj: vec4<f32>) -> vec3<f32> {
+    let gamma = max(adj.x, 0.1);
+    let brightness = adj.y;
+    let contrast = adj.z;
+    if abs(gamma - 1.0) < 0.0001
+        && abs(brightness - 1.0) < 0.0001
+        && abs(contrast - 1.0) < 0.0001
+    {
+        return linear_rgb;
+    }
+    var d = srgb_encode(linear_rgb);
+    // Contrast pivots around mid-gray (0.5); brightness shifts display luminance cleanly.
+    d = clamp(
+        (d - vec3<f32>(0.5)) * contrast + vec3<f32>(0.5) + vec3<f32>((brightness - 1.0) * 0.35),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    // Higher gamma (> 1.0) lifts midtones brighter; lower gamma (< 1.0) darkens midtones.
+    d = pow(max(d, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+    return srgb_decode(d);
 }
 
 fn apply_tonemap(hdr: vec3<f32>, tm: vec4<f32>) -> vec3<f32> {
@@ -192,6 +223,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             rgb = mix(rgb, cross_col, cross * grid_alpha);
         }
     }
+
+    // 5. Player display adjustments (Gamma, Brightness, Contrast from Options -> Graphics).
+    rgb = apply_display_adjust(rgb, blur.display_adjust);
 
     return vec4<f32>(rgb, centre.a);
 }

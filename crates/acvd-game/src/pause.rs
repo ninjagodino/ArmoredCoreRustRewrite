@@ -21,7 +21,7 @@ use bevy::window::CursorGrabMode;
 
 use crate::garage::{Mode, ModeSwitch, CUE_CANCEL, CUE_CATEGORY, CUE_MOVE, CUE_OK};
 use crate::garage_assemble::AssembleUiAssets;
-use crate::settings::{self, AudioChannel, GameSettings, OptionRow, OptionsTab};
+use crate::settings::{self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab};
 use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
 
 /// Active page inside the gameplay pause overlay.
@@ -118,6 +118,7 @@ pub enum PauseAction {
     SelectOptionRow(OptionRow),
     StepUiScale(i8),
     StepHudSway(i8),
+    StepDisplayParam(DisplayParam, i8),
     StepVolume(AudioChannel, i8),
     BackToMain,
 }
@@ -143,7 +144,7 @@ pub struct PauseAudioCtx<'w> {
 
 fn option_row_count(tab: OptionsTab) -> usize {
     match tab {
-        OptionsTab::Graphics => 4, // 0: Fullscreen, 1: UI Scale, 2: HUD Sway, 3: Back
+        OptionsTab::Graphics => 7, // 0: Fullscreen, 1: UI Scale, 2: HUD Sway, 3: Gamma, 4: Brightness, 5: Contrast, 6: Back
         OptionsTab::Sound => 5,    // 0: Master, 1: Music, 2: SFX, 3: Menu/UI, 4: Back
     }
 }
@@ -207,6 +208,28 @@ fn step_hud_sway(
     sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_MOVE);
     state.status_banner = Some((
         format!("HUD SWAY: {}%", options.settings.hud_sway_percent()),
+        palette::ACCENT_TEAL,
+    ));
+    state.dirty = true;
+}
+
+fn step_display_param(
+    commands: &mut Commands,
+    options: &mut PauseOptionsCtx,
+    audio: &mut PauseAudioCtx,
+    state: &mut PauseState,
+    param: DisplayParam,
+    delta: i8,
+) {
+    options.settings.step_display_param(param, delta);
+    options.settings.save();
+    sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_MOVE);
+    state.status_banner = Some((
+        format!(
+            "{}: {}%",
+            param.label(),
+            options.settings.display_param_percent(param)
+        ),
         palette::ACCENT_TEAL,
     ));
     state.dirty = true;
@@ -377,6 +400,18 @@ pub fn handle_input(
                 step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, delta);
                 return;
             }
+            PauseAction::StepDisplayParam(param, delta) => {
+                state.cursor = OptionRow::DisplayParam(param).cursor_index();
+                step_display_param(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    param,
+                    delta,
+                );
+                return;
+            }
             PauseAction::StepVolume(channel, delta) => {
                 state.cursor = OptionRow::Volume(channel).cursor_index();
                 step_volume(
@@ -502,6 +537,19 @@ pub fn handle_input(
                     step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, delta);
                     return;
                 }
+                PauseAction::SelectOptionRow(OptionRow::DisplayParam(param))
+                | PauseAction::StepDisplayParam(param, _) => {
+                    state.cursor = OptionRow::DisplayParam(param).cursor_index();
+                    step_display_param(
+                        &mut commands,
+                        &mut options,
+                        &mut audio,
+                        &mut state,
+                        param,
+                        delta,
+                    );
+                    return;
+                }
                 PauseAction::SelectOptionRow(OptionRow::Volume(channel))
                 | PauseAction::StepVolume(channel, _) => {
                     state.cursor = OptionRow::Volume(channel).cursor_index();
@@ -624,6 +672,30 @@ pub fn handle_input(
             (OptionsTab::Graphics, 2) => {
                 step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, delta)
             }
+            (OptionsTab::Graphics, 3) => step_display_param(
+                &mut commands,
+                &mut options,
+                &mut audio,
+                &mut state,
+                DisplayParam::Gamma,
+                delta,
+            ),
+            (OptionsTab::Graphics, 4) => step_display_param(
+                &mut commands,
+                &mut options,
+                &mut audio,
+                &mut state,
+                DisplayParam::Brightness,
+                delta,
+            ),
+            (OptionsTab::Graphics, 5) => step_display_param(
+                &mut commands,
+                &mut options,
+                &mut audio,
+                &mut state,
+                DisplayParam::Contrast,
+                delta,
+            ),
             (OptionsTab::Sound, 0) => step_volume(
                 &mut commands,
                 &mut options,
@@ -684,6 +756,30 @@ pub fn handle_input(
                 (OptionsTab::Graphics, 2) => {
                     step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, 1)
                 }
+                (OptionsTab::Graphics, 3) => step_display_param(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    DisplayParam::Gamma,
+                    1,
+                ),
+                (OptionsTab::Graphics, 4) => step_display_param(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    DisplayParam::Brightness,
+                    1,
+                ),
+                (OptionsTab::Graphics, 5) => step_display_param(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    DisplayParam::Contrast,
+                    1,
+                ),
                 (OptionsTab::Sound, 0) => step_volume(
                     &mut commands,
                     &mut options,
@@ -716,7 +812,7 @@ pub fn handle_input(
                     AudioChannel::Ui,
                     1,
                 ),
-                (OptionsTab::Graphics, 3) | (OptionsTab::Sound, 4) => {
+                (OptionsTab::Graphics, 6) | (OptionsTab::Sound, 4) => {
                     state.screen = PauseScreen::Main;
                     state.cursor = items
                         .iter()
@@ -1104,6 +1200,38 @@ pub fn sync_ui(
                         .entity(sway_slider.inc_btn)
                         .insert((Button, PauseAction::StepHudSway(1)));
 
+                    // Rows 3..=5: Gamma, Brightness, Contrast sliders (50% - 150%, I marker at 100%)
+                    for param in DisplayParam::ALL {
+                        let row_idx = OptionRow::DisplayParam(param).cursor_index();
+                        let pct_txt = format!("{}%", settings.display_param_percent(param));
+                        let slider = kit.spawn_slider_row(
+                            &mut commands,
+                            list,
+                            param.label(),
+                            &pct_txt,
+                            settings.display_param_fill(param),
+                            Some(GameSettings::display_param_default_mark()),
+                            state.cursor == row_idx,
+                            132.0,
+                            scale,
+                        );
+                        commands.entity(slider.row).insert((
+                            Button,
+                            PauseAction::SelectOptionRow(OptionRow::DisplayParam(param)),
+                        ));
+                        commands.entity(slider.track).insert(
+                            crate::garage::SliderTrack(
+                                crate::garage::SliderTrackTarget::DisplayParam(param),
+                            ),
+                        );
+                        commands
+                            .entity(slider.dec_btn)
+                            .insert((Button, PauseAction::StepDisplayParam(param, -1)));
+                        commands
+                            .entity(slider.inc_btn)
+                            .insert((Button, PauseAction::StepDisplayParam(param, 1)));
+                    }
+
                     // Combat HUD Color HSV / RGB picker
                     if garage_state.paint_hsv_synced_channel != Some(usize::MAX - 1) {
                         let c = settings.hud_color;
@@ -1133,7 +1261,7 @@ pub fn sync_ui(
                         scale * 0.88,
                     );
 
-                    3
+                    6
                 }
                 OptionsTab::Sound => {
                     // Section: Sound Settings (Master, Music, SFX, Menu / UI)
@@ -1278,7 +1406,7 @@ mod tests {
 
     #[test]
     fn option_row_counts_match_tabs() {
-        assert_eq!(option_row_count(OptionsTab::Graphics), 4);
+        assert_eq!(option_row_count(OptionsTab::Graphics), 7);
         assert_eq!(option_row_count(OptionsTab::Sound), 5);
     }
 }

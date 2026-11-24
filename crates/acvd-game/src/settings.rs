@@ -19,6 +19,33 @@ pub const UI_SCALE_MIN: f32 = 0.50;
 /// Maximum UI scale multiplier (150%).
 pub const UI_SCALE_MAX: f32 = 1.50;
 
+/// Left/Right display adjustment nudge in Options menus (5% steps).
+pub const DISPLAY_PARAM_STEP_PCT: i8 = 5;
+/// Minimum multiplier for Gamma / Brightness / Contrast (50%).
+pub const DISPLAY_PARAM_MIN: f32 = 0.50;
+/// Maximum multiplier for Gamma / Brightness / Contrast (150%).
+pub const DISPLAY_PARAM_MAX: f32 = 1.50;
+
+/// Post-process display tone adjustments exposed in the Graphics Options tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayParam {
+    Gamma,
+    Brightness,
+    Contrast,
+}
+
+impl DisplayParam {
+    pub const ALL: [Self; 3] = [Self::Gamma, Self::Brightness, Self::Contrast];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gamma => "GAMMA",
+            Self::Brightness => "BRIGHTNESS",
+            Self::Contrast => "CONTRAST",
+        }
+    }
+}
+
 /// Category tabs inside the Garage and Pause Options menus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OptionsTab {
@@ -51,6 +78,7 @@ pub enum OptionRow {
     Fullscreen,
     UiScale,
     HudSway,
+    DisplayParam(DisplayParam),
     Volume(AudioChannel),
 }
 
@@ -60,6 +88,9 @@ impl OptionRow {
             Self::Fullscreen => 0,
             Self::UiScale => 1,
             Self::HudSway => 2,
+            Self::DisplayParam(DisplayParam::Gamma) => 3,
+            Self::DisplayParam(DisplayParam::Brightness) => 4,
+            Self::DisplayParam(DisplayParam::Contrast) => 5,
             Self::Volume(AudioChannel::Master) => 0,
             Self::Volume(AudioChannel::Music) => 1,
             Self::Volume(AudioChannel::Sfx) => 2,
@@ -109,6 +140,12 @@ pub struct GameSettings {
     pub hud_sway: f32,
     /// Combat HUD (lock-sight ring, digits, gauges) RGB color (default `#00FFA5`).
     pub hud_color: [u8; 3],
+    /// Display gamma multiplier in `0.50..=1.50` (50–150%, default 100%).
+    pub gamma: f32,
+    /// Display brightness multiplier in `0.50..=1.50` (50–150%, default 100%).
+    pub brightness: f32,
+    /// Display contrast multiplier in `0.50..=1.50` (50–150%, default 100%).
+    pub contrast: f32,
     /// Linear master volume in `0.0..=1.0` (0–100%).
     pub volume: f32,
     /// Linear music/BGM volume multiplier in `0.0..=1.0` (0–100%).
@@ -126,6 +163,9 @@ impl Default for GameSettings {
             ui_scale: 1.0,
             hud_sway: 1.0,
             hud_color: [0x00, 0xff, 0xa5],
+            gamma: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
             volume: 1.0,
             music_volume: 1.0,
             sfx_volume: 1.0,
@@ -147,6 +187,9 @@ impl GameSettings {
     pub fn clamp_all(&mut self) {
         self.ui_scale = self.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
         self.hud_sway = self.hud_sway.clamp(0.0, 1.0);
+        self.gamma = self.gamma.clamp(DISPLAY_PARAM_MIN, DISPLAY_PARAM_MAX);
+        self.brightness = self.brightness.clamp(DISPLAY_PARAM_MIN, DISPLAY_PARAM_MAX);
+        self.contrast = self.contrast.clamp(DISPLAY_PARAM_MIN, DISPLAY_PARAM_MAX);
         self.volume = self.volume.clamp(0.0, 1.0);
         self.music_volume = self.music_volume.clamp(0.0, 1.0);
         self.sfx_volume = self.sfx_volume.clamp(0.0, 1.0);
@@ -204,6 +247,60 @@ impl GameSettings {
     pub fn set_hud_sway_from_fill(&mut self, fill: f32) {
         let pct = (fill.clamp(0.0, 1.0) * 100.0).round().clamp(0.0, 100.0) as u8;
         self.hud_sway = (pct as f32) / 100.0;
+    }
+
+    pub fn display_param(&self, param: DisplayParam) -> f32 {
+        match param {
+            DisplayParam::Gamma => self.gamma,
+            DisplayParam::Brightness => self.brightness,
+            DisplayParam::Contrast => self.contrast,
+        }
+        .clamp(DISPLAY_PARAM_MIN, DISPLAY_PARAM_MAX)
+    }
+
+    pub fn display_param_percent(&self, param: DisplayParam) -> u16 {
+        (self.display_param(param) * 100.0)
+            .round()
+            .clamp(DISPLAY_PARAM_MIN * 100.0, DISPLAY_PARAM_MAX * 100.0) as u16
+    }
+
+    /// Normalized `0.0..=1.0` gauge fill across `DISPLAY_PARAM_MIN..=DISPLAY_PARAM_MAX`.
+    pub fn display_param_fill(&self, param: DisplayParam) -> f32 {
+        ((self.display_param(param) - DISPLAY_PARAM_MIN)
+            / (DISPLAY_PARAM_MAX - DISPLAY_PARAM_MIN))
+            .clamp(0.0, 1.0)
+    }
+
+    /// Normalized position of the default `100%` marker on the display adjustment gauge bar.
+    pub fn display_param_default_mark() -> f32 {
+        (1.0 - DISPLAY_PARAM_MIN) / (DISPLAY_PARAM_MAX - DISPLAY_PARAM_MIN)
+    }
+
+    pub fn step_display_param(&mut self, param: DisplayParam, delta_steps: i8) {
+        let min_pct = (DISPLAY_PARAM_MIN * 100.0).round() as i16;
+        let max_pct = (DISPLAY_PARAM_MAX * 100.0).round() as i16;
+        let pct = self.display_param_percent(param) as i16
+            + i16::from(delta_steps) * i16::from(DISPLAY_PARAM_STEP_PCT);
+        let next = (pct.clamp(min_pct, max_pct) as f32) / 100.0;
+        match param {
+            DisplayParam::Gamma => self.gamma = next,
+            DisplayParam::Brightness => self.brightness = next,
+            DisplayParam::Contrast => self.contrast = next,
+        }
+    }
+
+    pub fn set_display_param_from_fill(&mut self, param: DisplayParam, fill: f32) {
+        let t = fill.clamp(0.0, 1.0);
+        let min_pct = (DISPLAY_PARAM_MIN * 100.0).round() as i16;
+        let max_pct = (DISPLAY_PARAM_MAX * 100.0).round() as i16;
+        let pct = ((DISPLAY_PARAM_MIN + t * (DISPLAY_PARAM_MAX - DISPLAY_PARAM_MIN)) * 100.0)
+            .round() as i16;
+        let next = (pct.clamp(min_pct, max_pct) as f32) / 100.0;
+        match param {
+            DisplayParam::Gamma => self.gamma = next,
+            DisplayParam::Brightness => self.brightness = next,
+            DisplayParam::Contrast => self.contrast = next,
+        }
     }
 
     pub fn channel_volume(&self, channel: AudioChannel) -> f32 {
@@ -365,6 +462,34 @@ mod tests {
         assert_eq!(parsed.channel_percent(AudioChannel::Music), 100);
         assert_eq!(parsed.channel_percent(AudioChannel::Sfx), 100);
         assert_eq!(parsed.channel_percent(AudioChannel::Ui), 100);
+        assert_eq!(parsed.display_param_percent(DisplayParam::Gamma), 100);
+        assert_eq!(parsed.display_param_percent(DisplayParam::Brightness), 100);
+        assert_eq!(parsed.display_param_percent(DisplayParam::Contrast), 100);
+    }
+
+    #[test]
+    fn display_params_step_clamp_and_fill_roundtrip() {
+        let mut s = GameSettings::default();
+        for p in DisplayParam::ALL {
+            assert_eq!(s.display_param_percent(p), 100);
+            assert!(
+                (s.display_param_fill(p) - GameSettings::display_param_default_mark()).abs() < 1e-4
+            );
+            s.step_display_param(p, -2);
+            assert_eq!(s.display_param_percent(p), 90);
+            for _ in 0..20 {
+                s.step_display_param(p, -1);
+            }
+            assert_eq!(s.display_param_percent(p), 50);
+            assert_eq!(s.display_param_fill(p), 0.0);
+            for _ in 0..30 {
+                s.step_display_param(p, 1);
+            }
+            assert_eq!(s.display_param_percent(p), 150);
+            assert_eq!(s.display_param_fill(p), 1.0);
+            s.set_display_param_from_fill(p, GameSettings::display_param_default_mark());
+            assert_eq!(s.display_param_percent(p), 100);
+        }
     }
 
     #[test]
@@ -375,6 +500,18 @@ mod tests {
         assert_eq!(OptionRow::Fullscreen.cursor_index(), 0);
         assert_eq!(OptionRow::UiScale.cursor_index(), 1);
         assert_eq!(OptionRow::HudSway.cursor_index(), 2);
+        assert_eq!(
+            OptionRow::DisplayParam(DisplayParam::Gamma).cursor_index(),
+            3
+        );
+        assert_eq!(
+            OptionRow::DisplayParam(DisplayParam::Brightness).cursor_index(),
+            4
+        );
+        assert_eq!(
+            OptionRow::DisplayParam(DisplayParam::Contrast).cursor_index(),
+            5
+        );
         assert_eq!(OptionRow::Volume(AudioChannel::Master).cursor_index(), 0);
         assert_eq!(OptionRow::Volume(AudioChannel::Music).cursor_index(), 1);
         assert_eq!(OptionRow::Volume(AudioChannel::Sfx).cursor_index(), 2);
