@@ -648,6 +648,129 @@ impl Built {
         Some((spec.parent, to_transform(t, r, s)))
     }
 
+    /// World-space (Bevy axes) AABB of part `part_idx` in the static frame-0 standing pose
+    /// produced by [`spawn_static`]. Used by the Garage `PARTS VIEW` preview to center and
+    /// fit-scale posed arm parts cleanly.
+    pub fn static_part_bounds(&self, part_idx: usize, part: &Loaded) -> Option<(Vec3, Vec3)> {
+        use bevy::mesh::VertexAttributeValues;
+
+        let &(first, unboned) = self.parts.get(part_idx)?;
+        let n_joints = self.joints.len();
+        let locals: Vec<Mat4> = self
+            .joints
+            .iter()
+            .map(|spec| {
+                let parent_bind = spec
+                    .parent
+                    .map_or(Affine3A::IDENTITY, |p| self.joints[p].bind);
+                let local = parent_bind.inverse() * spec.bind;
+                let (s, r, t) = local.to_scale_rotation_translation();
+                let mut transform = to_transform(t, r, s);
+                if let (Some(bone), Some(m)) = (spec.bone, self.motion.as_ref()) {
+                    if let (Some(rest), Some(cbone)) = (
+                        m.skeleton.bones.get(bone).and_then(|b| b.rest.as_ref()),
+                        m.clip.bones.get(bone),
+                    ) {
+                        let cbone = if m.in_place && rest.parent.is_none() {
+                            &m.skeleton.bones[bone]
+                        } else {
+                            cbone
+                        };
+                        let rotation = Quat::from_array(
+                            cbone
+                                .track
+                                .rotation(0.0)
+                                .unwrap_or_else(|| ani::euler_quat(rest.euler)),
+                        );
+                        let ct =
+                            Vec3::from(cbone.track.translation(0.0).unwrap_or(rest.translation));
+                        let cs = Vec3::from(cbone.track.scale(0.0).unwrap_or(rest.scale));
+                        let absolute = spec.parent.is_none_or(|p| self.joints[p].virtual_bone);
+                        let translation = if absolute {
+                            ct * m.scale
+                        } else {
+                            t + (ct - Vec3::from(rest.translation)) * m.scale
+                        };
+                        transform = to_transform(translation, rotation, cs);
+                    }
+                }
+                transform.to_matrix()
+            })
+            .collect();
+
+        let mut worlds: Vec<Option<Mat4>> = vec![None; n_joints];
+        fn resolve(
+            j: usize,
+            joints: &[Spec],
+            locals: &[Mat4],
+            worlds: &mut [Option<Mat4>],
+            depth: usize,
+        ) -> Mat4 {
+            if let Some(w) = worlds[j] {
+                return w;
+            }
+            if depth > 64 {
+                return locals[j];
+            }
+            let w = match joints[j].parent {
+                Some(p) => resolve(p, joints, locals, worlds, depth + 1) * locals[j],
+                None => locals[j],
+            };
+            worlds[j] = Some(w);
+            w
+        }
+
+        let n = part.rig.bones.len();
+        let mut skins: Vec<Mat4> = Vec::with_capacity(n + 1);
+        for b in 0..n {
+            let w = resolve(first + b, &self.joints, &locals, &mut worlds, 0);
+            let inv_bind = Mat4::from(mirror(self.joints[first + b].bind).inverse());
+            skins.push(w * inv_bind);
+        }
+        let extra_w = to_transform(unboned.translation.into(), Quat::IDENTITY, Vec3::ONE).to_matrix();
+        skins.push(extra_w * Mat4::from(mirror(unboned).inverse()));
+
+        let mut bmin = Vec3::splat(f32::INFINITY);
+        let mut bmax = Vec3::splat(f32::NEG_INFINITY);
+        for lm in &part.meshes {
+            let Some(VertexAttributeValues::Float32x3(positions)) =
+                lm.mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                continue;
+            };
+            let joints_attr = match lm.mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX) {
+                Some(VertexAttributeValues::Uint16x4(j)) => Some(j.as_slice()),
+                _ => None,
+            };
+            let weights_attr = match lm.mesh.attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT) {
+                Some(VertexAttributeValues::Float32x4(w)) => Some(w.as_slice()),
+                _ => None,
+            };
+            for (vi, &p) in positions.iter().enumerate() {
+                let p = Vec3::from_array(p);
+                let posed = if let (Some(js), Some(ws)) = (joints_attr, weights_attr) {
+                    let mut acc = Vec3::ZERO;
+                    let mut wsum = 0.0f32;
+                    for k in 0..4 {
+                        let w = ws[vi][k];
+                        if w > 0.0 {
+                            if let Some(&m) = skins.get(js[vi][k] as usize) {
+                                acc += m.transform_point3(p) * w;
+                                wsum += w;
+                            }
+                        }
+                    }
+                    if wsum > 1e-4 { acc / wsum } else { p }
+                } else {
+                    skins.last().map_or(p, |m| m.transform_point3(p))
+                };
+                bmin = bmin.min(posed);
+                bmax = bmax.max(posed);
+            }
+        }
+        (bmin.is_finite() && bmax.is_finite()).then_some((bmin, bmax))
+    }
+
     /// `child` bone's rest transform in `parent` bone's space, in Bevy axes.
     pub fn local_against(
         &self,

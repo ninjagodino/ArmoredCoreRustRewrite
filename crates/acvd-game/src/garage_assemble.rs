@@ -43,7 +43,7 @@ use bevy::ui::px;
 
 use crate::assemble;
 use crate::blur::ActiveMenuBackdrop;
-use crate::decal::{DecalSlot, DecalState};
+use crate::decal::{self, DecalSlot, DecalState};
 use crate::garage::{
     part_name, parts_for_slot, AcSpecs, AssembleSlot, GarageScreen, GarageState, GarageUi, Mode,
     UiAction, UiRow,
@@ -208,7 +208,7 @@ pub struct AcPreviewPivot;
 #[derive(Component)]
 pub struct AcPreviewMesh;
 
-type PreviewKey = (u8, u16, bool, u64);
+type PreviewKey = (u8, u16, bool, u64, u64);
 /// Key uniquely identifying the visible 3D state of the `ASSEMBLY VIEW` preview AC.
 type AcPreviewKey = ([u16; 11], u16, u64);
 
@@ -847,15 +847,8 @@ pub fn spawn_assemble_ui(
         ..default()
     };
 
-    // 1. Scoped translucent backing behind the left Assemble pane (`x = 76..696, y = 108..586`)
-    //    so the 3D workshop flows naturally behind the right-side AC without a harsh vertical seam.
-    commands.spawn((
-        px_rect(76.0, 108.0, 696.0, 586.0),
-        BackgroundColor(Color::srgba(0.01, 0.03, 0.05, 0.56)),
-        ChildOf(screen_root),
-    ));
-
-    // 2. Real `@ModelBackImage` DRB dialog (authentic left/right corner-reticle frames).
+    // 1. Real `@ModelBackImage` DRB dialog (authentic left/right corner-reticle frames +
+    //    9-slice translucent `汎用ベース1` panels spanning `[173,220,686,567]` and `[705,109,1213,567]`).
     if let Some(layout) = assets.layout.as_ref() {
         if let Some(idx) = layout.drb.dialogs.iter().position(|d| d.name == "@ModelBackImage") {
             let dlg = menu::spawn(commands, layout, idx, Vec2::ZERO, scale);
@@ -863,9 +856,9 @@ pub fn spawn_assemble_ui(
         }
     }
 
-    // 3. Normal View vs Detail View (`Tab` toggles `state.assemble_detail_view`).
+    // 2. Normal View vs Detail View (`Tab` toggles `state.assemble_detail_view`).
     if !state.assemble_detail_view {
-        // 3a-right. Live 3D full-AC preview inside `@AcLayout` (`ASSEMBLY VIEW`, `[705,109,1213,567]`),
+        // 2a-right. Live 3D full-AC preview inside `@AcLayout` (`ASSEMBLY VIEW`, `[705,109,1213,567]`),
         //           spawned before `@PartsNormal` so the Load/Energy bars draw cleanly on top.
         if let Some(ref ac_img) = assets.ac_preview_image {
             commands.spawn((
@@ -875,35 +868,14 @@ pub fn spawn_assemble_ui(
             ));
         }
 
-        // 3a. Dark blueprint backing behind the left `@PartsNormal` panel (`[173,220,686,567]`)
-        //     so stat text and the 3D part preview stand out cleanly over the blurred workshop.
-        commands.spawn((
-            px_rect(173.0, 220.0, 686.0, 567.0),
-            BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.78)),
-            ChildOf(screen_root),
-        ));
-        // Live 3D Part/Weapon Preview in the upper clear area of `@PartsLayout` (`[178,231,676,412]`).
-        let preview_box = commands
-            .spawn((
-                px_rect(178.0, 231.0, 676.0, 412.0),
-                BackgroundColor(Color::srgba(0.05, 0.08, 0.12, 0.45)),
-                BorderColor::all(Color::srgba(0.32, 0.45, 0.52, 0.45)),
-                ChildOf(screen_root),
-            ))
-            .id();
+        // 2a-left. Live 3D Part/Weapon Preview in the upper clear area of `@PartsLayout`
+        //          (`[178,231,676,412]`), sitting seamlessly inside `base_window_L`'s DRB frame.
         if let Some(ref preview_img) = assets.preview_image {
             if sel_id > 0 {
                 commands.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: px(0.0),
-                        top: px(0.0),
-                        width: px(498.0 * scale),
-                        height: px(181.0 * scale),
-                        ..default()
-                    },
+                    px_rect(178.0, 231.0, 676.0, 412.0),
                     ImageNode::new(preview_img.clone()),
-                    ChildOf(preview_box),
+                    ChildOf(screen_root),
                 ));
             }
         }
@@ -2022,12 +1994,10 @@ pub fn sync_part_preview(
     mode: Res<Mode>,
     state: Res<GarageState>,
     garage: Res<crate::Garage>,
+    decals: Res<DecalState>,
     mut assets: ResMut<AssembleUiAssets>,
     mut ac_packs: ResMut<crate::AcTexturePacks>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut std_mats: ResMut<Assets<StandardMaterial>>,
-    mut ac_mats: ResMut<Assets<paint::AcPaintMaterial>>,
-    mut images: ResMut<Assets<Image>>,
+    mut handles: AcPreviewAssetHandles,
     studio_q: Query<Entity, With<PartPreviewStudio>>,
     pivot_q: Query<Entity, With<PartPreviewPivot>>,
     mesh_q: Query<Entity, With<PartPreviewMesh>>,
@@ -2060,7 +2030,7 @@ pub fn sync_part_preview(
         return;
     };
 
-    assets.ensure_loaded(&garage.disc, &mut images);
+    assets.ensure_loaded(&garage.disc, &mut handles.images);
 
     // Spawn the isolated offscreen studio camera & 3-point lights once.
     if studio_q.is_empty() {
@@ -2128,7 +2098,21 @@ pub fn sync_part_preview(
             h
         })
         .unwrap_or(0);
-    let want = (cat, sel_id, is_left, color_key);
+    let emblem_hash = if slot == AssembleSlot::Arms {
+        let mut h = (garage.active_design.legs as u64) << 16 | (garage.active_design.core as u64);
+        if let Some(emblem_key) = decals.ac_emblem_key.as_deref() {
+            if decals.active_emblem_asset().is_some() {
+                h = h.wrapping_mul(31).wrapping_add(1);
+                for b in emblem_key.bytes() {
+                    h = h.wrapping_mul(31).wrapping_add(b as u64);
+                }
+            }
+        }
+        h
+    } else {
+        0
+    };
+    let want = (cat, sel_id, is_left, color_key, emblem_hash);
     if assets.preview_loaded == Some(want) {
         assets.preview_pending = None;
         return;
@@ -2136,7 +2120,8 @@ pub fn sync_part_preview(
 
     // If not already cached (and not the very first preview frame or empty slot), debounce
     // disc FLVER loading by 90 ms so rapid W/S scrolling stays 60 FPS.
-    let is_cached = sel_id == 0 || assets.preview_cache.contains_key(&want);
+    let is_cached = sel_id == 0
+        || (slot != AssembleSlot::Arms && assets.preview_cache.contains_key(&want));
     if !is_cached && assets.preview_loaded.is_some() {
         match assets.preview_pending {
             Some((k, ref mut rem)) if k == want => {
@@ -2154,6 +2139,10 @@ pub fn sync_part_preview(
     assets.preview_pending = None;
     assets.preview_loaded = Some(want);
     assets.reset_preview_view();
+    if slot == AssembleSlot::Arms {
+        // Start Arms preview in a 3/4 front-left angle so the left shoulder & emblem face the viewer.
+        assets.preview_yaw = -0.35;
+    }
 
     for e in &mesh_q {
         commands.entity(e).despawn();
@@ -2163,6 +2152,213 @@ pub fn sync_part_preview(
     }
     if sel_id == 0 {
         return;
+    }
+
+    let layer = RenderLayers::layer(PART_PREVIEW_LAYER);
+
+    // Arms preview: pose the highlighted arm part in its authentic standing/garage pose via
+    // `pose::build` + `pose::spawn_static` and bake the active AC shoulder emblem onto its
+    // Left Arm submeshes (matching retail 360 `PARTS VIEW`).
+    if slot == AssembleSlot::Arms {
+        let mut preview_design = garage.active_design;
+        preview_design.arms = sel_id as i16;
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &preview_design);
+        let color: Option<AcColor> = if garage.flat {
+            None
+        } else {
+            garage
+                .custom_color
+                .clone()
+                .or_else(|| paint::load_accolor(&garage.disc, preview_design.coloring_id))
+        };
+
+        let ac_cache = &mut *ac_packs;
+        let (packs, flvers, mut missing) = (&mut ac_cache.packs, &mut ac_cache.flvers, 0usize);
+        let mut loaded = Vec::new();
+        let mut known = vec![None; built.placements.len()];
+        for (index, p) in built.placements.iter().enumerate() {
+            if !matches!(p.column, "legs" | "core" | "arms") {
+                continue;
+            }
+            let places = assemble::root_places(p, &built.placements, &known);
+            if let Ok((meshes, rig)) =
+                flvers.rigged_model(&garage.disc, p.model.path, &|root| {
+                    assemble::place_of(&places, root)
+                })
+            {
+                known[index] = Some(assemble::Stored {
+                    places,
+                    frames: rig.frames.clone(),
+                });
+                loaded.push(pose::Loaded {
+                    index,
+                    placement: p,
+                    meshes,
+                    rig,
+                });
+            }
+        }
+        if let (Some(arm_idx), Ok(rig)) = (
+            loaded.iter().position(|p| p.placement.column == "arms"),
+            pose::build(&garage.disc, &loaded),
+        ) {
+            let (bmin, bmax) = rig
+                .static_part_bounds(arm_idx, &loaded[arm_idx])
+                .unwrap_or_else(|| {
+                    let mut lo = Vec3::splat(f32::INFINITY);
+                    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                    for m in &loaded[arm_idx].meshes {
+                        lo = lo.min(Vec3::from_array(m.min));
+                        hi = hi.max(Vec3::from_array(m.max));
+                    }
+                    (lo, hi)
+                });
+            let center = (bmin + bmax) * 0.5;
+            let extent = (bmax - bmin).max(Vec3::splat(0.05));
+            let radius = (extent.length() * 0.5).max(0.1);
+            let fit_scale = 1.32 / radius;
+
+            let pivot = commands
+                .spawn((
+                    PartPreviewPivot,
+                    Transform::from_rotation(
+                        Quat::from_rotation_x(assets.preview_pitch)
+                            * Quat::from_rotation_y(assets.preview_yaw),
+                    ),
+                    Visibility::default(),
+                    layer.clone(),
+                ))
+                .id();
+
+            let face_front = Quat::from_rotation_y(std::f32::consts::PI);
+            let arm_root = commands
+                .spawn((
+                    Transform {
+                        translation: -(face_front * center * fit_scale),
+                        rotation: face_front,
+                        scale: Vec3::splat(fit_scale),
+                    },
+                    Visibility::default(),
+                    layer.clone(),
+                    ChildOf(pivot),
+                ))
+                .id();
+
+            let (_joint_entities, skins) =
+                pose::spawn_static(&mut commands, arm_root, &rig, &loaded);
+            let mut skins = skins;
+            let arm_part = loaded.swap_remove(arm_idx);
+            let (joints, binds) = skins.swap_remove(arm_idx);
+
+            // Bake the active AC shoulder emblem onto this previewed arm's Left Arm UV1.
+            let l_kata_rest = arm_part
+                .rig
+                .bones
+                .iter()
+                .position(|b| b.name.eq_ignore_ascii_case("l_kata"))
+                .and_then(|i| binds.get(i))
+                .map(|m| m.inverse());
+            let left_emblem_tex: Option<Handle<Image>> =
+                l_kata_rest.zip(decals.active_emblem_asset()).and_then(|(rest, emblem_asset)| {
+                    let mut left_cache = decal::DecalMeshCache::default();
+                    for lm in &arm_part.meshes {
+                        let cx = 0.5 * (lm.min[0] + lm.max[0]);
+                        if DecalSlot::from_mesh_bounds("arms", lm.root.as_deref(), Some(cx))
+                            == Some(DecalSlot::LeftArm)
+                        {
+                            if let Some(cm) = decal::CachedPartMesh::from_mesh(
+                                DecalSlot::LeftArm,
+                                &lm.mesh,
+                                joints.clone(),
+                                binds.clone(),
+                            ) {
+                                left_cache.meshes.push(cm);
+                            }
+                        }
+                    }
+                    let left_refs: Vec<&decal::CachedPartMesh> = left_cache.meshes.iter().collect();
+                    let proj = decal::build_shoulder_emblem_projector(
+                        sel_id as i16,
+                        rest,
+                        &left_refs,
+                    )?;
+                    let pixels = decal::bake_slot_pixels(
+                        DecalSlot::LeftArm,
+                        512,
+                        &left_cache,
+                        &[],
+                        Some((&proj, emblem_asset)),
+                        &mut |_| None,
+                    );
+                    let mut img = Image::new(
+                        bevy::render::render_resource::Extent3d {
+                            width: 512,
+                            height: 512,
+                            depth_or_array_layers: 1,
+                        },
+                        bevy::render::render_resource::TextureDimension::D2,
+                        pixels,
+                        TextureFormat::Rgba8UnormSrgb,
+                        bevy::asset::RenderAssetUsages::RENDER_WORLD,
+                    );
+                    img.sampler = bevy::image::ImageSampler::linear();
+                    Some(handles.images.add(img))
+                });
+
+            let inverse_bindposes = handles
+                .bindposes
+                .add(SkinnedMeshInverseBindposes::from(binds));
+            for lm in arm_part.meshes {
+                let cx = 0.5 * (lm.min[0] + lm.max[0]);
+                let decal_slot = DecalSlot::from_mesh_bounds("arms", lm.root.as_deref(), Some(cx));
+                let decal_tex = if decal_slot == Some(DecalSlot::LeftArm) {
+                    left_emblem_tex.clone()
+                } else {
+                    None
+                };
+                let base = acvd_render::material(
+                    &garage.disc,
+                    &lm,
+                    packs,
+                    &mut handles.images,
+                    garage.flat,
+                    &mut missing,
+                );
+                let painted = color.as_ref().and_then(|col| {
+                    paint::material(
+                        &garage.disc,
+                        &base,
+                        &lm,
+                        "arms",
+                        col,
+                        decal_tex,
+                        packs,
+                        &mut handles.images,
+                    )
+                });
+                let mut e = commands.spawn((
+                    PartPreviewMesh,
+                    Mesh3d(handles.meshes.add(lm.mesh)),
+                    SkinnedMesh {
+                        inverse_bindposes: inverse_bindposes.clone(),
+                        joints: joints.clone(),
+                    },
+                    NoFrustumCulling,
+                    Transform::default(),
+                    layer.clone(),
+                    ChildOf(arm_root),
+                ));
+                match painted {
+                    Some(mat) => {
+                        e.insert(MeshMaterial3d(handles.ac_mats.add(mat)));
+                    }
+                    None => {
+                        e.insert(MeshMaterial3d(handles.std_mats.add(base)));
+                    }
+                }
+            }
+            return;
+        }
     }
 
     let cached_meshes = if let Some(cached) = assets.preview_cache.get(&want) {
@@ -2221,7 +2417,7 @@ pub fn sync_part_preview(
                 &garage.disc,
                 &lm,
                 &mut ac_packs.packs,
-                &mut images,
+                &mut handles.images,
                 garage.flat,
                 &mut missing,
             );
@@ -2234,19 +2430,19 @@ pub fn sync_part_preview(
                     col,
                     None,
                     &mut ac_packs.packs,
-                    &mut images,
+                    &mut handles.images,
                 )
             });
-            let mesh_h = meshes.add(lm.mesh);
+            let mesh_h = handles.meshes.add(lm.mesh);
             let child_xform = Transform {
                 translation: -center * fit_scale,
                 rotation: Quat::IDENTITY,
                 scale: Vec3::splat(fit_scale),
             };
             let mat = if let Some(mat) = painted {
-                PreviewMat::Painted(ac_mats.add(mat))
+                PreviewMat::Painted(handles.ac_mats.add(mat))
             } else {
-                PreviewMat::Std(std_mats.add(base))
+                PreviewMat::Std(handles.std_mats.add(base))
             };
             built.push(CachedPreviewMesh {
                 mesh: mesh_h,
@@ -2258,7 +2454,6 @@ pub fn sync_part_preview(
         built
     };
 
-    let layer = RenderLayers::layer(PART_PREVIEW_LAYER);
     let pivot = commands
         .spawn((
             PartPreviewPivot,
@@ -2954,5 +3149,50 @@ mod tests {
         assert_eq!(rows[0].cmp, 1); // 4564 > 3377 -> blue
         assert_eq!(rows[4].label, "Weight");
         assert_eq!(rows[4].cmp, -1); // 498 > 455 -> red (heavier is worse)
+    }
+
+    #[test]
+    fn posed_arm_preview_bounds_are_upright_and_finite() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let disc = Disc::open(&vfs::default_disc(&root)).expect("open 360 disc");
+        let design = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 6007)
+            .expect("design 6007")
+            .data;
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design);
+        let mut flvers = acvd_render::FlverCache::default();
+        let mut loaded = Vec::new();
+        let mut known = vec![None; built.placements.len()];
+        for (index, p) in built.placements.iter().enumerate() {
+            if !matches!(p.column, "legs" | "core" | "arms") {
+                continue;
+            }
+            let places = assemble::root_places(p, &built.placements, &known);
+            let (meshes, rig) = flvers
+                .rigged_model(&disc, p.model.path, &|root| assemble::place_of(&places, root))
+                .expect("rigged model");
+            known[index] = Some(assemble::Stored {
+                places,
+                frames: rig.frames.clone(),
+            });
+            loaded.push(pose::Loaded {
+                index,
+                placement: p,
+                meshes,
+                rig,
+            });
+        }
+        let arm_idx = loaded
+            .iter()
+            .position(|p| p.placement.column == "arms")
+            .expect("arms");
+        let rig = pose::build(&disc, &loaded).expect("pose build");
+        let (bmin, bmax) = rig
+            .static_part_bounds(arm_idx, &loaded[arm_idx])
+            .expect("posed bounds");
+        let ext = bmax - bmin;
+        assert!(ext.x > 1.0 && ext.y > 1.0 && ext.z > 0.5, "ext={ext:?}");
     }
 }

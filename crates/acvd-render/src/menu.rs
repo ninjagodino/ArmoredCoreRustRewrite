@@ -29,6 +29,7 @@ use bevy::prelude::{App, BackgroundColor, BorderColor, Changed, ChildOf, Childre
 use bevy::render::render_resource::{AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, RenderPipelineDescriptor};
 use bevy::shader::ShaderRef;
 use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient, UiRect, UiTransform};
+use bevy::ui::widget::NodeImageMode;
 use bevy::ui_render::prelude::{MaterialNode, UiMaterial, UiMaterialPlugin};
 use bevy::ui_render::ui_material::UiMaterialKey;
 
@@ -372,7 +373,15 @@ fn draw_sprites(
 ) {
     for (e, s, material) in &sprites {
         if !s.additive {
-            commands.entity(e).insert(ImageNode { image: s.image.clone(), color: s.color, rect: Some(s.rect), flip_x: s.flip_x, flip_y: s.flip_y, ..Default::default() });
+            commands.entity(e).insert(ImageNode {
+                image: s.image.clone(),
+                color: s.color,
+                rect: Some(s.rect),
+                flip_x: s.flip_x,
+                flip_y: s.flip_y,
+                image_mode: NodeImageMode::Stretch,
+                ..Default::default()
+            });
             continue;
         }
         if let Some(mut m) = material.and_then(|m| materials.get_mut(&m.0)) {
