@@ -1618,7 +1618,12 @@ fn show(
             let on_prong = if on_bay {
                 rack_bones[hand as usize].as_ref().and_then(
                     |(rack_i, rack_joints, front, back)| {
-                        let local = rig.local_against(loaded_i, root_bone, *rack_i, *front)?;
+                        let _ = (rack_i, rig.local_against(loaded_i, root_bone, *rack_i, *front));
+                        // Attach the bay weapon directly onto the prong joint (`*_hg_f` / `*_hg_b`):
+                        // `a00_011`/`a00_021` already orient the prongs so their +Z/+Y axes match
+                        // `r_armhand`/`l_armhand` at f=40 and f=150, and the prong bone itself sits
+                        // at the rack clamp (avoiding the ~1 m floating offset from un-parented d87).
+                        let local = Transform::IDENTITY;
                         let parent = *rack_joints.get(*front)?;
                         let alt_parent = back.and_then(|b| rack_joints.get(b).copied());
                         Some((parent, alt_parent, local))

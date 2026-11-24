@@ -1,16 +1,14 @@
 //! Hanger racks (`hgr0001` / `hgl0001`, `sheets/hanger_anim.csv`).
 //!
-//! The FLVER bind leaves `r_hg_f` / `l_hg_f` and `r_hg_b` / `l_hg_b` unrotated, so a weapon on
-//! dummy 87/85 stands straight up. The rack bank poses those bones:
-//! - Bones `0..=1` (`81`/`80`, `r_hg01`/`l_hg01`): stowed pitch from the racked weapon's
-//!   `hanger_pose` (`sheets/ac_part_fields.csv`, arrive clip `a00_(30 + 6*pose)` held on its
-//!   keyed frame + `STOW_CCW`).
-//! - Bones `2..` (`*_hg02`, `*_hg_f`, `*_hg03`, `*_hg_b`): dual-prong carousel driven by
-//!   `a00_011.ani` (phase `0 -> 1`, 180 frames) and `a00_021.ani` (phase `1 -> 0`, 180 frames),
-//!   triggered by TAE `2000..2003` (`kind=1` part-anim at frame 0, 360 `0x82876f48` phase toggle).
-//!   Frame `0..40` opens the empty prong to receive the hand weapon (seated at frame 40 via TAE
-//!   `kind=101`), frame `40..90` rotates the carousel 180°, and frame `90..150` presents the
-//!   previously stowed weapon for the hand to grab at frame 150.
+//! The FLVER bind leaves `r_hg_f`/`l_hg_f` (dummy 87/85) and `r_hg_b`/`l_hg_b` (dummy 88/86)
+//! unrotated. The rack animation bank drives all 6 bones (`81`/`80`, `*_hg01`, `*_hg02`,
+//! `*_hg_f`, `*_hg03`, `*_hg_b`) directly via the dual-prong carousel clips:
+//! - `a00_011.ani` (phase `0 -> 1`, 180 frames): starts with the stowed weapon on `*_hg_b` and
+//!   `*_hg_f` empty; `f0..f40` opens `*_hg_f` forward to match `r_armhand`/`l_armhand` at frame
+//!   40; `f40..f120` spins the carousel 180°; `f120..f150` presents `*_hg_b` aligned with the
+//!   hand for the frame-150 grab; `f150..f180` folds the now-empty `*_hg_b` back.
+//! - `a00_021.ani` (phase `1 -> 0`, 180 frames): exact symmetric return from `a00_011` frame 179
+//!   back to `a00_011` frame 0.
 
 use acvd_formats::ani;
 use acvd_formats::vfs::{self, Disc};
@@ -21,15 +19,11 @@ use crate::weapons::{Hand, Shift};
 const RIGHT: &str = "model/ac/parts/hanger/hgr0001/hgr0001_a.bnd.dcx";
 const LEFT: &str = "model/ac/parts/hanger/hgl0001/hgl0001_a.bnd.dcx";
 
-/// Keyed frame of each arrive clip `a00_(30 + 6*pose)` where the barrel sits ~49° above horizontal.
-const STOW_FRAMES: [f32; 5] = [8.0, 8.0, 8.0, 10.0, 12.0];
-
 struct Rack {
     hand: Hand,
     /// Current racked weapon's `hanger_pose` (`0..=4`).
+    #[allow(dead_code)]
     pose: u8,
-    /// All five arrive clips `a00_(30 + 6*pose)` so swapping weapons updates the stow pitch.
-    stowed: [Option<ani::Anim>; 5],
     /// Phase `0 -> 1` carousel clip (`a00_011.ani`, 180 frames).
     swing_01: ani::Anim,
     /// Phase `1 -> 0` carousel clip (`a00_021.ani`, 180 frames).
@@ -46,8 +40,6 @@ pub struct HangerPose {
 }
 
 impl HangerPose {
-    /// `pose` is the initial bay weapon's `hanger_pose` byte (`sheets/ac_part_fields.csv`):
-    /// `0..=4` selects arrive clip `a00_(30 + 6*pose)`.
     pub fn load(disc: &Disc, racks: Vec<(Hand, u8, Vec<(String, Entity)>)>) -> Self {
         let mut out = Vec::new();
         for (hand, pose, bones) in racks {
@@ -56,12 +48,6 @@ impl HangerPose {
                 continue;
             };
             let n_bones = skeleton.bones.len();
-            let stowed: [Option<ani::Anim>; 5] = std::array::from_fn(|p| {
-                let clip = 30 + (p as u32) * 6;
-                open(disc, path, &format!("a00_{clip:03}.ani"))
-                    .ok()
-                    .filter(|a| a.bones.len() == n_bones)
-            });
             let Ok(swing_01) = open(disc, path, "a00_011.ani") else {
                 continue;
             };
@@ -82,7 +68,6 @@ impl HangerPose {
             out.push(Rack {
                 hand,
                 pose: pose.min(4),
-                stowed,
                 swing_01,
                 swing_10,
                 joints,
@@ -109,9 +94,10 @@ fn bevy_quat(q: [f32; 4]) -> Quat {
     Quat::from_xyzw(q[0], -q[1], -q[2], q[3])
 }
 
-/// Extra shoulder pitch past the arrive clip. In the side view (forward to the right) this is
-/// counterclockwise: the muzzle swings from up, through back, to down.
-const STOW_CCW: f32 = 100.0_f32.to_radians();
+/// Idle stowed shoulder pitch on `*_hg01` (bone 1): angles the stowed barrel ~35° down-back
+/// behind the shoulder (matching retail ACVD). Blends smoothly to 0° during `f=20..150` of
+/// `a00_011`/`a00_021` so both handoffs (`f=40` seat, `f=150` grab) align with `*_armhand`.
+const STOW_PITCH_X: f32 = 100.0_f32.to_radians();
 
 pub fn pose(
     shift: Option<Res<Shift>>,
@@ -123,19 +109,7 @@ pub fn pose(
     };
     for rack in &mut hanger.racks {
         let side = rack.hand as usize;
-        let pose_idx = usize::from(rack.pose.min(4));
-        let Some(stowed_clip) = rack.stowed[pose_idx]
-            .as_ref()
-            .or_else(|| rack.stowed.iter().flatten().next())
-        else {
-            continue;
-        };
-        let stowed_end = STOW_FRAMES[pose_idx];
-
-        // Determine the carousel clip and frame for bones 2.. (`*_hg02`, `*_hg_f`, `*_hg03`, `*_hg_b`).
-        // During a non-purge shift, play `a00_011` (phase 0->1) or `a00_021` (phase 1->0) from
-        // frame 0..180. When idle, hold phase 0 (`a00_011` frame 0) or phase 1 (`a00_011` end).
-        let (carousel_clip, carousel_frame) = match shift.as_deref() {
+        let (carousel_clip, carousel_frame, shift_blend) = match shift.as_deref() {
             Some(s) => match s.hands[side].as_ref() {
                 Some(hs) if !hs.purge => {
                     let clip = if hs.phase == 0 {
@@ -144,30 +118,45 @@ pub fn pose(
                         &rack.swing_10
                     };
                     let max_f = clip.frames.saturating_sub(1) as f32;
-                    (clip, hs.rack_frame.clamp(0.0, max_f))
+                    let f = hs.rack_frame.clamp(0.0, max_f);
+                    let w = if f < 20.0 {
+                        f / 20.0
+                    } else if f <= 150.0 {
+                        1.0
+                    } else {
+                        ((180.0 - f) / 30.0).clamp(0.0, 1.0)
+                    };
+                    (clip, f, w)
                 }
                 _ => {
                     if s.phase[side] == 0 {
-                        (&rack.swing_01, 0.0)
+                        (&rack.swing_01, 0.0, 0.0)
                     } else {
-                        (&rack.swing_01, rack.swing_01.frames.saturating_sub(1) as f32)
+                        (
+                            &rack.swing_01,
+                            rack.swing_01.frames.saturating_sub(1) as f32,
+                            0.0,
+                        )
                     }
                 }
             },
-            None => (&rack.swing_01, 0.0),
+            None => (&rack.swing_01, 0.0, 0.0),
         };
 
-        let quats: Vec<[f32; 4]> = (0..stowed_clip.bones.len())
+        let quats: Vec<Quat> = (0..carousel_clip.bones.len())
             .map(|i| {
-                let (clip, frame) = if i >= 2 {
-                    (carousel_clip, carousel_frame)
-                } else {
-                    (stowed_clip, stowed_end)
-                };
-                clip.bones
-                    .get(i)
-                    .and_then(|b| b.track.rotation(frame))
-                    .unwrap_or([0.0, 0.0, 0.0, 1.0])
+                let q = bevy_quat(
+                    carousel_clip
+                        .bones
+                        .get(i)
+                        .and_then(|b| b.track.rotation(carousel_frame))
+                        .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                );
+                if i == 1 {
+                    let stow_q = Quat::from_rotation_x(STOW_PITCH_X * (1.0 - shift_blend));
+                    return stow_q * q;
+                }
+                q
             })
             .collect();
         if rack.translation.len() != rack.joints.len() {
@@ -183,13 +172,7 @@ pub fn pose(
             }
             let saved = *rack.translation[i].get_or_insert(transform.translation);
             transform.translation = saved;
-            let mut rotation = bevy_quat(quats[i]);
-            // Bone 1 is `r_hg01` / `l_hg01`, the shoulder of the rack. Parent X is the AC's
-            // lateral axis, so this pitch is the same CCW on both sides.
-            if i == 1 {
-                rotation = Quat::from_rotation_x(STOW_CCW) * rotation;
-            }
-            transform.rotation = rotation;
+            transform.rotation = quats[i];
         }
     }
 }
@@ -197,7 +180,55 @@ pub fn pose(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acvd_formats::vfs;
+    use acvd_formats::{ani, vfs};
+
+    /// Evaluate local-to-world matrix of a bone chain from an `.ani` clip at frame `f`
+    /// using the exact `pose::to_transform` / `hanger::bevy_quat` convention.
+    fn eval_ani_world(
+        skeleton: &ani::Anim,
+        clip: &ani::Anim,
+        f: f32,
+        bone_name: &str,
+    ) -> (Vec3, Quat) {
+        let idx = skeleton
+            .bones
+            .iter()
+            .position(|b| b.rest.as_ref().is_some_and(|r| r.name == bone_name))
+            .unwrap_or_else(|| panic!("no bone {bone_name}"));
+        let mut chain = Vec::new();
+        let mut cur = idx;
+        loop {
+            chain.push(cur);
+            let Some(p) = skeleton.bones[cur].rest.as_ref().and_then(|r| r.parent) else {
+                break;
+            };
+            if p as usize == cur {
+                break;
+            }
+            cur = p as usize;
+        }
+        chain.reverse();
+        let mut pos = Vec3::ZERO;
+        let mut rot = Quat::IDENTITY;
+        for b in chain {
+            let rest = skeleton.bones[b].rest.as_ref().unwrap();
+            let raw_t = clip
+                .bones
+                .get(b)
+                .and_then(|cb| cb.track.translation(f))
+                .unwrap_or(rest.translation);
+            let raw_r = clip
+                .bones
+                .get(b)
+                .and_then(|cb| cb.track.rotation(f))
+                .unwrap_or_else(|| ani::euler_quat(rest.euler));
+            let t = Vec3::new(-raw_t[0], raw_t[1], raw_t[2]);
+            let r = bevy_quat(raw_r);
+            pos += rot * t;
+            rot = (rot * r).normalize();
+        }
+        (pos, rot)
+    }
 
     #[test]
     fn carousel_clips_alternate_prongs_continuously() {
@@ -208,8 +239,8 @@ mod tests {
         let c10 = open(&disc, RIGHT, "a00_021.ani").unwrap();
         assert_eq!(c01.frames, 180);
         assert_eq!(c10.frames, 180);
-        // End of a00_011 (phase 1 idle) must match start of a00_021 seamlessly on bones 2..6.
-        for bi in 2..6 {
+        // End of a00_011 (phase 1 idle) must match start of a00_021 seamlessly on all 6 bones.
+        for bi in 0..6 {
             let end_01 = Quat::from_array(c01.bones[bi].track.rotation(179.0).unwrap());
             let start_10 = Quat::from_array(c10.bones[bi].track.rotation(0.0).unwrap());
             assert!(
@@ -223,14 +254,34 @@ mod tests {
                 "bone {bi} discontinuous between a00_021 end and a00_011 start"
             );
         }
-        // In a00_011 (phase 0->1), bone 3 (r_hg_f) swings out >90 deg between f0 and f40 to
-        // receive the hand weapon while bone 5 (r_hg_b) holds the stowed weapon at the back.
-        let f_0 = Quat::from_array(c01.bones[3].track.rotation(0.0).unwrap());
-        let f_40 = Quat::from_array(c01.bones[3].track.rotation(40.0).unwrap());
-        let b_0 = Quat::from_array(c01.bones[5].track.rotation(0.0).unwrap());
-        let b_40 = Quat::from_array(c01.bones[5].track.rotation(40.0).unwrap());
-        assert!(f_0.angle_between(f_40).to_degrees() > 90.0);
-        assert!(b_0.angle_between(b_40).to_degrees() < 35.0);
+        // Verify pure a00_011 aligns r_hg_f +Z/+Y with r_armhand +Z/+Y at f=40 (seat)
+        // and r_hg_b +Z/+Y with r_armhand +Z/+Y at f=150 (grab).
+        let design = acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN
+            .iter()
+            .find(|r| r.id == 5001)
+            .unwrap();
+        let m = acvd_data::ac_motion(3, design.data.legs as u16).unwrap();
+        let skel = open(&disc, m.set, m.skeleton).unwrap();
+        let prefix = m.skeleton.split('_').next().unwrap_or("a00");
+        let shift_r = open(&disc, m.set, &format!("{prefix}_301.ani")).unwrap();
+
+        for (f, is_front) in [(40.0, true), (150.0, false)] {
+            let (_, hand_r) = eval_ani_world(&skel, &shift_r, f, "r_armhand");
+            let (_, sh_r) = eval_ani_world(&skel, &shift_r, f, "r_kata");
+            let mut q = [Quat::IDENTITY; 6];
+            for i in 0..6 {
+                q[i] = bevy_quat(c01.bones[i].track.rotation(f).unwrap_or([0.0, 0.0, 0.0, 1.0]));
+            }
+            let prong_r = if is_front {
+                sh_r * q[0] * q[1] * q[2] * q[3]
+            } else {
+                sh_r * q[0] * q[1] * q[4] * q[5]
+            };
+            let barrel_dot = (hand_r * Vec3::Z).dot(prong_r * Vec3::Z);
+            assert!(
+                barrel_dot > 0.9,
+                "f={f}: prong +Z should match r_armhand +Z (dot={barrel_dot:.3})"
+            );
+        }
     }
 }
-
