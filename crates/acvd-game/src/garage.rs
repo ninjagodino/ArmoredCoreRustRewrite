@@ -133,6 +133,7 @@ pub enum UiAction {
     PaintChannel(usize),
     PaintRgbDelta(usize, i16),
     PaintCamoDelta(i8),
+    PaintCamoSelect(u8),
     PaintExitSave,
     PaintExitDiscard,
     DecalUpload,
@@ -298,15 +299,35 @@ pub enum PaintDragTarget {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ColorPickerTrack(pub PaintDragTarget);
 
-/// Cached GPU textures for the HSV 2D SV square and 1D Hue spectrum bar.
+/// Cached GPU textures for the HSV 2D SV square, 1D Hue spectrum bar, and 11 retail camo swatches.
 #[derive(Resource, Default)]
 pub struct PaintPickerAssets {
     pub sv_image: Option<Handle<Image>>,
     pub sv_hue_cached: f32,
     pub hue_image: Option<Handle<Image>>,
+    /// Retail camouflage thumbnails indexed by `camo_id` (`1..=11`; index `0` is `None`).
+    pub camo_thumbs: [Option<Handle<Image>>; 12],
+    pub camo_thumbs_loaded: bool,
 }
 
 impl PaintPickerAssets {
+    /// Lazily decodes retail camouflage textures `ca0001..ca0011` once for the Palette camo grid.
+    pub fn ensure_camo_thumbs(
+        &mut self,
+        disc: &acvd_formats::vfs::Disc,
+        images: &mut Assets<Image>,
+    ) {
+        if self.camo_thumbs_loaded {
+            return;
+        }
+        self.camo_thumbs_loaded = true;
+        let mut packs = acvd_render::Packs::default();
+        for camo_id in 1u8..=11 {
+            if let Some(handle) = paint::load_camo_map_handle(disc, &mut packs, images, camo_id) {
+                self.camo_thumbs[camo_id as usize] = Some(handle);
+            }
+        }
+    }
     // Matches the 354×104 SV box aspect ratio so Bevy's `ImageNode` fills 100% edge-to-edge at all UI scales.
     const SV_W: u32 = 354;
     const SV_H: u32 = 104;
@@ -1043,6 +1064,9 @@ pub struct GarageState {
     pub paint_hsv_synced_channel: Option<usize>,
     /// Active mouse click-drag target in `PAINT -> PALETTE`.
     pub paint_drag: Option<PaintDragTarget>,
+    /// Set to `true` on frames where a garage UI slider/strip consumed the mouse wheel so
+    /// `update_camera` (which runs after `sync_ui`) never also zooms the 3D mech camera.
+    pub wheel_consumed: bool,
     /// True when the "Save paint changes before exit?" modal prompt is open.
     pub paint_exit_prompt: bool,
     /// Selected choice in the paint exit prompt (`true` = YES / Save, `false` = NO / Discard).
@@ -1125,6 +1149,7 @@ impl GarageState {
             paint_hsv: [0.0, 0.0, 0.5],
             paint_hsv_synced_channel: None,
             paint_drag: None,
+            wheel_consumed: false,
             paint_exit_prompt: false,
             paint_exit_prompt_choice: true,
             sortie_map_idx,
@@ -1692,6 +1717,7 @@ pub fn update_camera(
             && action.wheel_adjust().is_some()
     });
     let ui_owns_wheel = in_assemble
+        || state.wheel_consumed
         || assemble_ui_owns_wheel(&state, windows.single().ok())
         || hover_wheel_adjust;
     if !decal_wheel_mod && !ui_owns_wheel && scroll.delta.y.abs() > 0.0 {
@@ -1795,6 +1821,8 @@ pub fn handle_input(
     if *mode != Mode::Garage {
         return;
     }
+
+    state.wheel_consumed = false;
 
     if let Some((_, _, ref mut ttl)) = state.banner {
         *ttl -= time.delta_secs();
@@ -1938,15 +1966,32 @@ pub fn handle_input(
                 return;
             }
             UiAction::PaintRgbDelta(comp, delta) => {
-                step_custom_channel_rgb(&mut garage, state.paint_channel, comp, delta);
-                state.paint_hsv = paint::rgb_to_hsv(current_channel_color(&garage, state.paint_channel));
-                state.paint_hsv_synced_channel = Some(state.paint_channel);
+                if state.paint_tab == PaintTab::Decals {
+                    let mut c = current_decal_tint(&decals);
+                    c[comp] = (c[comp] as i16 + delta).clamp(0, 255) as u8;
+                    apply_decal_tint_color(&mut decals, c);
+                    state.paint_hsv = paint::rgb_to_hsv(c);
+                    state.paint_hsv_synced_channel = Some(usize::MAX);
+                } else {
+                    step_custom_channel_rgb(&mut garage, state.paint_channel, comp, delta);
+                    state.paint_hsv = paint::rgb_to_hsv(current_channel_color(&garage, state.paint_channel));
+                    state.paint_hsv_synced_channel = Some(state.paint_channel);
+                }
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
                 state.ui_dirty = true;
                 return;
             }
             UiAction::PaintCamoDelta(delta) => {
                 step_custom_camo(&mut garage, delta);
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_EQUIP);
+                state.ui_dirty = true;
+                return;
+            }
+            UiAction::PaintCamoSelect(camo_id) => {
+                let col = ensure_custom_color(&mut garage);
+                let id = camo_id.min(11);
+                col.camo.fill(id);
+                garage.dirty = true;
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_EQUIP);
                 state.ui_dirty = true;
                 return;
@@ -2077,6 +2122,9 @@ pub fn handle_input(
                 return;
             }
             UiAction::DecalScaleStep(delta) => {
+                if delta == 0 {
+                    return;
+                }
                 if let Some(d) = decals.selected_layer_mut() {
                     d.scale = (d.scale + delta as f32 * 0.08).clamp(0.08, 2.5);
                     let (slot, mirror, sc) = (d.slot, d.mirror_x, d.scale);
@@ -2095,6 +2143,9 @@ pub fn handle_input(
                 return;
             }
             UiAction::DecalRotateStep(delta) => {
+                if delta == 0 {
+                    return;
+                }
                 if let Some(d) = decals.selected_layer_mut() {
                     d.rotation = (d.rotation + (delta as f32 * 15.0).to_radians())
                         .rem_euclid(std::f32::consts::TAU);
@@ -2109,6 +2160,9 @@ pub fn handle_input(
                 return;
             }
             UiAction::DecalOpacityStep(delta) => {
+                if delta == 0 {
+                    return;
+                }
                 if let Some(d) = decals.selected_layer_mut() {
                     d.opacity = (d.opacity + delta as f32 * 0.1).clamp(0.1, 1.0);
                     let (slot, mirror) = (d.slot, d.mirror_x);
@@ -2510,6 +2564,7 @@ pub fn handle_input(
                 .then(|| action.wheel_adjust())
                 .flatten()
         }) {
+            state.wheel_consumed = true;
             let delta = wheel_step_direction(scroll.delta.y);
             match target {
                 WheelAdjust::UiScale => {
@@ -2540,7 +2595,23 @@ pub fn handle_input(
                     );
                 }
                 WheelAdjust::PaintRgb(comp) => {
-                    step_custom_channel_rgb(&mut garage, state.paint_channel, comp, delta as i16 * 16);
+                    if state.paint_tab == PaintTab::Decals {
+                        let mut c = current_decal_tint(&decals);
+                        c[comp] = (c[comp] as i16 + delta as i16 * 8).clamp(0, 255) as u8;
+                        apply_decal_tint_color(&mut decals, c);
+                        state.paint_hsv = paint::rgb_to_hsv(c);
+                        state.paint_hsv_synced_channel = Some(usize::MAX);
+                    } else {
+                        step_custom_channel_rgb(
+                            &mut garage,
+                            state.paint_channel,
+                            comp,
+                            delta as i16 * 16,
+                        );
+                        state.paint_hsv =
+                            paint::rgb_to_hsv(current_channel_color(&garage, state.paint_channel));
+                        state.paint_hsv_synced_channel = Some(state.paint_channel);
+                    }
                     sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
                     state.ui_dirty = true;
                 }
@@ -3735,6 +3806,7 @@ pub fn handle_paint_color_drag(
     mut state: ResMut<GarageState>,
     mut garage: ResMut<crate::Garage>,
     buttons: Res<ButtonInput<MouseButton>>,
+    scroll: Res<AccumulatedMouseScroll>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     tracks: Query<(&ColorPickerTrack, &ComputedNode, &UiGlobalTransform)>,
     ac_meshes: Query<(&MeshMaterial3d<paint::AcPaintMaterial>, &paint::AcPaintGroup)>,
@@ -3750,11 +3822,6 @@ pub fn handle_paint_color_drag(
         return;
     }
 
-    if !buttons.pressed(MouseButton::Left) {
-        state.paint_drag = None;
-        return;
-    }
-
     let Ok(window) = windows.single() else {
         return;
     };
@@ -3762,6 +3829,67 @@ pub fn handle_paint_color_drag(
         return;
     };
     let cursor_phys = cursor_logical * window.scale_factor();
+
+    // Hover-to-scroll on 1D color picker slider tracks (Hue bar and RGB gradient bars).
+    if scroll.delta.y.abs() > 0.0 {
+        let hovered_slider = tracks.iter().find_map(|(track, computed, tf)| {
+            if track.0 == PaintDragTarget::HsvSv {
+                return None;
+            }
+            let (_, inside) = normalize_track_point(tf.translation, computed.size(), cursor_phys);
+            inside.then_some(track.0)
+        });
+        if let Some(target) = hovered_slider {
+            state.wheel_consumed = true;
+            let delta = wheel_step_direction(scroll.delta.y);
+            if state.paint_hsv_synced_channel != Some(state.paint_channel) {
+                state.paint_hsv =
+                    paint::rgb_to_hsv(current_channel_color(&garage, state.paint_channel));
+                state.paint_hsv_synced_channel = Some(state.paint_channel);
+            }
+            let prev_rgba = current_channel_color(&garage, state.paint_channel);
+            let new_rgba = match target {
+                PaintDragTarget::HsvHue => {
+                    state.paint_hsv[0] = (state.paint_hsv[0] + delta as f32 * 5.0).rem_euclid(360.0);
+                    picker_assets.ensure_loaded(state.paint_hsv[0], &mut images);
+                    paint::hsv_to_rgb(state.paint_hsv[0], state.paint_hsv[1], state.paint_hsv[2])
+                }
+                PaintDragTarget::RgbR => {
+                    let mut c = prev_rgba;
+                    c[0] = (c[0] as i16 + delta as i16 * 8).clamp(0, 255) as u8;
+                    state.paint_hsv = paint::rgb_to_hsv(c);
+                    c
+                }
+                PaintDragTarget::RgbG => {
+                    let mut c = prev_rgba;
+                    c[1] = (c[1] as i16 + delta as i16 * 8).clamp(0, 255) as u8;
+                    state.paint_hsv = paint::rgb_to_hsv(c);
+                    c
+                }
+                PaintDragTarget::RgbB => {
+                    let mut c = prev_rgba;
+                    c[2] = (c[2] as i16 + delta as i16 * 8).clamp(0, 255) as u8;
+                    state.paint_hsv = paint::rgb_to_hsv(c);
+                    c
+                }
+                PaintDragTarget::HsvSv => prev_rgba,
+            };
+            apply_custom_channel_color_live(
+                &mut garage,
+                state.paint_channel,
+                new_rgba,
+                &ac_meshes,
+                &mut paint_materials,
+            );
+            state.ui_dirty = true;
+            return;
+        }
+    }
+
+    if !buttons.pressed(MouseButton::Left) {
+        state.paint_drag = None;
+        return;
+    }
 
     if buttons.just_pressed(MouseButton::Left) {
         state.paint_drag = None;
@@ -4032,12 +4160,19 @@ pub fn sync_ui(
     } else if state.screen == GarageScreen::Options {
         spawn_garage_options_menu(&mut commands, root, &kit, &settings, state.cursor, scale);
     } else if state.screen == GarageScreen::Paint {
-        if state.paint_hsv_synced_channel != Some(state.paint_channel) {
-            state.paint_hsv =
-                paint::rgb_to_hsv(current_channel_color(&garage, state.paint_channel));
-            state.paint_hsv_synced_channel = Some(state.paint_channel);
-        }
         if state.paint_tab == PaintTab::Custom {
+            if state.paint_hsv_synced_channel != Some(state.paint_channel) {
+                state.paint_hsv =
+                    paint::rgb_to_hsv(current_channel_color(&garage, state.paint_channel));
+                state.paint_hsv_synced_channel = Some(state.paint_channel);
+            }
+            picker_assets.ensure_loaded(state.paint_hsv[0], &mut images);
+            picker_assets.ensure_camo_thumbs(&garage.disc, &mut images);
+        } else if state.paint_tab == PaintTab::Decals {
+            if state.paint_hsv_synced_channel != Some(usize::MAX) {
+                state.paint_hsv = paint::rgb_to_hsv(current_decal_tint(&decals));
+                state.paint_hsv_synced_channel = Some(usize::MAX);
+            }
             picker_assets.ensure_loaded(state.paint_hsv[0], &mut images);
         }
         spawn_garage_paint_menu(
@@ -6093,8 +6228,9 @@ fn spawn_paint_palette_tab(
         }
     }
 
-    // 12-swatch tactical color grid (6 cols × 2 rows)
-    let swatch_grid = commands
+    // 12-slot Camouflage pattern selector grid (6 cols × 2 rows: `NONE` + `CA0001..CA0011`)
+    let camo_id = garage.custom_color.map(|c| c.camo[0]).unwrap_or(0);
+    let camo_grid = commands
         .spawn((
             Node {
                 width: Val::Percent(100.0),
@@ -6106,29 +6242,74 @@ fn spawn_paint_palette_tab(
             ChildOf(panel),
         ))
         .id();
-    for (i, &(_, c)) in PAINT_SWATCHES.iter().enumerate() {
-        let matched = c[0] == rgba[0] && c[1] == rgba[1] && c[2] == rgba[2];
-        commands.spawn((
-            Button,
-            UiAction::PaintSwatch(i),
-            Node {
-                width: px((57.0 * scale).round()),
-                height: px((16.0 * scale).round()),
-                border: UiRect::all(px(if matched { (2.0 * scale).round().max(1.0) } else { bw })),
-                ..default()
-            },
-            BackgroundColor(Color::srgb_u8(c[0], c[1], c[2])),
-            BorderColor::all(if matched {
-                palette::ACCENT_AMBER
-            } else {
-                palette::BORDER_SUBTLE
-            }),
-            ChildOf(swatch_grid),
-        ));
+    for id in 0u8..=11 {
+        let matched = camo_id == id;
+        let tile = commands
+            .spawn((
+                Button,
+                UiAction::PaintCamoSelect(id),
+                Node {
+                    width: px((57.0 * scale).round()),
+                    height: px((22.0 * scale).round()),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    overflow: Overflow::clip(),
+                    border: UiRect::all(px(if matched {
+                        (2.0 * scale).round().max(1.0)
+                    } else {
+                        bw
+                    })),
+                    ..default()
+                },
+                BackgroundColor(if matched {
+                    palette::ACCENT_AMBER_FILL_TOP
+                } else {
+                    palette::BG_BAR
+                }),
+                BorderColor::all(if matched {
+                    palette::ACCENT_AMBER
+                } else {
+                    palette::BORDER_SUBTLE
+                }),
+                ChildOf(camo_grid),
+            ))
+            .id();
+        if id == 0 {
+            kit.spawn_text(
+                commands,
+                tile,
+                FontRole::Small,
+                "NONE",
+                scale * 0.72,
+                if matched {
+                    palette::ACCENT_AMBER
+                } else {
+                    palette::TEXT_MUTED
+                },
+            );
+        } else if let Some(handle) = picker_assets.camo_thumbs[id as usize].clone() {
+            commands.spawn((
+                ImageNode::new(handle),
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                ChildOf(tile),
+            ));
+        } else {
+            kit.spawn_text(
+                commands,
+                tile,
+                FontRole::Small,
+                &format!("{id:02}"),
+                scale * 0.74,
+                palette::TEXT_PRIMARY,
+            );
+        }
     }
 
-    // Camouflage pattern selector (`NONE` or `CA0001..CA0011`)
-    let camo_id = garage.custom_color.map(|c| c.camo[0]).unwrap_or(0);
+    // Camouflage active readout + prev/next steppers
     let camo_label = if camo_id == 0 {
         "CAMO: NONE".to_string()
     } else {
