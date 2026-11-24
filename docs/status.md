@@ -282,6 +282,10 @@ in order:
 
 ## Done
 
+- **Garage Top Menu & Shared Chrome `AcvdUiKit` Redesign (`acvd-game::garage`)**:
+  - Migrated the Garage landing screen (`GarageScreen::Top`) and shared garage HUD chrome (`sync_ui` top header bar, transient feedback banner, right `AC SPECS` panel, bottom key-guide footer, and `ViewMode` bar) onto `AcvdUiKit` with retail CCM bitmap fonts, `PanelStyle::Tactical` / `PanelStyle::Framed` corner reticles & brackets, `Title_Plate` headers, shaded amber-focus menu buttons with `Forcus` arrows and tactical tags, `LinePatrs_UP` stepped trace + `DESCRIPTION` helpline plate, `LOAD` / `ENERGY` capacity gauges with `I` markers, and alternating `@ParamLine` stat rows with live `PREV > NEW` deltas.
+  - Added window-resize reactivity (`GarageState::last_window_size`) so the `AcvdUiKit` layout rescales cleanly on resize/fullscreen toggles. Verified with `cargo test --release -p acvd-game -- garage::tests` (9/9 passed, including `test_garage_top_uikit_descriptions_fit_panel`) and `--shot` (`private/shots/garage_top_uikit_v2.png`).
+
 - **Sortie / AC TEST Pause Menu (`acvd-game::pause`, `main`)**:
   - Added an `AcvdUiKit` tactical pause overlay toggled via `Esc` / Gamepad `Start` (`--pause` / `--pause-options` CLI flags), freezing gameplay simulation, animations, AI, weapons, and HUD ticks (`in_active_sortie` / `not_paused_in_sortie`) and unlocking/showing the cursor while open.
   - Supports **RESUME**, inline **OPTIONS** (borderless fullscreen toggle + 5% master volume gauge saved to `settings.json`), and **RETURN TO GARAGE** when in the AC TEST arena (`Scene::is_test_arena()`). Verified with `cargo test -p acvd-game -- pause` (3/3 passed), `cargo clippy -p acvd-game`, and `--shot` (`private/shots/pause_main.png`, `private/shots/pause_options.png`).

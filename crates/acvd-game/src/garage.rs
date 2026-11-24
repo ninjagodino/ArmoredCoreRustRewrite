@@ -35,6 +35,9 @@ use acvd_formats::accolor::{
 };
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
+use acvd_render::ui_kit::{
+    palette, AcvdUiKit, ButtonState, FontRole, PanelStyle, StatDelta, TraceStyle,
+};
 use acvd_render::Packs;
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
 use bevy::camera::Exposure;
@@ -107,6 +110,7 @@ pub struct UiRow(pub usize);
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub enum UiAction {
     Back,
+    ListPage(i8),
     ToggleViewMode,
     PaintTab(PaintTab),
     PaintSwatch(usize),
@@ -195,14 +199,15 @@ pub enum PaintTab {
 }
 
 /// Top menu choices (order matches `private/lua360/script/garage/garagescene.lua`).
-const TOP_ITEMS: &[(&str, &str)] = &[
-    ("ASSEMBLE", "Customize AC frame, internals, and weapons"),
-    ("PAINT", "Presets, RGB paint, camo & drag-and-drop decals"),
-    ("AC DESIGN", "Load any preset AC blueprint as a base"),
-    ("GARAGE CUSTOM", "Switch between all 13 3D ACVD workshops"),
-    ("AC TEST", "Configure targets & sortie into combat test"),
-    ("VIEW MODE", "Hide HUD and inspect AC freely (V)"),
-    ("OPTIONS", "Fullscreen toggle and master volume"),
+/// Tuple: `(label, right_tag, helpline_description)`.
+const TOP_ITEMS: &[(&str, &str, &str)] = &[
+    ("ASSEMBLE", "PARTS", "Customize AC frame, internals,\nand weapons."),
+    ("PAINT", "COLOR", "Presets, RGB paint, camouflage,\nand drag-and-drop decals."),
+    ("AC DESIGN", "PRESET", "Load any preset AC blueprint\nas a starting base."),
+    ("GARAGE CUSTOM", "BAY", "Switch between all 13 retail\n3D ACVD workshops."),
+    ("AC TEST", "SORTIE", "Configure targets and sortie\ninto live combat test."),
+    ("VIEW MODE", "V", "Hide HUD and inspect your AC\nfreely from any angle."),
+    ("OPTIONS", "CFG", "Toggle fullscreen display and\nadjust master volume."),
 ];
 
 /// AC TEST target layer presets (`m4000_actest.msb`, `LAYER_PARAM_ST`).
@@ -830,6 +835,8 @@ pub struct GarageState {
     pub cam_manual_orbit: bool,
     /// Transient status banner shown inside the UI (e.g. "OVERWEIGHT", "EQUIPPED ...").
     pub banner: Option<(String, Color, f32)>,
+    /// Last window logical size used to lay out the UI (triggers rebuild on resize).
+    pub last_window_size: Vec2,
     /// True when the UI tree needs rebuilding.
     pub ui_dirty: bool,
 }
@@ -896,6 +903,7 @@ impl GarageState {
             cam_initialized: false,
             cam_manual_orbit: false,
             banner: None,
+            last_window_size: Vec2::ZERO,
             ui_dirty: true,
         }
     }
@@ -1331,8 +1339,8 @@ fn load_garage_tex(
     }
 }
 
-/// True when the cursor sits over `@PartsCategoryList` / `@PartsList` so the mouse wheel should
-/// scroll those strips instead of zooming the garage camera.
+/// True when the cursor sits over `@PartsCategoryList`, `@PartsList`, or the `PARTS VIEW`
+/// preview panel so the mouse wheel drives those controls instead of zooming the garage camera.
 fn assemble_ui_owns_wheel(state: &GarageState, window: Option<&Window>) -> bool {
     if !matches!(state.screen, GarageScreen::AssembleParts { .. }) {
         return false;
@@ -1343,14 +1351,13 @@ fn assemble_ui_owns_wheel(state: &GarageState, window: Option<&Window>) -> bool 
     let Some(cursor) = window.cursor_position() else {
         return false;
     };
-    crate::garage_assemble::hovered_scroll_strip(
-        Vec2::new(window.width(), window.height()),
-        cursor,
-    )
-    .is_some()
+    let win_size = Vec2::new(window.width(), window.height());
+    crate::garage_assemble::hovered_scroll_strip(win_size, cursor).is_some()
+        || (!state.assemble_detail_view
+            && crate::garage_assemble::cursor_in_part_preview_panel(win_size, cursor))
 }
 
-/// Drives the smooth `PARAM_ACSISDISPLAY_BIN` garage camera + free mouse orbit/zoom.
+/// Drives the smooth `PARAM_ACSISDISPLAY_BIN` garage camera + free mouse/gamepad orbit & zoom.
 #[allow(clippy::too_many_arguments)]
 pub fn update_camera(
     mode: Res<Mode>,
@@ -1359,6 +1366,7 @@ pub fn update_camera(
     keys: Res<ButtonInput<KeyCode>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
+    gamepads: Query<&Gamepad>,
     garage: Res<crate::Garage>,
     mut state: ResMut<GarageState>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
@@ -1412,6 +1420,19 @@ pub fn update_camera(
         state.cam_yaw -= motion.delta.x * 0.006;
         state.cam_pitch = (state.cam_pitch + motion.delta.y * 0.005).clamp(-0.35, 1.15);
     }
+    let mut right_stick = Vec2::ZERO;
+    for pad in &gamepads {
+        right_stick += pad.right_stick();
+    }
+    let s = &mut *state;
+    if apply_right_stick_orbit(
+        right_stick,
+        time.delta_secs(),
+        &mut s.cam_yaw,
+        &mut s.cam_pitch,
+    ) {
+        s.cam_manual_orbit = true;
+    }
     let decal_wheel_mod = state.screen == GarageScreen::Paint
         && state.paint_tab == PaintTab::Decals
         && (keys.pressed(KeyCode::ShiftLeft)
@@ -1463,6 +1484,22 @@ pub fn update_camera(
         eye.y = min_y;
     }
     *xf = Transform::from_translation(eye).looking_at(focus, Vec3::Y);
+}
+
+fn apply_right_stick_orbit(stick: Vec2, dt: f32, yaw: &mut f32, pitch: &mut f32) -> bool {
+    const DEADZONE: f32 = 0.15;
+    const YAW_RAD_PER_SEC: f32 = 2.2;
+    const PITCH_RAD_PER_SEC: f32 = 1.5;
+
+    let len = stick.length();
+    if len <= DEADZONE || dt <= 0.0 {
+        return false;
+    }
+    let mag = ((len - DEADZONE) / (1.0 - DEADZONE)).min(1.0);
+    let dir = (stick / len) * mag;
+    *yaw -= dir.x * YAW_RAD_PER_SEC * dt;
+    *pitch = (*pitch - dir.y * PITCH_RAD_PER_SEC * dt).clamp(-0.35, 1.15);
+    true
 }
 
 fn shortest_angle(from: f32, to: f32) -> f32 {
@@ -1572,6 +1609,19 @@ pub fn handle_input(
         match *action {
             UiAction::Back => {
                 trigger_cancel(&mut commands, &mut state, &mut garage, &mut cues, &mut audio_assets);
+                return;
+            }
+            UiAction::ListPage(delta) => {
+                let count = current_list_len(&state, &garage);
+                if count > LIST_WINDOW {
+                    let next_scroll = step_list_page(state.scroll, count, LIST_WINDOW, delta);
+                    state.scroll = next_scroll;
+                    state.cursor = next_scroll;
+                    state.cam_manual_orbit = false;
+                    apply_cursor_preview(&mut state, &mut garage);
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+                    state.ui_dirty = true;
+                }
                 return;
             }
             UiAction::ToggleViewMode => {
@@ -2392,6 +2442,24 @@ fn clamp_scroll(scroll: &mut usize, cursor: usize, count: usize) {
     clamp_scroll_win(scroll, cursor, count, LIST_WINDOW);
 }
 
+fn step_list_page(scroll: usize, count: usize, window: usize, delta: i8) -> usize {
+    if count <= window || window == 0 {
+        return 0;
+    }
+    if delta > 0 {
+        let next = scroll.saturating_add(window);
+        if next >= count { 0 } else { next }
+    } else if delta < 0 {
+        if scroll == 0 {
+            ((count - 1) / window) * window
+        } else {
+            scroll.saturating_sub(window)
+        }
+    } else {
+        scroll.min(count - 1)
+    }
+}
+
 fn switch_assemble_slot(
     commands: &mut Commands,
     state: &mut GarageState,
@@ -2913,10 +2981,16 @@ pub fn sync_ui(
         }
         return;
     }
-    if !state.ui_dirty {
+    let win_size = window
+        .single()
+        .map(|w| Vec2::new(w.width(), w.height()))
+        .unwrap_or(Vec2::new(1280.0, 720.0));
+    let resized = (win_size - state.last_window_size).length_squared() > 1.0;
+    if !state.ui_dirty && !resized && !existing.is_empty() {
         return;
     }
     state.ui_dirty = false;
+    state.last_window_size = win_size;
     decals.init_assets(&mut images);
     if state.screen == GarageScreen::Paint
         && state.paint_tab == PaintTab::Decals
@@ -2961,10 +3035,6 @@ pub fn sync_ui(
                 );
             }
         }
-        let win_size = window
-            .single()
-            .map(|w| Vec2::new(w.width(), w.height()))
-            .unwrap_or(Vec2::new(1280.0, 720.0));
         if crate::garage_assemble::spawn_assemble_ui(
             &mut commands,
             &mut assemble_assets,
@@ -2978,8 +3048,13 @@ pub fn sync_ui(
         }
     }
 
-    let bg_panel = Color::srgba(0.05, 0.07, 0.10, 0.86);
-    let bg_header = Color::srgba(0.08, 0.12, 0.17, 0.94);
+    // Load retail ACVD CCM fonts & chrome sprites once (shared with Assemble & Pause menus).
+    assemble_assets.ensure_loaded(&garage.disc, &mut images);
+    let kit = assemble_assets.kit.clone();
+    let scale = (win_size.x / 1280.0)
+        .min(win_size.y / 720.0)
+        .clamp(0.65, 2.0);
+
     let bg_row = Color::srgba(0.09, 0.12, 0.16, 0.65);
     let bg_sel = Color::srgba(0.88, 0.58, 0.14, 0.92);
     let fg_text = Color::srgb(0.90, 0.93, 0.96);
@@ -2987,7 +3062,7 @@ pub fn sync_ui(
     let fg_cyan = Color::srgb(0.38, 0.86, 0.96);
     let fg_amber = Color::srgb(0.98, 0.74, 0.24);
     let fg_dark = Color::srgb(0.06, 0.07, 0.09);
-    let border_col = Color::srgba(0.32, 0.44, 0.56, 0.55);
+    let border_col = palette::BORDER_SUBTLE;
 
     let root = commands
         .spawn((
@@ -3003,29 +3078,7 @@ pub fn sync_ui(
 
     // View Mode shows only a minimal unobtrusive bottom bar.
     if state.screen == GarageScreen::ViewMode {
-        commands.entity(root).with_children(|p| {
-            p.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: px(24.0),
-                    bottom: px(18.0),
-                    padding: UiRect::axes(px(14.0), px(7.0)),
-                    ..default()
-                },
-                BackgroundColor(bg_panel),
-                BorderColor::all(border_col),
-            ))
-            .with_children(|bar| {
-                bar.spawn((
-                    Text::new("VIEW MODE   |   Drag Left/Right: Orbit   |   Wheel: Zoom   |   R: Reset   |   V / Esc: Return"),
-                    TextFont {
-                        font_size: FontSize::Px(13.0),
-                        ..default()
-                    },
-                    TextColor(fg_cyan),
-                ));
-            });
-        });
+        spawn_garage_view_mode_bar(&mut commands, root, &kit, scale);
         return;
     }
 
@@ -3035,136 +3088,44 @@ pub fn sync_ui(
         .unwrap_or_else(|| "Workshop 5 - Underpass".to_string());
 
     // Top bar: ACVD GARAGE title + active design + workshop name.
-    commands.entity(root).with_children(|p| {
-        p.spawn((
+    spawn_garage_top_bar(
+        &mut commands,
+        root,
+        &kit,
+        state.screen,
+        &garage.active_name,
+        &ws_label,
+        scale,
+    );
+
+    // Transient feedback banner (top-center).
+    if let Some((ref msg, col, _)) = state.banner {
+        spawn_garage_banner(&mut commands, root, &kit, msg, col, scale);
+    }
+
+    // Left interactive menu panel.
+    if state.screen == GarageScreen::Top {
+        spawn_garage_top_menu(&mut commands, root, &kit, state.cursor, scale);
+    } else {
+        let left_panel = kit.spawn_panel(
+            &mut commands,
+            Some(root),
+            PanelStyle::Tactical,
             Node {
                 position_type: PositionType::Absolute,
-                left: px(20.0),
-                right: px(20.0),
-                top: px(14.0),
-                height: px(40.0),
-                padding: UiRect::axes(px(14.0), px(6.0)),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                border: UiRect::bottom(px(2.0)),
-                ..default()
-            },
-            BackgroundColor(bg_header),
-            BorderColor::all(fg_amber),
-        ))
-        .with_children(|top| {
-            let screen_title = match state.screen {
-                GarageScreen::Top => "GARAGE",
-                GarageScreen::AssembleSlots => "ASSEMBLE",
-                GarageScreen::AssembleParts { slot } => slot.label(),
-                GarageScreen::Paint => "PAINT & CAMOUFLAGE",
-                GarageScreen::Design => "AC DESIGN PRESETS",
-                GarageScreen::GarageCustom => "GARAGE CUSTOM",
-                GarageScreen::SortieConfig => "AC TEST SORTIE",
-                GarageScreen::Options => "OPTIONS",
-                GarageScreen::ViewMode => "VIEW MODE",
-            };
-            top.spawn((
-                Text::new(format!("ACVD  //  {screen_title}")),
-                TextFont {
-                    font_size: FontSize::Px(18.0),
-                    ..default()
-                },
-                TextColor(fg_amber),
-            ));
-            top.spawn((
-                Text::new(format!("AC: {}   |   {}", garage.active_name, ws_label)),
-                TextFont {
-                    font_size: FontSize::Px(13.0),
-                    ..default()
-                },
-                TextColor(fg_cyan),
-            ));
-        });
-
-        // Transient feedback banner (top-center).
-        if let Some((ref msg, col, _)) = state.banner {
-            p.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: px(60.0),
-                    left: Val::Percent(50.0),
-                    margin: UiRect::left(px(-220.0)),
-                    width: px(440.0),
-                    padding: UiRect::axes(px(14.0), px(5.0)),
-                    justify_content: JustifyContent::Center,
-                    border: UiRect::all(px(1.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.05, 0.08, 0.12, 0.90)),
-                BorderColor::all(col),
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new(msg.clone()),
-                    TextFont {
-                        font_size: FontSize::Px(13.0),
-                        ..default()
-                    },
-                    TextColor(col),
-                ));
-            });
-        }
-
-        // Left interactive menu panel.
-        p.spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(20.0),
-                top: px(66.0),
-                width: px(370.0),
-                padding: UiRect::all(px(10.0)),
+                left: px((20.0 * scale).round()),
+                top: px((66.0 * scale).round()),
+                width: px((370.0 * scale).round()),
+                padding: UiRect::all(px((12.0 * scale).round())),
                 flex_direction: FlexDirection::Column,
-                row_gap: px(4.0),
-                border: UiRect::all(px(1.0)),
+                row_gap: px((4.0 * scale).round()),
                 ..default()
             },
-            BackgroundColor(bg_panel),
-            BorderColor::all(border_col),
-        ))
-        .with_children(|panel| {
+            scale,
+        );
+        commands.entity(left_panel).with_children(|panel| {
             match state.screen {
-                GarageScreen::Top => {
-                    for (idx, &(title, desc)) in TOP_ITEMS.iter().enumerate() {
-                        let sel = state.cursor == idx;
-                        panel
-                            .spawn((
-                                Button,
-                                UiRow(idx),
-                                Node {
-                                    width: Val::Percent(100.0),
-                                    padding: UiRect::axes(px(10.0), px(8.0)),
-                                    flex_direction: FlexDirection::Column,
-                                    row_gap: px(2.0),
-                                    ..default()
-                                },
-                                BackgroundColor(if sel { bg_sel } else { bg_row }),
-                            ))
-                            .with_children(|r| {
-                                r.spawn((
-                                    Text::new(title),
-                                    TextFont {
-                                        font_size: FontSize::Px(15.0),
-                                        ..default()
-                                    },
-                                    TextColor(if sel { fg_dark } else { fg_text }),
-                                ));
-                                r.spawn((
-                                    Text::new(desc),
-                                    TextFont {
-                                        font_size: FontSize::Px(11.0),
-                                        ..default()
-                                    },
-                                    TextColor(if sel { fg_dark } else { fg_dim }),
-                                ));
-                            });
-                    }
-                }
+                GarageScreen::Top => {}
                 GarageScreen::AssembleSlots => {
                     let wa = has_weapon_arms(&garage.active_design);
                     let start = state.scroll;
@@ -3235,6 +3196,15 @@ pub fn sync_ui(
                                 ));
                             });
                     }
+                    spawn_list_pager(
+                        panel,
+                        start,
+                        end,
+                        AssembleSlot::ALL.len(),
+                        bg_row,
+                        fg_cyan,
+                        fg_dim,
+                    );
                     spawn_back_btn(panel, "< BACK TO TOP (Esc)", bg_row, fg_cyan);
                 }
                 GarageScreen::AssembleParts { slot } => {
@@ -3315,6 +3285,7 @@ pub fn sync_ui(
                                 ));
                             });
                     }
+                    spawn_list_pager(panel, start, end, parts.len(), bg_row, fg_cyan, fg_dim);
                     spawn_back_btn(panel, "< CANCEL / BACK (Esc)", bg_row, fg_cyan);
                 }
                 GarageScreen::Paint => {
@@ -3408,6 +3379,15 @@ pub fn sync_ui(
                                         }
                                     });
                             }
+                            spawn_list_pager(
+                                panel,
+                                start,
+                                end,
+                                state.color_presets.len(),
+                                bg_row,
+                                fg_cyan,
+                                fg_dim,
+                            );
                         }
                         PaintTab::Custom => {
                             for (ch, &name) in PAINT_CHANNEL_NAMES.iter().enumerate() {
@@ -3960,6 +3940,15 @@ pub fn sync_ui(
                                 ));
                             });
                     }
+                    spawn_list_pager(
+                        panel,
+                        start,
+                        end,
+                        garage.designs.len(),
+                        bg_row,
+                        fg_cyan,
+                        fg_dim,
+                    );
                     spawn_back_btn(panel, "< CANCEL / BACK (Esc)", bg_row, fg_cyan);
                 }
                 GarageScreen::GarageCustom => {
@@ -4007,6 +3996,15 @@ pub fn sync_ui(
                                 ));
                             });
                     }
+                    spawn_list_pager(
+                        panel,
+                        start,
+                        end,
+                        state.workshops.len(),
+                        bg_row,
+                        fg_cyan,
+                        fg_dim,
+                    );
                     spawn_back_btn(panel, "< BACK TO TOP (Esc)", bg_row, fg_cyan);
                 }
                 GarageScreen::SortieConfig => {
@@ -4376,28 +4374,30 @@ pub fn sync_ui(
                 GarageScreen::ViewMode => {}
             }
         });
+    }
 
-        // Right panel: Decal Inspector & Layers when in `PAINT -> DECALS`, otherwise AC SPECS telemetry.
-        let in_decal_mode =
-            state.screen == GarageScreen::Paint && state.paint_tab == PaintTab::Decals;
+    // Right panel: Decal Inspector & Layers when in `PAINT -> DECALS`, otherwise AC SPECS telemetry.
+    let in_decal_mode =
+        state.screen == GarageScreen::Paint && state.paint_tab == PaintTab::Decals;
 
-        if in_decal_mode {
-            p.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    right: px(20.0),
-                    top: px(66.0),
-                    width: px(280.0),
-                    padding: UiRect::all(px(10.0)),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: px(5.0),
-                    border: UiRect::all(px(1.0)),
-                    ..default()
-                },
-                BackgroundColor(bg_panel),
-                BorderColor::all(border_col),
-            ))
-            .with_children(|insp| {
+    if in_decal_mode {
+        let insp_panel = kit.spawn_panel(
+            &mut commands,
+            Some(root),
+            PanelStyle::Tactical,
+            Node {
+                position_type: PositionType::Absolute,
+                right: px((20.0 * scale).round()),
+                top: px((66.0 * scale).round()),
+                width: px((280.0 * scale).round()),
+                padding: UiRect::all(px((10.0 * scale).round())),
+                flex_direction: FlexDirection::Column,
+                row_gap: px((5.0 * scale).round()),
+                ..default()
+            },
+            scale,
+        );
+        commands.entity(insp_panel).with_children(|insp| {
                 insp.spawn((
                     Text::new(format!("DECAL INSPECTOR  ({} PLACED)", decals.layers.len())),
                     TextFont {
@@ -4744,8 +4744,8 @@ pub fn sync_ui(
                         });
                     }
                 }
-            });
-        } else {
+        });
+    } else {
         // Right AC SPECS telemetry panel (live `AcCtrlParam` calculation + preview delta!).
         let cur_specs = AcSpecs::calculate(&garage.active_design);
         let base_specs = state
@@ -4753,213 +4753,617 @@ pub fn sync_ui(
             .as_ref()
             .map(AcSpecs::calculate)
             .unwrap_or(cur_specs);
+        spawn_garage_specs_panel(&mut commands, root, &kit, cur_specs, base_specs, scale);
+    }
 
-        p.spawn((
+    // Bottom key-guide footer.
+    let footer_text = if in_decal_mode {
+        "L-DRAG PLACE/MOVE   R-DRAG ORBIT   SHIFT+WHEEL SIZE   CTRL+WHEEL ROTATE   M MIRROR   F FLIP   DEL REMOVE"
+    } else if state.screen == GarageScreen::Options {
+        "W/S NAVIGATE   LEFT/RIGHT ADJUST   ESC BACK   R-DRAG ORBIT   F9 MUTE BGM"
+    } else {
+        "W/S NAVIGATE   ENTER SELECT   ESC BACK   R-DRAG ORBIT   WHEEL ZOOM   V VIEW MODE   F9 MUTE BGM"
+    };
+    spawn_garage_footer(&mut commands, root, &kit, footer_text, scale);
+}
+
+fn screen_title_and_tag(screen: GarageScreen) -> (&'static str, &'static str) {
+    match screen {
+        GarageScreen::Top => ("GARAGE", "MAIN MENU"),
+        GarageScreen::AssembleSlots => ("ASSEMBLE", "SLOTS"),
+        GarageScreen::AssembleParts { slot } => (slot.label(), "ASSEMBLE"),
+        GarageScreen::Paint => ("PAINT", "CUSTOMIZE"),
+        GarageScreen::Design => ("AC DESIGN", "BLUEPRINTS"),
+        GarageScreen::GarageCustom => ("GARAGE CUSTOM", "WORKSHOPS"),
+        GarageScreen::SortieConfig => ("AC TEST", "SORTIE"),
+        GarageScreen::Options => ("OPTIONS", "SETTINGS"),
+        GarageScreen::ViewMode => ("VIEW MODE", "INSPECT"),
+    }
+}
+
+fn spawn_garage_top_bar(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    screen: GarageScreen,
+    ac_name: &str,
+    ws_label: &str,
+    scale: f32,
+) {
+    let (title, tag) = screen_title_and_tag(screen);
+    let pad_x = (14.0 * scale).round();
+    let pad_y = (6.0 * scale).round();
+    let bar = kit.spawn_panel(
+        commands,
+        Some(root),
+        PanelStyle::Framed,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px((20.0 * scale).round()),
+            right: px((20.0 * scale).round()),
+            top: px((12.0 * scale).round()),
+            min_height: px((40.0 * scale).round()),
+            padding: UiRect::axes(px(pad_x), px(pad_y)),
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: px((12.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+
+    // Subtle amber accent bar along the left edge of the header strip.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0.0),
+            top: px(0.0),
+            bottom: px(0.0),
+            width: px((3.0 * scale).round().max(2.0)),
+            ..default()
+        },
+        BackgroundColor(palette::ACCENT_AMBER),
+        ChildOf(bar),
+    ));
+
+    // Left: marker + ACVD // <SCREEN> + mode badge.
+    let left = commands
+        .spawn((
             Node {
-                position_type: PositionType::Absolute,
-                right: px(20.0),
-                top: px(66.0),
-                width: px(280.0),
-                padding: UiRect::all(px(10.0)),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(4.0),
-                border: UiRect::all(px(1.0)),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px((10.0 * scale).round()),
                 ..default()
             },
-            BackgroundColor(bg_panel),
-            BorderColor::all(border_col),
+            ChildOf(bar),
         ))
-        .with_children(|spec| {
-            spec.spawn((
-                Text::new("AC SPECS  (AcCtrlParam)"),
-                TextFont {
-                    font_size: FontSize::Px(13.0),
+        .id();
+
+    let sq = (7.0 * scale).round().max(4.0);
+    commands.spawn((
+        Node {
+            width: px(sq),
+            height: px(sq),
+            flex_shrink: 0.0,
+            ..default()
+        },
+        BackgroundColor(palette::ACCENT_AMBER),
+        ChildOf(left),
+    ));
+
+    kit.spawn_text(
+        commands,
+        left,
+        FontRole::Header,
+        &format!("ACVD  {title}"),
+        scale,
+        palette::TEXT_BRIGHT,
+    );
+    kit.spawn_badge(commands, left, tag, palette::ACCENT_TEAL, true, scale);
+
+    // Right: active AC identity + workshop tag.
+    let right = commands
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px((10.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(bar),
+        ))
+        .id();
+
+    kit.spawn_badge(commands, right, "AC", palette::ACCENT_AMBER, false, scale);
+    kit.spawn_text(
+        commands,
+        right,
+        FontRole::Body,
+        ac_name,
+        scale * 0.92,
+        palette::TEXT_PRIMARY,
+    );
+
+    // Thin vertical separator.
+    commands.spawn((
+        Node {
+            width: px((1.0 * scale).max(1.0)),
+            height: px((16.0 * scale).round()),
+            ..default()
+        },
+        BackgroundColor(palette::BORDER_BUTTON),
+        ChildOf(right),
+    ));
+
+    kit.spawn_text(
+        commands,
+        right,
+        FontRole::Small,
+        ws_label,
+        scale * 0.88,
+        palette::TEXT_PRIMARY,
+    );
+}
+
+fn spawn_garage_banner(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    msg: &str,
+    col: Color,
+    scale: f32,
+) {
+    let w = (440.0 * scale).round();
+    let banner = kit.spawn_panel(
+        commands,
+        Some(root),
+        PanelStyle::Framed,
+        Node {
+            position_type: PositionType::Absolute,
+            top: px((60.0 * scale).round()),
+            left: Val::Percent(50.0),
+            margin: UiRect::left(px(-w * 0.5)),
+            width: px(w),
+            padding: UiRect::axes(px((14.0 * scale).round()), px((6.0 * scale).round())),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        scale,
+    );
+    commands.entity(banner).insert(BorderColor::all(col));
+    kit.spawn_text(commands, banner, FontRole::Body, msg, scale * 0.92, col);
+}
+
+fn spawn_garage_top_menu(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    cursor: usize,
+    scale: f32,
+) {
+    let pad = (14.0 * scale).round();
+    let panel = kit.spawn_panel(
+        commands,
+        Some(root),
+        PanelStyle::Tactical,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px((20.0 * scale).round()),
+            top: px((64.0 * scale).round()),
+            width: px((336.0 * scale).round()),
+            padding: UiRect::all(px(pad)),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((8.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+
+    kit.spawn_header(commands, panel, "GARAGE MENU", Some("SELECT"), scale);
+
+    let list = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px((6.0 * scale).round()),
+                margin: UiRect::vertical(px((2.0 * scale).round())),
+                ..default()
+            },
+            ChildOf(panel),
+        ))
+        .id();
+
+    for (idx, &(title, tag, _desc)) in TOP_ITEMS.iter().enumerate() {
+        let btn_state = if cursor == idx {
+            ButtonState::Selected
+        } else {
+            ButtonState::Normal
+        };
+        let btn = kit.spawn_button(commands, list, title, Some(tag), btn_state, scale);
+        commands.entity(btn).insert((Button, UiRow(idx)));
+    }
+
+    kit.spawn_trace(commands, panel, TraceStyle::Stepped, scale);
+
+    // Retail-style helpline card explaining the currently focused menu item.
+    let active_desc = TOP_ITEMS
+        .get(cursor)
+        .map(|&(_, _, d)| d)
+        .unwrap_or("");
+    let help = kit.spawn_panel(
+        commands,
+        Some(panel),
+        PanelStyle::Subtle,
+        Node {
+            width: Val::Percent(100.0),
+            padding: UiRect::axes(px((10.0 * scale).round()), px((7.0 * scale).round())),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((3.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+    kit.spawn_text(
+        commands,
+        help,
+        FontRole::Small,
+        "DESCRIPTION",
+        scale * 0.9,
+        palette::TEXT_MUTED,
+    );
+    kit.spawn_text(
+        commands,
+        help,
+        FontRole::Small,
+        active_desc,
+        scale * 0.86,
+        palette::TEXT_BRIGHT,
+    );
+}
+
+fn spawn_garage_specs_panel(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    cur_specs: AcSpecs,
+    base_specs: AcSpecs,
+    scale: f32,
+) {
+    let pad = (12.0 * scale).round();
+    let stat_scale = scale * 0.86;
+    let spec = kit.spawn_panel(
+        commands,
+        Some(root),
+        PanelStyle::Tactical,
+        Node {
+            position_type: PositionType::Absolute,
+            right: px((20.0 * scale).round()),
+            top: px((64.0 * scale).round()),
+            width: px((304.0 * scale).round()),
+            padding: UiRect::all(px(pad)),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((6.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+
+    kit.spawn_header(commands, spec, "AC SPECS", Some("STATUS"), scale * 0.94);
+
+    // Alert banners when AC violates build / weight / EN constraints.
+    for (active, label) in [
+        (!cur_specs.buildable, "! UNBUILDABLE !"),
+        (cur_specs.overweight, "! OVERWEIGHT !"),
+        (cur_specs.en_shortage, "! EN SHORTAGE !"),
+    ] {
+        if active {
+            let alert = commands
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        padding: UiRect::axes(px((8.0 * scale).round()), px((3.0 * scale).round())),
+                        border: UiRect::all(px((1.0 * scale).max(1.0))),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.45, 0.08, 0.06, 0.88)),
+                    BorderColor::all(palette::TEXT_ALERT),
+                    ChildOf(spec),
+                ))
+                .id();
+            kit.spawn_text(
+                commands,
+                alert,
+                FontRole::Small,
+                label,
+                scale,
+                palette::TEXT_BRIGHT,
+            );
+        }
+    }
+
+    // Retail `@WeightBar` & `@EnergyBar` capacity gauges.
+    let gauges = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px((4.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(spec),
+        ))
+        .id();
+    let load_ratio = if cur_specs.leg_payload > 0.0 {
+        cur_specs.carried_load / cur_specs.leg_payload
+    } else {
+        1.0
+    };
+    let en_ratio = if cur_specs.en_output > 0.0 {
+        cur_specs.en_drain / cur_specs.en_output
+    } else {
+        1.0
+    };
+    kit.spawn_gauge(
+        commands,
+        gauges,
+        "LOAD",
+        load_ratio,
+        Some(0.85),
+        cur_specs.overweight,
+        stat_scale,
+    );
+    kit.spawn_gauge(
+        commands,
+        gauges,
+        "ENERGY",
+        en_ratio,
+        Some(0.80),
+        cur_specs.en_shortage,
+        stat_scale,
+    );
+
+    kit.spawn_trace(commands, spec, TraceStyle::Simple, scale);
+
+    // Alternating `@ParamLine` telemetry rows with live preview deltas (`PREV > NEW`).
+    let rows_box = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px((1.0 * scale).max(1.0)),
+                ..default()
+            },
+            ChildOf(spec),
+        ))
+        .id();
+
+    let rows: &[(&str, f32, f32, bool, &str)] = &[
+        ("AP", cur_specs.ap, base_specs.ap, true, ""),
+        ("KE DEF", cur_specs.ke_def, base_specs.ke_def, true, ""),
+        ("CE DEF", cur_specs.ce_def, base_specs.ce_def, true, ""),
+        ("TE DEF", cur_specs.te_def, base_specs.te_def, true, ""),
+        ("WEIGHT", cur_specs.total_weight, base_specs.total_weight, false, ""),
+        ("LOAD", cur_specs.carried_load, base_specs.carried_load, false, ""),
+        ("LOAD CAP", cur_specs.leg_payload, base_specs.leg_payload, true, ""),
+        ("EN OUTPUT", cur_specs.en_output, base_specs.en_output, true, ""),
+        ("EN DRAIN", cur_specs.en_drain, base_specs.en_drain, false, ""),
+        ("EN RECOV", cur_specs.en_recovery, base_specs.en_recovery, true, ""),
+        ("EN CAP", cur_specs.en_capacity, base_specs.en_capacity, true, ""),
+        ("BOOST SPD", cur_specs.boost_speed, base_specs.boost_speed, true, " km/h"),
+        ("HB SPEED", cur_specs.hb_speed, base_specs.hb_speed, true, " km/h"),
+        ("GLIDE SPD", cur_specs.glide_speed, base_specs.glide_speed, true, " km/h"),
+        ("TURN SPD", cur_specs.turn_speed, base_specs.turn_speed, true, " deg/s"),
+        ("LOCK RNG", cur_specs.lock_range, base_specs.lock_range, true, " m"),
+        ("SCAN TIME", cur_specs.scan_secs, base_specs.scan_secs, false, " s"),
+        ("STABILITY", cur_specs.stagger_thr, base_specs.stagger_thr, true, ""),
+    ];
+
+    for (idx, &(label, val, prev, higher_is_better, unit)) in rows.iter().enumerate() {
+        let diff = val - prev;
+        let is_secs = unit == " s";
+        let has_diff = if is_secs {
+            diff.abs() >= 0.01
+        } else {
+            diff.abs() >= 0.5
+        };
+
+        if has_diff {
+            let prev_str = if is_secs {
+                format!("{prev:.2}")
+            } else {
+                format!("{prev:.0}")
+            };
+            let new_str = if is_secs {
+                format!("{val:.2}{unit}")
+            } else {
+                format!("{val:.0}{unit}")
+            };
+            let cmp = if (diff > 0.0) == higher_is_better { 1 } else { -1 };
+            kit.spawn_stat_row(
+                commands,
+                rows_box,
+                label,
+                &prev_str,
+                Some(StatDelta {
+                    text: &new_str,
+                    cmp,
+                }),
+                idx % 2 == 0,
+                stat_scale,
+            );
+        } else {
+            let val_str = if is_secs {
+                format!("{val:.2}{unit}")
+            } else {
+                format!("{val:.0}{unit}")
+            };
+            kit.spawn_stat_row(
+                commands,
+                rows_box,
+                label,
+                &val_str,
+                None,
+                idx % 2 == 0,
+                stat_scale,
+            );
+        }
+    }
+}
+
+fn spawn_garage_footer(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    footer_text: &str,
+    scale: f32,
+) {
+    let foot = kit.spawn_panel(
+        commands,
+        Some(root),
+        PanelStyle::Framed,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px((20.0 * scale).round()),
+            right: px((20.0 * scale).round()),
+            bottom: px((12.0 * scale).round()),
+            min_height: px((30.0 * scale).round()),
+            padding: UiRect::axes(px((12.0 * scale).round()), px((4.0 * scale).round())),
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: px((12.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+
+    kit.spawn_text(
+        commands,
+        foot,
+        FontRole::Small,
+        footer_text,
+        scale * 0.90,
+        palette::TEXT_PRIMARY,
+    );
+
+    let view_btn = kit.spawn_badge(
+        commands,
+        foot,
+        "VIEW MODE [V]",
+        palette::ACCENT_TEAL,
+        true,
+        scale,
+    );
+    commands
+        .entity(view_btn)
+        .insert((Button, UiAction::ToggleViewMode));
+}
+
+fn spawn_garage_view_mode_bar(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    scale: f32,
+) {
+    let bar = kit.spawn_panel(
+        commands,
+        Some(root),
+        PanelStyle::Framed,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px((24.0 * scale).round()),
+            bottom: px((18.0 * scale).round()),
+            padding: UiRect::axes(px((12.0 * scale).round()), px((7.0 * scale).round())),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px((12.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+    kit.spawn_badge(commands, bar, "VIEW MODE", palette::ACCENT_TEAL, true, scale);
+    kit.spawn_text(
+        commands,
+        bar,
+        FontRole::Small,
+        "DRAG ORBIT   WHEEL ZOOM   R RESET   V / ESC RETURN",
+        scale,
+        palette::TEXT_PRIMARY,
+    );
+}
+
+fn spawn_list_pager(
+    panel: &mut ChildSpawnerCommands,
+    start: usize,
+    end: usize,
+    total: usize,
+    bg: Color,
+    fg_cyan: Color,
+    fg_dim: Color,
+) {
+    if total <= LIST_WINDOW {
+        return;
+    }
+    let pages = total.div_ceil(LIST_WINDOW);
+    let page = (start / LIST_WINDOW) + 1;
+    let label = if start % LIST_WINDOW == 0 {
+        format!("PAGE {page} / {pages}")
+    } else {
+        format!("{}-{} / {}", start + 1, end, total)
+    };
+    panel
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            margin: UiRect::top(px(4.0)),
+            ..default()
+        })
+        .with_children(|pg| {
+            pg.spawn((
+                Button,
+                UiAction::ListPage(-1),
+                Node {
+                    padding: UiRect::axes(px(10.0), px(4.0)),
                     ..default()
                 },
-                TextColor(fg_cyan),
-            ));
-
-            if !cur_specs.buildable {
-                spec.spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        padding: UiRect::axes(px(6.0), px(3.0)),
-                        justify_content: JustifyContent::Center,
+                BackgroundColor(bg),
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("< PREV"),
+                    TextFont {
+                        font_size: FontSize::Px(11.0),
                         ..default()
                     },
-                    BackgroundColor(Color::srgba(0.68, 0.14, 0.12, 0.90)),
-                ))
-                .with_children(|w| {
-                    w.spawn((
-                        Text::new("! UNBUILDABLE !"),
-                        TextFont {
-                            font_size: FontSize::Px(12.0),
-                            ..default()
-                        },
-                        TextColor(Color::WHITE),
-                    ));
-                });
-            }
-            if cur_specs.overweight {
-                spec.spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        padding: UiRect::axes(px(6.0), px(3.0)),
-                        justify_content: JustifyContent::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.68, 0.14, 0.12, 0.90)),
-                ))
-                .with_children(|w| {
-                    w.spawn((
-                        Text::new("! OVERWEIGHT !"),
-                        TextFont {
-                            font_size: FontSize::Px(12.0),
-                            ..default()
-                        },
-                        TextColor(Color::WHITE),
-                    ));
-                });
-            }
-            if cur_specs.en_shortage {
-                spec.spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        padding: UiRect::axes(px(6.0), px(3.0)),
-                        justify_content: JustifyContent::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.72, 0.34, 0.08, 0.90)),
-                ))
-                .with_children(|w| {
-                    w.spawn((
-                        Text::new("! EN SHORTAGE !"),
-                        TextFont {
-                            font_size: FontSize::Px(12.0),
-                            ..default()
-                        },
-                        TextColor(Color::WHITE),
-                    ));
-                });
-            }
-
-            let rows: &[(&str, f32, f32, bool, &str)] = &[
-                ("AP", cur_specs.ap, base_specs.ap, true, ""),
-                ("KE DEF", cur_specs.ke_def, base_specs.ke_def, true, ""),
-                ("CE DEF", cur_specs.ce_def, base_specs.ce_def, true, ""),
-                ("TE DEF", cur_specs.te_def, base_specs.te_def, true, ""),
-                ("WEIGHT", cur_specs.total_weight, base_specs.total_weight, false, ""),
-                ("LOAD", cur_specs.carried_load, base_specs.carried_load, false, ""),
-                ("LOAD CAP", cur_specs.leg_payload, base_specs.leg_payload, true, ""),
-                ("EN OUTPUT", cur_specs.en_output, base_specs.en_output, true, ""),
-                ("EN DRAIN", cur_specs.en_drain, base_specs.en_drain, false, ""),
-                ("EN RECOV", cur_specs.en_recovery, base_specs.en_recovery, true, ""),
-                ("EN CAP", cur_specs.en_capacity, base_specs.en_capacity, true, ""),
-                ("BOOST SPD", cur_specs.boost_speed, base_specs.boost_speed, true, " km/h"),
-                ("HB SPEED", cur_specs.hb_speed, base_specs.hb_speed, true, " km/h"),
-                ("GLIDE SPD", cur_specs.glide_speed, base_specs.glide_speed, true, " km/h"),
-                ("TURN SPD", cur_specs.turn_speed, base_specs.turn_speed, true, " deg/s"),
-                ("LOCK RNG", cur_specs.lock_range, base_specs.lock_range, true, " m"),
-                ("SCAN TIME", cur_specs.scan_secs, base_specs.scan_secs, false, " s"),
-                ("STABILITY", cur_specs.stagger_thr, base_specs.stagger_thr, true, ""),
-            ];
-            for &(label, val, prev, higher_is_better, unit) in rows {
-                let diff = val - prev;
-                let is_secs = unit == " s";
-                let has_diff = if is_secs {
-                    diff.abs() >= 0.01
-                } else {
-                    diff.abs() >= 0.5
-                };
-                let val_color = if !has_diff {
-                    fg_text
-                } else if (diff > 0.0) == higher_is_better {
-                    Color::srgb(0.40, 0.94, 0.56)
-                } else {
-                    Color::srgb(1.0, 0.40, 0.36)
-                };
-                let formatted = if is_secs {
-                    if has_diff {
-                        format!("{:.2}{unit} ({:+.2})", val, diff)
-                    } else {
-                        format!("{:.2}{unit}", val)
-                    }
-                } else if has_diff {
-                    format!("{:.0}{unit} ({:+.0})", val, diff)
-                } else {
-                    format!("{:.0}{unit}", val)
-                };
-                spec.spawn(Node {
-                    width: Val::Percent(100.0),
-                    justify_content: JustifyContent::SpaceBetween,
-                    ..default()
-                })
-                .with_children(|r| {
-                    r.spawn((
-                        Text::new(label),
-                        TextFont {
-                            font_size: FontSize::Px(11.5),
-                            ..default()
-                        },
-                        TextColor(fg_dim),
-                    ));
-                    r.spawn((
-                        Text::new(formatted),
-                        TextFont {
-                            font_size: FontSize::Px(11.5),
-                            ..default()
-                        },
-                        TextColor(val_color),
-                    ));
-                });
-            }
-        });
-        }
-
-        // Bottom key-guide footer.
-        let footer_text = if in_decal_mode {
-            "L-Drag AC: Place/Move  |  R-Drag: Orbit  |  Shift+Wheel/[-][+]: Size  |  Ctrl+Wheel/R/T: Rotate  |  M: Mirror  |  F: Flip  |  Del: Remove  |  Drop PNG: Upload"
-        } else if state.screen == GarageScreen::Options {
-            "W/S: Navigate   |   Left/Right or Enter: Adjust   |   Esc: Back   |   Right-Drag: Orbit   |   F9: Mute BGM"
-        } else {
-            "W/S or Up/Dn: Navigate   |   Enter / Click: Select   |   Esc: Back   |   Right-Drag: Orbit   |   Wheel: Zoom   |   V: View Mode   |   F9: Mute BGM"
-        };
-        p.spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(20.0),
-                right: px(20.0),
-                bottom: px(14.0),
-                height: px(30.0),
-                padding: UiRect::axes(px(12.0), px(4.0)),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(bg_panel),
-            BorderColor::all(border_col),
-        ))
-        .with_children(|foot| {
-            foot.spawn((
-                Text::new(footer_text),
+                    TextColor(fg_cyan),
+                ));
+            });
+            pg.spawn((
+                Text::new(label),
                 TextFont {
-                    font_size: FontSize::Px(11.5),
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(fg_dim),
             ));
-            foot.spawn((
+            pg.spawn((
                 Button,
-                UiAction::ToggleViewMode,
+                UiAction::ListPage(1),
                 Node {
-                    padding: UiRect::axes(px(8.0), px(2.0)),
+                    padding: UiRect::axes(px(10.0), px(4.0)),
                     ..default()
                 },
-                BackgroundColor(bg_row),
+                BackgroundColor(bg),
             ))
             .with_children(|b| {
                 b.spawn((
-                    Text::new("VIEW MODE"),
+                    Text::new("NEXT >"),
                     TextFont {
                         font_size: FontSize::Px(11.0),
                         ..default()
@@ -4968,7 +5372,6 @@ pub fn sync_ui(
                 ));
             });
         });
-    });
 }
 
 fn spawn_back_btn(
@@ -5252,6 +5655,69 @@ mod tests {
             if pass == "warm_return_head" {
                 assert_eq!(new_imgs, 0, "returning to an already-seen head must reuse all GPU texture handles");
             }
+        }
+    }
+
+    #[test]
+    fn test_step_list_page() {
+        // 118 preset designs, 13 rows per page (10 pages: 0, 13, ..., 104, 117).
+        assert_eq!(step_list_page(0, 118, 13, 1), 13);
+        assert_eq!(step_list_page(104, 118, 13, 1), 117);
+        assert_eq!(step_list_page(117, 118, 13, 1), 0);
+        assert_eq!(step_list_page(0, 118, 13, -1), 117);
+        assert_eq!(step_list_page(117, 118, 13, -1), 104);
+        assert_eq!(step_list_page(13, 118, 13, -1), 0);
+        // Unaligned scroll (after arrow-key stepping) steps cleanly.
+        assert_eq!(step_list_page(5, 118, 13, -1), 0);
+        assert_eq!(step_list_page(105, 118, 13, 1), 0);
+        // Exact multiple (26 items, 2 pages: 0 and 13).
+        assert_eq!(step_list_page(0, 26, 13, -1), 13);
+        assert_eq!(step_list_page(13, 26, 13, 1), 0);
+        // Fits on one page -> stays at 0.
+        assert_eq!(step_list_page(0, 10, 13, 1), 0);
+        assert_eq!(step_list_page(0, 10, 13, -1), 0);
+    }
+
+    #[test]
+    fn test_right_stick_orbit() {
+        let (mut yaw, mut pitch) = (0.0, 0.2);
+        // Inside deadzone: no change.
+        assert!(!apply_right_stick_orbit(Vec2::new(0.10, -0.05), 0.1, &mut yaw, &mut pitch));
+        assert_eq!((yaw, pitch), (0.0, 0.2));
+
+        // Full right stick right -> yaw decreases (matches mouse drag right / control.rs).
+        assert!(apply_right_stick_orbit(Vec2::new(1.0, 0.0), 0.5, &mut yaw, &mut pitch));
+        assert!((yaw - (-1.1)).abs() < 1e-5);
+        assert!((pitch - 0.2).abs() < 1e-5);
+
+        // Full right stick down -> pitch increases and clamps at 1.15.
+        assert!(apply_right_stick_orbit(Vec2::new(0.0, -1.0), 2.0, &mut yaw, &mut pitch));
+        assert!((pitch - 1.15).abs() < 1e-5);
+
+        // Full right stick up -> pitch decreases and clamps at -0.35.
+        assert!(apply_right_stick_orbit(Vec2::new(0.0, 1.0), 2.0, &mut yaw, &mut pitch));
+        assert!((pitch - (-0.35)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_garage_top_uikit_descriptions_fit_panel() {
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let mut images = Assets::<Image>::default();
+        let kit = AcvdUiKit::load(&disc, &mut images).unwrap();
+        // Left panel width 336 - 28 (outer pad) - 20 (help card pad) = 288px inner budget.
+        let max_inner_w = 288.0;
+        for &(title, tag, desc) in TOP_ITEMS {
+            assert!(!title.is_empty() && !tag.is_empty());
+            let sz = kit.measure_text(FontRole::Small, desc, 0.86);
+            assert!(
+                sz.x <= max_inner_w,
+                "TOP_ITEMS[{title}] description overflows helpline box: {:.1}px > {max_inner_w}px ({desc:?})",
+                sz.x
+            );
         }
     }
 }
