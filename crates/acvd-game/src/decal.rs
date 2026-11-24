@@ -875,6 +875,81 @@ impl DecalState {
         Ok(key)
     }
 
+    /// Permanently removes a custom uploaded image at `idx` from `custom_assets`, deletes its
+    /// backing file in `decals/`, and cleans up any active brush, AC emblem, or placed layers
+    /// referencing it. Returns the removed asset's display label on success.
+    pub fn delete_custom_asset(&mut self, idx: usize) -> Option<String> {
+        if idx >= self.custom_assets.len() {
+            return None;
+        }
+        let removed = self.custom_assets.remove(idx);
+        let key = removed.key;
+        let label = removed.label;
+
+        // Remove the persisted file from `decals/` so it does not reappear on next launch.
+        if let Some(file_name) = key.strip_prefix("custom:") {
+            if !file_name.is_empty()
+                && !file_name.contains('/')
+                && !file_name.contains('\\')
+                && !file_name.contains("..")
+            {
+                let path = Path::new(USER_DECAL_DIR).join(file_name);
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!("decals: failed to delete {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+
+        // Fall back active brush if it pointed at the deleted custom image.
+        if self.active_image_key.as_deref() == Some(key.as_str()) {
+            self.active_image_key = self.custom_assets.first().map(|a| a.key.clone());
+        }
+
+        let mut layout_changed = false;
+
+        // Remove any placed decal layers that used this image and rebake affected slots.
+        let mut removed_any_layer = false;
+        let mut i = 0;
+        while i < self.layers.len() {
+            if self.layers[i].image_key == key {
+                let layer = self.layers.remove(i);
+                if self.selected_id == Some(layer.id) {
+                    self.selected_id = None;
+                }
+                self.mark_decal_slots_dirty(layer.slot, layer.mirror_x, true);
+                removed_any_layer = true;
+                layout_changed = true;
+            } else {
+                i += 1;
+            }
+        }
+        if removed_any_layer && self.selected_id.is_none() {
+            self.selected_id = self.layers.last().map(|l| l.id);
+        }
+
+        // If this custom image was the active AC emblem, reset back to the design default.
+        if self.ac_emblem_key.as_deref() == Some(key.as_str()) {
+            self.reset_ac_emblem_to_default();
+            layout_changed = false; // `reset_ac_emblem_to_default` already saved.
+        }
+
+        if layout_changed {
+            if let Some(did) = self.loaded_design_id {
+                self.save_for_design(did);
+            }
+        }
+
+        // Keep library page in bounds after removal.
+        let pages = self.custom_assets.len().div_ceil(12).max(1);
+        if self.library_page >= pages {
+            self.library_page = pages - 1;
+        }
+
+        Some(label)
+    }
+
     /// Ensures a retail 360 emblem (`emblem:imXXXX`) is decoded from the disc and cached.
     pub fn ensure_emblem(
         &mut self,
@@ -2465,6 +2540,44 @@ mod tests {
             }],
             shoulder_emblem: None,
         }
+    }
+
+    #[test]
+    fn delete_custom_asset_cleans_up_brush_emblem_and_layers() {
+        let mut state = DecalState::new(None, None);
+        state.custom_assets.push(solid_asset("custom:test_nonexistent_a.png", [255, 0, 0, 255]));
+        state.custom_assets.push(solid_asset("custom:test_nonexistent_b.png", [0, 255, 0, 255]));
+        state.active_image_key = Some("custom:test_nonexistent_a.png".into());
+        state.ac_emblem_key = Some("custom:test_nonexistent_a.png".into());
+        state.emblem_override = true;
+        state.default_emblem_key = Some("emblem:im0001".into());
+        state.layers.push(PlacedDecal {
+            id: 1,
+            slot: DecalSlot::Core,
+            image_key: "custom:test_nonexistent_a.png".into(),
+            position: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+            scale: 0.5,
+            rotation: 0.0,
+            depth: 0.35,
+            opacity: 1.0,
+            mirror_x: false,
+            flip_h: false,
+            tint: [255, 255, 255, 255],
+        });
+        state.selected_id = Some(1);
+
+        let removed = state.delete_custom_asset(0);
+        assert_eq!(removed.as_deref(), Some("custom:test_nonexistent_a.png"));
+        assert_eq!(state.custom_assets.len(), 1);
+        assert_eq!(
+            state.active_image_key.as_deref(),
+            Some("custom:test_nonexistent_b.png")
+        );
+        assert_eq!(state.ac_emblem_key.as_deref(), Some("emblem:im0001"));
+        assert!(state.layers.is_empty());
+        assert_eq!(state.selected_id, None);
     }
 
     #[test]

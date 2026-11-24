@@ -207,6 +207,7 @@ fn main() {
         mut garage_id,
         mut garage_screen,
         mut garage_paint_tab,
+        mut garage_paint_picker_mode,
         mut cli_decal,
         mut cli_emblem,
     ) = (
@@ -214,6 +215,7 @@ fn main() {
         None,
         garage::GarageScreen::Top,
         garage::PaintTab::Presets,
+        garage::PaintPickerMode::Hsv,
         None::<PathBuf>,
         None::<String>,
     );
@@ -285,6 +287,18 @@ fn main() {
                     } else if raw.trim().eq_ignore_ascii_case("emblem") {
                         garage_screen = garage::GarageScreen::Paint;
                         garage_paint_tab = garage::PaintTab::Emblem;
+                    } else if raw.trim().eq_ignore_ascii_case("palette")
+                        || raw.trim().eq_ignore_ascii_case("palette-hsv")
+                    {
+                        garage_screen = garage::GarageScreen::Paint;
+                        garage_paint_tab = garage::PaintTab::Custom;
+                        garage_paint_picker_mode = garage::PaintPickerMode::Hsv;
+                    } else if raw.trim().eq_ignore_ascii_case("palette-rgb")
+                        || raw.trim().eq_ignore_ascii_case("palette_rgb")
+                    {
+                        garage_screen = garage::GarageScreen::Paint;
+                        garage_paint_tab = garage::PaintTab::Custom;
+                        garage_paint_picker_mode = garage::PaintPickerMode::Rgb;
                     } else if let Some(s) = garage::GarageScreen::from_cli(&raw) {
                         garage_screen = s;
                     }
@@ -398,6 +412,7 @@ fn main() {
         &test_arg,
     );
     garage_state.paint_tab = garage_paint_tab;
+    garage_state.paint_picker_mode = garage_paint_picker_mode;
 
     let enemy_parts = weapons::EnemyParts::load(&disc);
     let mut pause_state = pause::PauseState::default();
@@ -445,8 +460,9 @@ fn main() {
     .insert_resource(garage::ModeSwitch::default())
     .insert_resource(garage_state)
     .insert_resource(pause_state)
-    .init_resource::<AcTexturePacks>()
-    .init_resource::<garage_assemble::AssembleUiAssets>()
+        .init_resource::<AcTexturePacks>()
+        .init_resource::<garage_assemble::AssembleUiAssets>()
+        .init_resource::<garage::PaintPickerAssets>()
         .insert_resource(decal::DecalState::new(cli_decal, cli_emblem))
     .insert_resource(decal::DecalMeshCache::default())
     .insert_resource(Garage {
@@ -493,7 +509,9 @@ fn main() {
             garage::sync_room,
             decal::handle_imports,
             garage::handle_input,
+            garage::handle_paint_color_drag,
             garage::sync_ui,
+            garage::update_custom_thumb_delete_hover,
             garage_assemble::populate_drb_dialogs,
             garage_assemble::sync_part_preview,
             garage_assemble::rotate_part_preview,
@@ -1622,7 +1640,14 @@ fn show(
             ));
             match painted {
                 Some(mat) => {
-                    mesh_entity.insert(MeshMaterial3d(paint_materials.add(mat)));
+                    let group = acvd_formats::accolor::slot_group(
+                        part.placement.column,
+                        mesh.root.as_deref(),
+                    );
+                    mesh_entity.insert((
+                        MeshMaterial3d(paint_materials.add(mat)),
+                        paint::AcPaintGroup(group),
+                    ));
                 }
                 None => {
                     mesh_entity.insert(MeshMaterial3d(materials.add(base)));
