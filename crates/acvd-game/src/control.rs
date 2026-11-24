@@ -424,6 +424,10 @@ struct FollowCam {
     yaw_off: f32,
     /// Camera yaw (body + offset) last frame, so mouse swings can rotate the eased points rigidly.
     cam_yaw: f32,
+    /// Horizontal Lock-Sight lead (rad) during mouselook: `swing()` cancels horizontal camera lag
+    /// for crisp mouse aim, so this carries the same `look_at_rate[0]` lag onto the Lock Sight
+    /// billboard (always 0 when not in mouselook).
+    hud_yaw_lead: f32,
     /// Waist bone offset from the AC root on the last `pilot` step, used by the 3D lock-sight
     /// datum (`0x8287cdd0` -> `0x8260f878`).
     waist: Vec3,
@@ -764,6 +768,7 @@ impl FollowCam {
             pitch_vel: 0.0,
             yaw_off: 0.0,
             cam_yaw: 0.0,
+            hud_yaw_lead: 0.0,
             waist: Vec3::ZERO,
             tilt_speeds: (behavior.z_tilt_start_x_speed, behavior.z_tilt_max_x_speed),
             tilt_max: behavior.max_z_tilt_angle.to_radians(),
@@ -1380,6 +1385,14 @@ impl Pilot {
     /// posed yet.
     pub fn aim_direction(&self) -> Vec3 {
         Quat::from_rotation_y(self.yaw + self.cam.yaw_off)
+            * Quat::from_rotation_x(self.cam.pitch)
+            * FORWARD
+    }
+
+    /// Lock-Sight 3D projection direction (`0x829d2120`): `aim_direction` plus mouselook's
+    /// horizontal follow-rate lead (`hud_yaw_lead`, 0 outside mouselook).
+    pub fn sight_direction(&self) -> Vec3 {
+        Quat::from_rotation_y(self.yaw + self.cam.yaw_off + self.cam.hud_yaw_lead)
             * Quat::from_rotation_x(self.cam.pitch)
             * FORWARD
     }
@@ -2996,6 +3009,7 @@ pub fn pilot(
         if *mouselook {
             let delta = total_yaw - p.cam.cam_yaw;
             p.cam.swing(root + waist, delta);
+            p.cam.hud_yaw_lead = (p.cam.hud_yaw_lead + delta).clamp(-0.22, 0.22);
         }
         p.cam.cam_yaw = total_yaw;
         p.cam.waist = waist;
@@ -3003,6 +3017,8 @@ pub fn pilot(
         let (eye, look_at) = p
             .cam
             .follow(eye, look_at, cam_rot, airborne, time.delta_secs());
+        let yaw_follow = p.cam.look_at_rate[0].value.clamp(0.01, 1.0);
+        p.cam.hud_yaw_lead *= (1.0 - yaw_follow).powf(time.delta_secs() * TICK_RATE);
         o.focus = look_at;
         let velocity = p.velocity;
         let roll = p.cam.roll(velocity, transform.rotation, time.delta_secs());

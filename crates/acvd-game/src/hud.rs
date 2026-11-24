@@ -1922,7 +1922,7 @@ pub fn track_lock_sight(
     };
     let cam_gt = GlobalTransform::from(*cam_tf);
     let origin = pilot.sight_origin(ac_tf.translation);
-    let aim_dir = pilot.aim_direction();
+    let aim_dir = pilot.sight_direction();
     let (yaw, pitch) = pilot.aim_angles();
     let roll = pilot.camera_roll();
     let ring_rot = sight_ring_rotation(yaw, pitch);
