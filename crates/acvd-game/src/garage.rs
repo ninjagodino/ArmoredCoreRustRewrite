@@ -1264,6 +1264,35 @@ impl GarageState {
     }
 }
 
+/// Emissive multiplier for garage `_Grow` / `_Glow` / `Carlight_Phong` light fixtures
+/// (`material/mtd.bnd` `Phong_ColDifEmi.spx` `g_EmissionColor` / `g_DiffuseMapColor`), tuned so
+/// bright bulbs (e.g. `o9201_02`, `m0200_022`) cross the garage HDR bloom threshold (`1.50` in
+/// `menu1000`) and emit a soft optical halo through `m_ToneMapFilter`.
+const GARAGE_GLOW_EMISSIVE_BOOST: f32 = 2.8;
+
+/// Linear HDR gain for additive (`*_Add`) garage workshop submeshes (`material/mtd.bnd`):
+/// - Light-flare / lensflare sprites (`Map_Diffuse_Add` `m0200_026`, `mn1020_30`, `spot`, `light`,
+///   `s_light`, `fire`, etc.) use HDR overbright (`2.8`, matching 360 `g_DiffuseMapColor` 2.0..5.0)
+///   so flare cores exceed the `bloom.threshold * 2.0` bright-pass (`1.50` in `menu1000`) and bloom
+///   cleanly instead of clipping into flat, unbloomed color discs under `m_ToneMapFilter`.
+/// - Volumetric light shafts (`Ene_Diffuse_Add`, e.g. `menu1000` 差し込む光 `mn1000_50l`) use a
+///   gentle atmospheric gain (`1.25`) so shafts stay soft and below bloom threshold.
+/// - Additive floor/wall painted decals (`*sign*`, `*decal*`, `*hakusen*`, `grd*`) stay at `1.0`
+///   so markings remain crisp without blooming.
+fn garage_add_hdr_scale(mtd_stem: &str, diff_low: &str) -> f32 {
+    if diff_low.contains("sign")
+        || diff_low.contains("decal")
+        || diff_low.contains("hakusen")
+        || diff_low.starts_with("grd")
+    {
+        1.0
+    } else if mtd_stem == "ene_diffuse_add" {
+        1.25
+    } else {
+        2.8
+    }
+}
+
 /// Ensures the active 3D garage workshop model, `_env.msb` light sets (`SET_AC` + `SET_MAP`),
 /// and `POINT_PARAM_ST` dynamic point/spot lights (`0x82be8218`) are spawned whenever
 /// `Mode::Garage` is active or the workshop changes.
@@ -1445,10 +1474,15 @@ pub fn sync_room(
                         ChildOf(root),
                     ));
                 } else if is_add {
-                    // Additive volumetric light shafts (`menu1000` 差し込む光 `Ene_Diffuse_Add`)
-                    // and additive floor/wall light decals (`Map_Diffuse_Add`).
+                    // Additive light flares (`Map_Diffuse_Add` e.g. `m0200_026`), volumetric light
+                    // shafts (`Ene_Diffuse_Add` `menu1000` 差し込む光 `mn1000_50l`), and additive
+                    // floor/wall decals (`mn1000_sign01`, `*_decal*`).
+                    // 360 `material/mtd.bnd` drives light-flare `Map_Diffuse_Add` with HDR
+                    // `g_DiffuseMapColor` (2.0..5.0) so flare cores exceed the `bloom.threshold * 2`
+                    // bright-pass (1.50 in `menu1000`) and bloom smoothly through `m_ToneMapFilter`.
+                    let gain = garage_add_hdr_scale(&mtd_stem, &diff_low);
                     let mat = StandardMaterial {
-                        base_color: Color::linear_rgba(0.65, 0.65, 0.65, 1.0),
+                        base_color: Color::linear_rgba(gain, gain, gain, 1.0),
                         base_color_texture: diffuse,
                         unlit: true,
                         cull_mode: None,
@@ -1497,7 +1531,11 @@ pub fn sync_room(
                         alpha_mode,
                         ..default()
                     };
-                    let emissive_boost = if is_glow { 1.6 } else { 0.0 };
+                    let emissive_boost = if is_glow {
+                        GARAGE_GLOW_EMISSIVE_BOOST
+                    } else {
+                        0.0
+                    };
                     let env_mat = env::make_env_material(
                         base,
                         set,
@@ -9317,5 +9355,30 @@ mod tests {
         assets.ensure_loaded(120.0, &mut images);
         let sv_data = images.get(&sv_h).unwrap().data.as_ref().unwrap();
         assert_eq!(&sv_data[top_right..top_right + 4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn garage_add_hdr_scale_blooms_light_flares_without_blowing_out_decals() {
+        // menu1000 bloom threshold is `0.75 * 2.0 = 1.50`.
+        let bloom_threshold = 0.75 * 2.0;
+        let flare = garage_add_hdr_scale("map_diffuse_add", "m0200_026");
+        assert!(
+            flare > bloom_threshold,
+            "garage light-flare Map_Diffuse_Add ({flare}) must exceed bloom threshold ({bloom_threshold})"
+        );
+        let shaft = garage_add_hdr_scale("ene_diffuse_add", "mn1000_50l");
+        assert!(
+            shaft > 0.9 && shaft < bloom_threshold,
+            "volumetric light shafts ({shaft}) should stay soft below bloom threshold"
+        );
+        let sign = garage_add_hdr_scale("map_diffuse_add", "mn1000_sign01");
+        assert!(
+            sign <= 1.05 && sign < bloom_threshold,
+            "additive floor signs ({sign}) must not bloom"
+        );
+        assert!(
+            GARAGE_GLOW_EMISSIVE_BOOST > bloom_threshold,
+            "Carlight_Phong / _Grow fixtures must exceed bloom threshold"
+        );
     }
 }

@@ -303,6 +303,10 @@ in order:
 
 ## Done
 
+- **Garage Light-Flare & Fixture HDR Bloom/Brightness (`acvd-game::garage`)**:
+  - Raised garage `Map_Diffuse_Add` light-flare sprites (e.g. `menu1000` `m0200_026` overhead red/orange/cyan flares) from `0.65` (well below `menu1000`'s `1.50` bloom bright-pass cutoff) to `2.8` via `garage_add_hdr_scale` (matching 360 `material/mtd.bnd` HDR `g_DiffuseMapColor` 2.0..5.0), while keeping volumetric light shafts (`Ene_Diffuse_Add` `mn1000_50l`) at `1.25` and additive floor/wall signage decals (`*sign*`, `*decal*`, `*hakusen*`, `grd*`) at `1.0` so they stay below bloom threshold.
+  - Raised `GARAGE_GLOW_EMISSIVE_BOOST` for `_Grow` / `_Glow` / `Carlight_Phong` fixtures (`o9201_02`, `m0200_022`) from `1.6` to `2.8` so floodlight globes bloom cleanly through `m_ToneMapFilter` instead of tonemapping to dull grey. Verified with `cargo test -p acvd-game -- garage::tests` (15/15 passed, including `garage_add_hdr_scale_blooms_light_flares_without_blowing_out_decals`) and before/after `--shot` (`private/shots/garage_probe.png` peak `[204,158,160]` → `private/shots/garage_flare_after.png` peak `[254,231,233]` with smooth optical bloom halo).
+
 - **Garage Assemble Blurred `+`-Grid Backdrop & Dedicated `ASSEMBLY VIEW` Preview AC (`acvd-game::blur`, `zoom_blur.wgsl`, `garage_assemble`, `garage`, `main`)**:
   - Added `ActiveMenuBackdrop` + `ZoomBlur::menu_backdrop` in `blur.rs` / `zoom_blur.wgsl` to render a 24-tap Vogel-disk HDR bokeh blur, cool dark slate tint, and crisp `+` reticle grid over the live 3D garage background while in `GarageScreen::AssembleParts` (both Normal and Detail Specs views).
   - Added an isolated offscreen 3D full-AC preview studio (`AC_PREVIEW_LAYER = 5`, `768×692` transparent RGBA8 target, 3-point studio lighting, `pose::spawn_static`, interactive orbit/zoom) rendered inside the right-side `ASSEMBLY VIEW` frame (`[705,109,1213,567]`) behind the `Load`/`Energy` gauges.
