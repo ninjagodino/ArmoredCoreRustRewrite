@@ -4449,7 +4449,6 @@ pub fn handle_slider_track_drag(
     mut cues: ResMut<Cues>,
     mut audio_assets: ResMut<Assets<AudioSource>>,
     buttons: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     tracks: Query<(&SliderTrack, &ComputedNode, &UiGlobalTransform)>,
 ) {
     let in_pause_options = *mode == Mode::Sortie
@@ -4467,7 +4466,7 @@ pub fn handle_slider_track_drag(
         return;
     }
 
-    let Ok(window) = windows.single() else {
+    let Ok(window) = options.windows.single() else {
         return;
     };
     let Some(cursor_logical) = window.cursor_position() else {
