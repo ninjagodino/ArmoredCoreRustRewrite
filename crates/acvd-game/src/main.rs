@@ -32,8 +32,9 @@
 //! M toggles mouselook (mouse turns and pitches, cursor grabbed);
 //! Esc / Gamepad Start opens the sortie pause menu (`pause`, `--pause` / `--pause-options` to start
 //! paused: Resume, Options for fullscreen/volume, and Return to Garage in the AC TEST arena);
-//! P switches to the clip browser: Up/Down previous/next clip, Space pause. Left/Right: previous/next design,
-//! drag left mouse: orbit, wheel: zoom, R: reframe. `--clip`/`--frame` start in the browser,
+//! P switches to the freecam / clip browser: WASD move, Space/Ctrl ascend/descend (Shift fast),
+//! drag left mouse: orbit, wheel: zoom, R: reframe; Up/Down previous/next clip, Enter pause,
+//! Left/Right previous/next design. `--clip`/`--frame` start in the browser,
 //! `--frame` paused on that frame. `--hold w,shift,space,f` holds keys for the whole run, and
 //! `--wait` delays `--shot` that long. The default scene is the garage AC test: map `m4000`
 //! (drawn and collided from the disc, see `map`) with the AC at the start point of
@@ -1274,13 +1275,15 @@ fn reframe(
     keys: Res<ButtonInput<KeyCode>>,
     piloting: Res<control::Piloting>,
     garage: Res<Garage>,
+    ac: Query<&Transform, With<Ac>>,
     mut orbit: Query<&mut Orbit>,
 ) {
     if piloting.0 || !keys.just_pressed(KeyCode::KeyR) {
         return;
     }
     if let Ok(mut o) = orbit.single_mut() {
-        o.frame(garage.bounds.0, garage.bounds.1);
+        let pos = ac.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+        o.frame(pos + garage.bounds.0, pos + garage.bounds.1);
     }
 }
 
@@ -1799,7 +1802,7 @@ fn show(
         garage.bounds = (min, max);
         if *mode == garage::Mode::Sortie {
             if let Ok(mut o) = orbit.single_mut() {
-                o.frame(min, max);
+                o.frame(spawn_pos + min, spawn_pos + max);
             }
         }
     }
@@ -1843,7 +1846,7 @@ fn hud_lines(name: &str, design: &AcAssemblyDesignSt, parts: &Fmg) -> String {
     text
 }
 
-/// Up/Down: previous/next clip of the motion set, Space: pause.
+/// Up/Down: previous/next clip of the motion set, Enter: pause.
 fn clips(
     keys: Res<ButtonInput<KeyCode>>,
     garage: Res<Garage>,
@@ -1855,7 +1858,7 @@ fn clips(
     if piloting.0 {
         return;
     }
-    if keys.just_pressed(KeyCode::Space) {
+    if keys.just_pressed(KeyCode::Enter) {
         m.playing = !m.playing;
     }
     let step = [(KeyCode::ArrowDown, 1), (KeyCode::ArrowUp, -1)]

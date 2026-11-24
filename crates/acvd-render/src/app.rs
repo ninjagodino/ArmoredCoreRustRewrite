@@ -6,7 +6,7 @@ use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
-/// Drag the left mouse button to orbit `focus`, scroll to zoom.
+/// Drag the left mouse button to orbit `focus`, scroll to zoom, WASD + Space/Ctrl to fly.
 #[derive(Component)]
 pub struct Orbit {
     pub focus: Vec3,
@@ -29,12 +29,42 @@ impl Orbit {
     }
 }
 
+/// Camera-relative horizontal (WASD) and vertical (Space/Ctrl) displacement for [`orbit`].
+pub fn freecam_move(
+    yaw: f32,
+    radius: f32,
+    dt: f32,
+    forward_in: f32,
+    right_in: f32,
+    up_in: f32,
+    fast: bool,
+) -> Vec3 {
+    let dir = Vec3::new(-yaw.sin(), 0.0, -yaw.cos()) * forward_in
+        + Vec3::new(yaw.cos(), 0.0, -yaw.sin()) * right_in
+        + Vec3::Y * up_in;
+    if dir.length_squared() == 0.0 || dt <= 0.0 {
+        return Vec3::ZERO;
+    }
+    let base_speed = (radius * 1.5).clamp(10.0, 200.0);
+    let speed = if fast { base_speed * 3.0 } else { base_speed };
+    dir.normalize() * speed * dt
+}
+
 pub fn orbit(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     mut cams: Query<(&mut Orbit, &mut Transform)>,
 ) {
+    let forward_in = (keys.pressed(KeyCode::KeyW) as i32 - keys.pressed(KeyCode::KeyS) as i32) as f32;
+    let right_in = (keys.pressed(KeyCode::KeyD) as i32 - keys.pressed(KeyCode::KeyA) as i32) as f32;
+    let up_in = (keys.pressed(KeyCode::Space) as i32
+        - (keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight)) as i32)
+        as f32;
+    let fast = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let dt = time.delta_secs();
     for (mut o, mut t) in &mut cams {
         if o.follow {
             continue;
@@ -46,6 +76,8 @@ pub fn orbit(
         if scroll.delta.y != 0.0 {
             o.radius = (o.radius * (1.0 - scroll.delta.y * 0.1)).max(0.05);
         }
+        let delta = freecam_move(o.yaw, o.radius, dt, forward_in, right_in, up_in, fast);
+        o.focus += delta;
         let offset = Vec3::new(o.yaw.sin() * o.pitch.cos(), o.pitch.sin(), o.yaw.cos() * o.pitch.cos()) * o.radius;
         *t = Transform::from_translation(o.focus + offset).looking_at(o.focus, Vec3::Y);
     }
@@ -113,5 +145,44 @@ pub fn take_shot(
     if shot.waited > SHOT_DELAY + 30.0 {
         eprintln!("screenshot never arrived");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freecam_move_directions_and_vertical() {
+        // At yaw = 0, camera sits at +Z looking toward -Z; right is +X, up is +Y.
+        let fwd = freecam_move(0.0, 10.0, 1.0, 1.0, 0.0, 0.0, false);
+        assert!((fwd - Vec3::new(0.0, 0.0, -15.0)).length() < 1e-4, "fwd={fwd:?}");
+
+        let right = freecam_move(0.0, 10.0, 1.0, 0.0, 1.0, 0.0, false);
+        assert!((right - Vec3::new(15.0, 0.0, 0.0)).length() < 1e-4, "right={right:?}");
+
+        let up = freecam_move(0.0, 10.0, 1.0, 0.0, 0.0, 1.0, false);
+        assert!((up - Vec3::new(0.0, 15.0, 0.0)).length() < 1e-4, "up={up:?}");
+
+        let down = freecam_move(0.0, 10.0, 1.0, 0.0, 0.0, -1.0, false);
+        assert!((down - Vec3::new(0.0, -15.0, 0.0)).length() < 1e-4, "down={down:?}");
+
+        // At yaw = PI/2, camera sits at +X looking toward -X; right is -Z.
+        let half_pi = std::f32::consts::FRAC_PI_2;
+        let fwd_rot = freecam_move(half_pi, 10.0, 1.0, 1.0, 0.0, 0.0, false);
+        assert!((fwd_rot - Vec3::new(-15.0, 0.0, 0.0)).length() < 1e-4, "fwd_rot={fwd_rot:?}");
+
+        let right_rot = freecam_move(half_pi, 10.0, 1.0, 0.0, 1.0, 0.0, false);
+        assert!((right_rot - Vec3::new(0.0, 0.0, -15.0)).length() < 1e-4, "right_rot={right_rot:?}");
+
+        // Diagonal + vertical input is normalized; Shift triples speed.
+        let diag = freecam_move(0.0, 10.0, 1.0, 1.0, 1.0, 1.0, false);
+        assert!((diag.length() - 15.0).abs() < 1e-4, "diag len={}", diag.length());
+
+        let fast = freecam_move(0.0, 10.0, 1.0, 1.0, 0.0, 0.0, true);
+        assert!((fast.length() - 45.0).abs() < 1e-4, "fast len={}", fast.length());
+
+        assert_eq!(freecam_move(0.0, 10.0, 1.0, 0.0, 0.0, 0.0, false), Vec3::ZERO);
+        assert_eq!(freecam_move(0.0, 10.0, 0.0, 1.0, 0.0, 0.0, false), Vec3::ZERO);
     }
 }

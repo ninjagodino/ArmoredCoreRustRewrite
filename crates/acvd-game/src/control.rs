@@ -2753,11 +2753,25 @@ pub fn pilot(
             0.0,
             ReadyCamera::Off,
         );
-        if let Ok((mut o, _, _, mut blur)) = cams.single_mut() {
+        if let Ok((mut o, cam_t, _, mut blur)) = cams.single_mut() {
             blur.clear_speed_blur();
             if o.follow {
                 o.follow = false;
-                o.frame(garage.bounds.0, garage.bounds.1);
+                let center = transform.translation + (garage.bounds.0 + garage.bounds.1) * 0.5;
+                let offset = cam_t.translation - center;
+                let radius = offset.length();
+                if radius > 0.5 {
+                    let dir = offset / radius;
+                    o.focus = center;
+                    o.radius = radius;
+                    o.yaw = dir.x.atan2(dir.z);
+                    o.pitch = dir.y.clamp(-1.0, 1.0).asin().clamp(-1.5, 1.5);
+                } else {
+                    o.frame(
+                        transform.translation + garage.bounds.0,
+                        transform.translation + garage.bounds.1,
+                    );
+                }
             }
         }
         return;
