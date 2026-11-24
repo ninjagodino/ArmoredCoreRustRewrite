@@ -448,14 +448,54 @@ pub fn spawn(commands: &mut Commands, layout: &Layout, index: usize, origin: Vec
     root.left = px(origin.x);
     root.top = px(origin.y);
     let root = commands.spawn((MenuRoot, root)).id();
-    spawn_dialog(commands, layout, index, root, scale, u32::MAX, 0);
+    spawn_dialog(commands, layout, index, root, scale, u32::MAX, None, 0);
     root
+}
+
+/// Remaps a 9-slice child rect `[x0, y0, x1, y1]` from authored dialog size `src` into target
+/// `dst` (`Shape::Dialog` `flags & 1 != 0`, e.g. `0x101` on `ＦＥ_汎用枠` 21×21, `汎用ベース1`
+/// 32×32, `ボタン枠` 30×30):
+/// - edges pinned to `0` stay at `0` (left/top corners keep authored pixel size),
+/// - edges pinned to `src` shift by `dst - src` (right/bottom corners stay flush with `dst`),
+/// - interior bands (`0 < x < src`) stretch across `[x0, x1 + (dst - src)]`.
+fn remap_nine_slice(rect: [i16; 4], src: Vec2, dst: Vec2) -> [i16; 4] {
+    let remap_axis = |a: i16, b: i16, s: f32, d: f32| -> (i16, i16) {
+        let (lo, hi) = (a.min(b) as f32, a.max(b) as f32);
+        let (n0, n1) = if d < s && s > 0.0 {
+            let k = d / s;
+            (lo * k, hi * k)
+        } else {
+            let delta = d - s;
+            let at_start = lo <= 0.0;
+            let at_end = hi >= s;
+            let n0 = if at_start || !at_end { lo } else { lo + delta };
+            let n1 = if at_end || !at_start { hi + delta } else { hi };
+            (n0, n1.max(n0))
+        };
+        if a <= b {
+            (n0.round() as i16, n1.round() as i16)
+        } else {
+            (n1.round() as i16, n0.round() as i16)
+        }
+    };
+    let (x0, x1) = remap_axis(rect[0], rect[2], src.x, dst.x);
+    let (y0, y1) = remap_axis(rect[1], rect[3], src.y, dst.y);
+    [x0, y0, x1, y1]
 }
 
 /// `tint` is the product of the enclosing `Dialog` shapes' colors. That a Dialog's color
 /// modulates its sub-dialog is read off the layouts, not traced: `ACV_FE_LockSightCenter` puts
 /// the white `FE_font_base` plates behind its digits through `000000ff` Dialogs.
-fn spawn_dialog(commands: &mut Commands, layout: &Layout, index: usize, parent: Entity, scale: f32, tint: u32, depth: usize) {
+fn spawn_dialog(
+    commands: &mut Commands,
+    layout: &Layout,
+    index: usize,
+    parent: Entity,
+    scale: f32,
+    tint: u32,
+    nine_slice: Option<(Vec2, Vec2)>,
+    depth: usize,
+) {
     let Some(dialog) = layout.drb.dialogs.get(index) else { return };
     if depth > 16 {
         return;
@@ -464,17 +504,21 @@ fn spawn_dialog(commands: &mut Commands, layout: &Layout, index: usize, parent: 
         let [r, g, b, a] = modulate(c, tint).to_be_bytes();
         Color::srgba_u8(r, g, b, a)
     };
+    let map = |r: [i16; 4]| match nine_slice {
+        Some((src, dst)) => remap_nine_slice(r, src, dst),
+        None => r,
+    };
     for o in &dialog.objects {
         let spawned = match &o.shape {
             &Shape::Sprite { rect, uv, texture: Some(t), flags, color } => {
                 let Some(Some(image)) = layout.textures.get(t as usize).cloned() else { continue };
-                let (n, transform) = sprite_node(rect, flags, scale);
+                let (n, transform) = sprite_node(map(rect), flags, scale);
                 let sprite = MenuSprite { image, rect: texels(uv), color: rgba(color), flip_x: flags & 0x100 != 0, flip_y: flags & 0x200 != 0, additive: flags & 0xff == 2 };
                 commands.spawn((n, transform, sprite, ChildOf(parent))).id()
             }
             &Shape::AlphaAnimSprite { rect, uv, texture: Some(t), flags, color, mask_uv, mask: Some(m), mirror } => {
                 let (Some(Some(image)), Some(Some(mask))) = (layout.textures.get(t as usize).cloned(), layout.textures.get(m as usize).cloned()) else { continue };
-                let (n, transform) = sprite_node(rect, flags, scale);
+                let (n, transform) = sprite_node(map(rect), flags, scale);
                 let gauge = MenuGauge {
                     image,
                     rect: texels(uv),
@@ -489,23 +533,24 @@ fn spawn_dialog(commands: &mut Commands, layout: &Layout, index: usize, parent: 
                 };
                 commands.spawn((n, transform, gauge, ChildOf(parent))).id()
             }
-            &Shape::MonoRect { rect, color, .. } => commands.spawn((node(rect, scale), BackgroundColor(rgba(color)), ChildOf(parent))).id(),
+            &Shape::MonoRect { rect, color, .. } => commands.spawn((node(map(rect), scale), BackgroundColor(rgba(color)), ChildOf(parent))).id(),
             &Shape::MonoFrame { rect, flags, color } => {
-                let mut n = node(rect, scale);
+                let mut n = node(map(rect), scale);
                 n.border = UiRect::all(px((flags & 0xff).max(1) as f32 * scale));
                 commands.spawn((n, BorderColor::all(rgba(color)), ChildOf(parent))).id()
             }
             &Shape::GouraudRect { rect, colors, .. } => {
                 let gradient = LinearGradient::to_bottom(vec![ColorStop::auto(rgba(colors[0])), ColorStop::auto(rgba(colors[2]))]);
-                commands.spawn((node(rect, scale), BackgroundGradient::from(gradient), ChildOf(parent))).id()
+                commands.spawn((node(map(rect), scale), BackgroundGradient::from(gradient), ChildOf(parent))).id()
             }
             &Shape::GouraudFrame { rect, flags, colors } => {
-                let mut n = node(rect, scale);
+                let mut n = node(map(rect), scale);
                 n.border = UiRect::all(px((flags & 0xff).max(1) as f32 * scale));
                 commands.spawn((n, BorderColor::all(rgba(colors[0])), ChildOf(parent))).id()
             }
             Shape::Text { rect, color, font, align, source, .. } => {
                 let Some(f) = layout.fonts.get(font) else { continue };
+                let rect = map(*rect);
                 let size = Vec2::new((rect[2] - rect[0]).abs() as f32, (rect[3] - rect[1]).abs() as f32) * scale;
                 let string = match source {
                     TextSource::Static(s) => Some(s.clone()),
@@ -516,7 +561,7 @@ fn spawn_dialog(commands: &mut Commands, layout: &Layout, index: usize, parent: 
                             string = "000".into();
                         }
                         let text = MenuText { text: string, color: rgba(*color), font: f.clone(), align: *align, size, scale };
-                        commands.entity(parent).with_child((snapped_node(*rect, scale), text, MenuObject(o.name.clone())));
+                        commands.entity(parent).with_child((snapped_node(rect, scale), text, MenuObject(o.name.clone())));
                         continue;
                     }
                     _ => layout.placeholders.then(|| o.name.clone()),
@@ -525,17 +570,55 @@ fn spawn_dialog(commands: &mut Commands, layout: &Layout, index: usize, parent: 
                 if layout.placeholders && string == o.name && string.encode_utf16().any(|c| f.ccm.glyph(c).is_none()) {
                     string = "000".into();
                 }
-                let boxed = commands.spawn((snapped_node(*rect, scale), ChildOf(parent))).id();
+                let boxed = commands.spawn((snapped_node(rect, scale), ChildOf(parent))).id();
                 write_glyphs(commands, boxed, f, &string, *align, size, scale, rgba(*color));
                 boxed
             }
-            &Shape::Dialog { rect, dialog: Some(d), color, .. } => {
+            &Shape::Dialog { rect, dialog: Some(d), flags, color } => {
+                let rect = map(rect);
                 let child = commands.spawn((snapped_node(rect, scale), ChildOf(parent))).id();
-                spawn_dialog(commands, layout, d as usize, child, scale, modulate(color, tint), depth + 1);
+                let child_nine_slice = (flags & 1 != 0)
+                    .then(|| {
+                        let sub = layout.drb.dialogs.get(d as usize)?;
+                        let src = Vec2::new(sub.size[0] as f32, sub.size[1] as f32);
+                        let dst = Vec2::new((rect[2] - rect[0]).abs() as f32, (rect[3] - rect[1]).abs() as f32);
+                        (src.x > 0.0 && src.y > 0.0 && (dst.x != src.x || dst.y != src.y)).then_some((src, dst))
+                    })
+                    .flatten();
+                spawn_dialog(commands, layout, d as usize, child, scale, modulate(color, tint), child_nine_slice, depth + 1);
                 child
             }
             _ => continue,
         };
         commands.entity(spawned).insert(MenuObject(o.name.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nine_slice_remaps_3x3_frame_corners_and_edges() {
+        let src = Vec2::new(21.0, 21.0);
+        // scan_enemy_pic: 134x134
+        let dst = Vec2::new(134.0, 134.0);
+        assert_eq!(remap_nine_slice([0, 0, 7, 7], src, dst), [0, 0, 7, 7]);
+        assert_eq!(remap_nine_slice([7, 0, 14, 7], src, dst), [7, 0, 127, 7]);
+        assert_eq!(remap_nine_slice([14, 0, 21, 7], src, dst), [127, 0, 134, 7]);
+        assert_eq!(remap_nine_slice([0, 7, 7, 14], src, dst), [0, 7, 7, 127]);
+        assert_eq!(remap_nine_slice([7, 7, 14, 14], src, dst), [7, 7, 127, 127]);
+        assert_eq!(remap_nine_slice([14, 7, 21, 14], src, dst), [127, 7, 134, 127]);
+        assert_eq!(remap_nine_slice([0, 14, 7, 21], src, dst), [0, 127, 7, 134]);
+        assert_eq!(remap_nine_slice([7, 14, 14, 21], src, dst), [7, 127, 127, 134]);
+        assert_eq!(remap_nine_slice([14, 14, 21, 21], src, dst), [127, 127, 134, 134]);
+
+        // scan_enemy_name: [-9, 0, 378, 34] -> 387x34
+        let dst_name = Vec2::new(387.0, 34.0);
+        assert_eq!(remap_nine_slice([14, 14, 21, 21], src, dst_name), [380, 27, 387, 34]);
+        assert_eq!(remap_nine_slice([7, 7, 14, 14], src, dst_name), [7, 7, 380, 27]);
+
+        // Full-span child stretches to full target dimensions
+        assert_eq!(remap_nine_slice([0, 0, 21, 21], src, dst_name), [0, 0, 387, 34]);
     }
 }
