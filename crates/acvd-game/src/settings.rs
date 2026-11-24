@@ -1,6 +1,7 @@
 //! Local player options (display, UI scaling, and audio mix), persisted as `settings.json`.
 
 use bevy::audio::{AudioSink, AudioSinkPlayback, GlobalVolume, Volume};
+use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
 use bevy::prelude::*;
 use bevy::window::{MonitorSelection, WindowMode};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,129 @@ impl DisplayParam {
     }
 }
 
+/// Directional sun shadow draw distance presets exposed in the Graphics Options tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ShadowDistance {
+    Off,
+    Near,
+    #[default]
+    Medium,
+    Far,
+    FullMap,
+}
+
+impl ShadowDistance {
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Near,
+        Self::Medium,
+        Self::Far,
+        Self::FullMap,
+    ];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Near => 1,
+            Self::Medium => 2,
+            Self::Far => 3,
+            Self::FullMap => 4,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL[index.min(Self::ALL.len() - 1)]
+    }
+
+    pub fn step(self, delta: i8) -> Self {
+        let next = (self.index() as i16 + i16::from(delta))
+            .clamp(0, (Self::ALL.len() - 1) as i16) as usize;
+        Self::from_index(next)
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Near => "150M",
+            Self::Medium => "400M",
+            Self::Far => "1000M",
+            Self::FullMap => "FULL",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Near => "NEAR (150m)",
+            Self::Medium => "MEDIUM (400m)",
+            Self::Far => "FAR (1000m)",
+            Self::FullMap => "FULL MAP (4000m)",
+        }
+    }
+
+    /// Normalized `0.0..=1.0` gauge fill across [`Self::ALL`].
+    pub fn fill(self) -> f32 {
+        self.index() as f32 / (Self::ALL.len() - 1) as f32
+    }
+
+    /// Normalized position of the default preset marker on the gauge bar.
+    pub fn default_mark() -> f32 {
+        Self::default().fill()
+    }
+
+    pub fn from_fill(fill: f32) -> Self {
+        let idx = (fill.clamp(0.0, 1.0) * (Self::ALL.len() - 1) as f32).round() as usize;
+        Self::from_index(idx)
+    }
+
+    pub fn from_cli(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Some(Self::Off),
+            "near" | "low" | "150" => Some(Self::Near),
+            "medium" | "med" | "400" => Some(Self::Medium),
+            "far" | "high" | "1000" => Some(Self::Far),
+            "full" | "fullmap" | "full-map" | "full_map" | "map" | "max" | "ultra" | "4000" => {
+                Some(Self::FullMap)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn shadows_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn maximum_distance(self) -> f32 {
+        match self {
+            Self::Off | Self::Near => 150.0,
+            Self::Medium => 400.0,
+            Self::Far => 1000.0,
+            Self::FullMap => 4000.0,
+        }
+    }
+
+    pub fn cascade_config(self) -> CascadeShadowConfig {
+        let first_cascade_far_bound = match self {
+            Self::Off | Self::Near => 10.0,
+            Self::Medium => 16.0,
+            Self::Far => 24.0,
+            Self::FullMap => 35.0,
+        };
+        CascadeShadowConfigBuilder {
+            num_cascades: 4,
+            minimum_distance: 0.1,
+            first_cascade_far_bound,
+            maximum_distance: self.maximum_distance(),
+            overlap_proportion: 0.2,
+        }
+        .build()
+    }
+}
+
+/// Marks the primary sun `DirectionalLight` controlled by [`GameSettings::shadow_distance`].
+#[derive(Component)]
+pub struct PrimaryShadowLight;
+
 /// Category tabs inside the Garage and Pause Options menus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OptionsTab {
@@ -79,6 +203,7 @@ pub enum OptionRow {
     UiScale,
     HudSway,
     DisplayParam(DisplayParam),
+    ShadowDistance,
     Volume(AudioChannel),
 }
 
@@ -91,6 +216,7 @@ impl OptionRow {
             Self::DisplayParam(DisplayParam::Gamma) => 3,
             Self::DisplayParam(DisplayParam::Brightness) => 4,
             Self::DisplayParam(DisplayParam::Contrast) => 5,
+            Self::ShadowDistance => 6,
             Self::Volume(AudioChannel::Master) => 0,
             Self::Volume(AudioChannel::Music) => 1,
             Self::Volume(AudioChannel::Sfx) => 2,
@@ -146,6 +272,8 @@ pub struct GameSettings {
     pub brightness: f32,
     /// Display contrast multiplier in `0.50..=1.50` (50–150%, default 100%).
     pub contrast: f32,
+    /// Directional sun shadow draw distance preset.
+    pub shadow_distance: ShadowDistance,
     /// Linear master volume in `0.0..=1.0` (0–100%).
     pub volume: f32,
     /// Linear music/BGM volume multiplier in `0.0..=1.0` (0–100%).
@@ -166,6 +294,7 @@ impl Default for GameSettings {
             gamma: 1.0,
             brightness: 1.0,
             contrast: 1.0,
+            shadow_distance: ShadowDistance::default(),
             volume: 1.0,
             music_volume: 1.0,
             sfx_volume: 1.0,
@@ -303,6 +432,14 @@ impl GameSettings {
         }
     }
 
+    pub fn step_shadow_distance(&mut self, delta: i8) {
+        self.shadow_distance = self.shadow_distance.step(delta);
+    }
+
+    pub fn set_shadow_distance_from_fill(&mut self, fill: f32) {
+        self.shadow_distance = ShadowDistance::from_fill(fill);
+    }
+
     pub fn channel_volume(&self, channel: AudioChannel) -> f32 {
         match channel {
             AudioChannel::Master => self.volume,
@@ -359,6 +496,27 @@ pub fn apply_fullscreen(window: &mut Window, fullscreen: bool) {
     } else {
         WindowMode::Windowed
     };
+}
+
+/// Keeps the primary sun's shadow enable flag and cascade bounds in sync with
+/// [`GameSettings::shadow_distance`].
+pub fn sync_shadow_distance(
+    settings: Res<GameSettings>,
+    mut last: Local<Option<ShadowDistance>>,
+    mut lights: Query<(&mut DirectionalLight, &mut CascadeShadowConfig), With<PrimaryShadowLight>>,
+    added: Query<(), Added<PrimaryShadowLight>>,
+) {
+    if *last == Some(settings.shadow_distance) && added.is_empty() {
+        return;
+    }
+    let preset = settings.shadow_distance;
+    let enabled = preset.shadows_enabled();
+    let config = preset.cascade_config();
+    for (mut light, mut cascades) in &mut lights {
+        light.shadow_maps_enabled = enabled;
+        *cascades = config.clone();
+    }
+    *last = Some(preset);
 }
 
 /// Sets Bevy [`GlobalVolume`], updates future cue bus gains on [`Cues`], and re-scales
@@ -465,6 +623,79 @@ mod tests {
         assert_eq!(parsed.display_param_percent(DisplayParam::Gamma), 100);
         assert_eq!(parsed.display_param_percent(DisplayParam::Brightness), 100);
         assert_eq!(parsed.display_param_percent(DisplayParam::Contrast), 100);
+        assert_eq!(parsed.shadow_distance, ShadowDistance::Medium);
+    }
+
+    #[test]
+    fn shadow_distance_presets_step_fill_and_cascades() {
+        let mut s = GameSettings::default();
+        assert_eq!(s.shadow_distance, ShadowDistance::Medium);
+        assert!((s.shadow_distance.fill() - ShadowDistance::default_mark()).abs() < 1e-4);
+
+        s.step_shadow_distance(-10);
+        assert_eq!(s.shadow_distance, ShadowDistance::Off);
+        assert!(!s.shadow_distance.shadows_enabled());
+        assert_eq!(s.shadow_distance.fill(), 0.0);
+
+        s.step_shadow_distance(1);
+        assert_eq!(s.shadow_distance, ShadowDistance::Near);
+        assert!(s.shadow_distance.shadows_enabled());
+        assert!((s.shadow_distance.cascade_config().bounds.last().copied().unwrap() - 150.0).abs() < 1e-2);
+
+        s.step_shadow_distance(10);
+        assert_eq!(s.shadow_distance, ShadowDistance::FullMap);
+        assert!(s.shadow_distance.shadows_enabled());
+        assert_eq!(s.shadow_distance.fill(), 1.0);
+        assert!((s.shadow_distance.cascade_config().bounds.last().copied().unwrap() - 4000.0).abs() < 1e-1);
+
+        for preset in ShadowDistance::ALL {
+            s.set_shadow_distance_from_fill(preset.fill());
+            assert_eq!(s.shadow_distance, preset);
+        }
+        assert_eq!(ShadowDistance::from_cli("full"), Some(ShadowDistance::FullMap));
+        assert_eq!(ShadowDistance::from_cli("near"), Some(ShadowDistance::Near));
+        assert_eq!(ShadowDistance::from_cli("off"), Some(ShadowDistance::Off));
+    }
+
+    #[test]
+    fn sync_shadow_distance_updates_primary_sun_live() {
+        let mut app = App::new();
+        app.insert_resource(GameSettings::default());
+        app.add_systems(Update, sync_shadow_distance);
+
+        let light = app
+            .world_mut()
+            .spawn((
+                PrimaryShadowLight,
+                DirectionalLight {
+                    shadow_maps_enabled: true,
+                    ..default()
+                },
+                CascadeShadowConfig::default(),
+            ))
+            .id();
+
+        app.update();
+        let (dl, csc) = (
+            app.world().get::<DirectionalLight>(light).unwrap(),
+            app.world().get::<CascadeShadowConfig>(light).unwrap(),
+        );
+        assert!(dl.shadow_maps_enabled);
+        assert!((csc.bounds.last().copied().unwrap() - 400.0).abs() < 1e-1);
+
+        app.world_mut().resource_mut::<GameSettings>().shadow_distance = ShadowDistance::FullMap;
+        app.update();
+        let (dl, csc) = (
+            app.world().get::<DirectionalLight>(light).unwrap(),
+            app.world().get::<CascadeShadowConfig>(light).unwrap(),
+        );
+        assert!(dl.shadow_maps_enabled);
+        assert!((csc.bounds.last().copied().unwrap() - 4000.0).abs() < 1e-1);
+
+        app.world_mut().resource_mut::<GameSettings>().shadow_distance = ShadowDistance::Off;
+        app.update();
+        let dl = app.world().get::<DirectionalLight>(light).unwrap();
+        assert!(!dl.shadow_maps_enabled);
     }
 
     #[test]
@@ -512,6 +743,7 @@ mod tests {
             OptionRow::DisplayParam(DisplayParam::Contrast).cursor_index(),
             5
         );
+        assert_eq!(OptionRow::ShadowDistance.cursor_index(), 6);
         assert_eq!(OptionRow::Volume(AudioChannel::Master).cursor_index(), 0);
         assert_eq!(OptionRow::Volume(AudioChannel::Music).cursor_index(), 1);
         assert_eq!(OptionRow::Volume(AudioChannel::Sfx).cursor_index(), 2);

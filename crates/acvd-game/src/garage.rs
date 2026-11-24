@@ -51,7 +51,9 @@ use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient};
 use crate::decal::{self, DecalLibraryTab, DecalState, DECAL_TINTS};
 use crate::env;
 use crate::paint;
-use crate::settings::{self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab};
+use crate::settings::{
+    self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab, ShadowDistance,
+};
 use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
 
 /// Default ACVD garage workshop row ID in `param/customgarage.bin` (`id: 5` = Underpass `menu1000`).
@@ -175,6 +177,7 @@ pub enum UiAction {
     UiScaleStep(i8),
     HudSwayStep(i8),
     DisplayParamStep(DisplayParam, i8),
+    ShadowDistanceStep(i8),
     VolumeStep(AudioChannel, i8),
     QuitToDesktop,
 }
@@ -185,6 +188,7 @@ pub enum WheelAdjust {
     UiScale,
     HudSway,
     DisplayParam(DisplayParam),
+    ShadowDistance,
     Volume(AudioChannel),
     PaintRgb(usize),
     PaintCamo,
@@ -208,6 +212,9 @@ impl UiAction {
             }
             Self::SelectOptionRow(OptionRow::DisplayParam(p)) | Self::DisplayParamStep(p, _) => {
                 Some(WheelAdjust::DisplayParam(p))
+            }
+            Self::SelectOptionRow(OptionRow::ShadowDistance) | Self::ShadowDistanceStep(_) => {
+                Some(WheelAdjust::ShadowDistance)
             }
             Self::SelectOptionRow(OptionRow::Volume(ch)) | Self::VolumeStep(ch, _) => {
                 Some(WheelAdjust::Volume(ch))
@@ -322,6 +329,7 @@ pub enum SliderTrackTarget {
     UiScale,
     HudSway,
     DisplayParam(DisplayParam),
+    ShadowDistance,
     Volume(AudioChannel),
     PaintCamoScale,
     DecalScale,
@@ -470,8 +478,9 @@ fn options_row_desc(tab: OptionsTab, cursor: usize) -> &'static str {
             3 => "Adjust midtone gamma curve\n(50% - 150%, default 100%).",
             4 => "Adjust overall screen brightness\n(50% - 150%, default 100%).",
             5 => "Adjust light/dark contrast\n(50% - 150%, default 100%).",
-            6 => "Return to the Garage main menu.",
-            7 => "Exit the game and return\nto the desktop.",
+            6 => "Set sun shadow draw distance\n(Off to Full Map).",
+            7 => "Return to the Garage main menu.",
+            8 => "Exit the game and return\nto the desktop.",
             _ => "",
         },
         OptionsTab::Sound => match cursor {
@@ -2589,6 +2598,18 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::ShadowDistanceStep(delta) => {
+                state.cursor = OptionRow::ShadowDistance.cursor_index();
+                step_shadow_distance_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
             UiAction::VolumeStep(channel, delta) => {
                 state.cursor = OptionRow::Volume(channel).cursor_index();
                 step_volume_setting(
@@ -2838,6 +2859,17 @@ pub fn handle_input(
                         &mut audio_assets,
                         &mut state,
                         param,
+                        delta,
+                    );
+                }
+                WheelAdjust::ShadowDistance => {
+                    state.cursor = OptionRow::ShadowDistance.cursor_index();
+                    step_shadow_distance_setting(
+                        &mut commands,
+                        &mut options,
+                        &mut cues,
+                        &mut audio_assets,
+                        &mut state,
                         delta,
                     );
                 }
@@ -3214,6 +3246,17 @@ pub fn handle_input(
                 );
                 return;
             }
+            (OptionsTab::Graphics, 6) => {
+                step_shadow_distance_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
             (OptionsTab::Sound, 0) => {
                 step_volume_setting(
                     &mut commands,
@@ -3353,7 +3396,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
         GarageScreen::Options => match state.options_tab {
-            OptionsTab::Graphics => 8, // Fullscreen, UI Scale, HUD Sway, Gamma, Brightness, Contrast, Back, Quit
+            OptionsTab::Graphics => 9, // Fullscreen, UI Scale, HUD Sway, Gamma, Brightness, Contrast, Shadow Dist, Back, Quit
             OptionsTab::Sound => 6,    // Master, Music, SFX, Menu/UI, Back, Quit to Desktop
         },
         GarageScreen::ViewMode => 0,
@@ -3437,6 +3480,27 @@ fn step_display_param_setting(
             "{}: {}%",
             param.label(),
             options.settings.display_param_percent(param)
+        ),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+}
+
+fn step_shadow_distance_setting(
+    commands: &mut Commands,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    state: &mut GarageState,
+    delta: i8,
+) {
+    options.settings.step_shadow_distance(delta);
+    options.settings.save();
+    sound::cue(commands, cues, audio_assets, CUE_MOVE);
+    state.set_banner(
+        format!(
+            "SHADOW DISTANCE: {}",
+            options.settings.shadow_distance.display_name()
         ),
         Color::srgb(0.45, 0.92, 0.62),
     );
@@ -4031,9 +4095,12 @@ fn trigger_confirm(
                 );
             }
             (OptionsTab::Graphics, 6) => {
-                trigger_cancel(commands, state, garage, cues, audio_assets);
+                step_shadow_distance_setting(commands, options, cues, audio_assets, state, 1);
             }
             (OptionsTab::Graphics, 7) => {
+                trigger_cancel(commands, state, garage, cues, audio_assets);
+            }
+            (OptionsTab::Graphics, 8) => {
                 options.app_exit.write(AppExit::Success);
             }
             (OptionsTab::Sound, 0) => {
@@ -4707,6 +4774,22 @@ pub fn handle_slider_track_drag(
             if options.settings.display_param_percent(param) != prev || just_pressed {
                 options.settings.save();
                 let row = OptionRow::DisplayParam(param).cursor_index();
+                if in_pause_options {
+                    pause_state.cursor = row;
+                    pause_state.dirty = true;
+                } else {
+                    state.cursor = row;
+                    state.ui_dirty = true;
+                }
+                changed = true;
+            }
+        }
+        SliderTrackTarget::ShadowDistance => {
+            let prev = options.settings.shadow_distance;
+            options.settings.set_shadow_distance_from_fill(fill);
+            if options.settings.shadow_distance != prev || just_pressed {
+                options.settings.save();
+                let row = OptionRow::ShadowDistance.cursor_index();
                 if in_pause_options {
                     pause_state.cursor = row;
                     pause_state.dirty = true;
@@ -6178,6 +6261,32 @@ fn spawn_garage_options_menu(
                     .insert((Button, UiAction::DisplayParamStep(param, 1)));
             }
 
+            // Row 6: Shadow Draw Distance (Off, 150m, 400m, 1000m, Full Map)
+            let sd_row = OptionRow::ShadowDistance.cursor_index();
+            let sd_slider = kit.spawn_slider_row(
+                commands,
+                list,
+                "SHADOW DIST",
+                settings.shadow_distance.short_label(),
+                settings.shadow_distance.fill(),
+                Some(ShadowDistance::default_mark()),
+                cursor == sd_row,
+                104.0,
+                scale,
+            );
+            commands
+                .entity(sd_slider.row)
+                .insert((Button, UiAction::SelectOptionRow(OptionRow::ShadowDistance)));
+            commands
+                .entity(sd_slider.track)
+                .insert(SliderTrack(SliderTrackTarget::ShadowDistance));
+            commands
+                .entity(sd_slider.dec_btn)
+                .insert((Button, UiAction::ShadowDistanceStep(-1)));
+            commands
+                .entity(sd_slider.inc_btn)
+                .insert((Button, UiAction::ShadowDistanceStep(1)));
+
             // Combat HUD Color HSV / RGB picker
             kit.spawn_text(
                 commands,
@@ -6200,7 +6309,7 @@ fn spawn_garage_options_menu(
                 scale * 0.88,
             );
 
-            (6, 7)
+            (7, 8)
         }
         OptionsTab::Sound => {
             kit.spawn_text(
@@ -8983,7 +9092,7 @@ mod tests {
                 sz.x
             );
         }
-        for (tab, count) in [(OptionsTab::Graphics, 8usize), (OptionsTab::Sound, 6usize)] {
+        for (tab, count) in [(OptionsTab::Graphics, 9usize), (OptionsTab::Sound, 6usize)] {
             for i in 0..count {
                 let desc = options_row_desc(tab, i);
                 assert!(!desc.is_empty(), "options_row_desc({tab:?}, {i}) is empty");
@@ -9052,6 +9161,14 @@ mod tests {
         assert_eq!(
             UiAction::DisplayParamStep(DisplayParam::Contrast, -1).wheel_adjust(),
             Some(WheelAdjust::DisplayParam(DisplayParam::Contrast))
+        );
+        assert_eq!(
+            UiAction::SelectOptionRow(OptionRow::ShadowDistance).wheel_adjust(),
+            Some(WheelAdjust::ShadowDistance)
+        );
+        assert_eq!(
+            UiAction::ShadowDistanceStep(1).wheel_adjust(),
+            Some(WheelAdjust::ShadowDistance)
         );
         assert_eq!(
             UiAction::SelectOptionRow(OptionRow::Volume(AudioChannel::Master)).wheel_adjust(),

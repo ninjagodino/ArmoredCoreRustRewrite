@@ -21,7 +21,9 @@ use bevy::window::CursorGrabMode;
 
 use crate::garage::{Mode, ModeSwitch, CUE_CANCEL, CUE_CATEGORY, CUE_MOVE, CUE_OK};
 use crate::garage_assemble::AssembleUiAssets;
-use crate::settings::{self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab};
+use crate::settings::{
+    self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab, ShadowDistance,
+};
 use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
 
 /// Active page inside the gameplay pause overlay.
@@ -119,6 +121,7 @@ pub enum PauseAction {
     StepUiScale(i8),
     StepHudSway(i8),
     StepDisplayParam(DisplayParam, i8),
+    StepShadowDistance(i8),
     StepVolume(AudioChannel, i8),
     BackToMain,
 }
@@ -144,7 +147,7 @@ pub struct PauseAudioCtx<'w> {
 
 fn option_row_count(tab: OptionsTab) -> usize {
     match tab {
-        OptionsTab::Graphics => 7, // 0: Fullscreen, 1: UI Scale, 2: HUD Sway, 3: Gamma, 4: Brightness, 5: Contrast, 6: Back
+        OptionsTab::Graphics => 8, // 0: Fullscreen, 1: UI Scale, 2: HUD Sway, 3: Gamma, 4: Brightness, 5: Contrast, 6: Shadow Dist, 7: Back
         OptionsTab::Sound => 5,    // 0: Master, 1: Music, 2: SFX, 3: Menu/UI, 4: Back
     }
 }
@@ -229,6 +232,26 @@ fn step_display_param(
             "{}: {}%",
             param.label(),
             options.settings.display_param_percent(param)
+        ),
+        palette::ACCENT_TEAL,
+    ));
+    state.dirty = true;
+}
+
+fn step_shadow_distance(
+    commands: &mut Commands,
+    options: &mut PauseOptionsCtx,
+    audio: &mut PauseAudioCtx,
+    state: &mut PauseState,
+    delta: i8,
+) {
+    options.settings.step_shadow_distance(delta);
+    options.settings.save();
+    sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_MOVE);
+    state.status_banner = Some((
+        format!(
+            "SHADOW DISTANCE: {}",
+            options.settings.shadow_distance.display_name()
         ),
         palette::ACCENT_TEAL,
     ));
@@ -412,6 +435,11 @@ pub fn handle_input(
                 );
                 return;
             }
+            PauseAction::StepShadowDistance(delta) => {
+                state.cursor = OptionRow::ShadowDistance.cursor_index();
+                step_shadow_distance(&mut commands, &mut options, &mut audio, &mut state, delta);
+                return;
+            }
             PauseAction::StepVolume(channel, delta) => {
                 state.cursor = OptionRow::Volume(channel).cursor_index();
                 step_volume(
@@ -548,6 +576,12 @@ pub fn handle_input(
                         param,
                         delta,
                     );
+                    return;
+                }
+                PauseAction::SelectOptionRow(OptionRow::ShadowDistance)
+                | PauseAction::StepShadowDistance(_) => {
+                    state.cursor = OptionRow::ShadowDistance.cursor_index();
+                    step_shadow_distance(&mut commands, &mut options, &mut audio, &mut state, delta);
                     return;
                 }
                 PauseAction::SelectOptionRow(OptionRow::Volume(channel))
@@ -696,6 +730,9 @@ pub fn handle_input(
                 DisplayParam::Contrast,
                 delta,
             ),
+            (OptionsTab::Graphics, 6) => {
+                step_shadow_distance(&mut commands, &mut options, &mut audio, &mut state, delta)
+            }
             (OptionsTab::Sound, 0) => step_volume(
                 &mut commands,
                 &mut options,
@@ -780,6 +817,9 @@ pub fn handle_input(
                     DisplayParam::Contrast,
                     1,
                 ),
+                (OptionsTab::Graphics, 6) => {
+                    step_shadow_distance(&mut commands, &mut options, &mut audio, &mut state, 1)
+                }
                 (OptionsTab::Sound, 0) => step_volume(
                     &mut commands,
                     &mut options,
@@ -812,7 +852,7 @@ pub fn handle_input(
                     AudioChannel::Ui,
                     1,
                 ),
-                (OptionsTab::Graphics, 6) | (OptionsTab::Sound, 4) => {
+                (OptionsTab::Graphics, 7) | (OptionsTab::Sound, 4) => {
                     state.screen = PauseScreen::Main;
                     state.cursor = items
                         .iter()
@@ -1232,6 +1272,33 @@ pub fn sync_ui(
                             .insert((Button, PauseAction::StepDisplayParam(param, 1)));
                     }
 
+                    // Row 6: Shadow Draw Distance (Off, 150m, 400m, 1000m, Full Map)
+                    let sd_row = OptionRow::ShadowDistance.cursor_index();
+                    let sd_slider = kit.spawn_slider_row(
+                        &mut commands,
+                        list,
+                        "SHADOW DIST",
+                        settings.shadow_distance.short_label(),
+                        settings.shadow_distance.fill(),
+                        Some(ShadowDistance::default_mark()),
+                        state.cursor == sd_row,
+                        132.0,
+                        scale,
+                    );
+                    commands.entity(sd_slider.row).insert((
+                        Button,
+                        PauseAction::SelectOptionRow(OptionRow::ShadowDistance),
+                    ));
+                    commands.entity(sd_slider.track).insert(
+                        crate::garage::SliderTrack(crate::garage::SliderTrackTarget::ShadowDistance),
+                    );
+                    commands
+                        .entity(sd_slider.dec_btn)
+                        .insert((Button, PauseAction::StepShadowDistance(-1)));
+                    commands
+                        .entity(sd_slider.inc_btn)
+                        .insert((Button, PauseAction::StepShadowDistance(1)));
+
                     // Combat HUD Color HSV / RGB picker
                     if garage_state.paint_hsv_synced_channel != Some(usize::MAX - 1) {
                         let c = settings.hud_color;
@@ -1261,7 +1328,7 @@ pub fn sync_ui(
                         scale * 0.88,
                     );
 
-                    6
+                    7
                 }
                 OptionsTab::Sound => {
                     // Section: Sound Settings (Master, Music, SFX, Menu / UI)
@@ -1406,7 +1473,7 @@ mod tests {
 
     #[test]
     fn option_row_counts_match_tabs() {
-        assert_eq!(option_row_count(OptionsTab::Graphics), 7);
+        assert_eq!(option_row_count(OptionsTab::Graphics), 8);
         assert_eq!(option_row_count(OptionsTab::Sound), 5);
     }
 }

@@ -222,6 +222,7 @@ fn main() {
     );
     let mut start_pause: Option<pause::PauseScreen> = None;
     let mut start_options_tab = settings::OptionsTab::Graphics;
+    let mut shadow_dist_override: Option<settings::ShadowDistance> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -332,6 +333,11 @@ fn main() {
                 start_pause = Some(pause::PauseScreen::Options);
                 start_options_tab = settings::OptionsTab::Sound;
             }
+            "--shadow-dist" => {
+                shadow_dist_override = args
+                    .next()
+                    .and_then(|s| settings::ShadowDistance::from_cli(&s));
+            }
             _ => wanted = a.parse::<u32>().ok(),
         }
     }
@@ -439,7 +445,10 @@ fn main() {
             pause_state.options_tab = start_options_tab;
         }
     }
-    let game_settings = settings::GameSettings::load();
+    let mut game_settings = settings::GameSettings::load();
+    if let Some(sd) = shadow_dist_override {
+        game_settings.shadow_distance = sd;
+    }
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -539,6 +548,7 @@ fn main() {
             garage_assemble::sync_ac_preview,
             garage_assemble::rotate_ac_preview,
             garage::update_camera,
+            settings::sync_shadow_distance,
         )
             .chain()
             .before(show),
@@ -1181,6 +1191,7 @@ fn setup(
     collision: Res<Collision>,
     scene: Res<Scene>,
     show_hud: Res<ShowHud>,
+    settings: Res<settings::GameSettings>,
 ) {
     commands.spawn((
         Camera3d::default(),
@@ -1194,11 +1205,13 @@ fn setup(
         blur::ZoomBlur::default(),
     ));
     commands.spawn((
+        settings::PrimaryShadowLight,
         DirectionalLight {
             illuminance: 9000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: settings.shadow_distance.shadows_enabled(),
             ..default()
         },
+        settings.shadow_distance.cascade_config(),
         Transform::from_xyz(4.0, 10.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
