@@ -260,7 +260,7 @@ impl UiMaterial for GaugeSprite {
     }
 }
 
-/// Sharp-bilinear CCM bitmap font glyph material (`glyph_sprite.wgsl`).
+/// Catmull-Rom bicubic CCM bitmap font glyph material (`glyph_sprite.wgsl`).
 #[derive(AsBindGroup, Asset, TypePath, Clone)]
 pub struct GlyphSprite {
     #[uniform(0)]

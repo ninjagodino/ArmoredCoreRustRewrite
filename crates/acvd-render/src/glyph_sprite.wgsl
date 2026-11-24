@@ -6,31 +6,78 @@
 @group(1) @binding(2) var image: texture_2d<f32>;
 @group(1) @binding(3) var image_sampler: sampler;
 
-// Sharp-bilinear sampling for 720p CCM bitmap font sheets:
-// - At 1:1 (fw >= 1.0), collapses to standard 1:1 texel sampling.
-// - When upscaled (1080p/1440p/4K), keeps texel interiors crisp and restricts
-//   linear blending to a 1-screen-pixel anti-aliased band at texel edges.
-// - Un-premultiplies RGB on translucent edges to eliminate the dark fringe
-//   from empty transparent BC3 blocks (RGB=0, A=0) while preserving opaque
-//   shaded icons (e.g. controller buttons).
+// Catmull-Rom cubic basis weights for fractional offset `f` in [0, 1).
+// Interpolating (w(0) = 1, w(±1) = w(±2) = 0): reproduces exact original texels
+// at 1:1 texel centers with zero blur, and reconstructs smooth C1-continuous
+// anti-aliased glyph curves when upscaled (1080p/1440p/4K) without the blocky
+// stair-stepping of sharp-bilinear or the haze of plain bilinear.
+fn catmull_rom(f: f32) -> vec4<f32> {
+    let f2 = f * f;
+    let f3 = f2 * f;
+    return vec4<f32>(
+        -0.5 * f3 +       f2 - 0.5 * f,
+         1.5 * f3 - 2.5 * f2 + 1.0,
+        -1.5 * f3 + 2.0 * f2 + 0.5 * f,
+         0.5 * f3 - 0.5 * f2,
+    );
+}
+
+// Fetches one texel as premultiplied RGBA, treating texels outside the glyph's
+// atlas rect as transparent so neighboring glyphs never bleed into the 4x4 kernel.
+fn fetch_premul(coord: vec2<i32>, rmin: vec2<i32>, rmax: vec2<i32>) -> vec4<f32> {
+    if any(coord < rmin) || any(coord >= rmax) {
+        return vec4<f32>(0.0);
+    }
+    let s = textureLoad(image, coord, 0);
+    return vec4<f32>(s.rgb * s.a, s.a);
+}
+
+fn sample_row(base_x: i32, y: i32, wx: vec4<f32>, rmin: vec2<i32>, rmax: vec2<i32>) -> vec4<f32> {
+    return fetch_premul(vec2<i32>(base_x - 1, y), rmin, rmax) * wx.x
+         + fetch_premul(vec2<i32>(base_x,     y), rmin, rmax) * wx.y
+         + fetch_premul(vec2<i32>(base_x + 1, y), rmin, rmax) * wx.z
+         + fetch_premul(vec2<i32>(base_x + 2, y), rmin, rmax) * wx.w;
+}
+
 @fragment
 fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
-    let tex_size = vec2<f32>(textureDimensions(image));
+    let dims = vec2<i32>(textureDimensions(image));
+    let tex_size = vec2<f32>(dims);
     let texel = mix(rect.xy, rect.zw, in.uv);
-
-    let nearest = floor(texel + 0.5);
-    let dist = texel - nearest;
     let fw = max(fwidth(texel), vec2<f32>(1e-4));
-    let sharp_texel = nearest + clamp(dist / fw, vec2<f32>(-0.5), vec2<f32>(0.5));
-    let clamped = clamp(sharp_texel, rect.xy + 0.5, rect.zw - 0.5);
-    let uv = clamped / tex_size;
 
-    let sample = textureSample(image, image_sampler, uv);
-    let rgb = select(
-        sample.rgb,
-        min(sample.rgb / max(sample.a, 1e-4), vec3<f32>(1.0)),
-        sample.a > 0.0 && sample.a < 0.99,
+    // Hardware bilinear sample (executed in uniform control flow for derivatives).
+    let clamped_uv = clamp(texel, rect.xy + 0.5, rect.zw - 0.5) / tex_size;
+    let linear_s = textureSample(image, image_sampler, clamped_uv);
+    let linear_rgb = select(
+        linear_s.rgb,
+        min(linear_s.rgb / max(linear_s.a, 1e-4), vec3<f32>(1.0)),
+        linear_s.a > 0.0 && linear_s.a < 0.99,
     );
 
-    return vec4<f32>(rgb, sample.a) * tint;
+    // When downscaling, hardware linear filtering avoids point-sampling aliasing.
+    if max(fw.x, fw.y) > 1.05 {
+        return vec4<f32>(linear_rgb, linear_s.a) * tint;
+    }
+
+    // 4x4 Catmull-Rom bicubic in premultiplied space:
+    // - Eliminates dark fringes from empty BC3 blocks (RGB=0, A=0) identically
+    //   for both monochrome text and colored controller-button icons.
+    // - Bounds every tap to [rect.xy, rect.zw) so adjacent glyphs never bleed.
+    let rmin = max(vec2<i32>(floor(rect.xy + 0.001)), vec2<i32>(0));
+    let rmax = min(vec2<i32>(ceil(rect.zw - 0.001)), dims);
+    let p = texel - 0.5;
+    let base = vec2<i32>(floor(p));
+    let f = p - vec2<f32>(base);
+    let wx = catmull_rom(f.x);
+    let wy = catmull_rom(f.y);
+
+    let acc = sample_row(base.x, base.y - 1, wx, rmin, rmax) * wy.x
+            + sample_row(base.x, base.y,     wx, rmin, rmax) * wy.y
+            + sample_row(base.x, base.y + 1, wx, rmin, rmax) * wy.z
+            + sample_row(base.x, base.y + 2, wx, rmin, rmax) * wy.w;
+
+    let a = clamp(acc.a, 0.0, 1.0);
+    let rgb = select(vec3<f32>(0.0), clamp(acc.rgb / a, vec3<f32>(0.0), vec3<f32>(1.0)), a > 1e-4);
+    return vec4<f32>(rgb, a) * tint;
 }

@@ -16,8 +16,8 @@ use bevy::ui::px;
 
 use crate::Packs;
 
-/// A single laid-out font glyph; [`crate::menu::MenuPlugin`] draws it with the sharp-bilinear
-/// [`crate::menu::GlyphSprite`] shader so 720p CCM bitmap fonts stay crisp when upscaled.
+/// A single laid-out font glyph; [`crate::menu::MenuPlugin`] draws it with the Catmull-Rom
+/// bicubic [`crate::menu::GlyphSprite`] shader so 720p CCM bitmap fonts stay smooth and crisp when upscaled.
 #[derive(Component, Clone)]
 pub struct GlyphNode {
     pub image: Handle<Image>,
@@ -136,10 +136,10 @@ pub fn spawn_glyphs(commands: &mut Commands, font: &Font, quads: &[GlyphQuad], o
         commands.spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: px((origin.x + q.pos.x).round()),
-                top: px((origin.y + q.pos.y).round()),
-                width: px(q.size.x.round().max(1.0)),
-                height: px(q.size.y.round().max(1.0)),
+                left: px(origin.x + q.pos.x),
+                top: px(origin.y + q.pos.y),
+                width: px(q.size.x.max(1.0)),
+                height: px(q.size.y.max(1.0)),
                 ..Default::default()
             },
             GlyphNode { image, rect: q.uv, color },
@@ -204,5 +204,33 @@ mod tests {
         assert_eq!(quads.len(), 1);
         assert!((quads[0].size.x - 5.0).abs() < 1e-4, "got width {}", quads[0].size.x);
         assert!((quads[0].size.y - 16.0).abs() < 1e-4, "got height {}", quads[0].size.y);
+    }
+
+    #[test]
+    fn spawn_glyphs_preserves_subpixel_positions_for_bicubic_aa() {
+        let mut world = bevy::ecs::world::World::new();
+        let parent = world.spawn_empty().id();
+        let ccm = font();
+        let f = Font { ccm: ccm.clone(), sheets: vec![Handle::default()], sheet_size: vec![[256, 128]] };
+        let (quads, _) = layout(&ccm, &f.sheet_size, "AB", 0.86);
+        assert_eq!(quads.len(), 2);
+        {
+            let mut commands = world.commands();
+            spawn_glyphs(&mut commands, &f, &quads, Vec2::new(0.25, 0.5), parent, Color::WHITE);
+        }
+        world.flush();
+        let mut nodes: Vec<(f32, f32)> = world
+            .query::<(&Node, &GlyphNode)>()
+            .iter(&world)
+            .map(|(n, _)| match (n.left, n.width) {
+                (bevy::ui::Val::Px(l), bevy::ui::Val::Px(w)) => (l, w),
+                other => panic!("unexpected vals {other:?}"),
+            })
+            .collect();
+        nodes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(nodes.len(), 2);
+        assert!((nodes[0].0 - (0.25 + quads[0].pos.x)).abs() < 1e-4);
+        assert!((nodes[0].1 - quads[0].size.x).abs() < 1e-4);
+        assert!((nodes[1].0 - (0.25 + quads[1].pos.x)).abs() < 1e-4);
     }
 }

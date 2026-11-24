@@ -5,7 +5,7 @@
 //! in Bevy Flexbox layout while drawing with the real game's fonts, colors, gradients, corner
 //! reticles, stepped traces, shaded buttons, stat rows, and capacity gauges.
 //!
-//! Requires [`crate::menu::MenuPlugin`] in the Bevy `App` so [`GlyphNode`]s (sharp-bilinear
+//! Requires [`crate::menu::MenuPlugin`] in the Bevy `App` so [`GlyphNode`]s (Catmull-Rom bicubic
 //! `glyph_sprite.wgsl`) and [`MenuSprite`]s render.
 
 use std::sync::Arc;
@@ -329,8 +329,8 @@ impl AcvdUiKit {
         text::layout(&f.ccm, &f.sheet_size, text_str, scale).1
     }
 
-    /// Spawns flexbox-compatible ACVD disc bitmap text (`PositionType::Relative`, sharp-bilinear
-    /// [`GlyphNode`]s) inside `parent`. Falls back to Bevy `Text` only when no disc font is loaded.
+    /// Spawns flexbox-compatible ACVD disc bitmap text (`PositionType::Relative`, Catmull-Rom
+    /// bicubic [`GlyphNode`]s) inside `parent`. Falls back to Bevy `Text` only when no disc font is loaded.
     pub fn spawn_text(
         &self,
         commands: &mut Commands,
