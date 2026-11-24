@@ -509,7 +509,9 @@ fn motion(
                 crate::pose::TaeFired::Sound { cue } => {
                     cues.play(&mut commands, &mut assets, cue, false);
                 }
-                crate::pose::TaeFired::Ffx { .. } => {}
+                crate::pose::TaeFired::Ffx { .. }
+                | crate::pose::TaeFired::Reattach { .. }
+                | crate::pose::TaeFired::Purge { .. } => {}
             }
         }
     }

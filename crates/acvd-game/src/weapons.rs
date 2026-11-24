@@ -546,22 +546,43 @@ impl OwArmAttach {
     }
 }
 
-/// A bay shift in progress. While this exists the fire buttons do not shoot: they already
-/// started the exchange (`sheets/ac_states.csv` `bay_shift_*` / `bay_purge_*`).
-#[derive(Resource)]
-pub(crate) struct Shift {
+/// One arm's active bay shift or bay purge (`sheets/ac_states.csv` `bay_shift_*` / `bay_purge_*`,
+/// 360 `0x82876f48` + `0x828487b8` / `0x82848cc8`, TAE `2000..2003` / `2010..2013`).
+#[derive(Clone, Copy)]
+pub(crate) struct HandShift {
     pub hand: Hand,
     pub purge: bool,
-    /// Body-clip frame where the equipped weapon is parented onto the rack.
+    /// Rack carousel phase at the start of this shift (`0`: `a00_011` / TAE `2000`/`2001`;
+    /// `1`: `a00_021` / TAE `2002`/`2003`).
+    pub phase: u8,
+    /// Fallback frame where the equipped weapon is seated on the rack (`40`) or purged (`10`).
     pub swap_at: f32,
-    /// Body-clip frame where the hand, up at the shoulder again, takes the weapon that rode the spin.
+    /// Fallback frame where the hand takes the spun rack weapon (`150`).
     pub grab_at: f32,
     pub swapped: bool,
     pub grabbed: bool,
-    /// 0 = stowed prong, 1 = swung forward (`a00_011` around frame 90).
-    pub present: f32,
-    /// The weapon that started on the rack. It stays there until `grab_at`.
+    /// Current 60 Hz frame of the rack carousel clip (`a00_011` or `a00_021`, `0..=180`).
+    pub rack_frame: f32,
+    /// The weapon that started on the rack. It stays there until `grab`.
     pub racked: Option<Entity>,
+    /// `hanger_pose` byte (`acvparts` cat-10 `+0x0a`) of the weapon moving onto the rack.
+    pub incoming_pose: u8,
+}
+
+/// Per-hand bay shift state (`[0]` Right, `[1]` Left). While a hand is shifting, that hand's
+/// fire button does not shoot, while the other hand stays free (360 arm layers `0x0a` / `0x0b`).
+#[derive(Resource, Default)]
+pub(crate) struct Shift {
+    pub hands: [Option<HandShift>; 2],
+    /// Current rack carousel phase per hand (`0` = front prong `*_hg_f` holds the stowed weapon,
+    /// `1` = back prong `*_hg_b` holds it; toggled on each shift per 360 `0x82876f48`).
+    pub phase: [u8; 2],
+}
+
+impl Shift {
+    pub fn is_active(&self, hand: Hand) -> bool {
+        self.hands[hand as usize].is_some()
+    }
 }
 
 /// Range-decay curve packed by `0x8247d350` and evaluated by `0x8298be98` -> `0x827ca448`.
@@ -1872,21 +1893,28 @@ pub fn fire(
         want_shoulder |= pad.pressed(GamepadButton::RightTrigger);
     }
     // Bay shift (manual 20403): while the modifier is held, the fire buttons exchange that
-    // arm with its bay weapon instead of shooting. The clip keeps the block after release.
+    // arm with its bay weapon instead of shooting. Once started, only the shifting arm is
+    // blocked from firing (360 independent arm layers 0x0a/0x0b).
     // Scan Mode (`AC + 0xdb0 != 0`, `0x828b51e0` -> `0x82879d58(_, 0)`, `manual.fmg` 20407):
     // weapon fire is disabled while in Scan Mode (R2 becomes Target Scan).
     // Kick / Blade active (`AcActRestrictionParamSt` rows 2, 3, 9: `b_shoot == 0`): block fire.
-    let shifting = body.shift.is_some()
-        || keys.pressed(KeyCode::KeyR)
+    let shift_mod = keys.pressed(KeyCode::KeyR)
         || held.0.contains(&KeyCode::KeyR)
         || pads.iter().any(|pad| pad.pressed(GamepadButton::North));
     let ow_blocks = arms
         .overed
         .as_ref()
         .is_some_and(OveredWeaponState::blocks_normal_fire);
-    if shifting || pilot.scan_mode || pilot.in_kick() || pilot.in_blade() || ow_blocks {
+    if shift_mod || pilot.scan_mode || pilot.in_kick() || pilot.in_blade() || ow_blocks {
         want = [false, false];
         want_shoulder = false;
+    } else if let Some(shift) = body.shift.as_deref() {
+        if shift.is_active(Hand::Right) {
+            want[0] = false;
+        }
+        if shift.is_active(Hand::Left) {
+            want[1] = false;
+        }
     }
     let aim = pilot.aim_direction();
     let frames = dt * TICK_RATE;

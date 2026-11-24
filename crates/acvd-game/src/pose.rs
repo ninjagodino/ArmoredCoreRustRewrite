@@ -155,14 +155,38 @@ impl CoreControl {
 
 /// Decoded TAE timeline event emitted when playback crosses an event's `start_frame`
 /// (360 AC TAE dispatcher `0x8289acd0`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TaeFired {
     /// TAE kind `103` (`0x67`): footstep contact (`side`: 0/1, `kind`: step variant).
     Footstep { side: u32, kind: u32 },
     /// TAE kinds `1`, `2`, `602`: direct sound cue formatted via 360 table `0x8371c688`.
     Sound { cue: String },
-    /// TAE kind `0`: spawn FFX effect `ffx_id` on part dummy socket `dummy_id`.
-    Ffx { ffx_id: i32, dummy_id: u8 },
+    /// TAE kind `0`: spawn FFX effect `ffx_id` on part dummy socket `dummy_id` at `scale`
+    /// (`1.5` for bay-shift arm-overlay TAE `2000..2003`, verified in Xenia `bay_switch.jsonl`).
+    Ffx { ffx_id: i32, dummy_id: u8, scale: f32 },
+    /// TAE kind `101` (`0x65`): reattach weapon (`acattachinfo` row ID; frame 40 seat, frame 150 grab).
+    Reattach { id: u32 },
+    /// TAE kind `102` (`0x66`): purge weapon (`2`/`3`/`11`/`12` at frame 10 of `2010..2013`).
+    Purge { id: u32 },
+}
+
+/// Active per-arm overlay animation layer (360 `0x828487b8` / `0x82848cc8` -> `0x82854a50`
+/// layer `0x0a` right arm `r_kata`, layer `0x0b` left arm `l_kata`). Plays bay shift (`300`/`301`
+/// + TAE `2000..2003`) and bay purge (`302`/`303` + TAE `2010..2013`) independently on each arm
+/// without freezing the other arm or lower-body locomotion.
+pub struct ArmLayer {
+    pub anim_id: u16,
+    pub tae_id: u32,
+    pub clip: Arc<ani::Anim>,
+    pub frame: f32,
+    pub speed: f32,
+    pub fade: Fade,
+}
+
+impl ArmLayer {
+    pub fn finished(&self) -> bool {
+        self.frame >= self.clip.frames as f32
+    }
 }
 
 /// Active upper-body animation layer playing over lower-body locomotion (`c_center` / `core`
@@ -193,6 +217,9 @@ pub struct Driven {
     pub absolute: bool,
     pub bind: Vec3,
     pub upper: bool,
+    /// `Some(0)` for right arm (`r_kata` subtree, 360 layer `0x0a`), `Some(1)` for left arm
+    /// (`l_kata` subtree, 360 layer `0x0b`).
+    pub arm_side: Option<u8>,
     pub core_bone: CoreBone,
     group: usize,
     /// Last pre-Core-Control animated pose, captured by crossfade transitions so procedural
@@ -202,6 +229,8 @@ pub struct Driven {
     generation: u32,
     upper_from: Transform,
     upper_gen: u32,
+    arm_from: Transform,
+    arm_gen: u32,
 }
 
 /// Crossfade from the pose shown at the last clip change into the new clip: per bone group
@@ -268,6 +297,21 @@ pub fn is_upper_body(rest: &[ani::Rest], bone: usize) -> bool {
     false
 }
 
+/// Which arm subtree `bone` belongs to: `Some(0)` for right arm (`r_kata` and descendants,
+/// 360 layer `0x0a`), `Some(1)` for left arm (`l_kata` and descendants, 360 layer `0x0b`).
+pub fn arm_side_of(rest: &[ani::Rest], bone: usize) -> Option<u8> {
+    let mut at = Some(bone);
+    while let Some(i) = at {
+        match rest[i].name.as_str() {
+            "r_kata" => return Some(0),
+            "l_kata" => return Some(1),
+            _ => {}
+        }
+        at = rest[i].parent.map(usize::from);
+    }
+    None
+}
+
 /// Identifies the `core` and `head_01`/`head` bones that receive Core Control rotation
 /// (360 `0x8289e608` / `0x8289e158`).
 pub fn core_bone_of(rest: &[ani::Rest], bone: usize) -> CoreBone {
@@ -288,6 +332,18 @@ pub fn crossed_events(
     frames: f32,
     looping: bool,
 ) -> Vec<TaeFired> {
+    crossed_events_scaled(anim, prev, curr, frames, looping, 1.0)
+}
+
+/// Same as [`crossed_events`], applying `ffx_scale` to emitted `TaeFired::Ffx` events.
+pub fn crossed_events_scaled(
+    anim: &tae::Animation,
+    prev: f32,
+    curr: f32,
+    frames: f32,
+    looping: bool,
+    ffx_scale: f32,
+) -> Vec<TaeFired> {
     if anim.events.is_empty() || frames <= 0.0 || (curr - prev).abs() < 1e-6 {
         return Vec::new();
     }
@@ -305,12 +361,20 @@ pub fn crossed_events(
         }
         if let Some((side, kind)) = ev.as_footstep() {
             out.push(TaeFired::Footstep { side, kind });
+        } else if let Some(id) = ev.as_reattach() {
+            out.push(TaeFired::Reattach { id });
+        } else if let Some(id) = ev.as_purge() {
+            out.push(TaeFired::Purge { id });
         } else if let Some((cat, id)) = ev.as_sound() {
             if let Some(cue) = tae::Event::format_cue(cat, id) {
                 out.push(TaeFired::Sound { cue });
             }
         } else if let Some((ffx_id, dummy_id)) = ev.as_ffx() {
-            out.push(TaeFired::Ffx { ffx_id, dummy_id });
+            out.push(TaeFired::Ffx {
+                ffx_id,
+                dummy_id,
+                scale: ffx_scale,
+            });
         }
     }
     out
@@ -377,6 +441,11 @@ pub struct Motion {
     pub upper: Option<UpperLayer>,
     /// Smooth crossfade back to the lower-body clip after `upper` clears.
     upper_return_fade: Fade,
+    /// Per-arm overlay clips (`[0]` right arm `r_kata`, `[1]` left arm `l_kata`; 360 `0x828487b8`
+    /// -> `0x82854a50` layers `0x0a`/`0x0b`) for independent bay shifts and purges.
+    pub arm_layers: [Option<ArmLayer>; 2],
+    /// Smooth crossfade back to the body/upper clip after each arm overlay clears.
+    arm_return_fade: [Fade; 2],
     /// Core Control procedural aim yaw/pitch on `core` (+ slight `head_01` lead).
     pub core_ctrl: CoreControl,
     /// Loaded `tae/ac/motion_ow_disarm/own{:06}.tae` timeline for this legs motion set.
@@ -599,6 +668,68 @@ impl Motion {
         self.upper.as_ref().is_none_or(UpperLayer::finished)
     }
 
+    /// Plays clip `anim_id` on one arm's overlay layer (`side == 0` right `r_kata` / 360 layer
+    /// `0x0a`; `side == 1` left `l_kata` / 360 layer `0x0b`), firing TAE timeline `tae_id`
+    /// (`2000..2003` bay shift, `2010..2013` bay purge).
+    pub fn play_arm(
+        &mut self,
+        disc: &Disc,
+        side: usize,
+        anim_id: u16,
+        tae_id: u32,
+        speed: f32,
+        fade: [f32; 8],
+    ) -> Result<()> {
+        if side >= 2 {
+            return Ok(());
+        }
+        let index = *self
+            .clip_by_id
+            .get(&anim_id)
+            .with_context(|| format!("{} has no {}_{anim_id:03}.ani", self.set, self.prefix))?;
+        let clip = self.load_clip(disc, index)?;
+        let gen = self.arm_layers[side]
+            .as_ref()
+            .map_or(self.arm_return_fade[side].generation, |a| a.fade.generation)
+            .wrapping_add(1);
+        self.arm_layers[side] = Some(ArmLayer {
+            anim_id,
+            tae_id,
+            clip,
+            frame: 0.0,
+            speed,
+            fade: Fade {
+                generation: gen,
+                secs: fade,
+                t: 0.0,
+            },
+        });
+        Ok(())
+    }
+
+    /// Clears arm overlay `side` (`0` right, `1` left) and crossfades that arm back to the
+    /// underlying pose over `fade_secs` seconds.
+    pub fn clear_arm(&mut self, side: usize, fade_secs: f32) {
+        if side >= 2 {
+            return;
+        }
+        if let Some(a) = self.arm_layers[side].take() {
+            self.arm_return_fade[side] = Fade {
+                generation: a.fade.generation.wrapping_add(1),
+                secs: [fade_secs.max(0.0); 8],
+                t: 0.0,
+            };
+        }
+    }
+
+    /// Whether arm overlay `side` is inactive or has reached its end frame.
+    pub fn arm_finished(&self, side: usize) -> bool {
+        self.arm_layers
+            .get(side)
+            .and_then(|o| o.as_ref())
+            .is_none_or(ArmLayer::finished)
+    }
+
     /// Whether a non-looping clip has reached its last frame.
     pub fn finished(&self) -> bool {
         !self.looping && self.frame >= self.clip.frames.saturating_sub(1) as f32
@@ -629,6 +760,8 @@ pub struct Built {
     groups: Vec<usize>,
     /// Upper-body flag per clip bone (`c_center` / `core` subtree).
     upper: Vec<bool>,
+    /// Arm subtree tag per clip bone (`Some(0)` right `r_kata`, `Some(1)` left `l_kata`).
+    arm_side: Vec<Option<u8>>,
     /// Core Control bone tag per clip bone (`core` / `head_01`).
     core_bones: Vec<CoreBone>,
     pub motion: Option<Motion>,
@@ -968,6 +1101,8 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
         fade: Fade::default(),
         upper: None,
         upper_return_fade: Fade::default(),
+        arm_layers: [None, None],
+        arm_return_fade: [Fade::default(), Fade::default()],
         core_ctrl: CoreControl::from_disc(disc),
         tae: tae_file,
         ow_equip_set,
@@ -1119,12 +1254,14 @@ pub fn build(disc: &Disc, parts: &[Loaded]) -> Result<Built> {
         .collect();
     let groups = (0..rest.len()).map(|i| hokan_group(&rest, i)).collect();
     let upper = (0..rest.len()).map(|i| is_upper_body(&rest, i)).collect();
+    let arm_side = (0..rest.len()).map(|i| arm_side_of(&rest, i)).collect();
     let core_bones = (0..rest.len()).map(|i| core_bone_of(&rest, i)).collect();
     Ok(Built {
         joints,
         parts: parts_out,
         groups,
         upper,
+        arm_side,
         core_bones,
         motion,
     })
@@ -1183,6 +1320,7 @@ pub fn spawn(
                 absolute,
                 bind: t,
                 upper: built.upper.get(bone).copied().unwrap_or(false),
+                arm_side: built.arm_side.get(bone).copied().flatten(),
                 core_bone: built.core_bones.get(bone).copied().unwrap_or_default(),
                 group: built.groups.get(bone).copied().unwrap_or(0),
                 base: transform,
@@ -1190,6 +1328,8 @@ pub fn spawn(
                 generation: 0,
                 upper_from: transform,
                 upper_gen: 0,
+                arm_from: transform,
+                arm_gen: 0,
             });
         }
     }
@@ -1342,6 +1482,7 @@ pub fn spawn_npc(
                     absolute,
                     bind: t,
                     upper: built.upper.get(bone).copied().unwrap_or(false),
+                    arm_side: built.arm_side.get(bone).copied().flatten(),
                     core_bone: built.core_bones.get(bone).copied().unwrap_or_default(),
                     group: built.groups.get(bone).copied().unwrap_or(0),
                     base: transform,
@@ -1349,6 +1490,8 @@ pub fn spawn_npc(
                     generation: 0,
                     upper_from: transform,
                     upper_gen: 0,
+                    arm_from: transform,
+                    arm_gen: 0,
                 },
             ));
         }
@@ -1558,7 +1701,7 @@ pub fn animate(
     mut joints: Query<(&mut Driven, &mut Transform)>,
 ) {
     let Some(mut m) = motion else { return };
-    let dt = time.delta_secs();
+    let dt = time.delta_secs().min(0.1);
     m.tae_events.clear();
     let frames = m.clip.frames.max(1) as f32;
     if let Some(target) = m.wheel {
@@ -1617,6 +1760,8 @@ pub fn animate(
     }
     m.fade.t += dt;
     m.upper_return_fade.t += dt;
+    m.arm_return_fade[0].t += dt;
+    m.arm_return_fade[1].t += dt;
 
     // Advance upper-body layer and fire its TAE events if active.
     let upper_step = if let Some(ref mut u) = m.upper {
@@ -1645,16 +1790,88 @@ pub fn animate(
         }
     }
 
+    // Advance per-arm overlay layers (right `r_kata` / left `l_kata`, 360 layers 0x0a / 0x0b)
+    // and fire their TAE timelines (`2000..2003` bay shift, `2010..2013` bay purge).
+    let mut arm_steps = [None, None];
+    for side in 0..2 {
+        if let Some(ref mut a) = m.arm_layers[side] {
+            let a_frames = a.clip.frames.max(1) as f32;
+            let a_prev = a.frame;
+            let a_next = a_prev + dt * FRAME_RATE * a.speed;
+            // Clamp at `a_frames` (not `a_frames - 1`) so frame-150 TAE grab events fire on 150-frame clips.
+            a.frame = a_next.min(a_frames);
+            a.fade.t += dt;
+            arm_steps[side] = Some((a.tae_id, a_prev, a.frame, a_frames));
+        }
+    }
+    for step in arm_steps.into_iter().flatten() {
+        let (tae_id, a_prev, a_curr, a_frames) = step;
+        if let Some(anim) = m.tae.as_ref().and_then(|t| t.animation(tae_id)) {
+            // 360 bay-shift TAE FFX (`4109`, `98`) spawn at scale 1.5 (Xenia `bay_switch.jsonl`).
+            let fired = crossed_events_scaled(anim, a_prev, a_curr, a_frames, false, 1.5);
+            m.tae_events.extend(fired);
+        }
+    }
+
     // Step Core Control procedural aim tracking.
     m.core_ctrl.step(dt);
 
     let (f, scale, fade, return_fade) = (m.frame, m.scale, m.fade, m.upper_return_fade);
+    let arm_return = m.arm_return_fade;
     let (wheel, lean) = (m.wheel.is_some(), m.lean);
     let cc = m.core_ctrl;
     for (mut d, mut transform) in &mut joints {
         let Some(rest) = m.skeleton.bones.get(d.bone).and_then(|b| b.rest.as_ref()) else {
             continue;
         };
+
+        let arm_pose = d.arm_side.and_then(|side| {
+            m.arm_layers[usize::from(side)]
+                .as_ref()
+                .and_then(|a| a.clip.bones.get(d.bone).map(|b| (a, b)))
+        });
+        if let Some((a, abone)) = arm_pose {
+            if d.arm_gen != a.fade.generation {
+                (d.arm_from, d.arm_gen) = (d.base, a.fade.generation);
+            }
+            let sample_frame = a.frame.min(a.clip.frames.saturating_sub(1) as f32);
+            let rotation = Quat::from_array(
+                abone
+                    .track
+                    .rotation(sample_frame)
+                    .unwrap_or_else(|| ani::euler_quat(rest.euler)),
+            );
+            let t = Vec3::from(
+                abone
+                    .track
+                    .translation(sample_frame)
+                    .unwrap_or(rest.translation),
+            );
+            let s = Vec3::from(abone.track.scale(sample_frame).unwrap_or(rest.scale));
+            let translation = if d.absolute {
+                t * scale
+            } else {
+                d.bind + (t - Vec3::from(rest.translation)) * scale
+            };
+            let target = to_transform(translation, rotation, s);
+            let secs = a.fade.secs[d.group];
+            let w = if secs > 0.0 {
+                (a.fade.t / secs).min(1.0)
+            } else {
+                1.0
+            };
+            d.base = if w >= 1.0 {
+                target
+            } else {
+                Transform {
+                    translation: d.arm_from.translation.lerp(target.translation, w),
+                    rotation: d.arm_from.rotation.slerp(target.rotation, w),
+                    scale: d.arm_from.scale.lerp(target.scale, w),
+                }
+            };
+            *transform = d.base;
+            continue;
+        }
 
         let upper_pose = if d.upper {
             m.upper
@@ -1759,6 +1976,22 @@ pub fn animate(
             } else {
                 base
             };
+            // Smooth crossfade back from a recently cleared per-arm overlay (bay shift/purge).
+            if let Some(side) = d.arm_side {
+                let af = arm_return[usize::from(side)];
+                if af.generation != 0 && d.arm_gen != af.generation {
+                    (d.arm_from, d.arm_gen) = (d.base, af.generation);
+                }
+                let a_ret = af.secs[d.group];
+                if af.generation != 0 && a_ret > 0.0 && af.t < a_ret {
+                    let aw = (af.t / a_ret).clamp(0.0, 1.0);
+                    d.base = Transform {
+                        translation: d.arm_from.translation.lerp(d.base.translation, aw),
+                        rotation: d.arm_from.rotation.slerp(d.base.rotation, aw),
+                        scale: d.arm_from.scale.lerp(d.base.scale, aw),
+                    };
+                }
+            }
             *transform = d.base;
         }
 
@@ -2171,6 +2404,7 @@ mod tests {
                     absolute: false,
                     bind: Vec3::ZERO,
                     upper: true,
+                    arm_side: None,
                     core_bone: CoreBone::Core,
                     group: 0,
                     base: Transform::from_rotation(rest_q),
@@ -2178,6 +2412,8 @@ mod tests {
                     generation: 0,
                     upper_from: Transform::from_rotation(rest_q),
                     upper_gen: 0,
+                    arm_from: Transform::from_rotation(rest_q),
+                    arm_gen: 0,
                 },
             ))
             .id();

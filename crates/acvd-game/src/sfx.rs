@@ -150,12 +150,26 @@ fn tae_events(
 ) {
     let Some(motion) = motion else { return };
     for ev in &motion.tae_events {
-        if let crate::pose::TaeFired::Ffx { ffx_id, dummy_id } = ev {
+        if let crate::pose::TaeFired::Ffx {
+            ffx_id,
+            dummy_id,
+            scale,
+        } = ev
+        {
             if *ffx_id > 0 {
-                if let Some((entity, _)) = points.iter().find(|(_, p)| p.id == *dummy_id) {
+                // Prefer AC body/arm/rack sockets over weapon sockets when dummy IDs overlap
+                // (e.g. bay-shift dummies 1/2 live on `arms`/`rack_*`).
+                let target = points
+                    .iter()
+                    .find(|(_, p)| {
+                        p.id == *dummy_id
+                            && matches!(p.column, "arms" | "core" | "legs" | "rack_r" | "rack_l")
+                    })
+                    .or_else(|| points.iter().find(|(_, p)| p.id == *dummy_id));
+                if let Some((entity, _)) = target {
                     commands.spawn((
                         Sfx::new(*ffx_id),
-                        Transform::default(),
+                        Transform::from_scale(Vec3::splat(*scale)),
                         Visibility::default(),
                         ChildOf(entity),
                     ));

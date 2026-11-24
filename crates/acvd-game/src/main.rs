@@ -197,7 +197,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut wanted, mut disc, mut shot, mut flat, mut yaw, mut pitch, mut pos_override) =
         (None, None, None, false, None, None, None::<Vec3>);
-    let (mut clip, mut frame, mut held, mut wait) = (None, None, Vec::new(), 0.0);
+    let (mut clip, mut frame, mut held, mut hold_delay, mut wait) =
+        (None, None, Vec::new(), 0.0f32, 0.0);
     let (mut map, mut plane, mut water) = (Some("m4000".to_string()), false, None);
     let (mut layout, mut hits) = (Some("actest".to_string()), false);
     let mut test = targets::TestMode::default();
@@ -255,6 +256,12 @@ fn main() {
                     .split(',')
                     .filter_map(key)
                     .collect()
+            }
+            "--hold-delay" => {
+                hold_delay = args
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.0)
             }
             "--wait" => {
                 wait = args
@@ -524,7 +531,15 @@ fn main() {
     })
     .insert_resource(collision)
     .insert_resource(control::Piloting(piloting))
-    .insert_resource(control::Held(held))
+    .insert_resource(control::Held(if hold_delay > 0.0 {
+        Vec::new()
+    } else {
+        held.clone()
+    }))
+    .insert_resource(PendingHold {
+        delay: hold_delay,
+        keys: if hold_delay > 0.0 { held } else { Vec::new() },
+    })
     .insert_resource(ShowHud(!no_hud))
     .add_systems(Startup, (setup, weapons::setup))
     .add_systems(
@@ -575,7 +590,9 @@ fn main() {
                 .chain()
                 .after(hanger::pose),
             (
+                tick_pending_hold.run_if(in_active_sortie),
                 bay::shift.run_if(in_active_sortie),
+                bay::probe_shot.run_if(in_active_sortie),
                 weapons::fire.run_if(in_active_sortie),
                 weapons::step_overed_weapon.run_if(in_active_sortie),
                 weapons::step_melee.run_if(in_active_sortie),
@@ -633,6 +650,26 @@ fn main() {
             );
     }
     app.run();
+}
+
+#[derive(Resource)]
+struct PendingHold {
+    delay: f32,
+    keys: Vec<KeyCode>,
+}
+
+fn tick_pending_hold(
+    time: Res<Time>,
+    mut pending: ResMut<PendingHold>,
+    mut held: ResMut<control::Held>,
+) {
+    if pending.keys.is_empty() {
+        return;
+    }
+    pending.delay -= time.delta_secs();
+    if pending.delay <= 0.0 {
+        held.0.append(&mut pending.keys);
+    }
 }
 
 /// Seconds `--shot` still waits after the AC is shown (`--wait`), and whether it was shown.
@@ -1431,7 +1468,7 @@ fn show(
     let mut loadout = bay::Loadout::default();
     let mut weapon_anims = weapons::WeaponAnims::default();
     let mut nozzles = Vec::new();
-    let mut rack_bones: [Option<(usize, Vec<Entity>, usize)>; 2] = [None, None];
+    let mut rack_bones: [Option<(usize, Vec<Entity>, usize, Option<usize>)>; 2] = [None, None];
     let mut rack_named: [Option<Vec<(String, Entity)>>; 2] = [None, None];
     let mut rack_pose = [0u8; 2];
     let mut arms_dummy60: Option<(usize, usize, &assemble::Placement, usize, Entity)> = None;
@@ -1550,10 +1587,12 @@ fn show(
         }
         if part.placement.column == "rack_r" || part.placement.column == "rack_l" {
             let right = part.placement.column == "rack_r";
-            let prong = if right { "r_hg_f" } else { "l_hg_f" };
-            if let Some(bone) = part.rig.bones.iter().position(|b| b.name == prong) {
+            let front_name = if right { "r_hg_f" } else { "l_hg_f" };
+            let back_name = if right { "r_hg_b" } else { "l_hg_b" };
+            if let Some(front) = part.rig.bones.iter().position(|b| b.name == front_name) {
+                let back = part.rig.bones.iter().position(|b| b.name == back_name);
                 let side = usize::from(!right);
-                rack_bones[side] = Some((loaded_i, joints.clone(), bone));
+                rack_bones[side] = Some((loaded_i, joints.clone(), front, back));
                 rack_named[side] = Some(
                     part.rig
                         .bones
@@ -1571,28 +1610,31 @@ fn show(
             "hanger_l" => Some((weapons::Hand::Left, true)),
             _ => None,
         } {
+            let weapon_hanger_pose =
+                acvd_data::part_field(part.placement.part as i64, 10, "hanger_pose") as u8;
             if on_bay {
-                rack_pose[hand as usize] =
-                    acvd_data::part_field(part.placement.part as i64, 10, "hanger_pose") as u8;
+                rack_pose[hand as usize] = weapon_hanger_pose;
             }
             let on_prong = if on_bay {
-                rack_bones[hand as usize]
-                    .as_ref()
-                    .and_then(|(rack_i, rack_joints, prong)| {
-                        let local = rig.local_against(loaded_i, root_bone, *rack_i, *prong)?;
-                        let parent = *rack_joints.get(*prong)?;
-                        Some((parent, local))
-                    })
+                rack_bones[hand as usize].as_ref().and_then(
+                    |(rack_i, rack_joints, front, back)| {
+                        let local = rig.local_against(loaded_i, root_bone, *rack_i, *front)?;
+                        let parent = *rack_joints.get(*front)?;
+                        let alt_parent = back.and_then(|b| rack_joints.get(b).copied());
+                        Some((parent, alt_parent, local))
+                    },
+                )
             } else {
                 None
             };
-            let (parent, local) = on_prong.unwrap_or_else(|| {
+            let (parent, alt_parent, local) = on_prong.unwrap_or_else(|| {
                 let mounted = rig.mount_local(loaded_i, root_bone);
                 (
                     mounted
                         .and_then(|(p, _)| p)
                         .map(|p| joint_entities[p])
                         .unwrap_or(ac),
+                    None,
                     mounted.map(|(_, l)| l).unwrap_or(Transform::IDENTITY),
                 )
             });
@@ -1608,7 +1650,9 @@ fn show(
                     bay::Mounted {
                         weapon: root,
                         parent,
+                        alt_parent,
                         local,
+                        hanger_pose: weapon_hanger_pose,
                     },
                 );
             }

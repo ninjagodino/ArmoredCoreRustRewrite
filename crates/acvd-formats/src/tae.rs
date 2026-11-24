@@ -38,6 +38,8 @@ pub const VERSION: u32 = 0x0001_000B;
 pub const KIND_FFX: u32 = 0;
 pub const KIND_SOUND_EXT: u32 = 1;
 pub const KIND_SOUND: u32 = 2;
+pub const KIND_REATTACH: u32 = 101;
+pub const KIND_PURGE: u32 = 102;
 pub const KIND_FOOTSTEP: u32 = 103;
 pub const KIND_AC_SOUND: u32 = 602;
 
@@ -142,6 +144,34 @@ impl Event {
         let side = self.param_u32(0)?;
         let step_kind = self.param_u32(4).unwrap_or(0);
         Some((side, step_kind))
+    }
+
+    /// Decodes a `KIND_REATTACH` (101, 360 `0x8289acd0` case `0x65`) event as the
+    /// `acattachinfo` row ID (e.g. `13`/`14`/`9`/`10` seat on rack at frame 40;
+    /// `11`/`12`/`2`/`3` grab to hand at frame 150 in `own*.tae` anims `2000..2003`).
+    pub fn as_reattach(&self) -> Option<u32> {
+        (self.kind == KIND_REATTACH).then(|| self.param_u32(0)).flatten()
+    }
+
+    /// Decodes a `KIND_PURGE` (102, 360 `0x8289acd0` case `0x66`) event as the purge slot ID
+    /// (e.g. `2`/`3`/`11`/`12` at frame 10 in `own*.tae` anims `2010..2013`).
+    pub fn as_purge(&self) -> Option<u32> {
+        (self.kind == KIND_PURGE).then(|| self.param_u32(0)).flatten()
+    }
+
+    /// Decodes a part-animation event (`kind == 1` with part slot `17` = `rack_r` or `18` = `rack_l`,
+    /// e.g. `[17/18, 10/20, ..., speed]` in `own*.tae` anims `2000..2003`) as `(part_slot, anim_id)`.
+    pub fn as_part_anim(&self) -> Option<(u32, u32)> {
+        if self.kind != KIND_SOUND_EXT {
+            return None;
+        }
+        let part_slot = self.param_u32(0)?;
+        let anim_id = self.param_u32(4)?;
+        if matches!(part_slot, 17 | 18) && anim_id > 0 {
+            Some((part_slot, anim_id))
+        } else {
+            None
+        }
     }
 
     /// Formats a `(category, id)` pair using the 360 sound category format table at `0x8371c688`.
@@ -395,5 +425,49 @@ mod tests {
             .filter_map(|e| e.as_footstep().map(|s| (e.start_frame, s)))
             .collect();
         assert_eq!(steps, vec![(19, (1, 1)), (44, (0, 1))]);
+    }
+
+    #[test]
+    fn bay_shift_and_purge_tae_timelines() {
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
+        let own100 = read(
+            &crate::vfs::open(&disc, "tae/ac/motion_ow_disarm/own000100.tae").unwrap(),
+        )
+        .unwrap();
+
+        // Bay shift timelines 2000..2003 (360 0x82849440 / 0x82849450 -> 0x828487b8).
+        for (anim_id, dummy, part_slot, rack_anim, seat_id, grab_id) in [
+            (2000u32, 1u8, 18u32, 10u32, 13u32, 11u32),
+            (2001, 2, 17, 10, 14, 12),
+            (2002, 1, 18, 20, 9, 2),
+            (2003, 2, 17, 20, 10, 3),
+        ] {
+            let a = own100.animation(anim_id).unwrap_or_else(|| panic!("missing anim {anim_id}"));
+            assert!(a.events.iter().any(|e| {
+                e.start_frame == 0
+                    && e.as_sound().and_then(|(c, i)| Event::format_cue(c, i)).as_deref()
+                        == Some("c00000047")
+            }));
+            assert!(a.events.iter().any(|e| e.start_frame == 0 && e.as_ffx() == Some((4109, dummy))));
+            assert!(a.events.iter().any(|e| {
+                e.start_frame == 0 && e.as_part_anim() == Some((part_slot, rack_anim))
+            }));
+            assert!(a.events.iter().any(|e| e.start_frame == 15 && e.as_ffx() == Some((98, dummy))));
+            assert!(a.events.iter().any(|e| e.start_frame == 40 && e.as_reattach() == Some(seat_id)));
+            assert!(a.events.iter().any(|e| e.start_frame == 150 && e.as_reattach() == Some(grab_id)));
+        }
+
+        // Bay purge timelines 2010..2013 (360 0x82848548 -> 0x82848cc8).
+        for (anim_id, purge_slot) in [(2010u32, 2u32), (2011, 3), (2012, 11), (2013, 12)] {
+            let a = own100.animation(anim_id).unwrap_or_else(|| panic!("missing anim {anim_id}"));
+            assert!(a.events.iter().any(|e| {
+                e.start_frame == 10
+                    && e.as_sound().and_then(|(c, i)| Event::format_cue(c, i)).as_deref()
+                        == Some("c00000045")
+            }));
+            assert!(a.events.iter().any(|e| e.start_frame == 10 && e.as_purge() == Some(purge_slot)));
+        }
     }
 }
