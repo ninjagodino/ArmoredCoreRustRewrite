@@ -34,6 +34,85 @@ use bevy::shader::ShaderRef;
 
 pub type AcPaintMaterial = ExtendedMaterial<StandardMaterial, AcPaint>;
 
+/// Tags each painted AC mesh with its `AcColor` group index (`0..34`) so live color-picker drags
+/// can update `AcPaintParams` uniforms in-place without despawning/rebuilding the AC meshes.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct AcPaintGroup(pub usize);
+
+/// Updates `overlay`, `emission`, and `rim` uniforms on all live painted AC meshes in-place.
+pub fn update_ac_materials_in_place(
+    accolor: &AcColor,
+    meshes: &Query<(&MeshMaterial3d<AcPaintMaterial>, &AcPaintGroup)>,
+    paint_materials: &mut Assets<AcPaintMaterial>,
+) {
+    for (mat_h, group) in meshes {
+        if let Some(mut mat) = paint_materials.get_mut(&mat_h.0) {
+            let cols =
+                accolor.overlay_cols(group.0, STATIC_DRAW_PARAM.color_min, STATIC_DRAW_PARAM.color_max);
+            mat.extension.params.overlay = cols.map(Vec4::from);
+            if mat.extension.params.emission.w > 0.0 {
+                mat.extension.params.emission =
+                    Vec4::from(accolor.emission_col(group.0, GLOW_INTENSITY));
+            }
+            if mat.extension.params.rim.w > 0.0 {
+                mat.extension.params.rim =
+                    Vec4::from(accolor.emission_col(group.0, RIM_INTENSITY));
+            }
+        }
+    }
+}
+
+/// Converts an sRGB `[R, G, B, A]` byte color to `[hue_deg (0..360), saturation (0..1), value (0..1)]`.
+pub fn rgb_to_hsv(rgba: [u8; 4]) -> [f32; 3] {
+    let r = rgba[0] as f32 / 255.0;
+    let g = rgba[1] as f32 / 255.0;
+    let b = rgba[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+
+    let h = if delta < 1e-6 {
+        0.0
+    } else if (max - r).abs() < 1e-6 {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if (max - g).abs() < 1e-6 {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+    let s = if max < 1e-6 { 0.0 } else { delta / max };
+    [h.rem_euclid(360.0), s.clamp(0.0, 1.0), max.clamp(0.0, 1.0)]
+}
+
+/// Converts `[hue_deg (0..360), saturation (0..1), value (0..1)]` to an sRGB `[R, G, B, 255]` byte color.
+pub fn hsv_to_rgb(h_deg: f32, s: f32, v: f32) -> [u8; 4] {
+    let h = h_deg.rem_euclid(360.0);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r1, g1, b1) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    [
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        255,
+    ]
+}
+
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct AcPaint {
     #[uniform(100)]
@@ -377,5 +456,38 @@ mod tests {
         let expected_rim = col.emission_col(0, RIM_INTENSITY);
         assert_eq!(rim_mat.extension.params.rim, Vec4::from(expected_rim));
         assert!((rim_mat.extension.params.rim.x - (251.0 / 255.0) * 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rgb_hsv_roundtrip_primaries_and_grays() {
+        let samples: &[[u8; 4]] = &[
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            [128, 128, 128, 255],
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+            [0, 255, 255, 255],
+            [255, 0, 255, 255],
+            [92, 102, 72, 255],
+            [195, 176, 255, 255],
+            [216, 102, 28, 255],
+        ];
+        for &rgba in samples {
+            let [h, s, v] = rgb_to_hsv(rgba);
+            let back = hsv_to_rgb(h, s, v);
+            for i in 0..3 {
+                assert!(
+                    (rgba[i] as i16 - back[i] as i16).abs() <= 1,
+                    "roundtrip mismatch for {rgba:?} -> hsv({h:.2},{s:.3},{v:.3}) -> {back:?}"
+                );
+            }
+            assert_eq!(back[3], 255);
+        }
+        // Pure red = 0 deg, green = 120 deg, blue = 240 deg.
+        assert!((rgb_to_hsv([255, 0, 0, 255])[0] - 0.0).abs() < 1e-3);
+        assert!((rgb_to_hsv([0, 255, 0, 255])[0] - 120.0).abs() < 1e-3);
+        assert!((rgb_to_hsv([0, 0, 255, 255])[0] - 240.0).abs() < 1e-3);
     }
 }
