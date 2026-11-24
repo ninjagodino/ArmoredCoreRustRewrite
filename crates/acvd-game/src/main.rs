@@ -67,6 +67,7 @@ mod hanger;
 mod hud;
 mod lens_flare;
 mod map;
+mod debris;
 mod paint;
 mod pause;
 mod pose;
@@ -618,6 +619,8 @@ fn main() {
                 weapons::tick_player_health.run_if(in_active_sortie),
                 targets::tick.run_if(in_active_sortie),
                 map::step_destructibles.run_if(in_active_sortie),
+                debris::step.run_if(in_active_sortie),
+                debris::probe_shot.run_if(in_sortie),
                 orbit.run_if(in_active_sortie),
                 reframe.run_if(in_active_sortie),
             )
@@ -1632,13 +1635,13 @@ fn show(
             let on_prong = if on_bay {
                 rack_bones[hand as usize].as_ref().and_then(
                     |(rack_i, rack_joints, front, back)| {
-                        let _ = (rack_i, rig.local_against(loaded_i, root_bone, *rack_i, *front));
+                        let base = rig.local_against(loaded_i, root_bone, *rack_i, *front)?;
                         // Attach the bay weapon onto the prong joint (`*_hg_f` / `*_hg_b`) with
-                        // the FLVER dummy 87/88/85/86 flag-4 orientation (`fwd = [0, +1, 0]`,
-                        // `sheets/assembly_slots.csv`), zeroing the un-parented d87 translation
-                        // so the weapon sits cleanly at the rack clamp while pure `a00_011`/`a00_021`
-                        // drives the carousel with zero extra pitch/roll hacks.
-                        let local = Transform::from_rotation(hanger::prong_weapon_rotation());
+                        // the FLVER dummy 87/88/85/86 local translation (`[±0.0012, -0.5188, -0.8182]`
+                        // in prong space, placing the peg at the weapon's top-middle rather than
+                        // its grip) and flag-4 orientation (`prong_weapon_rotation()`, `0x8288a058`).
+                        let local = Transform::from_translation(base.translation)
+                            .with_rotation(hanger::prong_weapon_rotation());
                         let parent = *rack_joints.get(*front)?;
                         let alt_parent = back.and_then(|b| rack_joints.get(b).copied());
                         Some((parent, alt_parent, local))
