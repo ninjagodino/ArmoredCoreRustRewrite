@@ -34,6 +34,9 @@ struct ZoomBlur {
     god_ray: GodRayFilter,
     // `m_ToneMapFilter` (`0x82c18628`): `(c32 = 1 / (lum * key), c33 = mul, c34 = white, mode)`.
     tonemap: vec4<f32>,
+    // Garage menu blurred bokeh + `+` reticle grid backdrop:
+    // `(blur_strength, dim_factor, grid_alpha, grid_spacing_720p)`.
+    menu_backdrop: vec4<f32>,
 }
 
 @group(0) @binding(0) var screen: texture_2d<f32>;
@@ -132,8 +135,50 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // 2. Crepuscular god-ray radial blur + merge (`0x82c9f9f0`).
     rgb = apply_god_rays(rgb, in.uv, blur.god_ray);
 
+    // 2b. Garage menu out-of-focus bokeh blur (24-tap Vogel disk on HDR scene before tonemap).
+    let menu_blur = blur.menu_backdrop.x;
+    if menu_blur > 0.001 {
+        let dim = vec2<f32>(textureDimensions(screen));
+        let ui_scale = max(dim.y / 720.0, 0.5);
+        let radius_px = 16.0 * ui_scale * menu_blur;
+        let inv_dim = 1.0 / max(dim, vec2<f32>(1.0));
+        var accum = vec3<f32>(0.0);
+        let samples = 24;
+        for (var i = 0; i < 24; i++) {
+            let fi = f32(i);
+            let r = sqrt((fi + 0.5) / f32(samples)) * radius_px;
+            let theta = fi * 2.39996323;
+            let off = vec2<f32>(cos(theta), sin(theta)) * r * inv_dim;
+            let suv = clamp(in.uv + off, vec2<f32>(0.001), vec2<f32>(0.999));
+            accum += textureSampleLevel(screen, screen_sampler, suv, 0.0).rgb;
+        }
+        rgb = mix(rgb, accum / f32(samples), menu_blur);
+    }
+
     // 3. `m_ToneMapFilter` (`0x82c18628`, `c31 = 0.5` + Divide/Reinhard/Exp tonemap).
     rgb = apply_tonemap(rgb, blur.tonemap);
+
+    // 4. Garage menu dark slate backdrop tint + crisp `+` reticle grid overlay.
+    if menu_blur > 0.001 {
+        let dim_factor = blur.menu_backdrop.y;
+        rgb = rgb * dim_factor + vec3<f32>(0.006, 0.011, 0.020) * menu_blur;
+
+        let grid_alpha = blur.menu_backdrop.z;
+        if grid_alpha > 0.001 {
+            let dim = vec2<f32>(textureDimensions(screen));
+            let ui_scale = max(dim.y / 720.0, 0.5);
+            let spacing = max(blur.menu_backdrop.w * ui_scale, 16.0);
+            let px = in.uv * dim;
+            let cell = abs(fract((px + spacing * 0.5) / spacing) - 0.5) * spacing;
+            let arm = 4.5 * ui_scale;
+            let half_thick = max(0.65 * ui_scale, 0.55);
+            let horiz = step(cell.y, half_thick) * step(cell.x, arm);
+            let vert = step(cell.x, half_thick) * step(cell.y, arm);
+            let cross = max(horiz, vert);
+            let cross_col = vec3<f32>(0.62, 0.70, 0.78);
+            rgb = mix(rgb, cross_col, cross * grid_alpha);
+        }
+    }
 
     return vec4<f32>(rgb, centre.a);
 }

@@ -37,6 +37,11 @@ impl Default for ActiveToneMap {
     }
 }
 
+/// Garage menu backdrop post-process parameters synced onto every main camera's [`ZoomBlur`]:
+/// `(blur_strength, dim_factor, grid_alpha, grid_spacing_720p)`. All zeros disables the pass.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct ActiveMenuBackdrop(pub Vec4);
+
 /// Speed blur + crepuscular god-ray + `m_ToneMapFilter` parameters for one camera (`ZoomBlur`
 /// 360 `0x82c97ff8` / `0x82c98368`, `LensFlareGodRay` 360 `0x82c9f9f0`, `m_ToneMapFilter` 360
 /// `0x82c18628`), combined into a single `FullscreenMaterial` pass running deterministically
@@ -57,6 +62,9 @@ pub struct ZoomBlur {
     /// `m_ToneMapFilter` (`0x82c18628`): `(c32 = 1 / (lum * key), c33 = mul, c34 = white, mode)`.
     /// Mode `> 10` or `c32 <= 0` passes through untouched.
     pub tonemap: Vec4,
+    /// Garage menu blurred bokeh + `+` reticle grid backdrop:
+    /// `(blur_strength, dim_factor, grid_alpha, grid_spacing_720p)`.
+    pub menu_backdrop: Vec4,
 }
 
 impl Default for ZoomBlur {
@@ -68,6 +76,7 @@ impl Default for ZoomBlur {
             no_effect: Vec2::ZERO,
             god_ray: crate::lens_flare::GodRayFilter::default(),
             tonemap: TONEMAP_PASSTHROUGH,
+            menu_backdrop: Vec4::ZERO,
         }
     }
 }
@@ -103,9 +112,14 @@ impl FullscreenMaterial for ZoomBlur {
     }
 }
 
-fn sync_tonemap(active: Res<ActiveToneMap>, mut cams: Query<&mut ZoomBlur>) {
+fn sync_tonemap(
+    active: Res<ActiveToneMap>,
+    backdrop: Res<ActiveMenuBackdrop>,
+    mut cams: Query<&mut ZoomBlur>,
+) {
     for mut blur in &mut cams {
         blur.tonemap = active.0;
+        blur.menu_backdrop = backdrop.0;
     }
 }
 
@@ -115,6 +129,7 @@ impl Plugin for BlurPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "zoom_blur.wgsl");
         app.init_resource::<ActiveToneMap>()
+            .init_resource::<ActiveMenuBackdrop>()
             .add_plugins(FullscreenMaterialPlugin::<ZoomBlur>::default())
             .add_systems(PostUpdate, sync_tonemap);
     }

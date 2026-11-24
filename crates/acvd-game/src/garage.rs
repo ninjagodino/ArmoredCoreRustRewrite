@@ -133,6 +133,9 @@ pub enum UiAction {
     DecalTint(usize),
     DecalDuplicate,
     DecalClearAll,
+    EmblemSelect(usize),
+    EmblemResetDefault,
+    EmblemClear,
     SortieMapStep(i8),
     SortieTargetStep(i8),
     LaunchSortie,
@@ -198,13 +201,14 @@ pub enum PaintTab {
     Presets,
     Custom,
     Decals,
+    Emblem,
 }
 
 /// Top menu choices (order matches `private/lua360/script/garage/garagescene.lua`).
 /// Tuple: `(label, right_tag, helpline_description)`.
 const TOP_ITEMS: &[(&str, &str, &str)] = &[
     ("ASSEMBLE", "PARTS", "Customize AC frame, internals,\nand weapons."),
-    ("PAINT", "COLOR", "Presets, RGB paint, camouflage,\nand drag-and-drop decals."),
+    ("PAINT", "COLOR", "Presets, RGB paint, camouflage,\ndecals, and the AC emblem."),
     ("AC DESIGN", "PRESET", "Load any preset AC blueprint\nas a starting base."),
     ("GARAGE CUSTOM", "BAY", "Switch between all 13 retail\n3D ACVD workshops."),
     ("AC TEST", "SORTIE", "Configure targets and sortie\ninto live combat test."),
@@ -946,10 +950,10 @@ impl GarageState {
                 .get(self.cursor)
                 .map(|s| s.display_id())
                 .unwrap_or(DISPLAY_ACSIS_TOP),
-            GarageScreen::AssembleParts { slot } => slot.display_id(),
+            GarageScreen::AssembleParts { .. } => DISPLAY_ACSIS_TOP,
             GarageScreen::Paint => match self.paint_tab {
                 PaintTab::Presets => DISPLAY_PAINT_TOP,
-                PaintTab::Custom | PaintTab::Decals => DISPLAY_COLORING_TOP,
+                PaintTab::Custom | PaintTab::Decals | PaintTab::Emblem => DISPLAY_COLORING_TOP,
             },
             GarageScreen::Design => DISPLAY_DESIGN_DETAIL,
         }
@@ -969,6 +973,7 @@ pub fn sync_room(
     mut commands: Commands,
     mode: Res<Mode>,
     mut state: ResMut<GarageState>,
+    mut decals: ResMut<DecalState>,
     garage: Res<crate::Garage>,
     world: Query<Entity, With<GarageWorld>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -986,6 +991,7 @@ pub fn sync_room(
         ),
     >,
 ) {
+    decals.init_assets(&mut images);
     if *mode != Mode::Garage {
         if state.spawned_workshop.is_some() {
             for e in &world {
@@ -1078,25 +1084,35 @@ pub fn sync_room(
                         || mtd_stem.contains("glass"));
                 let is_specular = mtd_stem.contains("specul") || mtd_stem.contains("env");
 
-                let diffuse = part
-                    .diffuse
-                    .as_deref()
-                    .filter(|_| !garage.flat)
-                    .and_then(|name| {
-                        load_garage_tex(
-                            &garage.disc,
-                            &mut packs,
-                            &primary_tpf,
-                            fallback_tpf,
-                            name,
-                            false,
-                        )
-                        .map(|img| images.add(img))
-                        .or_else(|| {
-                            missing += 1;
-                            None
+                let is_garage_emblem = mtd_stem == "emblem"
+                    || diff_low == "emblem"
+                    || diff_low == "im999"
+                    || diff_low == "im9999";
+                let diffuse = if is_garage_emblem && !garage.flat {
+                    // 360 `0x825d3978`: overrides `"emblem"`, `"im999"`, `"im9999"` in the garage
+                    // FLVER with the player's live AC Emblem texture (V-flipped world copy —
+                    // hangar UVs are authored with V=0 at the bottom).
+                    Some(decals.emblem_world_texture.clone())
+                } else {
+                    part.diffuse
+                        .as_deref()
+                        .filter(|_| !garage.flat)
+                        .and_then(|name| {
+                            load_garage_tex(
+                                &garage.disc,
+                                &mut packs,
+                                &primary_tpf,
+                                fallback_tpf,
+                                name,
+                                false,
+                            )
+                            .map(|img| images.add(img))
+                            .or_else(|| {
+                                missing += 1;
+                                None
+                            })
                         })
-                    });
+                };
                 let normal = part
                     .bump
                     .as_deref()
@@ -1413,48 +1429,43 @@ pub fn update_camera(
         return;
     };
 
-    let mut target = acsis_camera_pose(
+    let target = acsis_camera_pose(
         state.display_preset_id(),
         garage.bounds,
         &ws_row,
         state.screen == GarageScreen::ViewMode,
     );
-    // In `AssembleParts` Normal view, pull back to frame the full AC inside the right-hand
-    // `@AcLayout` (`ASSEMBLY VIEW`) window `[705..1213]` while preserving the slot's yaw angle.
-    if matches!(state.screen, GarageScreen::AssembleParts { .. }) && !state.assemble_detail_view {
-        let ac_height = (garage.bounds.1.y - garage.bounds.0.y).clamp(4.5, 9.5);
-        let max_dist = (ws_row.camera_dist_max as f32).max(18.0);
-        target.dist = (target.dist * 1.65)
-            .max(ac_height * 1.95)
-            .clamp(12.0, max_dist);
-        target.focus.y = garage.bounds.0.y + ac_height * 0.46;
-        target.pitch = target.pitch.clamp(-0.10, 0.22);
-    }
 
     if let Projection::Perspective(ref mut p) = *proj {
         p.fov = target.fov_deg.to_radians();
     }
 
+    // In `AssembleParts`, the main garage scene is the blurred background while mouse/stick
+    // orbit and zoom drive the right-side `ASSEMBLY VIEW` preview AC (or left `PARTS VIEW`).
+    let in_assemble = matches!(state.screen, GarageScreen::AssembleParts { .. });
     let allow_left_drag = state.screen == GarageScreen::ViewMode;
-    let dragging = buttons.pressed(MouseButton::Right)
-        || (allow_left_drag && buttons.pressed(MouseButton::Left));
+    let dragging = !in_assemble
+        && (buttons.pressed(MouseButton::Right)
+            || (allow_left_drag && buttons.pressed(MouseButton::Left)));
     if dragging && motion.delta.length_squared() > 0.0 {
         state.cam_manual_orbit = true;
         state.cam_yaw -= motion.delta.x * 0.006;
         state.cam_pitch = (state.cam_pitch + motion.delta.y * 0.005).clamp(-0.35, 1.15);
     }
-    let mut right_stick = Vec2::ZERO;
-    for pad in &gamepads {
-        right_stick += pad.right_stick();
-    }
-    let s = &mut *state;
-    if apply_right_stick_orbit(
-        right_stick,
-        time.delta_secs(),
-        &mut s.cam_yaw,
-        &mut s.cam_pitch,
-    ) {
-        s.cam_manual_orbit = true;
+    if !in_assemble {
+        let mut right_stick = Vec2::ZERO;
+        for pad in &gamepads {
+            right_stick += pad.right_stick();
+        }
+        let s = &mut *state;
+        if apply_right_stick_orbit(
+            right_stick,
+            time.delta_secs(),
+            &mut s.cam_yaw,
+            &mut s.cam_pitch,
+        ) {
+            s.cam_manual_orbit = true;
+        }
     }
     let decal_wheel_mod = state.screen == GarageScreen::Paint
         && state.paint_tab == PaintTab::Decals
@@ -1462,7 +1473,7 @@ pub fn update_camera(
             || keys.pressed(KeyCode::ShiftRight)
             || keys.pressed(KeyCode::ControlLeft)
             || keys.pressed(KeyCode::ControlRight));
-    let ui_owns_wheel = assemble_ui_owns_wheel(&state, windows.single().ok());
+    let ui_owns_wheel = in_assemble || assemble_ui_owns_wheel(&state, windows.single().ok());
     if !decal_wheel_mod && !ui_owns_wheel && scroll.delta.y.abs() > 0.0 {
         state.cam_manual_orbit = true;
         let max_d = (ws_row.camera_dist_max as f32).max(18.0);
@@ -1494,14 +1505,7 @@ pub fn update_camera(
         state.cam_pitch.sin(),
         state.cam_yaw.cos() * state.cam_pitch.cos(),
     ) * state.cam_dist;
-    let mut focus = state.cam_focus;
-    // In `AssembleParts` Normal view, shift the camera aim slightly left so the 3D AC frames
-    // cleanly inside the right-hand `@AcLayout` (`ASSEMBLY VIEW`) window `[705..1213]`.
-    if matches!(state.screen, GarageScreen::AssembleParts { .. }) && !state.assemble_detail_view {
-        let forward = (-offset).normalize_or_zero();
-        let cam_right = forward.cross(Vec3::Y).normalize_or_zero();
-        focus -= cam_right * (state.cam_dist * 0.24);
-    }
+    let focus = state.cam_focus;
     let mut eye = focus + offset;
     if eye.y < min_y {
         eye.y = min_y;
@@ -1668,6 +1672,15 @@ pub fn handle_input(
                     state.cursor = 0;
                     state.scroll = 0;
                     state.cam_manual_orbit = false;
+                    // Emblem tab defaults to the 360 catalog when the active emblem is retail.
+                    if tab == PaintTab::Emblem
+                        && decals
+                            .ac_emblem_key
+                            .as_deref()
+                            .is_some_and(|k| k.starts_with("emblem:"))
+                    {
+                        decals.library_tab = DecalLibraryTab::Emblems;
+                    }
                     sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CATEGORY);
                     state.ui_dirty = true;
                 }
@@ -1928,6 +1941,43 @@ pub fn handle_input(
                     sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
                     state.set_banner("CLEARED ALL DECALS", Color::srgb(0.95, 0.72, 0.32));
                 }
+                return;
+            }
+            UiAction::EmblemSelect(idx) => {
+                let selected = match decals.library_tab {
+                    DecalLibraryTab::Custom => decals
+                        .custom_assets
+                        .get(idx)
+                        .map(|a| (a.key.clone(), a.label.clone())),
+                    DecalLibraryTab::Emblems => decals.disc_emblems.get(idx).cloned().map(|e| {
+                        let _ = decals.ensure_emblem(&garage.disc, &e.key, &mut images);
+                        (e.key, e.name)
+                    }),
+                };
+                if let Some((key, label)) = selected {
+                    decals.set_ac_emblem(Some(key), true);
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_EQUIP);
+                    state.set_banner(
+                        format!("AC EMBLEM SET: {label} (SHOULDER & GARAGE)"),
+                        Color::srgb(0.45, 0.92, 0.62),
+                    );
+                }
+                return;
+            }
+            UiAction::EmblemResetDefault => {
+                decals.reset_ac_emblem_to_default();
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_OK);
+                let msg = match &decals.ac_emblem_key {
+                    Some(k) => format!("RESET EMBLEM TO DESIGN DEFAULT ({})", k.strip_prefix("emblem:").unwrap_or(k)),
+                    None => "RESET EMBLEM TO DESIGN DEFAULT (NONE)".to_string(),
+                };
+                state.set_banner(msg, Color::srgb(0.55, 0.85, 1.0));
+                return;
+            }
+            UiAction::EmblemClear => {
+                decals.set_ac_emblem(None, true);
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
+                state.set_banner("CLEARED AC EMBLEM", Color::srgb(0.95, 0.72, 0.32));
                 return;
             }
             UiAction::SortieMapStep(delta) => {
@@ -2250,7 +2300,8 @@ pub fn handle_input(
         state.paint_tab = match state.paint_tab {
             PaintTab::Presets => PaintTab::Custom,
             PaintTab::Custom => PaintTab::Decals,
-            PaintTab::Decals => PaintTab::Presets,
+            PaintTab::Decals => PaintTab::Emblem,
+            PaintTab::Emblem => PaintTab::Presets,
         };
         state.cursor = 0;
         state.scroll = 0;
@@ -2476,7 +2527,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::Paint => match state.paint_tab {
             PaintTab::Presets => state.color_presets.len(),
             PaintTab::Custom => 8, // 7 channels + Camouflage
-            PaintTab::Decals => 0,
+            PaintTab::Decals | PaintTab::Emblem => 0,
         },
         GarageScreen::Design => garage.designs.len(),
         GarageScreen::GarageCustom => state.workshops.len(),
@@ -2693,10 +2744,9 @@ fn apply_cursor_preview(state: &mut GarageState, garage: &mut crate::Garage) {
             );
             if let Some(&part_id) = parts.get(state.cursor) {
                 if slot.get(&garage.active_design) != part_id {
+                    // Only the isolated `ASSEMBLY VIEW` preview AC updates while browsing parts;
+                    // the main garage mech in the blurred background updates on Enter (equip).
                     slot.set(&mut garage.active_design, part_id);
-                    if slot_has_visible_ac_model(slot) {
-                        state.ac_preview_debounce = Some(0.18);
-                    }
                 }
             }
         }
@@ -2912,7 +2962,8 @@ fn trigger_confirm(
             let Some(&part_id) = parts.get(state.cursor) else {
                 return;
             };
-            let changed = slot.get(&garage.active_design) != part_id;
+            let orig = state.saved_design.unwrap_or(garage.active_design);
+            let changed = slot.get(&orig) != part_id;
             slot.set(&mut garage.active_design, part_id);
             let pending = state.ac_preview_debounce.take().is_some();
             state.ac_preview_rebuilt = false;
@@ -2953,7 +3004,7 @@ fn trigger_confirm(
                     sound::cue(commands, cues, audio_assets, CUE_OK);
                     state.set_banner("CUSTOM PAINT SAVED", Color::srgb(0.45, 0.92, 0.62));
                 }
-                PaintTab::Decals => {}
+                PaintTab::Decals | PaintTab::Emblem => {}
             }
             state.ui_dirty = true;
         }
@@ -3201,7 +3252,16 @@ pub fn sync_ui(
     state.last_ui_scale = settings.ui_scale;
     decals.init_assets(&mut images);
     if state.screen == GarageScreen::Paint
-        && state.paint_tab == PaintTab::Decals
+        && state.paint_tab == PaintTab::Emblem
+        && decals
+            .ac_emblem_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("emblem:"))
+    {
+        decals.library_tab = DecalLibraryTab::Emblems;
+    }
+    if state.screen == GarageScreen::Paint
+        && matches!(state.paint_tab, PaintTab::Decals | PaintTab::Emblem)
         && decals.library_tab == DecalLibraryTab::Emblems
     {
         decals.warm_emblem_page(&garage.disc, &mut images, DECAL_GRID_PAGE_SIZE);
@@ -3511,6 +3571,7 @@ pub fn sync_ui(
                                 (PaintTab::Presets, "PRESETS"),
                                 (PaintTab::Custom, "PALETTE"),
                                 (PaintTab::Decals, "DECALS"),
+                                (PaintTab::Emblem, "EMBLEM"),
                             ] {
                                 let active = state.paint_tab == tab;
                                 tabs.spawn((
@@ -4037,6 +4098,382 @@ pub fn sync_ui(
                                     });
 
                                 // Pagination bar.
+                                if pages > 1 {
+                                    panel
+                                        .spawn(Node {
+                                            width: Val::Percent(100.0),
+                                            justify_content: JustifyContent::SpaceBetween,
+                                            align_items: AlignItems::Center,
+                                            margin: UiRect::top(px(4.0)),
+                                            ..default()
+                                        })
+                                        .with_children(|pg| {
+                                            pg.spawn((
+                                                Button,
+                                                UiAction::DecalLibPage(-1),
+                                                Node {
+                                                    padding: UiRect::axes(px(10.0), px(4.0)),
+                                                    ..default()
+                                                },
+                                                BackgroundColor(bg_row),
+                                            ))
+                                            .with_children(|b| {
+                                                b.spawn((
+                                                    Text::new("< PREV"),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(11.0),
+                                                        ..default()
+                                                    },
+                                                    TextColor(fg_cyan),
+                                                ));
+                                            });
+                                            pg.spawn((
+                                                Text::new(format!("PAGE {} / {}", page + 1, pages)),
+                                                TextFont {
+                                                    font_size: FontSize::Px(11.0),
+                                                    ..default()
+                                                },
+                                                TextColor(fg_dim),
+                                            ));
+                                            pg.spawn((
+                                                Button,
+                                                UiAction::DecalLibPage(1),
+                                                Node {
+                                                    padding: UiRect::axes(px(10.0), px(4.0)),
+                                                    ..default()
+                                                },
+                                                BackgroundColor(bg_row),
+                                            ))
+                                            .with_children(|b| {
+                                                b.spawn((
+                                                    Text::new("NEXT >"),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(11.0),
+                                                        ..default()
+                                                    },
+                                                    TextColor(fg_cyan),
+                                                ));
+                                            });
+                                        });
+                                }
+                            }
+                        }
+                        PaintTab::Emblem => {
+                            // One AC Emblem (assembly slot 0xa / design +0x50), separate from freestyle Decals.
+                            let active_label = decals
+                                .active_emblem_asset()
+                                .map(|a| a.label.clone())
+                                .or_else(|| {
+                                    decals.ac_emblem_key.as_ref().map(|k| {
+                                        k.strip_prefix("emblem:")
+                                            .or_else(|| k.strip_prefix("custom:"))
+                                            .unwrap_or(k)
+                                            .to_string()
+                                    })
+                                })
+                                .unwrap_or_else(|| "NONE".to_string());
+                            let default_label = match &decals.default_emblem_key {
+                                Some(k) => k
+                                    .strip_prefix("emblem:")
+                                    .unwrap_or(k)
+                                    .to_string(),
+                                None => "NONE".to_string(),
+                            };
+                            let status = if decals.emblem_override {
+                                format!("ACTIVE: {active_label}  (CUSTOM OVERRIDE)")
+                            } else {
+                                format!("ACTIVE: {active_label}  (DESIGN DEFAULT)")
+                            };
+
+                            panel
+                                .spawn(Node {
+                                    width: Val::Percent(100.0),
+                                    padding: UiRect::axes(px(10.0), px(8.0)),
+                                    column_gap: px(10.0),
+                                    align_items: AlignItems::Center,
+                                    border: UiRect::all(px(1.0)),
+                                    ..default()
+                                })
+                                .insert((
+                                    BackgroundColor(Color::srgba(0.10, 0.14, 0.18, 0.92)),
+                                    BorderColor::all(border_col),
+                                ))
+                                .with_children(|row| {
+                                    row.spawn((
+                                        ImageNode::new(decals.emblem_texture.clone()),
+                                        Node {
+                                            width: px(64.0),
+                                            height: px(64.0),
+                                            ..default()
+                                        },
+                                    ));
+                                    row.spawn(Node {
+                                        flex_direction: FlexDirection::Column,
+                                        row_gap: px(3.0),
+                                        flex_grow: 1.0,
+                                        ..default()
+                                    })
+                                    .with_children(|col| {
+                                        col.spawn((
+                                            Text::new(status),
+                                            TextFont {
+                                                font_size: FontSize::Px(12.5),
+                                                ..default()
+                                            },
+                                            TextColor(fg_amber),
+                                        ));
+                                        col.spawn((
+                                            Text::new(format!(
+                                                "Design default: {default_label}  ·  Left-arm shoulder + garage banner"
+                                            )),
+                                            TextFont {
+                                                font_size: FontSize::Px(10.5),
+                                                ..default()
+                                            },
+                                            TextColor(fg_dim),
+                                        ));
+                                    });
+                                });
+
+                            panel
+                                .spawn((
+                                    Button,
+                                    UiAction::DecalUpload,
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        padding: UiRect::axes(px(10.0), px(8.0)),
+                                        margin: UiRect::top(px(4.0)),
+                                        justify_content: JustifyContent::Center,
+                                        border: UiRect::all(px(1.5)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.14, 0.34, 0.44, 0.92)),
+                                    BorderColor::all(fg_cyan),
+                                ))
+                                .with_children(|b| {
+                                    b.spawn((
+                                        Text::new("+ UPLOAD CUSTOM EMBLEM  (PNG / JPG / WEBP)"),
+                                        TextFont {
+                                            font_size: FontSize::Px(12.5),
+                                            ..default()
+                                        },
+                                        TextColor(fg_text),
+                                    ));
+                                });
+
+                            panel.spawn((
+                                Text::new(
+                                    "Tip: click a thumbnail to set the AC emblem (shoulder + workshop wall). Drop an image while this tab is open to use it as the emblem.",
+                                ),
+                                TextFont {
+                                    font_size: FontSize::Px(10.5),
+                                    ..default()
+                                },
+                                TextColor(fg_dim),
+                            ));
+
+                            panel
+                                .spawn(Node {
+                                    width: Val::Percent(100.0),
+                                    column_gap: px(4.0),
+                                    margin: UiRect::top(px(2.0)),
+                                    ..default()
+                                })
+                                .with_children(|row| {
+                                    row.spawn((
+                                        Button,
+                                        UiAction::EmblemResetDefault,
+                                        Node {
+                                            flex_grow: 1.0,
+                                            padding: UiRect::axes(px(8.0), px(5.0)),
+                                            justify_content: JustifyContent::Center,
+                                            ..default()
+                                        },
+                                        BackgroundColor(bg_row),
+                                    ))
+                                    .with_children(|b| {
+                                        b.spawn((
+                                            Text::new("RESET TO DESIGN"),
+                                            TextFont {
+                                                font_size: FontSize::Px(11.0),
+                                                ..default()
+                                            },
+                                            TextColor(fg_cyan),
+                                        ));
+                                    });
+                                    row.spawn((
+                                        Button,
+                                        UiAction::EmblemClear,
+                                        Node {
+                                            flex_grow: 1.0,
+                                            padding: UiRect::axes(px(8.0), px(5.0)),
+                                            justify_content: JustifyContent::Center,
+                                            ..default()
+                                        },
+                                        BackgroundColor(bg_row),
+                                    ))
+                                    .with_children(|b| {
+                                        b.spawn((
+                                            Text::new("CLEAR EMBLEM"),
+                                            TextFont {
+                                                font_size: FontSize::Px(11.0),
+                                                ..default()
+                                            },
+                                            TextColor(fg_amber),
+                                        ));
+                                    });
+                                });
+
+                            // Library sub-tabs: CUSTOM | 360 EMBLEMS
+                            panel
+                                .spawn(Node {
+                                    width: Val::Percent(100.0),
+                                    column_gap: px(4.0),
+                                    margin: UiRect::top(px(4.0)),
+                                    ..default()
+                                })
+                                .with_children(|ltabs| {
+                                    let tabs = [
+                                        (
+                                            DecalLibraryTab::Custom,
+                                            format!("CUSTOM ({})", decals.custom_assets.len()),
+                                        ),
+                                        (
+                                            DecalLibraryTab::Emblems,
+                                            format!("360 EMBLEMS ({})", decals.disc_emblems.len()),
+                                        ),
+                                    ];
+                                    for (tab, lbl) in tabs {
+                                        let active = decals.library_tab == tab;
+                                        ltabs
+                                            .spawn((
+                                                Button,
+                                                UiAction::DecalLibTab(tab),
+                                                Node {
+                                                    flex_grow: 1.0,
+                                                    padding: UiRect::axes(px(6.0), px(4.0)),
+                                                    justify_content: JustifyContent::Center,
+                                                    ..default()
+                                                },
+                                                BackgroundColor(if active { bg_sel } else { bg_row }),
+                                            ))
+                                            .with_children(|b| {
+                                                b.spawn((
+                                                    Text::new(lbl),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(11.0),
+                                                        ..default()
+                                                    },
+                                                    TextColor(if active { fg_dark } else { fg_text }),
+                                                ));
+                                            });
+                                    }
+                                });
+
+                            let total = match decals.library_tab {
+                                DecalLibraryTab::Custom => decals.custom_assets.len(),
+                                DecalLibraryTab::Emblems => decals.disc_emblems.len(),
+                            };
+                            let pages = total.div_ceil(DECAL_GRID_PAGE_SIZE).max(1);
+                            let page = decals.library_page.min(pages - 1);
+                            let start = page * DECAL_GRID_PAGE_SIZE;
+                            let end = (start + DECAL_GRID_PAGE_SIZE).min(total);
+
+                            if total == 0 {
+                                panel
+                                    .spawn((
+                                        Node {
+                                            width: Val::Percent(100.0),
+                                            padding: UiRect::all(px(12.0)),
+                                            justify_content: JustifyContent::Center,
+                                            ..default()
+                                        },
+                                        BackgroundColor(bg_row),
+                                    ))
+                                    .with_children(|empty| {
+                                        empty.spawn((
+                                            Text::new(
+                                                "No custom images yet.\nUpload or drop a PNG/JPG to set your AC emblem!",
+                                            ),
+                                            TextFont {
+                                                font_size: FontSize::Px(11.0),
+                                                ..default()
+                                            },
+                                            TextColor(fg_dim),
+                                        ));
+                                    });
+                            } else {
+                                panel
+                                    .spawn(Node {
+                                        width: Val::Percent(100.0),
+                                        flex_wrap: FlexWrap::Wrap,
+                                        row_gap: px(5.0),
+                                        column_gap: px(5.0),
+                                        margin: UiRect::top(px(4.0)),
+                                        ..default()
+                                    })
+                                    .with_children(|grid| {
+                                        for idx in start..end {
+                                            let (key, label, thumb) = match decals.library_tab {
+                                                DecalLibraryTab::Custom => {
+                                                    let a = &decals.custom_assets[idx];
+                                                    (a.key.as_str(), a.label.as_str(), Some(a.thumb.clone()))
+                                                }
+                                                DecalLibraryTab::Emblems => {
+                                                    let e = &decals.disc_emblems[idx];
+                                                    let t = decals.peek_asset(&e.key).map(|a| a.thumb.clone());
+                                                    (e.key.as_str(), e.name.as_str(), t)
+                                                }
+                                            };
+                                            let selected =
+                                                decals.ac_emblem_key.as_deref() == Some(key);
+                                            grid.spawn((
+                                                Button,
+                                                UiAction::EmblemSelect(idx),
+                                                Node {
+                                                    width: px(82.0),
+                                                    height: px(82.0),
+                                                    padding: UiRect::all(px(3.0)),
+                                                    flex_direction: FlexDirection::Column,
+                                                    align_items: AlignItems::Center,
+                                                    justify_content: JustifyContent::SpaceBetween,
+                                                    border: UiRect::all(px(if selected { 2.0 } else { 1.0 })),
+                                                    ..default()
+                                                },
+                                                BackgroundColor(if selected {
+                                                    Color::srgba(0.20, 0.30, 0.38, 0.92)
+                                                } else {
+                                                    Color::srgba(0.08, 0.11, 0.15, 0.80)
+                                                }),
+                                                BorderColor::all(if selected {
+                                                    fg_amber
+                                                } else {
+                                                    border_col
+                                                }),
+                                            ))
+                                            .with_children(|cell| {
+                                                if let Some(handle) = thumb {
+                                                    cell.spawn((
+                                                        ImageNode::new(handle),
+                                                        Node {
+                                                            width: px(58.0),
+                                                            height: px(58.0),
+                                                            ..default()
+                                                        },
+                                                    ));
+                                                }
+                                                cell.spawn((
+                                                    Text::new(truncate(label, 10)),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(9.5),
+                                                        ..default()
+                                                    },
+                                                    TextColor(if selected { fg_amber } else { fg_dim }),
+                                                ));
+                                            });
+                                        }
+                                    });
+
                                 if pages > 1 {
                                     panel
                                         .spawn(Node {

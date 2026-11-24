@@ -25,27 +25,36 @@
 use std::collections::{BTreeSet, HashMap};
 
 use acvd_data::ac_part;
+use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
+use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
 use acvd_formats::accolor::AcColor;
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
 use acvd_render::menu::{self, Layout, MenuObject, MenuRoot, MenuText};
 use acvd_render::ui_kit::{palette, AcvdUiKit, ButtonState, FontRole, PanelStyle, TraceStyle};
 use acvd_render::Packs;
-use bevy::camera::visibility::RenderLayers;
+use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::camera::RenderTarget;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::ui::px;
 
+use crate::assemble;
+use crate::blur::ActiveMenuBackdrop;
+use crate::decal::{DecalSlot, DecalState};
 use crate::garage::{
     part_name, parts_for_slot, AcSpecs, AssembleSlot, GarageScreen, GarageState, GarageUi, Mode,
     UiAction, UiRow,
 };
 use crate::paint;
+use crate::pose;
 
 /// Dedicated Bevy render layer for the offscreen 3D part/weapon preview studio (`@PartsLayout`).
 pub const PART_PREVIEW_LAYER: usize = 4;
+/// Dedicated Bevy render layer for the offscreen 3D full-AC preview studio (`@AcLayout` / `ASSEMBLY VIEW`).
+pub const AC_PREVIEW_LAYER: usize = 5;
 
 const ASSEMBLE_DRB: &str = "lang/en/menu/assemble.drb.dcx";
 const SCREEN_W: f32 = 1280.0;
@@ -53,6 +62,9 @@ const SCREEN_H: f32 = 720.0;
 /// Offscreen render target dimensions for `@PartsLayout` upper preview window (`[178,231,676,412]` = 498×181).
 const PREVIEW_TEX_W: u32 = 512;
 const PREVIEW_TEX_H: u32 = 186;
+/// Offscreen render target dimensions for `@AcLayout` (`ASSEMBLY VIEW`, `[705,109,1213,567]` = 508×458).
+const AC_PREVIEW_TEX_W: u32 = 768;
+const AC_PREVIEW_TEX_H: u32 = 692;
 /// Number of visible part thumbnails in `@PartsList` (`[86,220,170,562]`, 6 × 57px).
 pub const ASSEMBLE_THUMB_WINDOW: usize = 6;
 /// Number of visible slot tabs in `@PartsCategoryList` (`[86,148,686,202]`, 7 × 86px).
@@ -107,6 +119,35 @@ pub fn cursor_in_part_preview_panel(window_size: Vec2, cursor: Vec2) -> bool {
     (173.0..=686.0).contains(&v.x) && (220.0..=567.0).contains(&v.y)
 }
 
+/// True when the cursor is hovering over the right `ASSEMBLY VIEW` panel (`[705,109,1213,567]` in
+/// virtual `1280×720` coordinates), where mouse drag orbits and mouse wheel zooms the preview AC.
+pub fn cursor_in_ac_preview_panel(window_size: Vec2, cursor: Vec2) -> bool {
+    let v = window_to_virtual(window_size, cursor);
+    (705.0..=1213.0).contains(&v.x) && (109.0..=567.0).contains(&v.y)
+}
+
+/// Default hero orbit yaw (radians) for the right-side `ASSEMBLY VIEW` preview AC per slot.
+pub fn ac_preview_default_yaw(slot: AssembleSlot) -> f32 {
+    match slot {
+        AssembleSlot::Head | AssembleSlot::Core | AssembleSlot::Fcs | AssembleSlot::Generator | AssembleSlot::Recon => 0.28,
+        AssembleSlot::Arms | AssembleSlot::Legs => 0.36,
+        AssembleSlot::ArmUnitR | AssembleSlot::HangerR => 0.46,
+        AssembleSlot::ArmUnitL | AssembleSlot::HangerL => -0.50,
+        AssembleSlot::Shoulder => -0.38,
+        AssembleSlot::Booster | AssembleSlot::OveredWeapon => 2.55,
+    }
+}
+
+/// Computes the offscreen `ASSEMBLY VIEW` studio camera transform for a given AC height and zoom.
+pub fn ac_preview_camera_transform(ac_height: f32, zoom: f32) -> Transform {
+    let h = ac_height.clamp(4.0, 10.0);
+    let z = zoom.clamp(0.55, 1.85);
+    let dist = h * 2.30 * z;
+    // Slight downward look target nudges the AC slightly up above the Load/Energy bars.
+    let target = Vec3::new(0.0, -h * 0.05, 0.0);
+    Transform::from_translation(Vec3::new(0.0, h * 0.14, dist)).looking_at(target, Vec3::Y)
+}
+
 /// Applies mouse-drag delta (pixels) to the 3D part preview yaw & pitch.
 pub fn apply_part_preview_drag(yaw: &mut f32, pitch: &mut f32, delta: Vec2) {
     *yaw = (*yaw + delta.x * 0.01).rem_euclid(std::f32::consts::TAU);
@@ -128,9 +169,14 @@ pub fn part_preview_camera_transform(zoom: f32) -> Transform {
     Transform::from_translation(PREVIEW_CAM_BASE * z).looking_at(Vec3::ZERO, Vec3::Y)
 }
 
-/// Marker on the offscreen 3D camera & lights that render the hovered part/weapon into `@PartsLayout`.
+/// Shared marker on offscreen Assemble preview cameras (both `PARTS VIEW` and `ASSEMBLY VIEW`)
+/// so main-camera systems (`env`, `lens_flare`, `garage::update_camera`, `main`) exclude them.
 #[derive(Component)]
 pub struct PartPreviewCamera;
+
+/// Marker specific to the left `PARTS VIEW` offscreen camera.
+#[derive(Component)]
+pub struct PartOnlyPreviewCamera;
 
 /// Marker on studio entities (camera + lights) for the 3D part preview.
 #[derive(Component)]
@@ -144,7 +190,47 @@ pub struct PartPreviewPivot;
 #[derive(Component)]
 pub struct PartPreviewMesh;
 
+/// Marker on studio entities (camera + lights) for the right-side `ASSEMBLY VIEW` full-AC preview.
+#[derive(Component)]
+pub struct AcPreviewStudio;
+
+/// Marker specific to the right-side `ASSEMBLY VIEW` offscreen camera.
+#[derive(Component)]
+pub struct AcPreviewCamera;
+
+/// Marker on the rotating pivot holding the full preview AC in `ASSEMBLY VIEW`.
+#[derive(Component)]
+pub struct AcPreviewPivot;
+
+/// Marker on individual submesh entities inside the `ASSEMBLY VIEW` full preview AC.
+/// [`sync_part_hologram`] targets ONLY entities with this marker so the main garage mech stays
+/// solid and untouched in the blurred background.
+#[derive(Component)]
+pub struct AcPreviewMesh;
+
 type PreviewKey = (u8, u16, bool, u64);
+/// Key uniquely identifying the visible 3D state of the `ASSEMBLY VIEW` preview AC.
+type AcPreviewKey = ([u16; 11], u16, u64);
+
+fn ac_preview_key(design: &AcAssemblyDesignSt, color_hash: u64) -> AcPreviewKey {
+    (
+        [
+            AssembleSlot::Head.get(design),
+            AssembleSlot::Core.get(design),
+            AssembleSlot::Arms.get(design),
+            AssembleSlot::Legs.get(design),
+            AssembleSlot::Booster.get(design),
+            AssembleSlot::ArmUnitR.get(design),
+            AssembleSlot::ArmUnitL.get(design),
+            AssembleSlot::Shoulder.get(design),
+            AssembleSlot::HangerR.get(design),
+            AssembleSlot::HangerL.get(design),
+            AssembleSlot::OveredWeapon.get(design),
+        ],
+        design.coloring_id,
+        color_hash,
+    )
+}
 
 #[derive(Clone)]
 pub enum PreviewMat {
@@ -182,6 +268,20 @@ pub struct AssembleUiAssets {
     pub preview_zoom: f32,
     pub preview_dragging: bool,
     pub preview_manual: bool,
+    /// Offscreen RGBA8 render target for the right-side `ASSEMBLY VIEW` full-AC preview camera.
+    pub ac_preview_image: Option<Handle<Image>>,
+    /// Currently spawned preview AC loadout key in `AC_PREVIEW_LAYER`.
+    pub ac_preview_loaded: Option<AcPreviewKey>,
+    /// Short debounce before rebuilding the preview AC while rapidly scrolling parts.
+    pub ac_preview_pending: Option<(AcPreviewKey, f32)>,
+    /// Last active slot in `AssembleParts`, used to smoothly re-angle the preview AC on slot switch.
+    pub ac_preview_last_slot: Option<AssembleSlot>,
+    pub ac_preview_yaw: f32,
+    pub ac_preview_pitch: f32,
+    pub ac_preview_zoom: f32,
+    pub ac_preview_height: f32,
+    pub ac_preview_dragging: bool,
+    pub ac_preview_manual: bool,
     /// Dedicated TPF pack cache for 128×64 part thumbnails.
     pub packs: Packs,
 }
@@ -204,6 +304,16 @@ impl Default for AssembleUiAssets {
             preview_zoom: 1.0,
             preview_dragging: false,
             preview_manual: false,
+            ac_preview_image: None,
+            ac_preview_loaded: None,
+            ac_preview_pending: None,
+            ac_preview_last_slot: None,
+            ac_preview_yaw: 0.30,
+            ac_preview_pitch: 0.08,
+            ac_preview_zoom: 1.0,
+            ac_preview_height: 6.8,
+            ac_preview_dragging: false,
+            ac_preview_manual: false,
             packs: Packs::default(),
         }
     }
@@ -247,6 +357,16 @@ impl AssembleUiAssets {
         );
         target.sampler = bevy::image::ImageSampler::linear();
         self.preview_image = Some(images.add(target));
+
+        // Allocate transparent RGBA8 offscreen render target for the right-side `ASSEMBLY VIEW` AC preview.
+        let mut ac_target = Image::new_target_texture(
+            AC_PREVIEW_TEX_W,
+            AC_PREVIEW_TEX_H,
+            TextureFormat::Rgba8UnormSrgb,
+            None,
+        );
+        ac_target.sampler = bevy::image::ImageSampler::linear();
+        self.ac_preview_image = Some(images.add(ac_target));
     }
 
     /// Loads (or returns cached) the authentic 128×64 disc thumbnail for `(category, part_id)`.
@@ -745,8 +865,18 @@ pub fn spawn_assemble_ui(
 
     // 3. Normal View vs Detail View (`Tab` toggles `state.assemble_detail_view`).
     if !state.assemble_detail_view {
+        // 3a-right. Live 3D full-AC preview inside `@AcLayout` (`ASSEMBLY VIEW`, `[705,109,1213,567]`),
+        //           spawned before `@PartsNormal` so the Load/Energy bars draw cleanly on top.
+        if let Some(ref ac_img) = assets.ac_preview_image {
+            commands.spawn((
+                px_rect(705.0, 109.0, 1213.0, 567.0),
+                ImageNode::new(ac_img.clone()),
+                ChildOf(screen_root),
+            ));
+        }
+
         // 3a. Dark blueprint backing behind the left `@PartsNormal` panel (`[173,220,686,567]`)
-        //     so stat text and the 3D part preview stand out cleanly over the 3D workshop.
+        //     so stat text and the 3D part preview stand out cleanly over the blurred workshop.
         commands.spawn((
             px_rect(173.0, 220.0, 686.0, 567.0),
             BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.78)),
@@ -1510,8 +1640,8 @@ pub enum HoloSavedMat {
 }
 
 /// Applies the ACVD translucent amber-orange hologram highlight to the currently selected
-/// [`AssembleSlot`]'s submeshes on the main 3D AC while in `GarageScreen::AssembleParts`, and
-/// cleanly restores original opaque materials when switching slots or leaving Assemble.
+/// [`AssembleSlot`]'s submeshes on the right-side `ASSEMBLY VIEW` preview AC ([`AcPreviewMesh`])
+/// while in `GarageScreen::AssembleParts`, leaving the main garage mech untouched and opaque.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_part_hologram(
     mut commands: Commands,
@@ -1521,13 +1651,16 @@ pub fn sync_part_hologram(
     mut ac_mats: ResMut<Assets<paint::AcPaintMaterial>>,
     mut std_mats: ResMut<Assets<StandardMaterial>>,
     mut holo_std: Local<Option<Handle<StandardMaterial>>>,
-    meshes: Query<(
-        Entity,
-        &crate::AcPartColumn,
-        Option<&MeshMaterial3d<paint::AcPaintMaterial>>,
-        Option<&MeshMaterial3d<StandardMaterial>>,
-        Option<&HoloSavedMat>,
-    )>,
+    meshes: Query<
+        (
+            Entity,
+            &crate::AcPartColumn,
+            Option<&MeshMaterial3d<paint::AcPaintMaterial>>,
+            Option<&MeshMaterial3d<StandardMaterial>>,
+            Option<&HoloSavedMat>,
+        ),
+        With<AcPreviewMesh>,
+    >,
 ) {
     let target_col = if *mode == Mode::Garage {
         match state.screen {
@@ -1936,6 +2069,7 @@ pub fn sync_part_preview(
             commands.spawn((
                 PartPreviewStudio,
                 PartPreviewCamera,
+                PartOnlyPreviewCamera,
                 Camera3d::default(),
                 Camera {
                     order: -2,
@@ -2175,8 +2309,8 @@ pub fn rotate_part_preview(
     scroll: Res<AccumulatedMouseScroll>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut assets: ResMut<AssembleUiAssets>,
-    mut pivots: Query<&mut Transform, (With<PartPreviewPivot>, Without<PartPreviewCamera>)>,
-    mut cams: Query<&mut Transform, (With<PartPreviewCamera>, Without<PartPreviewPivot>)>,
+    mut pivots: Query<&mut Transform, (With<PartPreviewPivot>, Without<PartOnlyPreviewCamera>)>,
+    mut cams: Query<&mut Transform, (With<PartOnlyPreviewCamera>, Without<PartPreviewPivot>)>,
 ) {
     let active = *mode == Mode::Garage
         && matches!(state.screen, GarageScreen::AssembleParts { .. })
@@ -2231,6 +2365,435 @@ pub fn rotate_part_preview(
     }
 }
 
+/// Asset storage bundle for [`sync_ac_preview`] so its system parameters stay concise.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct AcPreviewAssetHandles<'w> {
+    meshes: ResMut<'w, Assets<Mesh>>,
+    std_mats: ResMut<'w, Assets<StandardMaterial>>,
+    ac_mats: ResMut<'w, Assets<paint::AcPaintMaterial>>,
+    images: ResMut<'w, Assets<Image>>,
+    bindposes: ResMut<'w, Assets<SkinnedMeshInverseBindposes>>,
+}
+
+/// Synchronizes the Garage Assemble blurred bokeh + `+` grid backdrop (`ActiveMenuBackdrop`)
+/// and the isolated right-side `ASSEMBLY VIEW` full-AC preview studio (`AC_PREVIEW_LAYER`).
+///
+/// The preview AC is a separate 3D model from the main garage mech so [`sync_part_hologram`]
+/// highlights only the preview AC's selected slot while the main garage mech remains solid and
+/// untouched in the blurred background.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_ac_preview(
+    mut commands: Commands,
+    time: Res<Time>,
+    mode: Res<Mode>,
+    state: Res<GarageState>,
+    garage: Res<crate::Garage>,
+    decals: Res<DecalState>,
+    mut backdrop: ResMut<ActiveMenuBackdrop>,
+    mut assets: ResMut<AssembleUiAssets>,
+    mut ac_packs: ResMut<crate::AcTexturePacks>,
+    mut handles: AcPreviewAssetHandles,
+    studio_q: Query<Entity, With<AcPreviewStudio>>,
+    pivot_q: Query<Entity, With<AcPreviewPivot>>,
+) {
+    let in_assemble = *mode == Mode::Garage && matches!(state.screen, GarageScreen::AssembleParts { .. });
+    // Blurred bokeh garage + crisp `+` reticle grid backdrop (active in both Normal and Detail Specs).
+    backdrop.0 = if in_assemble {
+        Vec4::new(1.0, 0.48, 0.36, 92.0)
+    } else {
+        Vec4::ZERO
+    };
+
+    let active_slot = if in_assemble && !state.assemble_detail_view {
+        match state.screen {
+            GarageScreen::AssembleParts { slot } => Some(slot),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let Some(slot) = active_slot else {
+        if !studio_q.is_empty() || !pivot_q.is_empty() {
+            for e in &pivot_q {
+                commands.entity(e).despawn();
+            }
+            for e in &studio_q {
+                commands.entity(e).despawn();
+            }
+            assets.ac_preview_loaded = None;
+            assets.ac_preview_pending = None;
+            assets.ac_preview_last_slot = None;
+            assets.ac_preview_dragging = false;
+            assets.ac_preview_manual = false;
+        }
+        return;
+    };
+
+    assets.ensure_loaded(&garage.disc, &mut handles.images);
+
+    // Re-angle the preview AC toward the newly selected slot when switching slots.
+    if assets.ac_preview_last_slot != Some(slot) {
+        let first_open = assets.ac_preview_last_slot.is_none();
+        assets.ac_preview_last_slot = Some(slot);
+        assets.ac_preview_manual = false;
+        if first_open {
+            assets.ac_preview_yaw = ac_preview_default_yaw(slot);
+            assets.ac_preview_pitch = 0.08;
+            assets.ac_preview_zoom = 1.0;
+        }
+    }
+
+    // Spawn the isolated offscreen studio camera & 3-point lights once.
+    if studio_q.is_empty() {
+        if let Some(ref target_img) = assets.ac_preview_image {
+            let layer = RenderLayers::layer(AC_PREVIEW_LAYER);
+            commands.spawn((
+                AcPreviewStudio,
+                PartPreviewCamera,
+                AcPreviewCamera,
+                Camera3d::default(),
+                Camera {
+                    order: -3,
+                    clear_color: ClearColorConfig::Custom(Color::NONE),
+                    ..default()
+                },
+                RenderTarget::Image(target_img.clone().into()),
+                Projection::Perspective(PerspectiveProjection {
+                    fov: 30.0f32.to_radians(),
+                    near: 0.1,
+                    far: 120.0,
+                    ..default()
+                }),
+                ac_preview_camera_transform(assets.ac_preview_height, assets.ac_preview_zoom),
+                layer.clone(),
+            ));
+            // Studio key light (warm-white front-top-right).
+            commands.spawn((
+                AcPreviewStudio,
+                DirectionalLight {
+                    color: Color::srgb(1.0, 0.97, 0.92),
+                    illuminance: 15_000.0,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_xyz(4.0, 6.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+                layer.clone(),
+            ));
+            // Soft cool fill light from front-left to keep mechanical detail readable.
+            commands.spawn((
+                AcPreviewStudio,
+                DirectionalLight {
+                    color: Color::srgb(0.65, 0.78, 0.95),
+                    illuminance: 4_500.0,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_xyz(-4.5, 2.5, 3.5).looking_at(Vec3::ZERO, Vec3::Y),
+                layer.clone(),
+            ));
+            // Crisp cool-blue rim light from behind-left for clean silhouette separation.
+            commands.spawn((
+                AcPreviewStudio,
+                DirectionalLight {
+                    color: Color::srgb(0.50, 0.75, 1.0),
+                    illuminance: 7_500.0,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_xyz(-3.5, 4.0, -5.0).looking_at(Vec3::ZERO, Vec3::Y),
+                layer,
+            ));
+        }
+    }
+
+    let color_hash = garage
+        .custom_color
+        .as_ref()
+        .map(|c| {
+            let mut h = 0u64;
+            for g in &c.groups {
+                for ch in g {
+                    for &b in ch {
+                        h = h.wrapping_mul(31).wrapping_add(b as u64);
+                    }
+                }
+            }
+            h
+        })
+        .unwrap_or(0);
+    let want = ac_preview_key(&garage.active_design, color_hash);
+    if assets.ac_preview_loaded == Some(want) {
+        assets.ac_preview_pending = None;
+        return;
+    }
+
+    // Brief 60 ms debounce when scrolling rapidly through parts after initial spawn.
+    if assets.ac_preview_loaded.is_some() {
+        match assets.ac_preview_pending {
+            Some((k, ref mut rem)) if k == want => {
+                *rem -= time.delta_secs();
+                if *rem > 0.0 {
+                    return;
+                }
+            }
+            _ => {
+                assets.ac_preview_pending = Some((want, 0.06));
+                return;
+            }
+        }
+    }
+    assets.ac_preview_pending = None;
+    assets.ac_preview_loaded = Some(want);
+
+    for e in &pivot_q {
+        commands.entity(e).despawn();
+    }
+
+    // Assemble & pose the preview AC on `AC_PREVIEW_LAYER` using cached FLVERs/TPFs.
+    let design_data = garage.active_design;
+    let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &design_data);
+    let accolor = if garage.flat {
+        None
+    } else {
+        garage
+            .custom_color
+            .or_else(|| paint::load_accolor(&garage.disc, design_data.coloring_id))
+    };
+
+    let ac_cache = &mut *ac_packs;
+    let (packs, flvers, mut missing) = (&mut ac_cache.packs, &mut ac_cache.flvers, 0usize);
+    let mut loaded = Vec::new();
+    let mut known = vec![None; built.placements.len()];
+    for (index, p) in built.placements.iter().enumerate() {
+        let places = assemble::root_places(p, &built.placements, &known);
+        if let Ok((meshes, rig)) =
+            flvers.rigged_model(&garage.disc, p.model.path, &|root| {
+                assemble::place_of(&places, root)
+            })
+        {
+            known[index] = Some(assemble::Stored {
+                places,
+                frames: rig.frames.clone(),
+            });
+            loaded.push(pose::Loaded {
+                index,
+                placement: p,
+                meshes,
+                rig,
+            });
+        }
+    }
+    if loaded.is_empty() {
+        return;
+    }
+    let Ok(rig) = pose::build(&garage.disc, &loaded) else {
+        return;
+    };
+
+    let mut bmin = Vec3::splat(f32::MAX);
+    let mut bmax = Vec3::splat(f32::MIN);
+    for part in &loaded {
+        for mesh in &part.meshes {
+            bmin = bmin.min(Vec3::from(mesh.min));
+            bmax = bmax.max(Vec3::from(mesh.max));
+        }
+    }
+    let center = if bmin.x.is_finite() && bmax.x.is_finite() {
+        (bmin + bmax) * 0.5
+    } else {
+        Vec3::new(0.0, 3.2, 0.0)
+    };
+    let ac_height = if bmin.y.is_finite() && bmax.y.is_finite() {
+        (bmax.y - bmin.y).clamp(4.0, 10.0)
+    } else {
+        6.8
+    };
+    assets.ac_preview_height = ac_height;
+
+    let layer = RenderLayers::layer(AC_PREVIEW_LAYER);
+    let pivot = commands
+        .spawn((
+            AcPreviewPivot,
+            Transform::from_rotation(
+                Quat::from_rotation_x(assets.ac_preview_pitch)
+                    * Quat::from_rotation_y(assets.ac_preview_yaw),
+            ),
+            Visibility::default(),
+            layer.clone(),
+        ))
+        .id();
+
+    let face_front = Quat::from_rotation_y(std::f32::consts::PI);
+    let ac_root = commands
+        .spawn((
+            Transform {
+                translation: -(face_front * center),
+                rotation: face_front,
+                scale: Vec3::ONE,
+            },
+            Visibility::default(),
+            layer.clone(),
+            ChildOf(pivot),
+        ))
+        .id();
+
+    let (_joint_entities, skins) = pose::spawn_static(&mut commands, ac_root, &rig, &loaded);
+    for (part, (joints, binds)) in loaded.into_iter().zip(skins) {
+        let inverse_bindposes = handles
+            .bindposes
+            .add(SkinnedMeshInverseBindposes::from(binds));
+        for mesh in part.meshes {
+            let decal_slot =
+                DecalSlot::from_mesh(part.placement.column, mesh.root.as_deref());
+            let base = acvd_render::material(
+                &garage.disc,
+                &mesh,
+                packs,
+                &mut handles.images,
+                garage.flat,
+                &mut missing,
+            );
+            let painted = accolor.as_ref().and_then(|col| {
+                paint::material(
+                    &garage.disc,
+                    &base,
+                    &mesh,
+                    part.placement.column,
+                    col,
+                    decal_slot.map(|s| decals.slot_handle(s)),
+                    packs,
+                    &mut handles.images,
+                )
+            });
+            let mut mesh_entity = commands.spawn((
+                AcPreviewMesh,
+                crate::AcPartColumn(part.placement.column),
+                Mesh3d(handles.meshes.add(mesh.mesh)),
+                SkinnedMesh {
+                    inverse_bindposes: inverse_bindposes.clone(),
+                    joints: joints.clone(),
+                },
+                NoFrustumCulling,
+                Transform::default(),
+                layer.clone(),
+                ChildOf(ac_root),
+            ));
+            match painted {
+                Some(mat) => {
+                    mesh_entity.insert(MeshMaterial3d(handles.ac_mats.add(mat)));
+                }
+                None => {
+                    mesh_entity.insert(MeshMaterial3d(handles.std_mats.add(base)));
+                }
+            }
+        }
+    }
+}
+
+/// Interactive orbit and scroll-zoom controller for the right-side `ASSEMBLY VIEW` preview AC.
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_ac_preview(
+    time: Res<Time>,
+    mode: Res<Mode>,
+    state: Res<GarageState>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
+    gamepads: Query<&Gamepad>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut assets: ResMut<AssembleUiAssets>,
+    mut pivots: Query<&mut Transform, (With<AcPreviewPivot>, Without<AcPreviewCamera>)>,
+    mut cams: Query<&mut Transform, (With<AcPreviewCamera>, Without<AcPreviewPivot>)>,
+) {
+    let active_slot = if *mode == Mode::Garage && !state.assemble_detail_view {
+        match state.screen {
+            GarageScreen::AssembleParts { slot } => Some(slot),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some(slot) = active_slot else {
+        assets.ac_preview_dragging = false;
+        return;
+    };
+    if pivots.is_empty() {
+        assets.ac_preview_dragging = false;
+        return;
+    }
+
+    let cursor_win = windows
+        .single()
+        .ok()
+        .and_then(|w| w.cursor_position().map(|c| (Vec2::new(w.width(), w.height()), c)));
+    let over_ac = cursor_win
+        .map(|(ws, c)| cursor_in_ac_preview_panel(ws, c))
+        .unwrap_or(false);
+    let over_part = cursor_win
+        .map(|(ws, c)| cursor_in_part_preview_panel(ws, c))
+        .unwrap_or(false);
+
+    let start_drag = (buttons.just_pressed(MouseButton::Left) && over_ac)
+        || (buttons.just_pressed(MouseButton::Right) && !over_part);
+    if start_drag {
+        assets.ac_preview_dragging = true;
+        assets.ac_preview_manual = true;
+    }
+    if !buttons.pressed(MouseButton::Left) && !buttons.pressed(MouseButton::Right) {
+        assets.ac_preview_dragging = false;
+    }
+
+    if assets.ac_preview_dragging && motion.delta.length_squared() > 0.0 {
+        assets.ac_preview_yaw =
+            (assets.ac_preview_yaw + motion.delta.x * 0.008).rem_euclid(std::f32::consts::TAU);
+        assets.ac_preview_pitch = (assets.ac_preview_pitch + motion.delta.y * 0.006).clamp(-0.65, 0.85);
+    }
+
+    let mut right_stick = Vec2::ZERO;
+    for pad in &gamepads {
+        right_stick += pad.right_stick();
+    }
+    if right_stick.length() > 0.15 {
+        assets.ac_preview_manual = true;
+        assets.ac_preview_yaw = (assets.ac_preview_yaw + right_stick.x * 2.0 * time.delta_secs())
+            .rem_euclid(std::f32::consts::TAU);
+        assets.ac_preview_pitch = (assets.ac_preview_pitch - right_stick.y * 1.3 * time.delta_secs())
+            .clamp(-0.65, 0.85);
+    }
+
+    if !assets.ac_preview_manual {
+        let target_yaw = ac_preview_default_yaw(slot);
+        let mut dyaw = (target_yaw - assets.ac_preview_yaw) % std::f32::consts::TAU;
+        if dyaw > std::f32::consts::PI {
+            dyaw -= std::f32::consts::TAU;
+        } else if dyaw < -std::f32::consts::PI {
+            dyaw += std::f32::consts::TAU;
+        }
+        let t = 1.0 - (-8.0 * time.delta_secs()).exp();
+        assets.ac_preview_yaw += dyaw * t;
+        assets.ac_preview_pitch += (0.08 - assets.ac_preview_pitch) * t;
+    }
+
+    if over_ac && scroll.delta.y.abs() > 0.0 {
+        let step = match scroll.unit {
+            MouseScrollUnit::Line => scroll.delta.y,
+            MouseScrollUnit::Pixel => scroll.delta.y * 0.02,
+        };
+        assets.ac_preview_zoom = (assets.ac_preview_zoom * (1.0 - step * 0.10)).clamp(0.55, 1.85);
+    }
+
+    let rot = Quat::from_rotation_x(assets.ac_preview_pitch)
+        * Quat::from_rotation_y(assets.ac_preview_yaw);
+    for mut tf in &mut pivots {
+        tf.rotation = rot;
+    }
+    let cam_tf = ac_preview_camera_transform(assets.ac_preview_height, assets.ac_preview_zoom);
+    for mut tf in &mut cams {
+        *tf = cam_tf;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2266,6 +2829,20 @@ mod tests {
         assert!(!cursor_in_part_preview_panel(win, Vec2::new(120.0, 320.0)));
         assert!(!cursor_in_part_preview_panel(win, Vec2::new(420.0, 170.0)));
         assert!(!cursor_in_part_preview_panel(win, Vec2::new(900.0, 360.0)));
+
+        // Right-side `ASSEMBLY VIEW` hit test (`[705,109,1213,567]`).
+        assert!(cursor_in_ac_preview_panel(win, Vec2::new(950.0, 340.0)));
+        assert!(!cursor_in_ac_preview_panel(win, Vec2::new(420.0, 320.0)));
+        assert!(!cursor_in_ac_preview_panel(win, Vec2::new(950.0, 40.0)));
+
+        // `ASSEMBLY VIEW` camera framing clamps height and zoom cleanly.
+        let near = ac_preview_camera_transform(6.8, 0.1);
+        let mid = ac_preview_camera_transform(6.8, 1.0);
+        let far = ac_preview_camera_transform(6.8, 10.0);
+        assert!(near.translation.z < mid.translation.z);
+        assert!(mid.translation.z < far.translation.z);
+        assert!(ac_preview_default_yaw(AssembleSlot::ArmUnitR) > 0.0);
+        assert!(ac_preview_default_yaw(AssembleSlot::ArmUnitL) < 0.0);
 
         // Dragging updates yaw and clamps pitch within ±PREVIEW_PITCH_LIMIT.
         let mut yaw = 0.0f32;

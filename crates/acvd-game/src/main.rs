@@ -202,8 +202,21 @@ fn main() {
     let mut test = targets::TestMode::default();
     let mut test_arg = "actest2".to_string();
     let (mut preview, mut burst, mut no_hud) = (None, 1, false);
-    let (mut start_garage, mut garage_id, mut garage_screen, mut garage_paint_tab, mut cli_decal) =
-        (false, None, garage::GarageScreen::Top, garage::PaintTab::Presets, None::<PathBuf>);
+    let (
+        mut start_garage,
+        mut garage_id,
+        mut garage_screen,
+        mut garage_paint_tab,
+        mut cli_decal,
+        mut cli_emblem,
+    ) = (
+        false,
+        None,
+        garage::GarageScreen::Top,
+        garage::PaintTab::Presets,
+        None::<PathBuf>,
+        None::<String>,
+    );
     let mut start_pause: Option<pause::PauseScreen> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -269,6 +282,9 @@ fn main() {
                     if raw.trim().eq_ignore_ascii_case("decals") {
                         garage_screen = garage::GarageScreen::Paint;
                         garage_paint_tab = garage::PaintTab::Decals;
+                    } else if raw.trim().eq_ignore_ascii_case("emblem") {
+                        garage_screen = garage::GarageScreen::Paint;
+                        garage_paint_tab = garage::PaintTab::Emblem;
                     } else if let Some(s) = garage::GarageScreen::from_cli(&raw) {
                         garage_screen = s;
                     }
@@ -276,6 +292,9 @@ fn main() {
             }
             "--decal" => {
                 cli_decal = args.next().map(PathBuf::from);
+            }
+            "--emblem" => {
+                cli_emblem = args.next();
             }
             "--pause" => {
                 start_pause = Some(pause::PauseScreen::Main);
@@ -428,7 +447,7 @@ fn main() {
     .insert_resource(pause_state)
     .init_resource::<AcTexturePacks>()
     .init_resource::<garage_assemble::AssembleUiAssets>()
-    .insert_resource(decal::DecalState::new(cli_decal))
+        .insert_resource(decal::DecalState::new(cli_decal, cli_emblem))
     .insert_resource(decal::DecalMeshCache::default())
     .insert_resource(Garage {
         disc,
@@ -478,6 +497,8 @@ fn main() {
             garage_assemble::populate_drb_dialogs,
             garage_assemble::sync_part_preview,
             garage_assemble::rotate_part_preview,
+            garage_assemble::sync_ac_preview,
+            garage_assemble::rotate_ac_preview,
             garage::update_camera,
         )
             .chain()
@@ -1282,6 +1303,8 @@ fn show(
     garage.dirty = false;
     decals.init_assets(images);
     decal_cache.meshes.clear();
+    decal_cache.shoulder_emblem = None;
+    let mut l_kata_rest: Option<Mat4> = None;
     let design_data = garage.active_design;
     let design_name = garage.active_name.clone();
     for e in acs.iter().chain(shots.iter()).chain(labels.iter()) {
@@ -1538,6 +1561,15 @@ fn show(
         let leg_type = acvd_data::part_field(design_data.legs as i64, 3, "leg_type") as u8;
         weapon_anims.load(&garage.disc, part.placement, &part.rig, &joints, leg_type);
         sfx::effect_points(&mut commands, &part.rig, &joints, part.placement.column);
+        if part.placement.column == "arms" {
+            l_kata_rest = part
+                .rig
+                .bones
+                .iter()
+                .position(|b| b.name.eq_ignore_ascii_case("l_kata"))
+                .and_then(|i| binds_vec.get(i))
+                .map(|m| m.inverse());
+        }
         for mesh in part.meshes {
             min = min.min(Vec3::from(mesh.min));
             max = max.max(Vec3::from(mesh.max));
@@ -1607,6 +1639,14 @@ fn show(
             }
         }
     }
+    decal_cache.shoulder_emblem = l_kata_rest.and_then(|rest| {
+        let left_meshes: Vec<&decal::CachedPartMesh> = decal_cache
+            .meshes
+            .iter()
+            .filter(|m| m.slot == decal::DecalSlot::LeftArm)
+            .collect();
+        decal::build_shoulder_emblem_projector(design_data.arms, rest, &left_meshes)
+    });
     decals.mark_changed_frame_parts(
         design_data.head,
         design_data.core,
