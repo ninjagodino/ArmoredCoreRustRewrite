@@ -282,6 +282,13 @@ in order:
 
 ## Done
 
+- **Arena & Garage Options UI Scale + Multi-Channel Sound Sliders (`acvd-render::ui_kit`, `acvd-game::settings`, `sound`, `hud`, `pause`, `garage`)**:
+  - Added reusable `AcvdUiKit::spawn_slider_row` (focus arrow, label, `<`/`>` disc arrow steppers, metallic gauge track with optional `I` default marker, and percentage readout).
+  - Expanded `GameSettings` (`settings.json`, backwards-compatible via `#[serde(default)]`) with `ui_scale` (`75%`–`150%`, 5% steps, default `100%`) and separate `music_volume`, `sfx_volume`, and `ui_volume` channels alongside `volume` (Master).
+  - Tagged `Cues` FEV projects by `AudioBus::Sfx` (`weapon`, `bombs`, `booster`, `ac`, `enemy`) vs `AudioBus::Ui` (`menu`, `garage`) and updated `bgm_update` + `settings::apply_volume` so Master, Music, SFX, and Menu/UI sliders live-scale both newly spawned and already-playing audio sinks.
+  - Wired `GameSettings::ui_scale` live into `hud::layout` (with edge-quadrant anchoring so scaling above `100%` grows inward without clipping), `pause::sync_ui`, and `garage::rebuild_ui`.
+  - Upgraded both the Arena Pause Options (`pause.rs`) and Garage Options (`garage.rs`) menus with `DISPLAY` (`FULLSCREEN`, `UI SCALE`) and `SOUND SETTINGS` (`MASTER`, `MUSIC`, `SFX`, `MENU / UI`) slider bars. Verified with `cargo test -p acvd-game -- settings pause garage sound` (24/24 passed) and `--shot` (`private/shots/arena_options_sliders.png`, `private/shots/garage_options_sliders.png`).
+
 - **Garage Options Menu `AcvdUiKit` Redesign & `Esc` Toggle (`acvd-game::garage`)**:
   - Migrated `GarageScreen::Options` onto `AcvdUiKit` (`spawn_garage_options_menu`) matching the Garage Top Menu's `PanelStyle::Tactical` frame, `Title_Plate` header, shaded amber-focus `FULLSCREEN` / `MASTER VOLUME` / `BACK TO GARAGE` buttons, `LEVEL` volume gauge with `< -5%` / `+5% >` framed arrow steppers, stepped trace divider, and `DESCRIPTION` helpline card.
   - Wired `Esc` (and Gamepad `Start`) in the Garage to open `GarageScreen::Options` from `GarageScreen::Top` and close it back to `Top` when already open (updating the Top menu tag and footer hints to `ESC`). Verified with `cargo test -p acvd-game -- garage` (16/16 passed, including `test_escape_toggles_garage_options` and `test_garage_top_uikit_descriptions_fit_panel`) and `--shot` (`private/shots/garage_options_uikit.png`).

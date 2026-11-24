@@ -36,7 +36,7 @@ use acvd_formats::accolor::{
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
 use acvd_render::ui_kit::{
-    palette, AcvdUiKit, ArrowDir, ButtonState, FontRole, PanelStyle, StatDelta, TraceStyle,
+    palette, AcvdUiKit, ButtonState, FontRole, PanelStyle, StatDelta, TraceStyle,
 };
 use acvd_render::Packs;
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
@@ -49,8 +49,8 @@ use bevy::ui::px;
 use crate::decal::{self, DecalLibraryTab, DecalState, DECAL_TINTS};
 use crate::env;
 use crate::paint;
-use crate::settings::{self, GameSettings};
-use crate::sound::{self, BgmPlayer, BgmState, Cues};
+use crate::settings::{self, AudioChannel, GameSettings};
+use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
 
 /// Default ACVD garage workshop row ID in `param/customgarage.bin` (`id: 5` = Underpass `menu1000`).
 pub const DEFAULT_GARAGE_ID: u32 = 5;
@@ -143,7 +143,9 @@ pub enum UiAction {
     AssembleDmgFilter(Option<u8>),
     AssembleToggleDetail,
     ToggleFullscreen,
-    VolumeStep(i8),
+    SelectOptionRow(usize),
+    UiScaleStep(i8),
+    VolumeStep(AudioChannel, i8),
 }
 
 /// Active garage screen.
@@ -210,11 +212,22 @@ const TOP_ITEMS: &[(&str, &str, &str)] = &[
     ("OPTIONS", "ESC", "Toggle fullscreen display and\nadjust master volume."),
 ];
 
-/// Helpline descriptions for [`GarageScreen::Options`] rows (0: Fullscreen, 1: Volume, 2: Back).
-const OPTIONS_ROW_DESCS: [&str; 3] = [
+/// Helpline descriptions for [`GarageScreen::Options`] rows.
+const OPTIONS_ROW_DESCS: [&str; 7] = [
     "Toggle fullscreen or windowed\ndisplay mode.",
-    "Adjust master audio volume\nwith Left / Right or -5% / +5%.",
+    "Scale HUD and menu size\n(75% - 150%, default 100%).",
+    "Adjust master audio volume\nacross all sound channels.",
+    "Adjust background music volume\nin Garage and Sortie.",
+    "Adjust weapon, booster, and\ncombat sound effects volume.",
+    "Adjust menu navigation and\nUI feedback sound volume.",
     "Return to the Garage main menu.",
+];
+
+const GARAGE_OPTION_CHANNELS: [(usize, AudioChannel); 4] = [
+    (2, AudioChannel::Master),
+    (3, AudioChannel::Music),
+    (4, AudioChannel::Sfx),
+    (5, AudioChannel::Ui),
 ];
 
 /// AC TEST target layer presets (`m4000_actest.msb`, `LAYER_PARAM_ST`).
@@ -844,6 +857,8 @@ pub struct GarageState {
     pub banner: Option<(String, Color, f32)>,
     /// Last window logical size used to lay out the UI (triggers rebuild on resize).
     pub last_window_size: Vec2,
+    /// Last `GameSettings::ui_scale` used to lay out the UI (triggers rebuild on scale change).
+    pub last_ui_scale: f32,
     /// True when the UI tree needs rebuilding.
     pub ui_dirty: bool,
 }
@@ -911,6 +926,7 @@ impl GarageState {
             cam_manual_orbit: false,
             banner: None,
             last_window_size: Vec2::ZERO,
+            last_ui_scale: 1.0,
             ui_dirty: true,
         }
     }
@@ -1527,6 +1543,7 @@ pub struct OptionsCtx<'w, 's> {
     bgm: Res<'w, BgmState>,
     sinks: Query<'w, 's, (Entity, &'static mut AudioSink)>,
     bgm_players: Query<'w, 's, Entity, With<BgmPlayer>>,
+    audio_buses: Query<'w, 's, &'static AudioBus>,
     windows: Query<'w, 's, &'static mut Window, With<bevy::window::PrimaryWindow>>,
 }
 
@@ -1949,14 +1966,38 @@ pub fn handle_input(
                 );
                 return;
             }
-            UiAction::VolumeStep(delta) => {
+            UiAction::SelectOptionRow(row) => {
+                if state.cursor != row {
+                    state.cursor = row;
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+                    state.ui_dirty = true;
+                }
+                return;
+            }
+            UiAction::UiScaleStep(delta) => {
                 state.cursor = 1;
+                step_ui_scale_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
+            UiAction::VolumeStep(channel, delta) => {
+                if let Some((row, _)) = GARAGE_OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel)
+                {
+                    state.cursor = *row;
+                }
                 step_volume_setting(
                     &mut commands,
                     &mut options,
                     &mut cues,
                     &mut audio_assets,
                     &mut state,
+                    channel,
                     delta,
                 );
                 return;
@@ -2277,7 +2318,7 @@ pub fn handle_input(
         }
     }
 
-    // Options screen: Left/Right toggles fullscreen or nudges master volume.
+    // Options screen: Left/Right toggles fullscreen or nudges UI scale / audio sliders.
     if state.screen == GarageScreen::Options && (left || right) {
         let delta: i8 = if right { 1 } else { -1 };
         match state.cursor {
@@ -2292,12 +2333,60 @@ pub fn handle_input(
                 return;
             }
             1 => {
+                step_ui_scale_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
+            2 => {
                 step_volume_setting(
                     &mut commands,
                     &mut options,
                     &mut cues,
                     &mut audio_assets,
                     &mut state,
+                    AudioChannel::Master,
+                    delta,
+                );
+                return;
+            }
+            3 => {
+                step_volume_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    AudioChannel::Music,
+                    delta,
+                );
+                return;
+            }
+            4 => {
+                step_volume_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    AudioChannel::Sfx,
+                    delta,
+                );
+                return;
+            }
+            5 => {
+                step_volume_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    AudioChannel::Ui,
                     delta,
                 );
                 return;
@@ -2392,7 +2481,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::Design => garage.designs.len(),
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
-        GarageScreen::Options => 3, // Fullscreen, Volume, Back
+        GarageScreen::Options => 7, // Fullscreen, UI Scale, Master, Music, SFX, Menu/UI, Back
         GarageScreen::ViewMode => 0,
     }
 }
@@ -2421,7 +2510,7 @@ fn toggle_fullscreen_setting(
     state.ui_dirty = true;
 }
 
-fn step_volume_setting(
+fn step_ui_scale_setting(
     commands: &mut Commands,
     options: &mut OptionsCtx,
     cues: &mut Cues,
@@ -2429,18 +2518,43 @@ fn step_volume_setting(
     state: &mut GarageState,
     delta: i8,
 ) {
-    options.settings.step_volume(delta);
+    options.settings.step_ui_scale(delta);
+    options.settings.save();
+    sound::cue(commands, cues, audio_assets, CUE_MOVE);
+    state.set_banner(
+        format!("UI SCALE: {}%", options.settings.ui_scale_percent()),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+}
+
+fn step_volume_setting(
+    commands: &mut Commands,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    state: &mut GarageState,
+    channel: AudioChannel,
+    delta: i8,
+) {
+    options.settings.step_channel(channel, delta);
     settings::apply_volume(
         &options.settings,
         &options.bgm,
+        cues,
         &mut options.global_volume,
         &mut options.sinks,
         &options.bgm_players,
+        &options.audio_buses,
     );
     options.settings.save();
     sound::cue(commands, cues, audio_assets, CUE_MOVE);
     state.set_banner(
-        format!("VOLUME: {}%", options.settings.volume_percent()),
+        format!(
+            "{}: {}%",
+            channel.label(),
+            options.settings.channel_percent(channel)
+        ),
         Color::srgb(0.45, 0.92, 0.62),
     );
     state.ui_dirty = true;
@@ -2907,9 +3021,53 @@ fn trigger_confirm(
                 toggle_fullscreen_setting(commands, options, cues, audio_assets, state);
             }
             1 => {
-                step_volume_setting(commands, options, cues, audio_assets, state, 1);
+                step_ui_scale_setting(commands, options, cues, audio_assets, state, 1);
             }
             2 => {
+                step_volume_setting(
+                    commands,
+                    options,
+                    cues,
+                    audio_assets,
+                    state,
+                    AudioChannel::Master,
+                    1,
+                );
+            }
+            3 => {
+                step_volume_setting(
+                    commands,
+                    options,
+                    cues,
+                    audio_assets,
+                    state,
+                    AudioChannel::Music,
+                    1,
+                );
+            }
+            4 => {
+                step_volume_setting(
+                    commands,
+                    options,
+                    cues,
+                    audio_assets,
+                    state,
+                    AudioChannel::Sfx,
+                    1,
+                );
+            }
+            5 => {
+                step_volume_setting(
+                    commands,
+                    options,
+                    cues,
+                    audio_assets,
+                    state,
+                    AudioChannel::Ui,
+                    1,
+                );
+            }
+            6 => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
             }
             _ => {}
@@ -3034,11 +3192,13 @@ pub fn sync_ui(
         .map(|w| Vec2::new(w.width(), w.height()))
         .unwrap_or(Vec2::new(1280.0, 720.0));
     let resized = (win_size - state.last_window_size).length_squared() > 1.0;
-    if !state.ui_dirty && !resized && !existing.is_empty() {
+    let ui_scale_changed = (settings.ui_scale - state.last_ui_scale).abs() > 1e-4;
+    if !state.ui_dirty && !resized && !ui_scale_changed && !existing.is_empty() {
         return;
     }
     state.ui_dirty = false;
     state.last_window_size = win_size;
+    state.last_ui_scale = settings.ui_scale;
     decals.init_assets(&mut images);
     if state.screen == GarageScreen::Paint
         && state.paint_tab == PaintTab::Decals
@@ -3099,9 +3259,8 @@ pub fn sync_ui(
     // Load retail ACVD CCM fonts & chrome sprites once (shared with Assemble & Pause menus).
     assemble_assets.ensure_loaded(&garage.disc, &mut images);
     let kit = assemble_assets.kit.clone();
-    let scale = (win_size.x / 1280.0)
-        .min(win_size.y / 720.0)
-        .clamp(0.65, 2.0);
+    let scale = ((win_size.x / 1280.0).min(win_size.y / 720.0) * settings.ui_scale)
+        .clamp(0.55, 2.2);
 
     let bg_row = Color::srgba(0.09, 0.12, 0.16, 0.65);
     let bg_sel = Color::srgba(0.88, 0.58, 0.14, 0.92);
@@ -4940,10 +5099,10 @@ fn spawn_garage_options_menu(
             position_type: PositionType::Absolute,
             left: px((20.0 * scale).round()),
             top: px((64.0 * scale).round()),
-            width: px((336.0 * scale).round()),
+            width: px((372.0 * scale).round()),
             padding: UiRect::all(px(pad)),
             flex_direction: FlexDirection::Column,
-            row_gap: px((8.0 * scale).round()),
+            row_gap: px((7.0 * scale).round()),
             ..default()
         },
         scale,
@@ -4956,13 +5115,22 @@ fn spawn_garage_options_menu(
             Node {
                 width: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                row_gap: px((6.0 * scale).round()),
+                row_gap: px((5.0 * scale).round()),
                 margin: UiRect::vertical(px((2.0 * scale).round())),
                 ..default()
             },
             ChildOf(panel),
         ))
         .id();
+
+    kit.spawn_text(
+        commands,
+        list,
+        FontRole::Small,
+        "DISPLAY",
+        scale * 0.9,
+        palette::TEXT_MUTED,
+    );
 
     // Row 0: Fullscreen toggle
     let fs_tag = if settings.fullscreen { "ON" } else { "OFF" };
@@ -4976,106 +5144,68 @@ fn spawn_garage_options_menu(
         .entity(fs_btn)
         .insert((Button, UiAction::ToggleFullscreen));
 
-    // Row 1: Master Volume header + ACVD gauge + -5% / +5% stepper buttons
-    let vol_tag = format!("{}%", settings.volume_percent());
-    let vol_state = if cursor == 1 {
-        ButtonState::Selected
-    } else {
-        ButtonState::Normal
-    };
-    let vol_btn = kit.spawn_button(
+    // Row 1: UI Scale slider (75% - 150%, I marker at 100%)
+    let ui_scale_txt = format!("{}%", settings.ui_scale_percent());
+    let ui_slider = kit.spawn_slider_row(
         commands,
         list,
-        "MASTER VOLUME",
-        Some(&vol_tag),
-        vol_state,
+        "UI SCALE",
+        &ui_scale_txt,
+        settings.ui_scale_fill(),
+        Some(GameSettings::ui_scale_default_mark()),
+        cursor == 1,
+        104.0,
         scale,
     );
-    commands.entity(vol_btn).insert((Button, UiRow(1)));
+    commands
+        .entity(ui_slider.row)
+        .insert((Button, UiAction::SelectOptionRow(1)));
+    commands
+        .entity(ui_slider.dec_btn)
+        .insert((Button, UiAction::UiScaleStep(-1)));
+    commands
+        .entity(ui_slider.inc_btn)
+        .insert((Button, UiAction::UiScaleStep(1)));
 
-    let vol_card = kit.spawn_panel(
+    kit.spawn_trace(commands, list, TraceStyle::Simple, scale);
+
+    kit.spawn_text(
         commands,
-        Some(list),
-        PanelStyle::Subtle,
-        Node {
-            width: Val::Percent(100.0),
-            padding: UiRect::axes(px((10.0 * scale).round()), px((8.0 * scale).round())),
-            flex_direction: FlexDirection::Column,
-            row_gap: px((8.0 * scale).round()),
-            ..default()
-        },
-        scale,
-    );
-    kit.spawn_gauge(
-        commands,
-        vol_card,
-        "LEVEL",
-        settings.volume,
-        None,
-        false,
-        scale,
+        list,
+        FontRole::Small,
+        "SOUND SETTINGS",
+        scale * 0.9,
+        palette::TEXT_MUTED,
     );
 
-    let step_row = commands
-        .spawn((
-            Node {
-                width: Val::Percent(100.0),
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::SpaceBetween,
-                column_gap: px((8.0 * scale).round()),
-                ..default()
-            },
-            ChildOf(vol_card),
-        ))
-        .id();
-
-    for (delta, label, dir) in [(-1i8, "-5%", ArrowDir::Left), (1i8, "+5%", ArrowDir::Right)] {
-        let step_btn = kit.spawn_panel(
+    for &(row_idx, channel) in &GARAGE_OPTION_CHANNELS {
+        let pct_txt = format!("{}%", settings.channel_percent(channel));
+        let slider = kit.spawn_slider_row(
             commands,
-            Some(step_row),
-            PanelStyle::Framed,
-            Node {
-                flex_grow: 1.0,
-                padding: UiRect::axes(px((10.0 * scale).round()), px((4.0 * scale).round())),
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                column_gap: px((6.0 * scale).round()),
-                ..default()
-            },
+            list,
+            channel.short_label(),
+            &pct_txt,
+            settings.channel_volume(channel),
+            None,
+            cursor == row_idx,
+            104.0,
             scale,
         );
         commands
-            .entity(step_btn)
-            .insert((Button, UiAction::VolumeStep(delta)));
-        if dir == ArrowDir::Left {
-            kit.spawn_arrow(commands, step_btn, dir, scale, palette::TEXT_PRIMARY);
-            kit.spawn_text(
-                commands,
-                step_btn,
-                FontRole::Small,
-                label,
-                scale,
-                palette::TEXT_PRIMARY,
-            );
-        } else {
-            kit.spawn_text(
-                commands,
-                step_btn,
-                FontRole::Small,
-                label,
-                scale,
-                palette::TEXT_PRIMARY,
-            );
-            kit.spawn_arrow(commands, step_btn, dir, scale, palette::TEXT_PRIMARY);
-        }
+            .entity(slider.row)
+            .insert((Button, UiAction::SelectOptionRow(row_idx)));
+        commands
+            .entity(slider.dec_btn)
+            .insert((Button, UiAction::VolumeStep(channel, -1)));
+        commands
+            .entity(slider.inc_btn)
+            .insert((Button, UiAction::VolumeStep(channel, 1)));
     }
 
     kit.spawn_trace(commands, list, TraceStyle::Simple, scale);
 
-    // Row 2: Back to Garage Top
-    let back_state = if cursor == 2 {
+    // Row 6: Back to Garage Top
+    let back_state = if cursor == 6 {
         ButtonState::Selected
     } else {
         ButtonState::Normal

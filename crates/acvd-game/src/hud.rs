@@ -141,7 +141,9 @@ pub struct Sortie {
     layout: Layout,
     /// Window size the HUD was last laid out for.
     size: Vec2,
-    /// Current layout scale factor (`min(size / SCREEN)`).
+    /// UI scale multiplier (`GameSettings::ui_scale`) the HUD was last laid out for.
+    ui_scale: f32,
+    /// Current layout scale factor (`min(size / SCREEN) * ui_scale`).
     scale: f32,
     /// Gauge show scale (`0x829d0b30` this+0x3f0), 0 when the lock sight appears.
     show: f32,
@@ -164,6 +166,7 @@ pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
     Ok(Sortie {
         layout: menu::load(disc, LAYOUT, images)?,
         size: Vec2::ZERO,
+        ui_scale: 1.0,
         scale: 1.0,
         show: 0.0,
         low: [0.0; 5],
@@ -375,6 +378,7 @@ fn ap_damage_color() -> Color {
 pub fn layout(
     mut commands: Commands,
     hud: Option<ResMut<Sortie>>,
+    settings: Option<Res<crate::settings::GameSettings>>,
     window: Query<&Window, With<PrimaryWindow>>,
     roots: Query<Entity, With<MenuRoot>>,
 ) {
@@ -382,17 +386,51 @@ pub fn layout(
         return;
     };
     let size = window.size();
-    if size == hud.size || size.min_element() <= 0.0 {
+    let ui_scale = settings
+        .as_ref()
+        .map(|s| {
+            s.ui_scale
+                .clamp(crate::settings::UI_SCALE_MIN, crate::settings::UI_SCALE_MAX)
+        })
+        .unwrap_or(1.0);
+    if (size == hud.size && (ui_scale - hud.ui_scale).abs() < 1e-4) || size.min_element() <= 0.0 {
         return;
     }
+    let only_ui_scale = size == hud.size && hud.size != Vec2::ZERO;
     hud.size = size;
-    hud.show = 0.0;
+    hud.ui_scale = ui_scale;
+    if !only_ui_scale {
+        hud.show = 0.0;
+    }
     for e in &roots {
         commands.entity(e).despawn();
     }
-    let scale = (size / SCREEN).min_element();
+    let base_scale = (size / SCREEN).min_element();
+    let base_corner = (size - SCREEN * base_scale) / 2.0;
+    let scale = base_scale * ui_scale;
     hud.scale = scale;
     let corner = (size - SCREEN * scale) / 2.0;
+    // Anchor edge-placed 1280x720 HUD panels relative to their nearest screen edge so
+    // scaling above 100% grows inward instead of clipping off-screen (100% is exact).
+    let anchor_origin = |rect: [i16; 4]| -> Vec2 {
+        let l = rect[0].min(rect[2]) as f32;
+        let t = rect[1].min(rect[3]) as f32;
+        let r = rect[0].max(rect[2]) as f32;
+        let b = rect[1].max(rect[3]) as f32;
+        let w = (r - l) * scale;
+        let h = (b - t) * scale;
+        let x = if (l + r) * 0.5 < SCREEN.x * 0.5 {
+            base_corner.x + l * base_scale
+        } else {
+            base_corner.x + SCREEN.x * base_scale - (SCREEN.x - r) * base_scale - w
+        };
+        let y = if (t + b) * 0.5 < SCREEN.y * 0.5 {
+            base_corner.y + t * base_scale
+        } else {
+            base_corner.y + SCREEN.y * base_scale - (SCREEN.y - b) * base_scale - h
+        };
+        Vec2::new(x, y)
+    };
     let dialog = |name: &str| hud.layout.drb.dialogs.iter().position(|d| d.name == name);
     for (name, centered) in DIALOGS {
         let Some(index) = dialog(name) else {
@@ -493,8 +531,7 @@ pub fn layout(
             continue;
         };
         let rect = o.shape.rect();
-        let origin =
-            corner + Vec2::new(rect[0].min(rect[2]) as f32, rect[1].min(rect[3]) as f32) * scale;
+        let origin = anchor_origin(rect);
         let root = menu::spawn(&mut commands, &hud.layout, weapon, origin, scale);
         commands.entity(root).insert(Panel(hand));
     }
@@ -508,8 +545,7 @@ pub fn layout(
         dialog("FE_EspialMachineInfo"),
     ) {
         let rect = anchor.shape.rect();
-        let origin =
-            corner + Vec2::new(rect[0].min(rect[2]) as f32, rect[1].min(rect[3]) as f32) * scale;
+        let origin = anchor_origin(rect);
         let root = menu::spawn(&mut commands, &hud.layout, dlg, origin, scale);
         commands
             .entity(root)
@@ -523,8 +559,7 @@ pub fn layout(
         dialog("FE_ReconRaderMode"),
     ) {
         let rect = anchor.shape.rect();
-        let origin =
-            corner + Vec2::new(rect[0].min(rect[2]) as f32, rect[1].min(rect[3]) as f32) * scale;
+        let origin = anchor_origin(rect);
         let root = menu::spawn(&mut commands, &hud.layout, dlg, origin, scale);
         commands
             .entity(root)
@@ -540,8 +575,7 @@ pub fn layout(
         dialog("ErrorLog_Stagger"),
     ) {
         let rect = anchor.shape.rect();
-        let origin =
-            corner + Vec2::new(rect[0].min(rect[2]) as f32, rect[1].min(rect[3]) as f32) * scale;
+        let origin = anchor_origin(rect);
         let root = menu::spawn(&mut commands, &hud.layout, dlg, origin, scale);
         commands
             .entity(root)

@@ -210,6 +210,15 @@ pub struct StatDelta<'a> {
     pub cmp: i8,
 }
 
+/// Entities returned by [`AcvdUiKit::spawn_slider_row`] so callers can attach their own
+/// click-action components to the row itself and its `<` / `>` stepper buttons.
+#[derive(Debug, Clone, Copy)]
+pub struct SliderRowEntities {
+    pub row: Entity,
+    pub dec_btn: Entity,
+    pub inc_btn: Entity,
+}
+
 /// Loaded retail ACVD UI kit: CCM bitmap fonts + reusable DRB chrome sprites.
 ///
 /// Insert once as a Bevy [`Resource`] via [`AcvdUiKit::load`] or [`AcvdUiKit::from_layout`].
@@ -1083,6 +1092,280 @@ impl AcvdUiKit {
         }
 
         row
+    }
+
+    /// Spawns a compact ACVD interactive slider bar row with a focus indicator, label,
+    /// `<` / `>` disc arrow steppers, metallic gauge track (with optional `I` default marker),
+    /// and right-aligned value readout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_slider_row(
+        &self,
+        commands: &mut Commands,
+        parent: Entity,
+        label: &str,
+        value_text: &str,
+        fill: f32,
+        recommend_mark: Option<f32>,
+        selected: bool,
+        label_width: f32,
+        scale: f32,
+    ) -> SliderRowEntities {
+        let bw = (1.0 * scale).max(1.0);
+        let (top_c, bot_c, border_c, fg_c) = if selected {
+            (
+                palette::ACCENT_AMBER_FILL_TOP,
+                palette::ACCENT_AMBER_FILL_BOT,
+                palette::ACCENT_AMBER,
+                palette::TEXT_BRIGHT,
+            )
+        } else {
+            (
+                palette::BG_BUTTON_TOP,
+                palette::BG_BUTTON_BOT,
+                palette::BORDER_BUTTON,
+                palette::TEXT_PRIMARY,
+            )
+        };
+
+        let row = commands
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    min_height: px((32.0 * scale).round()),
+                    padding: UiRect::axes(px((10.0 * scale).round()), px((5.0 * scale).round())),
+                    border: UiRect::all(px(bw)),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::SpaceBetween,
+                    column_gap: px((8.0 * scale).round()),
+                    position_type: PositionType::Relative,
+                    ..Default::default()
+                },
+                BackgroundGradient::from(LinearGradient::to_bottom(vec![
+                    ColorStop::auto(top_c),
+                    ColorStop::auto(bot_c),
+                ])),
+                BorderColor::all(border_c),
+                ChildOf(parent),
+            ))
+            .id();
+
+        // Left: focus arrow + label
+        let left = commands
+            .spawn((
+                Node {
+                    width: px((label_width * scale).round()),
+                    flex_shrink: 0.0,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px((5.0 * scale).round()),
+                    ..Default::default()
+                },
+                ChildOf(row),
+            ))
+            .id();
+
+        if selected {
+            if let Some(arrow) = &self.focus_arrow {
+                let s = arrow.size() * (0.58 * scale);
+                arrow.spawn(
+                    commands,
+                    left,
+                    Node {
+                        width: px(s.x.round()),
+                        height: px(s.y.round()),
+                        flex_shrink: 0.0,
+                        ..Default::default()
+                    },
+                    palette::ACCENT_ARROW,
+                    false,
+                    false,
+                    true,
+                );
+            }
+        }
+        self.spawn_text(commands, left, FontRole::Body, label, scale * 0.92, fg_c);
+
+        // Middle: `<` button + gauge track + `>` button
+        let controls = commands
+            .spawn((
+                Node {
+                    flex_grow: 1.0,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px((6.0 * scale).round()),
+                    ..Default::default()
+                },
+                ChildOf(row),
+            ))
+            .id();
+
+        let step_pad_x = (5.0 * scale).round().max(3.0);
+        let step_pad_y = (3.0 * scale).round().max(2.0);
+        let dec_btn = commands
+            .spawn((
+                Node {
+                    padding: UiRect::axes(px(step_pad_x), px(step_pad_y)),
+                    border: UiRect::all(px(bw)),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                },
+                BackgroundColor(palette::BG_BAR),
+                BorderColor::all(if selected {
+                    palette::ACCENT_AMBER
+                } else {
+                    palette::BORDER_SUBTLE
+                }),
+                ChildOf(controls),
+            ))
+            .id();
+        self.spawn_arrow(commands, dec_btn, ArrowDir::Left, scale * 0.82, fg_c);
+
+        let track_h = (10.0 * scale).round().max(6.0);
+        let track = commands
+            .spawn((
+                Node {
+                    flex_grow: 1.0,
+                    height: px(track_h),
+                    border: UiRect::all(px(bw)),
+                    padding: UiRect::all(px((1.0 * scale).round().max(1.0))),
+                    position_type: PositionType::Relative,
+                    align_items: AlignItems::Center,
+                    ..Default::default()
+                },
+                BackgroundColor(palette::BG_BAR),
+                BorderColor::all(if selected {
+                    palette::ACCENT_AMBER
+                } else {
+                    palette::BORDER_SUBTLE
+                }),
+                ChildOf(controls),
+            ))
+            .id();
+
+        let (g_top, g_bot) = if selected {
+            (palette::ACCENT_AMBER, palette::ACCENT_AMBER_FILL_BOT)
+        } else {
+            (palette::GAUGE_TOP, palette::GAUGE_BOT)
+        };
+        commands.spawn((
+            Node {
+                width: Val::Percent(fill.clamp(0.0, 1.0) * 100.0),
+                height: Val::Percent(100.0),
+                ..Default::default()
+            },
+            BackgroundGradient::from(LinearGradient::to_bottom(vec![
+                ColorStop::auto(g_top),
+                ColorStop::auto(g_bot),
+            ])),
+            ChildOf(track),
+        ));
+
+        if let Some(mark) = recommend_mark {
+            let pct = mark.clamp(0.0, 1.0) * 100.0;
+            let bar_w = (2.0 * scale).round().max(1.0);
+            let cap_w = (6.0 * scale).round().max(4.0);
+            let cap_h = (2.0 * scale).round().max(1.0);
+            let marker = commands
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Percent(pct),
+                        top: px(-2.0 * scale),
+                        bottom: px(-2.0 * scale),
+                        width: px(cap_w),
+                        margin: UiRect::left(px(-cap_w * 0.5)),
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::SpaceBetween,
+                        ..Default::default()
+                    },
+                    ChildOf(track),
+                ))
+                .id();
+            commands.spawn((
+                Node {
+                    width: px(cap_w),
+                    height: px(cap_h),
+                    ..Default::default()
+                },
+                BackgroundColor(palette::GAUGE_MARKER),
+                ChildOf(marker),
+            ));
+            commands.spawn((
+                Node {
+                    width: px(bar_w),
+                    flex_grow: 1.0,
+                    ..Default::default()
+                },
+                BackgroundColor(palette::GAUGE_MARKER),
+                ChildOf(marker),
+            ));
+            commands.spawn((
+                Node {
+                    width: px(cap_w),
+                    height: px(cap_h),
+                    ..Default::default()
+                },
+                BackgroundColor(palette::GAUGE_MARKER),
+                ChildOf(marker),
+            ));
+        }
+
+        let inc_btn = commands
+            .spawn((
+                Node {
+                    padding: UiRect::axes(px(step_pad_x), px(step_pad_y)),
+                    border: UiRect::all(px(bw)),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                },
+                BackgroundColor(palette::BG_BAR),
+                BorderColor::all(if selected {
+                    palette::ACCENT_AMBER
+                } else {
+                    palette::BORDER_SUBTLE
+                }),
+                ChildOf(controls),
+            ))
+            .id();
+        self.spawn_arrow(commands, inc_btn, ArrowDir::Right, scale * 0.82, fg_c);
+
+        // Right: fixed-width percentage readout
+        let val_box = commands
+            .spawn((
+                Node {
+                    width: px((48.0 * scale).round()),
+                    flex_shrink: 0.0,
+                    justify_content: JustifyContent::FlexEnd,
+                    align_items: AlignItems::Center,
+                    ..Default::default()
+                },
+                ChildOf(row),
+            ))
+            .id();
+        self.spawn_text(
+            commands,
+            val_box,
+            FontRole::Small,
+            value_text,
+            scale,
+            if selected {
+                palette::TEXT_BRIGHT
+            } else {
+                palette::TEXT_MUTED
+            },
+        );
+
+        SliderRowEntities {
+            row,
+            dec_btn,
+            inc_btn,
+        }
     }
 
     /// Spawns a compact tactical tag/badge (`■ PARTS VIEW`, `ALL TYPES`, `KE`, `CE`, `TE`).

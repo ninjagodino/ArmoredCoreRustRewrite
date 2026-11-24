@@ -34,33 +34,43 @@ const QUICK_BOOST: [&str; 2] = ["b00000007", "b00000008"];
 /// to the glide caller.
 const GLIDE_ON: &str = "b00000006";
 
+/// Audio channel bus attached to spawned cue entities so runtime volume sliders
+/// can re-scale already-playing SFX and UI sounds independently of BGM.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioBus {
+    Sfx,
+    Ui,
+}
+
 /// Projects and the banks a cue has already pulled in.
 #[derive(Resource)]
 pub struct Cues {
     disc: Disc,
-    projects: Vec<fev::Project>,
+    projects: Vec<(fev::Project, AudioBus)>,
     banks: HashMap<String, fsb::Bank>,
     decoded: HashMap<(String, u32), Handle<AudioSource>>,
     missing: HashSet<String>,
+    sfx_volume: f32,
+    ui_volume: f32,
 }
 
 impl Cues {
     fn load(disc: &Disc) -> Self {
         let mut projects = Vec::new();
-        for name in [
-            "acv2_se_weapon.fev",
-            "acv2_se_bombs.fev",
-            "acv2_se_booster.fev",
-            "acv2_se_ac.fev",
-            "acv2_se_enemy.fev",
-            "acv2_se_menu.fev",
-            "acv2_se_garage.fev",
+        for (name, bus) in [
+            ("acv2_se_weapon.fev", AudioBus::Sfx),
+            ("acv2_se_bombs.fev", AudioBus::Sfx),
+            ("acv2_se_booster.fev", AudioBus::Sfx),
+            ("acv2_se_ac.fev", AudioBus::Sfx),
+            ("acv2_se_enemy.fev", AudioBus::Sfx),
+            ("acv2_se_menu.fev", AudioBus::Ui),
+            ("acv2_se_garage.fev", AudioBus::Ui),
         ] {
             match disc
                 .read(&format!("sound/{name}"))
                 .and_then(|b| fev::read(&b))
             {
-                Ok(project) => projects.push(project),
+                Ok(project) => projects.push((project, bus)),
                 Err(err) => eprintln!("sound: {err:#}"),
             }
         }
@@ -70,7 +80,14 @@ impl Cues {
             banks: HashMap::new(),
             decoded: HashMap::new(),
             missing: HashSet::new(),
+            sfx_volume: 1.0,
+            ui_volume: 1.0,
         }
+    }
+
+    pub fn set_bus_volumes(&mut self, sfx: f32, ui: f32) {
+        self.sfx_volume = sfx.clamp(0.0, 1.0);
+        self.ui_volume = ui.clamp(0.0, 1.0);
     }
 
     fn play(
@@ -80,31 +97,40 @@ impl Cues {
         cue: &str,
         looping: bool,
     ) -> Vec<Entity> {
-        let waves: Vec<fev::Wave> = self
+        let found: Option<(Vec<fev::Wave>, AudioBus)> = self
             .projects
             .iter()
-            .find_map(|p| {
+            .find_map(|(p, bus)| {
                 p.event(cue)
-                    .map(|_| p.waves(cue).into_iter().cloned().collect())
-            })
-            .unwrap_or_default();
+                    .map(|_| (p.waves(cue).into_iter().cloned().collect(), *bus))
+            });
+        let Some((waves, bus)) = found else {
+            if self.missing.insert(cue.to_string()) {
+                eprintln!("sound: no cue {cue}");
+            }
+            return Vec::new();
+        };
         if waves.is_empty() {
             if self.missing.insert(cue.to_string()) {
                 eprintln!("sound: no cue {cue}");
             }
             return Vec::new();
         }
+        let bus_vol = match bus {
+            AudioBus::Sfx => self.sfx_volume,
+            AudioBus::Ui => self.ui_volume,
+        };
         let settings = if looping {
-            PlaybackSettings::LOOP
+            PlaybackSettings::LOOP.with_volume(Volume::Linear(bus_vol))
         } else {
-            PlaybackSettings::DESPAWN
+            PlaybackSettings::DESPAWN.with_volume(Volume::Linear(bus_vol))
         };
         let mut spawned = Vec::new();
         for wave in waves {
             let Some(handle) = self.source(assets, &wave) else {
                 continue;
             };
-            spawned.push(commands.spawn((AudioPlayer(handle), settings)).id());
+            spawned.push(commands.spawn((AudioPlayer(handle), settings, bus)).id());
         }
         spawned
     }
@@ -211,7 +237,17 @@ impl Plugin for SoundPlugin {
         };
         app.insert_resource(Cues::load(&self.disc))
             .insert_resource(bgm)
+            .add_systems(Startup, sync_initial_bus_volumes)
             .add_systems(Update, (motion.after(crate::weapons::fire), bgm_update));
+    }
+}
+
+fn sync_initial_bus_volumes(
+    settings: Option<Res<crate::settings::GameSettings>>,
+    mut cues: ResMut<Cues>,
+) {
+    if let Some(s) = settings {
+        cues.set_bus_volumes(s.sfx_volume, s.ui_volume);
     }
 }
 
@@ -332,9 +368,14 @@ fn bgm_update(
     mut bgm: ResMut<BgmState>,
     keys: Res<ButtonInput<KeyCode>>,
     global: Res<GlobalVolume>,
+    settings: Option<Res<crate::settings::GameSettings>>,
     mut sinks: Query<&mut AudioSink, With<BgmPlayer>>,
 ) {
     let master = global.volume.to_linear();
+    let music = settings
+        .as_ref()
+        .map(|s| s.music_volume.clamp(0.0, 1.0))
+        .unwrap_or(1.0);
     if let Some(rx) = bgm.rx.as_ref() {
         let received = rx.lock().ok().and_then(|r| r.try_recv().ok());
         if let Some(wav) = received {
@@ -346,7 +387,7 @@ fn bgm_update(
             let volume = if bgm.muted {
                 Volume::Linear(0.0)
             } else {
-                Volume::Linear(BGM_VOLUME)
+                Volume::Linear(BGM_VOLUME * music)
             };
             commands.spawn((
                 AudioPlayer(handle),
@@ -357,7 +398,7 @@ fn bgm_update(
     }
     if keys.just_pressed(KeyCode::F9) {
         bgm.muted = !bgm.muted;
-        let vol = bgm_playback_volume(bgm.muted, master);
+        let vol = bgm_playback_volume(bgm.muted, master * music);
         for mut sink in &mut sinks {
             sink.set_volume(vol);
         }
@@ -531,7 +572,7 @@ mod tests {
             let waves: Vec<fev::Wave> = cues
                 .projects
                 .iter()
-                .find_map(|p| {
+                .find_map(|(p, _)| {
                     p.event(cue)
                         .map(|_| p.waves(cue).into_iter().cloned().collect())
                 })

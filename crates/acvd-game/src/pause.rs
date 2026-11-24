@@ -8,7 +8,7 @@
 //!   transitioning cleanly back to the 3D Garage with the current AC.
 
 use acvd_render::ui_kit::{
-    palette, AcvdUiKit, ArrowDir, ButtonState, FontRole, PanelStyle, TraceStyle,
+    palette, AcvdUiKit, ButtonState, FontRole, PanelStyle, TraceStyle,
 };
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
 use bevy::ecs::system::SystemParam;
@@ -20,8 +20,8 @@ use bevy::window::CursorGrabMode;
 
 use crate::garage::{Mode, ModeSwitch, CUE_CANCEL, CUE_CATEGORY, CUE_MOVE, CUE_OK};
 use crate::garage_assemble::AssembleUiAssets;
-use crate::settings::{self, GameSettings};
-use crate::sound::{self, BgmPlayer, BgmState, Cues};
+use crate::settings::{self, AudioChannel, GameSettings};
+use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
 
 /// Active page inside the gameplay pause overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,6 +79,7 @@ pub struct PauseState {
     pub cursor: usize,
     pub dirty: bool,
     pub last_window_size: Vec2,
+    pub last_ui_scale: f32,
     pub status_banner: Option<(String, Color)>,
     pub kit: Option<AcvdUiKit>,
 }
@@ -112,7 +113,8 @@ pub enum PauseAction {
     MainItem(PauseItem),
     ToggleFullscreen,
     SelectOptionRow(usize),
-    StepVolume(i8),
+    StepUiScale(i8),
+    StepVolume(AudioChannel, i8),
     BackToMain,
 }
 
@@ -124,6 +126,7 @@ pub struct PauseOptionsCtx<'w, 's> {
     bgm: Res<'w, BgmState>,
     sinks: Query<'w, 's, (Entity, &'static mut AudioSink)>,
     bgm_players: Query<'w, 's, Entity, With<BgmPlayer>>,
+    audio_buses: Query<'w, 's, &'static AudioBus>,
     windows: Query<'w, 's, &'static mut Window, With<bevy::window::PrimaryWindow>>,
 }
 
@@ -134,8 +137,15 @@ pub struct PauseAudioCtx<'w> {
     audio_assets: ResMut<'w, Assets<AudioSource>>,
 }
 
+const OPTION_CHANNELS: [(usize, AudioChannel); 4] = [
+    (2, AudioChannel::Master),
+    (3, AudioChannel::Music),
+    (4, AudioChannel::Sfx),
+    (5, AudioChannel::Ui),
+];
+
 fn option_row_count() -> usize {
-    3 // 0: Fullscreen, 1: Master Volume, 2: Back
+    7 // 0: Fullscreen, 1: UI Scale, 2: Master, 3: Music, 4: SFX, 5: Menu/UI, 6: Back
 }
 
 fn step_cursor(cursor: usize, len: usize, delta: isize) -> usize {
@@ -168,25 +178,49 @@ fn toggle_fullscreen(
     state.dirty = true;
 }
 
-fn step_volume(
+fn step_ui_scale(
     commands: &mut Commands,
     options: &mut PauseOptionsCtx,
     audio: &mut PauseAudioCtx,
     state: &mut PauseState,
     delta: i8,
 ) {
-    options.settings.step_volume(delta);
+    options.settings.step_ui_scale(delta);
+    options.settings.save();
+    sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_MOVE);
+    state.status_banner = Some((
+        format!("UI SCALE: {}%", options.settings.ui_scale_percent()),
+        palette::ACCENT_TEAL,
+    ));
+    state.dirty = true;
+}
+
+fn step_volume(
+    commands: &mut Commands,
+    options: &mut PauseOptionsCtx,
+    audio: &mut PauseAudioCtx,
+    state: &mut PauseState,
+    channel: AudioChannel,
+    delta: i8,
+) {
+    options.settings.step_channel(channel, delta);
     settings::apply_volume(
         &options.settings,
         &options.bgm,
+        &mut audio.cues,
         &mut options.global_volume,
         &mut options.sinks,
         &options.bgm_players,
+        &options.audio_buses,
     );
     options.settings.save();
     sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_MOVE);
     state.status_banner = Some((
-        format!("MASTER VOLUME: {}%", options.settings.volume_percent()),
+        format!(
+            "{}: {}%",
+            channel.label(),
+            options.settings.channel_percent(channel)
+        ),
         palette::ACCENT_TEAL,
     ));
     state.dirty = true;
@@ -302,9 +336,23 @@ pub fn handle_input(
                 }
                 return;
             }
-            PauseAction::StepVolume(delta) => {
+            PauseAction::StepUiScale(delta) => {
                 state.cursor = 1;
-                step_volume(&mut commands, &mut options, &mut audio, &mut state, delta);
+                step_ui_scale(&mut commands, &mut options, &mut audio, &mut state, delta);
+                return;
+            }
+            PauseAction::StepVolume(channel, delta) => {
+                if let Some((row, _)) = OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel) {
+                    state.cursor = *row;
+                }
+                step_volume(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    channel,
+                    delta,
+                );
                 return;
             }
             PauseAction::BackToMain => {
@@ -399,12 +447,42 @@ pub fn handle_input(
     }
 
     if state.screen == PauseScreen::Options && (left || right) {
+        let delta = if right { 1 } else { -1 };
         match state.cursor {
             0 => toggle_fullscreen(&mut commands, &mut options, &mut audio, &mut state),
-            1 => {
-                let delta = if right { 1 } else { -1 };
-                step_volume(&mut commands, &mut options, &mut audio, &mut state, delta);
-            }
+            1 => step_ui_scale(&mut commands, &mut options, &mut audio, &mut state, delta),
+            2 => step_volume(
+                &mut commands,
+                &mut options,
+                &mut audio,
+                &mut state,
+                AudioChannel::Master,
+                delta,
+            ),
+            3 => step_volume(
+                &mut commands,
+                &mut options,
+                &mut audio,
+                &mut state,
+                AudioChannel::Music,
+                delta,
+            ),
+            4 => step_volume(
+                &mut commands,
+                &mut options,
+                &mut audio,
+                &mut state,
+                AudioChannel::Sfx,
+                delta,
+            ),
+            5 => step_volume(
+                &mut commands,
+                &mut options,
+                &mut audio,
+                &mut state,
+                AudioChannel::Ui,
+                delta,
+            ),
             _ => {}
         }
         return;
@@ -425,8 +503,40 @@ pub fn handle_input(
             }
             PauseScreen::Options => match state.cursor {
                 0 => toggle_fullscreen(&mut commands, &mut options, &mut audio, &mut state),
-                1 => step_volume(&mut commands, &mut options, &mut audio, &mut state, 1),
-                2 => {
+                1 => step_ui_scale(&mut commands, &mut options, &mut audio, &mut state, 1),
+                2 => step_volume(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    AudioChannel::Master,
+                    1,
+                ),
+                3 => step_volume(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    AudioChannel::Music,
+                    1,
+                ),
+                4 => step_volume(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    AudioChannel::Sfx,
+                    1,
+                ),
+                5 => step_volume(
+                    &mut commands,
+                    &mut options,
+                    &mut audio,
+                    &mut state,
+                    AudioChannel::Ui,
+                    1,
+                ),
+                6 => {
                     state.screen = PauseScreen::Main;
                     state.cursor = items
                         .iter()
@@ -502,11 +612,13 @@ pub fn sync_ui(
     }
 
     let resized = (win_size - state.last_window_size).length_squared() > 1.0;
-    if !state.dirty && !resized && !existing.is_empty() {
+    let ui_scale_changed = (settings.ui_scale - state.last_ui_scale).abs() > 1e-4;
+    if !state.dirty && !resized && !ui_scale_changed && !existing.is_empty() {
         return;
     }
     state.dirty = false;
     state.last_window_size = win_size;
+    state.last_ui_scale = settings.ui_scale;
 
     for e in &existing {
         commands.entity(e).despawn();
@@ -526,9 +638,8 @@ pub fn sync_ui(
     let fallback_kit = AcvdUiKit::default();
     let kit = state.kit.as_ref().unwrap_or(&fallback_kit);
 
-    let scale = (win_size.x / 1280.0)
-        .min(win_size.y / 720.0)
-        .clamp(0.65, 2.0);
+    let base_scale = (win_size.x / 1280.0).min(win_size.y / 720.0);
+    let scale = (base_scale * settings.ui_scale).clamp(0.55, 2.2);
     let in_test_arena = scene.is_test_arena();
     let mode_tag = if in_test_arena {
         "AC TEST ARENA"
@@ -559,7 +670,7 @@ pub fn sync_ui(
 
     let dialog_w = match state.screen {
         PauseScreen::Main => (460.0 * scale).round(),
-        PauseScreen::Options => (540.0 * scale).round(),
+        PauseScreen::Options => (580.0 * scale).round(),
     };
     let pad = (18.0 * scale).round();
     let gap = (10.0 * scale).round();
@@ -683,13 +794,23 @@ pub fn sync_ui(
                     Node {
                         width: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        row_gap: px((8.0 * scale).round()),
-                        margin: UiRect::vertical(px((4.0 * scale).round())),
+                        row_gap: px((6.0 * scale).round()),
+                        margin: UiRect::vertical(px((2.0 * scale).round())),
                         ..default()
                     },
                     ChildOf(dialog),
                 ))
                 .id();
+
+            // Section 1: Display & UI Scale
+            kit.spawn_text(
+                &mut commands,
+                list,
+                FontRole::Small,
+                "DISPLAY",
+                scale * 0.92,
+                palette::TEXT_MUTED,
+            );
 
             // Row 0: Fullscreen toggle
             let fs_tag = if settings.fullscreen { "ON" } else { "OFF" };
@@ -710,110 +831,69 @@ pub fn sync_ui(
                 .entity(fs_btn)
                 .insert((Button, PauseAction::ToggleFullscreen));
 
-            // Row 1: Master Volume header + ACVD gauge + -5% / +5% stepper buttons
-            let vol_pct = settings.volume_percent();
-            let vol_tag = format!("{vol_pct}%");
-            let vol_state = if state.cursor == 1 {
-                ButtonState::Selected
-            } else {
-                ButtonState::Normal
-            };
-            let vol_btn = kit.spawn_button(
+            // Row 1: UI Scale slider (75% - 150%, with I marker at 100%)
+            let ui_scale_txt = format!("{}%", settings.ui_scale_percent());
+            let ui_slider = kit.spawn_slider_row(
                 &mut commands,
                 list,
-                "MASTER VOLUME",
-                Some(&vol_tag),
-                vol_state,
+                "UI SCALE",
+                &ui_scale_txt,
+                settings.ui_scale_fill(),
+                Some(GameSettings::ui_scale_default_mark()),
+                state.cursor == 1,
+                132.0,
                 scale,
             );
             commands
-                .entity(vol_btn)
+                .entity(ui_slider.row)
                 .insert((Button, PauseAction::SelectOptionRow(1)));
+            commands
+                .entity(ui_slider.dec_btn)
+                .insert((Button, PauseAction::StepUiScale(-1)));
+            commands
+                .entity(ui_slider.inc_btn)
+                .insert((Button, PauseAction::StepUiScale(1)));
 
-            let vol_card = kit.spawn_panel(
+            kit.spawn_trace(&mut commands, list, TraceStyle::Simple, scale);
+
+            // Section 2: Sound Settings (Master, Music, SFX, Menu / UI)
+            kit.spawn_text(
                 &mut commands,
-                Some(list),
-                PanelStyle::Subtle,
-                Node {
-                    width: Val::Percent(100.0),
-                    padding: UiRect::axes(px((10.0 * scale).round()), px((8.0 * scale).round())),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: px((8.0 * scale).round()),
-                    ..default()
-                },
-                scale,
-            );
-            kit.spawn_gauge(
-                &mut commands,
-                vol_card,
-                "LEVEL",
-                settings.volume,
-                None,
-                false,
-                scale,
+                list,
+                FontRole::Small,
+                "SOUND SETTINGS",
+                scale * 0.92,
+                palette::TEXT_MUTED,
             );
 
-            let step_row = commands
-                .spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        justify_content: JustifyContent::SpaceBetween,
-                        column_gap: px((10.0 * scale).round()),
-                        ..default()
-                    },
-                    ChildOf(vol_card),
-                ))
-                .id();
-
-            for (delta, label, dir) in [(-1i8, "-5%", ArrowDir::Left), (1i8, "+5%", ArrowDir::Right)]
-            {
-                let step_btn = kit.spawn_panel(
+            for &(row_idx, channel) in &OPTION_CHANNELS {
+                let pct_txt = format!("{}%", settings.channel_percent(channel));
+                let slider = kit.spawn_slider_row(
                     &mut commands,
-                    Some(step_row),
-                    PanelStyle::Framed,
-                    Node {
-                        flex_grow: 1.0,
-                        padding: UiRect::axes(px((10.0 * scale).round()), px((4.0 * scale).round())),
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        justify_content: JustifyContent::Center,
-                        column_gap: px((6.0 * scale).round()),
-                        ..default()
-                    },
+                    list,
+                    channel.short_label(),
+                    &pct_txt,
+                    settings.channel_volume(channel),
+                    None,
+                    state.cursor == row_idx,
+                    132.0,
                     scale,
                 );
                 commands
-                    .entity(step_btn)
-                    .insert((Button, PauseAction::StepVolume(delta)));
-                if dir == ArrowDir::Left {
-                    kit.spawn_arrow(&mut commands, step_btn, dir, scale, palette::TEXT_PRIMARY);
-                    kit.spawn_text(
-                        &mut commands,
-                        step_btn,
-                        FontRole::Small,
-                        label,
-                        scale,
-                        palette::TEXT_PRIMARY,
-                    );
-                } else {
-                    kit.spawn_text(
-                        &mut commands,
-                        step_btn,
-                        FontRole::Small,
-                        label,
-                        scale,
-                        palette::TEXT_PRIMARY,
-                    );
-                    kit.spawn_arrow(&mut commands, step_btn, dir, scale, palette::TEXT_PRIMARY);
-                }
+                    .entity(slider.row)
+                    .insert((Button, PauseAction::SelectOptionRow(row_idx)));
+                commands
+                    .entity(slider.dec_btn)
+                    .insert((Button, PauseAction::StepVolume(channel, -1)));
+                commands
+                    .entity(slider.inc_btn)
+                    .insert((Button, PauseAction::StepVolume(channel, 1)));
             }
 
             kit.spawn_trace(&mut commands, list, TraceStyle::Simple, scale);
 
-            // Row 2: Back to Pause Main
-            let back_state = if state.cursor == 2 {
+            // Row 6: Back to Pause Main
+            let back_state = if state.cursor == 6 {
                 ButtonState::Selected
             } else {
                 ButtonState::Normal
