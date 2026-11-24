@@ -5405,6 +5405,109 @@ impl WeaponAnims {
             .chain(self.recoil_bones.iter().map(|b| b.entity))
     }
 
+    pub(crate) fn trigger_kick(&mut self, hand: Hand, sniper: bool) {
+        self.kick(hand, sniper);
+    }
+
+    pub(crate) fn update_sniper(
+        &mut self,
+        want: Option<Hand>,
+        motion: &mut Motion,
+        disc: &Disc,
+        pilot: &mut Pilot,
+    ) {
+        self.sniper.update(want, motion, disc, pilot);
+    }
+
+    pub(crate) fn sniper_allows(&self, hand: Hand) -> bool {
+        self.sniper.allows(hand)
+    }
+
+    /// Steps hand weapon, shoulder pod (`am*_a`), weapon-arm, and recoil animations during
+    /// Garage View Mode action testing (`360 0x825cdf88` / `0x825cdd00`).
+    pub(crate) fn step_garage_view(
+        &mut self,
+        want_hand: [bool; 2],
+        fire_hand: [bool; 2],
+        want_shoulder: bool,
+        weapon_arm: bool,
+        frames: f32,
+        posed: &mut Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
+    ) {
+        if weapon_arm {
+            if let Some(wa) = self.weapon_arm.as_mut() {
+                let want = want_hand[0] || want_hand[1];
+                let fired = fire_hand[0] || fire_hand[1];
+                wa.tick(want, want, fired, frames);
+                wa.apply(posed);
+            }
+            self.apply_recoil(frames, posed);
+            return;
+        }
+        for (i, hand) in [Hand::Right, Hand::Left].into_iter().enumerate() {
+            let deploy = if let Some(rig) = self
+                .rigs
+                .iter_mut()
+                .find(|r| r.hand == hand && !r.bay && !r.retired)
+            {
+                rig.playback.tick(want_hand[i], fire_hand[i], frames);
+                rig.apply(posed);
+                rig.playback.deploys()
+            } else {
+                false
+            };
+            if let Some(arm) = self.arms.iter_mut().find(|r| r.hand == hand) {
+                arm.playback.tick(want_shoulder || deploy, false, frames);
+                arm.apply(posed);
+            }
+        }
+        self.apply_recoil(frames, posed);
+    }
+
+    /// Resets all weapon, shoulder-pod, weapon-arm, and recoil animations back to their stowed
+    /// rest pose (used when pressing Idle or leaving Garage View Mode).
+    pub(crate) fn reset_garage_view(
+        &mut self,
+        posed: &mut Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
+    ) {
+        for rig in &mut self.rigs {
+            rig.playback.phase = Phase::Stowed;
+            rig.playback.role = 0;
+            rig.playback.frame = 0.0;
+            rig.apply(posed);
+        }
+        for arm in &mut self.arms {
+            arm.playback.phase = Phase::Stowed;
+            arm.playback.role = 0;
+            arm.playback.frame = 0.0;
+            arm.apply(posed);
+        }
+        if let Some(wa) = self.weapon_arm.as_mut() {
+            wa.phase = WeaponArmPhase::Stowed;
+            wa.frame = 0.0;
+            wa.apply(posed);
+        }
+        for aim in &mut self.aim {
+            aim.hold = 0.0;
+            aim.weight = 0.0;
+            aim.frame = None;
+        }
+        for bone in &mut self.recoil_bones {
+            bone.kick.clock = None;
+            bone.kick.ramping = false;
+            bone.kick.shown = 0.0;
+            bone.kick.from = 0.0;
+            bone.kick.progress = 1.0;
+            if let Ok((mut tf, _)) = posed.get_mut(bone.entity) {
+                if bone.written == Some(tf.rotation) {
+                    tf.rotation = bone.base;
+                }
+            }
+            bone.written = None;
+        }
+        self.sniper = SniperStance::default();
+    }
+
     /// Stowed pose, applied once at spawn so the first frame is not the bind pose.
     pub fn rest_pose(&self) -> Vec<(Entity, Transform)> {
         self.rigs

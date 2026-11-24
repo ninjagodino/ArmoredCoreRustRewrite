@@ -175,42 +175,20 @@ pub(crate) struct Edges {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn shift(
-    press: Press,
-    piloting: Res<Piloting>,
-    garage: Res<Garage>,
-    mut commands: Commands,
-    active: Option<ResMut<Shift>>,
-    mut loadout: Option<ResMut<Loadout>>,
-    mut acs: Query<(&mut Pilot, &mut Armament)>,
-    mut anims: Option<ResMut<WeaponAnims>>,
-    mut hanger: Option<ResMut<HangerPose>>,
-    mut points: Query<&mut EffectPoint>,
-    hardpoints: Query<(Entity, &Hardpoint)>,
-    meshes: Query<(Entity, &WeaponMesh)>,
-    mut motion: Option<ResMut<Motion>>,
-    time: Res<Time>,
-    mut edges: Local<Edges>,
+pub(crate) fn step_active_shifts(
+    commands: &mut Commands,
+    shift: &mut Shift,
+    loadout: &mut Loadout,
+    arms: &mut Armament,
+    mut anims: Option<&mut WeaponAnims>,
+    mut hanger: Option<&mut HangerPose>,
+    points: &mut Query<&mut EffectPoint>,
+    hardpoints: &Query<(Entity, &Hardpoint)>,
+    meshes: &Query<(Entity, &WeaponMesh)>,
+    mut motion: Option<&mut Motion>,
+    dt_secs: f32,
 ) {
-    if !piloting.0 {
-        return;
-    }
-    let Some(loadout) = loadout.as_mut() else {
-        return;
-    };
-    let Ok((pilot, mut arms)) = acs.single_mut() else {
-        return;
-    };
-    if arms.weapon_arm {
-        return;
-    }
-    let Some(mut shift) = active else {
-        commands.insert_resource(Shift::default());
-        return;
-    };
-
-    // 1. Advance any active per-hand shifts and handle TAE Reattach / Purge events.
-    let dt_frames = time.delta_secs().min(0.1) * 60.0;
+    let dt_frames = dt_secs.min(0.1) * 60.0;
     let tae_events: Vec<TaeFired> = motion
         .as_ref()
         .map(|m| m.tae_events.clone())
@@ -250,13 +228,13 @@ pub(crate) fn shift(
             hs.swapped = true;
             if hs.purge {
                 exchange(
-                    &mut commands,
+                    commands,
                     loadout,
-                    &mut arms,
+                    arms,
                     anims.as_deref_mut(),
-                    &mut points,
-                    &hardpoints,
-                    &meshes,
+                    points,
+                    hardpoints,
+                    meshes,
                     hs.hand,
                     true,
                 );
@@ -275,10 +253,10 @@ pub(crate) fn shift(
             grab(
                 commands.reborrow(),
                 loadout,
-                &mut arms,
+                arms,
                 anims.as_deref_mut(),
-                &mut points,
-                &hardpoints,
+                points,
+                hardpoints,
                 &hs,
             );
         }
@@ -286,7 +264,7 @@ pub(crate) fn shift(
         let arm_done = motion.as_ref().is_none_or(|m| m.arm_finished(side));
         let rack_done = hs.purge || hs.rack_frame >= RACK_FRAMES;
         if hs.grabbed && arm_done {
-            if let Some(m) = motion.as_mut() {
+            if let Some(m) = motion.as_deref_mut() {
                 if m.arm_layers[side].is_some() {
                     m.clear_arm(side, 0.15);
                 }
@@ -301,6 +279,151 @@ pub(crate) fn shift(
             shift.hands[side] = Some(hs);
         }
     }
+}
+
+/// Starts a bay shift (or purge when `allow_purge` is true and the hand weapon has `stance`) on
+/// `hand`. Returns `true` if a shift was started.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_start_shift(
+    hand: Hand,
+    allow_purge: bool,
+    garage: &Garage,
+    commands: &mut Commands,
+    shift: &mut Shift,
+    loadout: &mut Loadout,
+    pilot: &Pilot,
+    arms: &mut Armament,
+    anims: Option<&mut WeaponAnims>,
+    points: &mut Query<&mut EffectPoint>,
+    hardpoints: &Query<(Entity, &Hardpoint)>,
+    meshes: &Query<(Entity, &WeaponMesh)>,
+    motion: Option<&mut Motion>,
+) -> bool {
+    let i = hand as usize;
+    if arms.weapon_arm || shift.hands[i].is_some() {
+        return false;
+    }
+    if arms.bays[i].kind == Kind::Skip && arms.hands[i].kind == Kind::Skip {
+        return false;
+    }
+    // Nothing on the rack to bring forward.
+    if loadout.slots[index(hand, true)]
+        .as_ref()
+        .is_none_or(|m| m.weapon.is_none())
+    {
+        return false;
+    }
+    let purge = arms.hands[i].stance;
+    if purge && !allow_purge {
+        return false;
+    }
+    let (state, swap_at) = match (hand, purge) {
+        (Hand::Right, false) => ("bay_shift_r", SEAT_FRAME),
+        (Hand::Left, false) => ("bay_shift_l", SEAT_FRAME),
+        (Hand::Right, true) => ("bay_purge_r", PURGE_FRAME),
+        (Hand::Left, true) => ("bay_purge_l", PURGE_FRAME),
+    };
+    let phase = shift.phase[i];
+    let tae_id = tae_id_for(hand, phase, purge);
+    let racked = loadout.slots[index(hand, true)]
+        .as_ref()
+        .and_then(|m| m.weapon);
+    let incoming_pose = loadout.slots[index(hand, false)]
+        .as_ref()
+        .map(|m| m.hanger_pose)
+        .unwrap_or(0);
+    let mut grab_at = if purge { swap_at } else { GRAB_FRAME };
+    let played = motion.is_some_and(|motion| {
+        let Some(row) = ac_state(state, None).and_then(|s| find(PARAM_ACMOTION_BIN, s.row)) else {
+            return false;
+        };
+        let ok = motion
+            .play_arm(
+                &garage.disc,
+                i,
+                row.data.anim_id,
+                tae_id,
+                1.0,
+                pilot.fade(row.data.interpolate_id),
+            )
+            .is_ok();
+        if ok && !purge {
+            if let Some(ref arm) = motion.arm_layers[i] {
+                grab_at = (arm.clip.frames as f32).min(GRAB_FRAME).max(swap_at);
+            }
+        }
+        ok
+    });
+    if !played {
+        exchange(
+            commands, loadout, arms, anims, points, hardpoints, meshes, hand, purge,
+        );
+        return true;
+    }
+    shift.hands[i] = Some(HandShift {
+        hand,
+        purge,
+        phase,
+        swap_at,
+        grab_at,
+        swapped: false,
+        grabbed: false,
+        rack_frame: 0.0,
+        racked,
+        incoming_pose,
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shift(
+    press: Press,
+    piloting: Res<Piloting>,
+    garage: Res<Garage>,
+    mut commands: Commands,
+    active: Option<ResMut<Shift>>,
+    mut loadout: Option<ResMut<Loadout>>,
+    mut acs: Query<(&mut Pilot, &mut Armament)>,
+    mut anims: Option<ResMut<WeaponAnims>>,
+    mut hanger: Option<ResMut<HangerPose>>,
+    mut points: Query<&mut EffectPoint>,
+    hardpoints: Query<(Entity, &Hardpoint)>,
+    meshes: Query<(Entity, &WeaponMesh)>,
+    mut motion: Option<ResMut<Motion>>,
+    time: Res<Time>,
+    mut edges: Local<Edges>,
+) {
+    if !piloting.0 {
+        return;
+    }
+    let Some(loadout) = loadout.as_mut() else {
+        return;
+    };
+    let Ok((pilot, mut arms)) = acs.single_mut() else {
+        return;
+    };
+    if arms.weapon_arm {
+        return;
+    }
+    let Some(mut shift) = active else {
+        commands.insert_resource(Shift::default());
+        return;
+    };
+
+    // 1. Advance any active per-hand shifts and handle TAE Reattach / Purge events.
+    step_active_shifts(
+        &mut commands,
+        &mut shift,
+        loadout,
+        &mut arms,
+        anims.as_deref_mut(),
+        hanger.as_deref_mut(),
+        &mut points,
+        &hardpoints,
+        &meshes,
+        motion.as_deref_mut(),
+        time.delta_secs(),
+    );
 
     // 2. Check for new bay shift / purge input on any idle hand.
     if !press.modifier() {
@@ -321,85 +444,21 @@ pub(crate) fn shift(
         if !edge {
             continue;
         }
-        let i = hand as usize;
-        if shift.hands[i].is_some() {
-            continue;
-        }
-        if arms.bays[i].kind == Kind::Skip && arms.hands[i].kind == Kind::Skip {
-            continue;
-        }
-        // Nothing on the rack to bring forward.
-        if loadout.slots[index(hand, true)]
-            .as_ref()
-            .is_none_or(|m| m.weapon.is_none())
-        {
-            continue;
-        }
-        let purge = arms.hands[i].stance;
-        let (state, swap_at) = match (hand, purge) {
-            (Hand::Right, false) => ("bay_shift_r", SEAT_FRAME),
-            (Hand::Left, false) => ("bay_shift_l", SEAT_FRAME),
-            (Hand::Right, true) => ("bay_purge_r", PURGE_FRAME),
-            (Hand::Left, true) => ("bay_purge_l", PURGE_FRAME),
-        };
-        let phase = shift.phase[i];
-        let tae_id = tae_id_for(hand, phase, purge);
-        let racked = loadout.slots[index(hand, true)]
-            .as_ref()
-            .and_then(|m| m.weapon);
-        let incoming_pose = loadout.slots[index(hand, false)]
-            .as_ref()
-            .map(|m| m.hanger_pose)
-            .unwrap_or(0);
-        let mut grab_at = if purge { swap_at } else { GRAB_FRAME };
-        let played = motion.as_mut().is_some_and(|motion| {
-            let Some(row) = ac_state(state, None).and_then(|s| find(PARAM_ACMOTION_BIN, s.row))
-            else {
-                return false;
-            };
-            let ok = motion
-                .play_arm(
-                    &garage.disc,
-                    i,
-                    row.data.anim_id,
-                    tae_id,
-                    1.0,
-                    pilot.fade(row.data.interpolate_id),
-                )
-                .is_ok();
-            if ok && !purge {
-                if let Some(ref arm) = motion.arm_layers[i] {
-                    grab_at = (arm.clip.frames as f32).min(GRAB_FRAME).max(swap_at);
-                }
-            }
-            ok
-        });
-        if !played {
-            exchange(
-                &mut commands,
-                loadout,
-                &mut arms,
-                anims.as_deref_mut(),
-                &mut points,
-                &hardpoints,
-                &meshes,
-                hand,
-                purge,
-            );
-            continue;
-        }
-        shift.hands[i] = Some(HandShift {
+        try_start_shift(
             hand,
-            purge,
-            phase,
-            swap_at,
-            grab_at,
-            swapped: false,
-            grabbed: false,
-            rack_frame: 0.0,
-            racked,
-            incoming_pose,
-        });
+            true,
+            &garage,
+            &mut commands,
+            &mut shift,
+            loadout,
+            &pilot,
+            &mut arms,
+            anims.as_deref_mut(),
+            &mut points,
+            &hardpoints,
+            &meshes,
+            motion.as_deref_mut(),
+        );
     }
 }
 

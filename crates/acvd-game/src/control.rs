@@ -1132,6 +1132,12 @@ impl Pilot {
         (self.state, self.hokan_base)
     }
 
+    /// Overrides the reported locomotion state (used by Garage View Mode action tests so
+    /// `boost::pose` opens/stows the booster nozzles from `acmotion.BoosterAnimID`).
+    pub(crate) fn set_pose_state(&mut self, state: Option<(&'static str, Option<u8>)>) {
+        self.state = state;
+    }
+
     /// Whether a High Boost / Boost Charge (`HighBoostState`, `0x8200d378`) is active.
     pub fn in_quick_boost(&self) -> bool {
         self.qb.is_some()

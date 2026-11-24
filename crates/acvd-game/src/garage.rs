@@ -22,14 +22,14 @@
 use std::collections::BTreeSet;
 use std::f32::consts::PI;
 
-use acvd_data::generated::ac_unit::AcAssemblyDesignSt;
+use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::assembly::AC_PARTS;
 use acvd_data::generated::ctrl::AcCtrlParam;
 use acvd_data::generated::menu::{AcsisDisplaySt, PARAM_ACSISDISPLAY_BIN};
 use acvd_data::generated::progression::{CustomGarageSt, PARAM_CUSTOMGARAGE_BIN};
 #[cfg(test)]
 use acvd_data::generated::render::PARAM_GARAGELIGHTING_BIN;
-use acvd_data::{ac_part, find};
+use acvd_data::{ac_part, ac_state, find};
 use acvd_formats::accolor::{
     AcColor, CH_AID, CH_AID2, CH_BASE, CH_JOINT, CH_KOJIMA, CH_OPTIONAL, GROUP_COUNT,
 };
@@ -48,13 +48,21 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient};
 
+use crate::bay::{self, Loadout, WeaponMesh};
+use crate::control::Pilot;
 use crate::decal::{self, DecalLibraryTab, DecalState, DECAL_TINTS};
 use crate::env;
+use crate::hanger::HangerPose;
 use crate::paint;
+use crate::pose::{Driven, Motion};
 use crate::settings::{
     self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab, ShadowDistance,
 };
+use crate::sfx::{EffectPoint, Sfx};
 use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
+use crate::weapons::{
+    Armament, ClipJoint, Hand, Hardpoint, Kind, Shift, ShoulderHardpoint, WeaponAnims,
+};
 
 /// Default ACVD garage workshop row ID in `param/customgarage.bin` (`id: 5` = Underpass `menu1000`).
 pub const DEFAULT_GARAGE_ID: u32 = 5;
@@ -179,7 +187,126 @@ pub enum UiAction {
     DisplayParamStep(DisplayParam, i8),
     ShadowDistanceStep(i8),
     VolumeStep(AudioChannel, i8),
+    ViewAction(GarageViewAction),
+    ToggleViewUi,
     QuitToDesktop,
+}
+
+/// Action animations testable in Garage View Mode (`360 0x825bb670` -> `0x825cef60`, actions `0..=7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GarageViewAction {
+    /// Action 0 (`0x825cef60(0)` -> `0x8284af28`): return to `idle` and stow weapons/boosters.
+    Idle,
+    /// Action 1 (`0x825bb670` `0x8000` -> `0x82883648` row 9): forward walk (`3.0 s`, `0x836fc288`).
+    Walk,
+    /// Action 2 (`0x825bb670` `0x4000` -> `0x82883870` row 17): forward boost dash (`3.0 s`, `0x836fc288`).
+    Boost,
+    /// Action 3 (`0x825bb670` `0x100` -> `0x825cdf88(1)`): Right Arm Unit action (fire / ready / blade / weapon arm).
+    RightArm,
+    /// Action 4 (`0x825bb670` `0x200` -> `0x825cdf88(2)`): Left Arm Unit action (fire / ready / blade / weapon arm).
+    LeftArm,
+    /// Action 5 (`0x825bb670` `0x1000` -> `0x825cd198(1)`): Right Bay Shift (`bay_shift_r`, 150f + rack spin + swap).
+    RightBayShift,
+    /// Action 6 (`0x825bb670` `0x2000` -> `0x825cd198(2)`): Left Bay Shift (`bay_shift_l`, 150f + rack spin + swap).
+    LeftBayShift,
+    /// Action 7 (`0x825bb670` `0x80` -> `0x825cdf88(0)`): Shoulder Unit deploy/fire (`am*_a` pods + VFX/SE).
+    Shoulder,
+}
+
+impl GarageViewAction {
+    /// Parses a CLI `--view-action` argument into a `GarageViewAction`.
+    pub fn from_cli(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "idle" => Some(Self::Idle),
+            "walk" => Some(Self::Walk),
+            "boost" | "dash" => Some(Self::Boost),
+            "r_arm" | "right_arm" | "rarm" => Some(Self::RightArm),
+            "l_arm" | "left_arm" | "larm" => Some(Self::LeftArm),
+            "r_bay" | "right_bay" | "rbay" => Some(Self::RightBayShift),
+            "l_bay" | "left_bay" | "lbay" => Some(Self::LeftBayShift),
+            "shoulder" | "shldr" => Some(Self::Shoulder),
+            _ => None,
+        }
+    }
+}
+
+/// 360 `0x836fc288`: Walk & Boost hold duration in Garage View Mode before auto-returning to idle.
+pub const VIEW_LOCOMOTION_SECS: f32 = 3.0;
+/// 360 `0x836fc28c`: Ready-position stance hold duration in Garage View Mode.
+pub const VIEW_READY_HOLD_SECS: f32 = 2.0;
+/// 360 `0x836fc290`: Continuous hold refresh timer while a weapon trigger/key is held.
+pub const VIEW_HOLD_REFRESH_SECS: f32 = 0.1;
+/// Click-pulse duration for standard weapon fire / shoulder pod deploy so a single click plays visibly.
+pub const VIEW_WEAPON_PULSE_SECS: f32 = 1.5;
+/// Muzzle dummy ID (`MUZZLE_POINT` in `weapons.rs`).
+const VIEW_MUZZLE_POINT: u8 = 101;
+
+/// Active full-body animation in Garage View Mode (`360 0x825cef60` / `0x825cec68`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum GarageViewBody {
+    #[default]
+    Idle,
+    Walk { remaining: f32 },
+    Boost { remaining: f32 },
+    Ready { hand: Hand, remaining: f32 },
+    Blade { hand: Hand, remaining: f32 },
+}
+
+/// Runtime state for the Garage View Mode action animation tester (`360 0x825bb670` / `0x825cef60`).
+#[derive(Debug, Clone, Default)]
+pub struct GarageViewAnimState {
+    pub pending: Option<GarageViewAction>,
+    pub body: GarageViewBody,
+    /// Remaining active seconds for Right (`[0]`) and Left (`[1]`) weapon deploy/fire anims.
+    pub hand_timers: [f32; 2],
+    /// Seconds until the next muzzle flash / shot sound while firing Right/Left hand weapons.
+    pub hand_fire_cd: [f32; 2],
+    /// Remaining active seconds for Shoulder Unit pod deploy/fire anim.
+    pub shoulder_timer: f32,
+    /// Seconds until the next shoulder muzzle flash / shot sound.
+    pub shoulder_fire_cd: f32,
+    /// True if any Bay Shift swapped weapons during this View Mode session (restores on exit).
+    pub bay_swapped: bool,
+    /// Tracks whether the previous frame was in `GarageScreen::ViewMode` for clean exit resets.
+    pub was_in_view_mode: bool,
+    /// Tracks whether the ready-stance shot has fired once deployed.
+    pub ready_fired: bool,
+}
+
+impl GarageViewAnimState {
+    /// Returns true if the given action is currently active for UI highlight feedback.
+    pub fn is_active(&self, action: GarageViewAction, shift: Option<&Shift>) -> bool {
+        match action {
+            GarageViewAction::Idle => {
+                matches!(self.body, GarageViewBody::Idle)
+                    && self.hand_timers[0] <= 0.0
+                    && self.hand_timers[1] <= 0.0
+                    && self.shoulder_timer <= 0.0
+                    && shift.is_none_or(|s| s.hands[0].is_none() && s.hands[1].is_none())
+            }
+            GarageViewAction::Walk => matches!(self.body, GarageViewBody::Walk { .. }),
+            GarageViewAction::Boost => matches!(self.body, GarageViewBody::Boost { .. }),
+            GarageViewAction::RightArm => {
+                self.hand_timers[0] > 0.0
+                    || matches!(
+                        self.body,
+                        GarageViewBody::Ready { hand: Hand::Right, .. }
+                            | GarageViewBody::Blade { hand: Hand::Right, .. }
+                    )
+            }
+            GarageViewAction::LeftArm => {
+                self.hand_timers[1] > 0.0
+                    || matches!(
+                        self.body,
+                        GarageViewBody::Ready { hand: Hand::Left, .. }
+                            | GarageViewBody::Blade { hand: Hand::Left, .. }
+                    )
+            }
+            GarageViewAction::RightBayShift => shift.is_some_and(|s| s.hands[0].is_some()),
+            GarageViewAction::LeftBayShift => shift.is_some_and(|s| s.hands[1].is_some()),
+            GarageViewAction::Shoulder => self.shoulder_timer > 0.0,
+        }
+    }
 }
 
 /// Adjustable garage UI control that responds to mouse-wheel scrolling while hovered.
@@ -1150,6 +1277,10 @@ pub struct GarageState {
     pub last_window_size: Vec2,
     /// Last `GameSettings::ui_scale` used to lay out the UI (triggers rebuild on scale change).
     pub last_ui_scale: f32,
+    /// Action animation tester state for `GarageScreen::ViewMode` (`360 0x825bb670` / `0x825cef60`).
+    pub view_anim: GarageViewAnimState,
+    /// When true in `GarageScreen::ViewMode`, hides the bottom action bar for clean screenshots (`H`).
+    pub view_ui_hidden: bool,
     /// True when the UI tree needs rebuilding.
     pub ui_dirty: bool,
 }
@@ -1230,6 +1361,8 @@ impl GarageState {
             banner: None,
             last_window_size: Vec2::ZERO,
             last_ui_scale: 1.0,
+            view_anim: GarageViewAnimState::default(),
+            view_ui_hidden: false,
             ui_dirty: true,
         }
     }
@@ -1787,7 +1920,10 @@ pub fn update_camera(
     // In `AssembleParts`, the main garage scene is the blurred background while mouse/stick
     // orbit and zoom drive the right-side `ASSEMBLY VIEW` preview AC (or left `PARTS VIEW`).
     let in_assemble = matches!(state.screen, GarageScreen::AssembleParts { .. });
-    let allow_left_drag = state.screen == GarageScreen::ViewMode;
+    let ui_btn_active = action_buttons
+        .iter()
+        .any(|(i, _)| matches!(i, Interaction::Hovered | Interaction::Pressed));
+    let allow_left_drag = state.screen == GarageScreen::ViewMode && !ui_btn_active;
     let dragging = !in_assemble
         && (buttons.pressed(MouseButton::Right)
             || (allow_left_drag && buttons.pressed(MouseButton::Left)));
@@ -2110,12 +2246,24 @@ pub fn handle_input(
             UiAction::ToggleViewMode => {
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_VIEW_MODE);
                 state.screen = if state.screen == GarageScreen::ViewMode {
+                    state.view_ui_hidden = false;
                     GarageScreen::Top
                 } else {
                     revert_preview(&mut state, &mut garage);
                     GarageScreen::ViewMode
                 };
                 state.cam_manual_orbit = false;
+                state.ui_dirty = true;
+                return;
+            }
+            UiAction::ViewAction(action) => {
+                state.view_anim.pending = Some(action);
+                state.ui_dirty = true;
+                return;
+            }
+            UiAction::ToggleViewUi => {
+                state.view_ui_hidden = !state.view_ui_hidden;
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
                 state.ui_dirty = true;
                 return;
             }
@@ -3081,7 +3229,48 @@ pub fn handle_input(
         if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::Backspace) || gp_cancel {
             sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
             state.screen = GarageScreen::Top;
+            state.view_ui_hidden = false;
             state.cam_manual_orbit = false;
+            state.ui_dirty = true;
+            return;
+        }
+        if keys.just_pressed(KeyCode::KeyH) {
+            state.view_ui_hidden = !state.view_ui_hidden;
+            sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+            state.ui_dirty = true;
+            return;
+        }
+        // 360 Garage View Mode action triggers (`0x825bb670` -> `0x825cef60`, actions 0..=7).
+        let gp_r_arm = gamepads
+            .iter()
+            .any(|g| g.just_pressed(GamepadButton::RightTrigger2));
+        let gp_l_arm = gamepads
+            .iter()
+            .any(|g| g.just_pressed(GamepadButton::LeftTrigger2));
+        let gp_shoulder = gamepads
+            .iter()
+            .any(|g| g.just_pressed(GamepadButton::RightTrigger));
+        let triggered = if keys.just_pressed(KeyCode::Digit0) || keys.just_pressed(KeyCode::Space) {
+            Some(GarageViewAction::Idle)
+        } else if keys.just_pressed(KeyCode::Digit1) || gp_up {
+            Some(GarageViewAction::Walk)
+        } else if keys.just_pressed(KeyCode::Digit2) || gp_down {
+            Some(GarageViewAction::Boost)
+        } else if keys.just_pressed(KeyCode::Digit3) || gp_r_arm {
+            Some(GarageViewAction::RightArm)
+        } else if keys.just_pressed(KeyCode::Digit4) || gp_l_arm {
+            Some(GarageViewAction::LeftArm)
+        } else if keys.just_pressed(KeyCode::Digit5) || gp_right {
+            Some(GarageViewAction::RightBayShift)
+        } else if keys.just_pressed(KeyCode::Digit6) || gp_left {
+            Some(GarageViewAction::LeftBayShift)
+        } else if keys.just_pressed(KeyCode::Digit7) || gp_shoulder {
+            Some(GarageViewAction::Shoulder)
+        } else {
+            None
+        };
+        if let Some(action) = triggered {
+            state.view_anim.pending = Some(action);
             state.ui_dirty = true;
         }
         return;
@@ -5004,6 +5193,8 @@ pub fn sync_ui(
     mut assemble_assets: ResMut<crate::garage_assemble::AssembleUiAssets>,
     mut picker_assets: ResMut<PaintPickerAssets>,
     mut images: ResMut<Assets<Image>>,
+    shift: Option<Res<Shift>>,
+    arms_q: Query<&Armament>,
     window: Query<&Window, With<bevy::window::PrimaryWindow>>,
     existing: Query<Entity, With<GarageUi>>,
 ) {
@@ -5109,9 +5300,20 @@ pub fn sync_ui(
         ))
         .id();
 
-    // View Mode shows only a minimal unobtrusive bottom bar.
+    // View Mode shows an unobtrusive bottom action-test bar (or hides cleanly when `H` is toggled).
     if state.screen == GarageScreen::ViewMode {
-        spawn_garage_view_mode_bar(&mut commands, root, &kit, scale);
+        if !state.view_ui_hidden {
+            let arms = arms_q.single().ok();
+            spawn_garage_view_mode_bar(
+                &mut commands,
+                root,
+                &kit,
+                &state.view_anim,
+                shift.as_deref(),
+                arms,
+                scale,
+            );
+        }
         return;
     }
 
@@ -8692,17 +8894,108 @@ fn spawn_garage_view_mode_bar(
     commands: &mut Commands,
     root: Entity,
     kit: &AcvdUiKit,
+    view_anim: &GarageViewAnimState,
+    shift: Option<&Shift>,
+    arms: Option<&Armament>,
     scale: f32,
 ) {
-    let bar = kit.spawn_panel(
+    let wrap = commands
+        .spawn((
+            ChildOf(root),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px((20.0 * scale).round()),
+                right: px((20.0 * scale).round()),
+                bottom: px((16.0 * scale).round()),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexStart,
+                row_gap: px((6.0 * scale).round()),
+                ..default()
+            },
+        ))
+        .id();
+
+    let weapon_arm = arms.is_some_and(|a| a.weapon_arm);
+    let has_r_arm = arms.is_some_and(|a| a.weapon_arm || a.hands[0].kind != Kind::Skip);
+    let has_l_arm = arms.is_some_and(|a| a.weapon_arm || a.hands[1].kind != Kind::Skip);
+    let has_r_bay = arms.is_some_and(|a| {
+        !a.weapon_arm && a.bays[0].kind != Kind::Skip && !a.hands[0].stance
+    });
+    let has_l_bay = arms.is_some_and(|a| {
+        !a.weapon_arm && a.bays[1].kind != Kind::Skip && !a.hands[1].stance
+    });
+    let has_shoulder = arms.is_some_and(|a| !a.weapon_arm && a.shoulder.kind != Kind::Skip);
+
+    // Row 1: Action animation test buttons (`360 0x825bb670` -> `0x825cef60`, actions 0..=7).
+    let action_bar = kit.spawn_panel(
         commands,
-        Some(root),
+        Some(wrap),
         PanelStyle::Framed,
         Node {
-            position_type: PositionType::Absolute,
-            left: px((24.0 * scale).round()),
-            bottom: px((18.0 * scale).round()),
-            padding: UiRect::axes(px((12.0 * scale).round()), px((7.0 * scale).round())),
+            padding: UiRect::axes(px((10.0 * scale).round()), px((6.0 * scale).round())),
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
+            align_items: AlignItems::Center,
+            column_gap: px((6.0 * scale).round()),
+            row_gap: px((4.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+    kit.spawn_badge(commands, action_bar, "ACTION TEST", palette::ACCENT_AMBER, true, scale);
+
+    let items: [(&str, &str, GarageViewAction, bool); 8] = [
+        ("1", "WALK", GarageViewAction::Walk, true),
+        ("2", "BOOST", GarageViewAction::Boost, true),
+        (
+            "3",
+            if weapon_arm { "WEP ARM" } else { "R ARM" },
+            GarageViewAction::RightArm,
+            has_r_arm,
+        ),
+        ("4", "L ARM", GarageViewAction::LeftArm, has_l_arm && !weapon_arm),
+        ("5", "R BAY", GarageViewAction::RightBayShift, has_r_bay),
+        ("6", "L BAY", GarageViewAction::LeftBayShift, has_l_bay),
+        ("7", "SHLDR", GarageViewAction::Shoulder, has_shoulder),
+        ("0", "IDLE", GarageViewAction::Idle, true),
+    ];
+
+    for (key, label, action, enabled) in items {
+        let active = enabled && view_anim.is_active(action, shift);
+        let btn_state = if !enabled {
+            ButtonState::Disabled
+        } else if active {
+            ButtonState::Selected
+        } else {
+            ButtonState::Normal
+        };
+        let btn = kit.spawn_button(
+            commands,
+            action_bar,
+            &format!("[{key}] {label}"),
+            None,
+            btn_state,
+            scale * 0.86,
+        );
+        commands.entity(btn).insert(Node {
+            padding: UiRect::axes(px((8.0 * scale).round()), px((4.0 * scale).round())),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px((4.0 * scale).round()),
+            ..default()
+        });
+        if enabled {
+            commands.entity(btn).insert((Button, UiAction::ViewAction(action)));
+        }
+    }
+
+    // Row 2: Camera & view guide bar + HIDE UI button.
+    let bar = kit.spawn_panel(
+        commands,
+        Some(wrap),
+        PanelStyle::Framed,
+        Node {
+            padding: UiRect::axes(px((12.0 * scale).round()), px((6.0 * scale).round())),
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
             column_gap: px((12.0 * scale).round()),
@@ -8715,10 +9008,562 @@ fn spawn_garage_view_mode_bar(
         commands,
         bar,
         FontRole::Small,
-        "DRAG ORBIT   WHEEL ZOOM   R RESET   V / ESC RETURN",
+        "DRAG ORBIT   WHEEL ZOOM   R RESET   1-7 ACTION   0 IDLE   H HIDE UI   V / ESC RETURN",
         scale,
         palette::TEXT_PRIMARY,
     );
+    let hide_btn = kit.spawn_button(
+        commands,
+        bar,
+        "[H] HIDE UI",
+        None,
+        ButtonState::Normal,
+        scale * 0.82,
+    );
+    commands.entity(hide_btn).insert((
+        Button,
+        UiAction::ToggleViewUi,
+        Node {
+            padding: UiRect::axes(px((8.0 * scale).round()), px((3.0 * scale).round())),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+    ));
+}
+
+/// SystemParam bundle for `step_view_actions` (keeps Bevy system parameter count compact).
+#[derive(SystemParam)]
+pub struct ViewActionRig<'w, 's> {
+    pub shift: Option<ResMut<'w, Shift>>,
+    pub anims: Option<ResMut<'w, WeaponAnims>>,
+    pub motion: Option<ResMut<'w, Motion>>,
+    pub acs: Query<'w, 's, (&'static mut Pilot, &'static mut Armament)>,
+    pub points: Query<'w, 's, (Entity, &'static mut EffectPoint)>,
+    pub hardpoints: Query<'w, 's, (Entity, &'static Hardpoint)>,
+    pub shoulder_hp: Query<'w, 's, (Entity, &'static ShoulderHardpoint)>,
+    pub posed: Query<'w, 's, (&'static mut Transform, Option<&'static Driven>), With<ClipJoint>>,
+}
+
+/// Drives retail Xbox 360 Garage View Mode action animations (`0x825bb670` -> `0x825cef60` ->
+/// `0x825cec68` / `0x825cdd00` / `0x825cd198`): Walk (`3.0 s`), Boost (`3.0 s` + booster nozzles
+/// & flames), Right/Left Arm Unit (gun fire + recoil + muzzle VFX / ready-position stance `2.0 s` /
+/// melee blade swing / weapon arm deploy & fire), Right/Left Bay Shift (150f arm overlay + TAE
+/// `2000..2003` + rack carousel + swap), and Shoulder Unit (`am*_a` shoulder pod deploy + VFX/SE).
+#[allow(clippy::too_many_arguments)]
+pub fn step_view_actions(
+    time: Res<Time>,
+    mode: Res<Mode>,
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut commands: Commands,
+    mut state: ResMut<GarageState>,
+    mut garage: ResMut<crate::Garage>,
+    mut cues: ResMut<Cues>,
+    mut audio_assets: ResMut<Assets<AudioSource>>,
+    mut rig: ViewActionRig,
+) {
+    let in_view = *mode == Mode::Garage && state.screen == GarageScreen::ViewMode;
+    if !in_view {
+        if state.view_anim.was_in_view_mode {
+            reset_view_actions_to_idle(
+                &mut state,
+                &mut garage,
+                &mut rig,
+                true,
+            );
+            state.view_anim.was_in_view_mode = false;
+        }
+        return;
+    }
+    state.view_anim.was_in_view_mode = true;
+
+    let Ok((mut pilot, arms)) = rig.acs.single_mut() else {
+        return;
+    };
+
+    let dt = time.delta_secs().min(0.1);
+    let frames = dt * crate::pose::FRAME_RATE;
+    let prev_body = state.view_anim.body;
+    let prev_shift_active = rig
+        .shift
+        .as_ref()
+        .map(|s| [s.hands[0].is_some(), s.hands[1].is_some()])
+        .unwrap_or([false, false]);
+    let prev_hand_active = [
+        state.view_anim.hand_timers[0] > 0.0,
+        state.view_anim.hand_timers[1] > 0.0,
+    ];
+    let prev_shoulder_active = state.view_anim.shoulder_timer > 0.0;
+
+    // 1. Continuous hold refresh (`360 0x8234d850`: RT/LT/RB or keys 3/4/7 held).
+    let hold_r = keys.pressed(KeyCode::Digit3)
+        || gamepads.iter().any(|g| g.pressed(GamepadButton::RightTrigger2));
+    let hold_l = keys.pressed(KeyCode::Digit4)
+        || gamepads.iter().any(|g| g.pressed(GamepadButton::LeftTrigger2));
+    let hold_sh = keys.pressed(KeyCode::Digit7)
+        || gamepads.iter().any(|g| g.pressed(GamepadButton::RightTrigger));
+
+    if hold_r && state.view_anim.hand_timers[0] > 0.0 {
+        state.view_anim.hand_timers[0] = state.view_anim.hand_timers[0].max(VIEW_HOLD_REFRESH_SECS);
+    }
+    if hold_l && state.view_anim.hand_timers[1] > 0.0 {
+        state.view_anim.hand_timers[1] = state.view_anim.hand_timers[1].max(VIEW_HOLD_REFRESH_SECS);
+    }
+    if hold_sh && state.view_anim.shoulder_timer > 0.0 {
+        state.view_anim.shoulder_timer = state.view_anim.shoulder_timer.max(VIEW_HOLD_REFRESH_SECS);
+    }
+    if let GarageViewBody::Ready { hand, remaining } = &mut state.view_anim.body {
+        if (*hand == Hand::Right && hold_r) || (*hand == Hand::Left && hold_l) {
+            *remaining = remaining.max(VIEW_HOLD_REFRESH_SECS);
+        }
+    }
+
+    // 3. Consume any newly triggered action (`0x825cef60`).
+    if let Some(action) = state.view_anim.pending.take() {
+        match action {
+            GarageViewAction::Idle => {
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+                if let Some(motion) = rig.motion.as_deref_mut() {
+                    play_view_body_state(motion, &garage.disc, &mut pilot, "idle", None);
+                    for side in 0..2 {
+                        motion.clear_arm(side, 0.15);
+                    }
+                }
+                pilot.boost = false;
+                pilot.command = Vec2::ZERO;
+                state.view_anim.body = GarageViewBody::Idle;
+                state.view_anim.hand_timers = [0.0; 2];
+                state.view_anim.hand_fire_cd = [0.0; 2];
+                state.view_anim.shoulder_timer = 0.0;
+                state.view_anim.shoulder_fire_cd = 0.0;
+                state.view_anim.ready_fired = false;
+                if let Some(anims) = rig.anims.as_deref_mut() {
+                    anims.reset_garage_view(&mut rig.posed);
+                }
+            }
+            GarageViewAction::Walk => {
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_OK);
+                pilot.boost = false;
+                pilot.command = Vec2::ZERO;
+                if let Some(motion) = rig.motion.as_deref_mut() {
+                    play_view_body_state(motion, &garage.disc, &mut pilot, "walk", Some(0));
+                }
+                state.view_anim.body = GarageViewBody::Walk {
+                    remaining: VIEW_LOCOMOTION_SECS,
+                };
+            }
+            GarageViewAction::Boost => {
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, "b00000000");
+                pilot.boost = true;
+                pilot.command = Vec2::new(0.0, 1.0);
+                if let Some(motion) = rig.motion.as_deref_mut() {
+                    play_view_body_state(motion, &garage.disc, &mut pilot, "dash", Some(0));
+                }
+                state.view_anim.body = GarageViewBody::Boost {
+                    remaining: VIEW_LOCOMOTION_SECS,
+                };
+            }
+            GarageViewAction::RightArm | GarageViewAction::LeftArm => {
+                let hand = if action == GarageViewAction::RightArm {
+                    Hand::Right
+                } else {
+                    Hand::Left
+                };
+                let idx = if arms.weapon_arm { 0 } else { hand as usize };
+                let gun = arms.hands[idx];
+                if gun.kind == Kind::Skip {
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_ERROR);
+                } else if arms.weapon_arm {
+                    state.view_anim.hand_timers[0] = VIEW_WEAPON_PULSE_SECS;
+                    state.view_anim.hand_fire_cd[0] = 0.0;
+                } else if gun.stance {
+                    pilot.boost = false;
+                    pilot.command = Vec2::ZERO;
+                    state.view_anim.body = GarageViewBody::Ready {
+                        hand,
+                        remaining: VIEW_READY_HOLD_SECS,
+                    };
+                    state.view_anim.hand_timers[idx] = VIEW_READY_HOLD_SECS;
+                    state.view_anim.ready_fired = false;
+                } else if gun.kind == Kind::Blade {
+                    pilot.boost = false;
+                    pilot.command = Vec2::ZERO;
+                    let physical = gun.blade.is_some_and(|b| b.physical);
+                    let blade_state = match (physical, hand) {
+                        (false, Hand::Right) => "blade_swing_r",
+                        (false, Hand::Left) => "blade_swing_l",
+                        (true, Hand::Right) => "phys_blade_swing_r",
+                        (true, Hand::Left) => "phys_blade_swing_l",
+                    };
+                    let mut dur = 1.0_f32;
+                    if let Some(motion) = rig.motion.as_deref_mut() {
+                        if play_view_body_state(motion, &garage.disc, &mut pilot, blade_state, None)
+                        {
+                            dur = (motion.clip.frames as f32 / crate::pose::FRAME_RATE).max(0.5);
+                        }
+                    }
+                    sound::shot(&mut commands, &mut cues, &mut audio_assets, gun.shoot);
+                    if gun.fx.bullet > 0 {
+                        if let Some((hp_e, _)) = rig.hardpoints.iter().find(|(_, h)| h.hand == hand)
+                        {
+                            commands.spawn((
+                                Sfx::new(gun.fx.bullet),
+                                Transform::default(),
+                                Visibility::default(),
+                                ChildOf(hp_e),
+                            ));
+                        }
+                    }
+                    state.view_anim.body = GarageViewBody::Blade {
+                        hand,
+                        remaining: dur,
+                    };
+                    state.view_anim.hand_timers[idx] = dur;
+                    state.view_anim.hand_fire_cd[idx] = dur;
+                } else {
+                    state.view_anim.hand_timers[idx] = VIEW_WEAPON_PULSE_SECS;
+                    state.view_anim.hand_fire_cd[idx] = 0.0;
+                }
+            }
+            GarageViewAction::RightBayShift | GarageViewAction::LeftBayShift => {
+                // Handled by `step_view_bay_shifts` immediately below (clean EffectPoint query).
+                state.view_anim.pending = Some(action);
+            }
+            GarageViewAction::Shoulder => {
+                if arms.weapon_arm || arms.shoulder.kind == Kind::Skip {
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_ERROR);
+                } else {
+                    state.view_anim.shoulder_timer = VIEW_READY_HOLD_SECS;
+                    state.view_anim.shoulder_fire_cd = 0.0;
+                }
+            }
+        }
+    }
+
+    // 4. Step full-body timers (`0x825ced0c..0x825ced58` auto-return to idle).
+    match state.view_anim.body {
+        GarageViewBody::Idle => {}
+        GarageViewBody::Walk { mut remaining } => {
+            remaining -= dt;
+            if remaining <= 0.0 {
+                state.view_anim.body = GarageViewBody::Idle;
+                if let Some(motion) = rig.motion.as_deref_mut() {
+                    play_view_body_state(motion, &garage.disc, &mut pilot, "idle", None);
+                }
+            } else {
+                state.view_anim.body = GarageViewBody::Walk { remaining };
+            }
+        }
+        GarageViewBody::Boost { mut remaining } => {
+            remaining -= dt;
+            if remaining <= 0.0 {
+                state.view_anim.body = GarageViewBody::Idle;
+                pilot.boost = false;
+                pilot.command = Vec2::ZERO;
+                if let Some(motion) = rig.motion.as_deref_mut() {
+                    play_view_body_state(motion, &garage.disc, &mut pilot, "idle", None);
+                }
+            } else {
+                state.view_anim.body = GarageViewBody::Boost { remaining };
+            }
+        }
+        GarageViewBody::Blade { hand, mut remaining } => {
+            remaining -= dt;
+            let done = remaining <= 0.0
+                || rig.motion.as_ref().is_some_and(|m| m.finished());
+            if done {
+                state.view_anim.body = GarageViewBody::Idle;
+                if let Some(motion) = rig.motion.as_deref_mut() {
+                    play_view_body_state(motion, &garage.disc, &mut pilot, "idle", None);
+                }
+            } else {
+                state.view_anim.body = GarageViewBody::Blade { hand, remaining };
+            }
+        }
+        GarageViewBody::Ready { hand, mut remaining } => {
+            remaining -= dt;
+            if remaining <= 0.0 {
+                state.view_anim.body = GarageViewBody::Idle;
+                state.view_anim.ready_fired = false;
+            } else {
+                state.view_anim.body = GarageViewBody::Ready { hand, remaining };
+            }
+        }
+    }
+
+    // 5. Update SniperStance (ready-position body engage/hold/release) if active or releasing.
+    let want_sniper = match state.view_anim.body {
+        GarageViewBody::Ready { hand, .. } => Some(hand),
+        _ => None,
+    };
+    if let (Some(anims), Some(motion)) = (rig.anims.as_deref_mut(), rig.motion.as_deref_mut()) {
+        anims.update_sniper(want_sniper, motion, &garage.disc, &mut pilot);
+    }
+
+    // 6. Step hand weapon fire / muzzle flash VFX / recoil kick / shot sound.
+    let mut want_hand = [false; 2];
+    let mut fire_hand = [false; 2];
+    for i in 0..2 {
+        if state.view_anim.hand_timers[i] > 0.0 {
+            state.view_anim.hand_timers[i] = (state.view_anim.hand_timers[i] - dt).max(0.0);
+            want_hand[i] = true;
+            let hand = if i == 0 { Hand::Right } else { Hand::Left };
+            let gun = arms.hands[if arms.weapon_arm { 0 } else { i }];
+            let is_ready = matches!(state.view_anim.body, GarageViewBody::Ready { hand: h, .. } if h == hand);
+            let stance_ok = !is_ready
+                || rig.anims.as_ref().is_none_or(|a| a.sniper_allows(hand));
+            if gun.kind != Kind::Skip && gun.kind != Kind::Blade && stance_ok {
+                state.view_anim.hand_fire_cd[i] -= dt;
+                let should_fire = if is_ready {
+                    !state.view_anim.ready_fired
+                } else {
+                    state.view_anim.hand_fire_cd[i] <= 0.0
+                };
+                if should_fire {
+                    fire_hand[i] = true;
+                    if is_ready {
+                        state.view_anim.ready_fired = true;
+                    }
+                    let reload_secs = (gun.reload_time / crate::pose::FRAME_RATE).clamp(0.14, 0.85);
+                    state.view_anim.hand_fire_cd[i] = reload_secs;
+                    sound::shot(&mut commands, &mut cues, &mut audio_assets, gun.shoot);
+                    if let Some(anims) = rig.anims.as_deref_mut() {
+                        if arms.weapon_arm {
+                            anims.trigger_kick(Hand::Right, gun.sniper);
+                            anims.trigger_kick(Hand::Left, gun.sniper);
+                        } else {
+                            anims.trigger_kick(hand, gun.sniper);
+                        }
+                    }
+                    if gun.fx.muzzle > 0 {
+                        let col = if i == 0 { "armwep_r" } else { "armwep_l" };
+                        let muzzle_e = rig
+                            .points
+                            .iter()
+                            .find(|(_, p)| {
+                                (arms.weapon_arm && p.column == "arms" && p.id == VIEW_MUZZLE_POINT)
+                                    || (!arms.weapon_arm && p.column == col && p.id == VIEW_MUZZLE_POINT)
+                            })
+                            .map(|(e, _)| e)
+                            .or_else(|| {
+                                rig.hardpoints
+                                    .iter()
+                                    .find(|(_, h)| h.hand == hand)
+                                    .map(|(e, _)| e)
+                            });
+                        if let Some(parent) = muzzle_e {
+                            commands.spawn((
+                                Sfx::new(gun.fx.muzzle),
+                                Transform::default(),
+                                Visibility::default(),
+                                ChildOf(parent),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Step Shoulder Unit deploy/fire animation + shoulder muzzle VFX/SE.
+    let mut want_shoulder = false;
+    if state.view_anim.shoulder_timer > 0.0 {
+        state.view_anim.shoulder_timer = (state.view_anim.shoulder_timer - dt).max(0.0);
+        want_shoulder = true;
+        state.view_anim.shoulder_fire_cd -= dt;
+        if state.view_anim.shoulder_fire_cd <= 0.0 && arms.shoulder.kind != Kind::Skip {
+            state.view_anim.shoulder_fire_cd = 0.55;
+            sound::shot(&mut commands, &mut cues, &mut audio_assets, arms.shoulder.shoot);
+            if arms.shoulder.fx.muzzle > 0 {
+                if let Ok((sh_e, _)) = rig.shoulder_hp.single() {
+                    commands.spawn((
+                        Sfx::new(arms.shoulder.fx.muzzle),
+                        Transform::default(),
+                        Visibility::default(),
+                        ChildOf(sh_e),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 8. Pose hand weapon, shoulder-pod (`am*_a`), weapon-arm, and recoil bones.
+    if let Some(anims) = rig.anims.as_deref_mut() {
+        anims.step_garage_view(
+            want_hand,
+            fire_hand,
+            want_shoulder,
+            arms.weapon_arm,
+            frames,
+            &mut rig.posed,
+        );
+    }
+
+    // Rebuild View Mode UI bar whenever an action's active highlight flips on or off.
+    let cur_shift_active = rig
+        .shift
+        .as_ref()
+        .map(|s| [s.hands[0].is_some(), s.hands[1].is_some()])
+        .unwrap_or([false, false]);
+    let cur_hand_active = [
+        state.view_anim.hand_timers[0] > 0.0,
+        state.view_anim.hand_timers[1] > 0.0,
+    ];
+    let cur_shoulder_active = state.view_anim.shoulder_timer > 0.0;
+    if prev_body != state.view_anim.body
+        || prev_shift_active != cur_shift_active
+        || prev_hand_active != cur_hand_active
+        || prev_shoulder_active != cur_shoulder_active
+    {
+        state.ui_dirty = true;
+    }
+}
+
+/// Companion system to `step_view_actions` that runs `bay::step_active_shifts` and
+/// `bay::try_start_shift` in Garage View Mode with the exact `Query<&mut EffectPoint>` signature
+/// expected by `bay.rs`.
+#[allow(clippy::too_many_arguments)]
+pub fn step_view_bay_shifts(
+    time: Res<Time>,
+    mode: Res<Mode>,
+    garage: Res<crate::Garage>,
+    mut state: ResMut<GarageState>,
+    mut commands: Commands,
+    mut cues: ResMut<Cues>,
+    mut audio_assets: ResMut<Assets<AudioSource>>,
+    active: Option<ResMut<Shift>>,
+    mut loadout: Option<ResMut<Loadout>>,
+    mut acs: Query<(&mut Pilot, &mut Armament)>,
+    mut anims: Option<ResMut<WeaponAnims>>,
+    mut hanger: Option<ResMut<HangerPose>>,
+    mut points: Query<&mut EffectPoint>,
+    hardpoints: Query<(Entity, &Hardpoint)>,
+    meshes: Query<(Entity, &WeaponMesh)>,
+    mut motion: Option<ResMut<Motion>>,
+) {
+    if *mode != Mode::Garage || state.screen != GarageScreen::ViewMode {
+        return;
+    }
+    let Some(loadout) = loadout.as_mut() else {
+        return;
+    };
+    let Ok((pilot, mut arms)) = acs.single_mut() else {
+        return;
+    };
+    let Some(mut shift) = active else {
+        commands.insert_resource(Shift::default());
+        return;
+    };
+
+    let prev = [shift.hands[0].is_some(), shift.hands[1].is_some()];
+    bay::step_active_shifts(
+        &mut commands,
+        &mut shift,
+        loadout,
+        &mut arms,
+        anims.as_deref_mut(),
+        hanger.as_deref_mut(),
+        &mut points,
+        &hardpoints,
+        &meshes,
+        motion.as_deref_mut(),
+        time.delta_secs(),
+    );
+
+    if let Some(action @ (GarageViewAction::RightBayShift | GarageViewAction::LeftBayShift)) =
+        state.view_anim.pending
+    {
+        state.view_anim.pending = None;
+        let hand = if action == GarageViewAction::RightBayShift {
+            Hand::Right
+        } else {
+            Hand::Left
+        };
+        let started = bay::try_start_shift(
+            hand,
+            false,
+            &garage,
+            &mut commands,
+            &mut shift,
+            loadout,
+            &pilot,
+            &mut arms,
+            anims.as_deref_mut(),
+            &mut points,
+            &hardpoints,
+            &meshes,
+            motion.as_deref_mut(),
+        );
+        if started {
+            state.view_anim.bay_swapped = true;
+        } else {
+            sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_ERROR);
+        }
+    }
+
+    let cur = [shift.hands[0].is_some(), shift.hands[1].is_some()];
+    if prev != cur {
+        state.ui_dirty = true;
+    }
+}
+
+/// Plays a named `ac_state` row on `Motion` and updates `pilot.set_pose_state` so `boost::pose`
+/// stays in sync with `BoosterAnimID`.
+fn play_view_body_state(
+    motion: &mut Motion,
+    disc: &Disc,
+    pilot: &mut Pilot,
+    name: &'static str,
+    direction: Option<u8>,
+) -> bool {
+    let Some(row) = ac_state(name, direction).and_then(|s| find(PARAM_ACMOTION_BIN, s.row)) else {
+        return false;
+    };
+    let looping = row.data.b_loop != 0 || matches!(name, "idle" | "walk" | "dash");
+    motion.in_place = true;
+    let ok = motion
+        .play(
+            disc,
+            row.data.anim_id,
+            looping,
+            1.0,
+            pilot.fade(row.data.interpolate_id),
+        )
+        .is_ok();
+    if ok {
+        pilot.set_pose_state(Some((name, direction)));
+    }
+    ok
+}
+
+/// Cleanly resets all Garage View Mode test animations when exiting View Mode.
+fn reset_view_actions_to_idle(
+    state: &mut GarageState,
+    garage: &mut crate::Garage,
+    rig: &mut ViewActionRig,
+    restore_bay_if_swapped: bool,
+) {
+    if let Ok((mut pilot, _)) = rig.acs.single_mut() {
+        pilot.boost = false;
+        pilot.command = Vec2::ZERO;
+        if let Some(motion) = rig.motion.as_deref_mut() {
+            play_view_body_state(motion, &garage.disc, &mut pilot, "idle", None);
+            for side in 0..2 {
+                motion.clear_arm(side, 0.15);
+            }
+        }
+    }
+    if let Some(anims) = rig.anims.as_deref_mut() {
+        anims.reset_garage_view(&mut rig.posed);
+    }
+    if let Some(shift) = rig.shift.as_deref_mut() {
+        shift.hands = [None, None];
+    }
+    if restore_bay_if_swapped && state.view_anim.bay_swapped {
+        garage.dirty = true;
+    }
+    state.view_anim = GarageViewAnimState::default();
 }
 
 fn spawn_list_pager(
@@ -9393,5 +10238,43 @@ mod tests {
             GARAGE_GLOW_EMISSIVE_BOOST > bloom_threshold,
             "Carlight_Phong / _Grow fixtures must exceed bloom threshold"
         );
+    }
+
+    #[test]
+    fn garage_view_action_cli_and_active_state_match_360_actions() {
+        // 360 `0x836fc288`, `0x836fc28c`, `0x836fc290` timer constants.
+        assert!((VIEW_LOCOMOTION_SECS - 3.0).abs() < 1e-6);
+        assert!((VIEW_READY_HOLD_SECS - 2.0).abs() < 1e-6);
+        assert!((VIEW_HOLD_REFRESH_SECS - 0.1).abs() < 1e-6);
+
+        assert_eq!(GarageViewAction::from_cli("idle"), Some(GarageViewAction::Idle));
+        assert_eq!(GarageViewAction::from_cli("walk"), Some(GarageViewAction::Walk));
+        assert_eq!(GarageViewAction::from_cli("boost"), Some(GarageViewAction::Boost));
+        assert_eq!(GarageViewAction::from_cli("dash"), Some(GarageViewAction::Boost));
+        assert_eq!(GarageViewAction::from_cli("r_arm"), Some(GarageViewAction::RightArm));
+        assert_eq!(GarageViewAction::from_cli("l_arm"), Some(GarageViewAction::LeftArm));
+        assert_eq!(GarageViewAction::from_cli("r_bay"), Some(GarageViewAction::RightBayShift));
+        assert_eq!(GarageViewAction::from_cli("l_bay"), Some(GarageViewAction::LeftBayShift));
+        assert_eq!(GarageViewAction::from_cli("shoulder"), Some(GarageViewAction::Shoulder));
+        assert_eq!(GarageViewAction::from_cli("unknown"), None);
+
+        let mut anim = GarageViewAnimState::default();
+        assert!(anim.is_active(GarageViewAction::Idle, None));
+        assert!(!anim.is_active(GarageViewAction::Walk, None));
+
+        anim.body = GarageViewBody::Boost { remaining: 2.5 };
+        assert!(anim.is_active(GarageViewAction::Boost, None));
+        assert!(!anim.is_active(GarageViewAction::Idle, None));
+
+        anim.body = GarageViewBody::Idle;
+        anim.hand_timers[0] = 1.0;
+        assert!(anim.is_active(GarageViewAction::RightArm, None));
+        assert!(!anim.is_active(GarageViewAction::LeftArm, None));
+        assert!(!anim.is_active(GarageViewAction::Idle, None));
+
+        anim.hand_timers[0] = 0.0;
+        anim.shoulder_timer = 1.5;
+        assert!(anim.is_active(GarageViewAction::Shoulder, None));
+        assert!(!anim.is_active(GarageViewAction::Idle, None));
     }
 }

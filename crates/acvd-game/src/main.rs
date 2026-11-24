@@ -227,6 +227,7 @@ fn main() {
     let mut shadow_dist_override: Option<settings::ShadowDistance> = None;
     let mut hanger_r_override: Option<i16> = None;
     let mut hanger_l_override: Option<i16> = None;
+    let mut start_view_action: Option<garage::GarageViewAction> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
@@ -335,6 +336,15 @@ fn main() {
             }
             "--decal" => {
                 cli_decal = args.next().map(PathBuf::from);
+            }
+            "--view-action" => {
+                if let Some(raw) = args.next() {
+                    start_view_action = garage::GarageViewAction::from_cli(&raw);
+                    if start_view_action.is_some() {
+                        start_garage = true;
+                        garage_screen = garage::GarageScreen::ViewMode;
+                    }
+                }
             }
             "--emblem" => {
                 cli_emblem = args.next();
@@ -458,6 +468,9 @@ fn main() {
     garage_state.paint_tab = garage_paint_tab;
     garage_state.paint_picker_mode = garage_paint_picker_mode;
     garage_state.options_tab = start_options_tab;
+    if shot.is_none() {
+        garage_state.view_anim.pending = start_view_action;
+    }
 
     let enemy_parts = weapons::EnemyParts::load(&disc);
     let mut pause_state = pause::PauseState::default();
@@ -601,7 +614,12 @@ fn main() {
                 hanger::pose.run_if(not_paused_in_sortie),
             )
                 .chain(),
-            (decal::interact_and_gizmo, decal::sync_bakes)
+            (
+                decal::interact_and_gizmo,
+                decal::sync_bakes,
+                garage::step_view_actions,
+                garage::step_view_bay_shifts,
+            )
                 .chain()
                 .after(hanger::pose),
             (
@@ -655,7 +673,7 @@ fn main() {
     }
     if let Some(mut shot) = shot {
         shot.burst = burst;
-        app.insert_resource(ShotDelay(wait, false))
+        app.insert_resource(ShotDelay(wait, false, 0.0, start_view_action))
             .insert_resource(shot)
             .insert_resource(acvd_render::app::ShotMark::default())
             .init_resource::<FramePerf>()
@@ -691,7 +709,7 @@ fn tick_pending_hold(
 
 /// Seconds `--shot` still waits after the AC is shown (`--wait`), and whether it was shown.
 #[derive(Resource)]
-struct ShotDelay(f32, bool);
+struct ShotDelay(f32, bool, f32, Option<garage::GarageViewAction>);
 
 /// Rolling frame-time samples for `--shot` PERF dumps (ms).
 #[derive(Resource, Default)]
@@ -700,11 +718,25 @@ struct FramePerf {
     warmed: bool,
 }
 
-fn delay_shot(time: Res<Time>, mut delay: ResMut<ShotDelay>, mut shot: ResMut<Shot>) {
+fn delay_shot(
+    time: Res<Time>,
+    mut delay: ResMut<ShotDelay>,
+    mut shot: ResMut<Shot>,
+    mut garage_state: ResMut<garage::GarageState>,
+) {
     delay.1 |= shot.ready;
     if delay.1 && delay.0 > 0.0 {
         delay.0 -= time.delta_secs();
         shot.ready = delay.0 <= 0.0;
+    }
+    if shot.ready {
+        delay.2 += time.delta_secs();
+        if delay.2 >= 2.2 {
+            if let Some(action) = delay.3.take() {
+                garage_state.view_anim.pending = Some(action);
+                garage_state.ui_dirty = true;
+            }
+        }
     }
 }
 
