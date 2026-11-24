@@ -17,6 +17,7 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{Exposure, Hdr, RenderTarget};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::light::NotShadowCaster;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
@@ -569,7 +570,8 @@ struct EnvDisc(Disc);
 struct MapEnv {
     env: Env,
     parts_by_name: HashMap<String, msb::Part>,
-    made: HashMap<(AssetId<StandardMaterial>, u32, Option<AssetId<Image>>), Handle<EnvMaterial>>,
+    made: HashMap<(AssetId<StandardMaterial>, u32, Option<AssetId<Image>>, u32), Handle<EnvMaterial>>,
+    unlit: HashMap<(AssetId<StandardMaterial>, bool), Handle<SkyMaterial>>,
     waters: HashMap<(Option<AssetId<Image>>, u32), Handle<WaterMaterial>>,
     skies: HashMap<String, Option<Handle<SkyMaterial>>>,
     packs: Packs,
@@ -705,6 +707,7 @@ pub(crate) fn load_map_env(
         env,
         parts_by_name,
         made: HashMap::new(),
+        unlit: HashMap::new(),
         waters: HashMap::new(),
         skies: HashMap::new(),
         packs: Packs::default(),
@@ -897,11 +900,54 @@ fn relight(
                 ));
             continue;
         }
+        let mtd_low = meta
+            .map(|m| {
+                m.mtd
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&m.mtd)
+                    .trim_end_matches(".mtd")
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        let is_add = matches!(base.alpha_mode, AlphaMode::Add);
+        let is_nolight = mtd_low.contains("nolight");
+        if is_add || is_nolight {
+            let handle = env
+                .unlit
+                .entry((material.0.id(), is_add))
+                .or_insert_with(|| {
+                    let tex = base
+                        .base_color_texture
+                        .clone()
+                        .unwrap_or_else(|| env.white_srgb.clone());
+                    sky_materials.add(make_sky_material(
+                        tex,
+                        base.alpha_mode,
+                        false,
+                        is_add || matches!(base.alpha_mode, AlphaMode::Blend),
+                        1.0,
+                    ))
+                })
+                .clone();
+            let mut ec = commands.entity(entity);
+            ec.remove::<MeshMaterial3d<StandardMaterial>>()
+                .insert(MeshMaterial3d(handle));
+            if is_add {
+                ec.insert(NotShadowCaster);
+            }
+            continue;
+        }
+        let emissive_boost: f32 = if mtd_low.contains("grow") || mtd_low.contains("glow") {
+            1.6
+        } else {
+            0.0
+        };
         let diffuse2_handle = meta.and_then(|m| m.diffuse2.clone());
         let diffuse2_id = diffuse2_handle.as_ref().map(Handle::id);
         let handle = env
             .made
-            .entry((material.0.id(), slot, diffuse2_id))
+            .entry((material.0.id(), slot, diffuse2_id, emissive_boost.to_bits()))
             .or_insert_with(|| {
                 let has_d1 = base.base_color_texture.is_some();
                 let has_d2 = diffuse2_handle.is_some();
@@ -915,17 +961,19 @@ fn relight(
                 materials.add(EnvMaterial {
                     base: base.clone(),
                     extension: EnvLit {
-                        params: params(set, has_d1, has_d2, false, 0.0),
+                        params: params(set, has_d1, has_d2, false, emissive_boost),
                         diffuse1,
                         diffuse2,
                     },
                 })
             })
             .clone();
-        commands
-            .entity(entity)
-            .remove::<MeshMaterial3d<StandardMaterial>>()
+        let mut ec = commands.entity(entity);
+        ec.remove::<MeshMaterial3d<StandardMaterial>>()
             .insert(MeshMaterial3d(handle));
+        if matches!(base.alpha_mode, AlphaMode::Blend) {
+            ec.insert(NotShadowCaster);
+        }
     }
 }
 
@@ -1027,5 +1075,31 @@ mod tests {
         let below_view = refl.rotation.inverse() * (Vec3::new(400.0, -8.9, 650.0) - refl.translation);
         assert!(plane.truncate().dot(above_view) + plane.w > 0.0);
         assert!(plane.truncate().dot(below_view) + plane.w < 0.0);
+    }
+
+    #[test]
+    fn mtd_alpha_mode_classifies_m4000_decals_and_fences() {
+        assert_eq!(map::mtd_alpha_mode("Map_Diffuse"), (AlphaMode::Opaque, 0));
+        assert_eq!(map::mtd_alpha_mode("Map_Speculer"), (AlphaMode::Opaque, 0));
+        assert_eq!(
+            map::mtd_alpha_mode("Map_Diffuse_Alpha"),
+            (AlphaMode::Blend, 2)
+        );
+        assert_eq!(
+            map::mtd_alpha_mode("Map_Diffuse_alpha"),
+            (AlphaMode::Blend, 2)
+        );
+        assert_eq!(
+            map::mtd_alpha_mode("Map_Speculer_Alpha"),
+            (AlphaMode::Blend, 2)
+        );
+        assert_eq!(
+            map::mtd_alpha_mode("Map_Diffuse_AlphaMask"),
+            (AlphaMode::Mask(0.5), 1)
+        );
+        assert_eq!(
+            map::mtd_alpha_mode("Map_Diffuse_Add"),
+            (AlphaMode::Add, 3)
+        );
     }
 }

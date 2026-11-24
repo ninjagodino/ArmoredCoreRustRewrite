@@ -94,6 +94,18 @@ fn apply_god_rays(base: vec3<f32>, uv_in: vec2<f32>, gr: GodRayFilter) -> vec3<f
     }
 }
 
+// Exact IEC sRGB -> linear decode: Xbox 360 `m_ToneMapFilter` (`0x82c18628`) outputs
+// display-referred sRGB directly to an 8-bit A8R8G8B8 framebuffer (no hardware sRGB write),
+// whereas Bevy's fullscreen post-process writes to a linear HDR target before the sRGB swapchain
+// applies hardware linear -> sRGB encoding. Decoding here cancels the swapchain encode so the
+// final display pixels match the 360 framebuffer 1:1.
+fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
+    let clamped = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = clamped / 12.92;
+    let hi = pow((clamped + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, clamped <= vec3<f32>(0.04045));
+}
+
 fn apply_tonemap(hdr: vec3<f32>, tm: vec4<f32>) -> vec3<f32> {
     if tm.w > 10.0 || tm.x <= 0.0 {
         return hdr;
@@ -101,16 +113,17 @@ fn apply_tonemap(hdr: vec3<f32>, tm: vec4<f32>) -> vec3<f32> {
     let src = max(hdr, vec3<f32>(0.0)) * 0.5;
     let x = src * tm.x;
     let mode = u32(tm.w + 0.5);
+    var display = src;
     if mode == 0u {
-        return sqrt(max(vec3<f32>(1.0) - exp2(-x), vec3<f32>(0.0))) * tm.y;
+        display = sqrt(max(vec3<f32>(1.0) - exp2(-x), vec3<f32>(0.0))) * tm.y;
     } else if mode == 1u {
-        return (x / (x + vec3<f32>(1.0))) * tm.y;
+        display = (x / (x + vec3<f32>(1.0))) * tm.y;
     } else if mode == 2u {
         let w = max(tm.z * tm.x, 1e-4);
         let w2 = w * w;
-        return (x * (vec3<f32>(1.0) + x / w2) / (x + vec3<f32>(1.0))) * tm.y;
+        display = (x * (vec3<f32>(1.0) + x / w2) / (x + vec3<f32>(1.0))) * tm.y;
     }
-    return src;
+    return srgb_decode(display);
 }
 
 @fragment

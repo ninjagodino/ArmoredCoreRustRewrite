@@ -88,6 +88,27 @@ in order:
       blend (`g_FresnelPow = 70`, `g_FresnelBias = 0.5`, `g_FresnelScale = 0.9`) over squared
       `g_WaterColor (0.15, 0.10, 0.05)`, directional specular lobes from `colors_b` (`c11`/`c12`,
       `g_SpecularPower = 10`), distance/height fog, and tonemap.
+  - Done (360 tone-map sRGB parity, directional shadows, & map decal/alpha MTDs):
+    - **`m_ToneMapFilter` display sRGB decode (`zoom_blur.wgsl`, `0x82c18628`, verified against
+      Xenia `private/xenia/shots/ac_test_start.png` & `private/xenia/m4000_lit.jsonl`)**: the 360
+      `ToneMap_{Exp,Divide,Reinhard}ToneMapPS` shaders write display-referred sRGB directly to an
+      8-bit framebuffer without hardware sRGB encoding, whereas Bevy's `ZoomBlur` post-process
+      writes to a linear HDR texture before the sRGB swapchain encodes it (`c^(1/2.2)`). Decoding
+      the tonemap output via `srgb_decode` eliminates the double-gamma fullbright washout across
+      `m4000` and the garage.
+    - **Directional shadows on map pieces (`env_lit.wgsl`)**: `env_lit.wgsl` now samples Bevy's
+      primary shadow-casting `DirectionalLight` cascade map (`shadows::fetch_directional_shadow`)
+      with a `0.30` skylight floor (`mix(0.30, 1.0, dir_shadow)`), matching the shadowed bridge
+      deck and AC ground shadow in `ac_test_start.png`.
+    - **Crater decals & alpha/additive/glow map MTDs (`map.rs` `mtd_alpha_mode`, `env.rs::relight`)**:
+      `m4000_map.msb` uses `Map_Diffuse_Alpha` (33 meshes, `m0200_decal02`/`m0200_decal03` ground
+      craters), `Map_Speculer_Alpha` (11 meshes, `m0100_decal04`/`m0100_decal05`),
+      `Map_Diffuse_alpha` (3), `Map_Diffuse_AlphaMask` (1, `net`), `Map_Diffuse_Add` (41,
+      `m0100_03`), `Map_Diffuse _Grow` (2), and `Map_NoLight` (2). `map.rs` now keys its material
+      cache by alpha kind and sets `AlphaMode::{Blend, Mask(0.5), Add}` + `cull_mode: None`, and
+      `env::relight` routes `_Add`/`NoLight` to unlit `SkyMaterial`, `_Grow` to `emissive_boost =
+      1.6`, and marks `Blend`/`Add` decals `NotShadowCaster` (removing the opaque black quad
+      background on crater decals).
   - Open, in order: (1) sky leftovers: which pixel shader the sky pass binds (NoLightNoFog vs
     Flver_Sky.fpo with fog; the colour already matches the 360 shot). (2) c0 / c16 / c19 / c136
     values (taken as 1, no SSAO).

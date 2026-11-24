@@ -87,10 +87,38 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     raw = raw * vcol.rgb;
     let albedo = raw * raw;
 
+    let view_z = dot(vec4<f32>(
+        view_bindings::view.view_from_world[0].z,
+        view_bindings::view.view_from_world[1].z,
+        view_bindings::view.view_from_world[2].z,
+        view_bindings::view.view_from_world[3].z
+    ), pbr.world_position);
+
+    // Sample primary directional shadow map (sun cascade shadows from AC & map structures).
+    var dir_shadow: f32 = 1.0;
+    if (pbr.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u {
+        let n_dir = view_bindings::lights.n_directional_lights;
+        for (var i: u32 = 0u; i < n_dir; i = i + 1u) {
+            if (view_bindings::lights.directional_lights[i].flags
+                    & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
+                dir_shadow = shadows::fetch_directional_shadow(
+                    i,
+                    pbr.world_position,
+                    pbr.world_normal,
+                    view_z,
+                    pbr.frag_coord.xy,
+                );
+                break;
+            }
+        }
+    }
+
     let n = pbr.N;
     let ambient = max(env.amb_mid.rgb + env.amb_half.rgb * n.y, vec3(0.0));
+    let shadow_factor = mix(0.30, 1.0, dir_shadow);
     let direct = max(
-        saturate(dot(n, env.dir0.xyz)) * env.col0.rgb + saturate(dot(n, env.dir1.xyz)) * env.col1.rgb,
+        saturate(dot(n, env.dir0.xyz)) * env.col0.rgb * shadow_factor
+            + saturate(dot(n, env.dir1.xyz)) * env.col1.rgb,
         vec3(0.0),
     );
     var col = albedo * (ambient + direct);
@@ -118,12 +146,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         lighting_input.F0_metallic = albedo;
         lighting_input.F_ab = F_ab;
 
-        let view_z = dot(vec4<f32>(
-            view_bindings::view.view_from_world[0].z,
-            view_bindings::view.view_from_world[1].z,
-            view_bindings::view.view_from_world[2].z,
-            view_bindings::view.view_from_world[3].z
-        ), pbr.world_position);
         let cluster_index = clustering::view_fragment_cluster_index(
             pbr.frag_coord.xy,
             view_z,

@@ -857,15 +857,35 @@ pub(crate) fn bevy_transform(xf: &flver::Xform) -> Transform {
     Transform::from_matrix(mat)
 }
 
-/// Map materials keyed by `(diffuse, bump)` texture names: the map's own full-resolution
-/// texture first, then the first disc pack with that name.
+/// Map materials keyed by `(diffuse, bump, alpha_kind)` so opaque and alpha-blended/masked/additive
+/// MTDs sharing a texture name never collide.
 #[derive(Default)]
 struct Textures {
     own: String,
     packs: Packs,
-    by_name: HashMap<(Option<String>, Option<String>), Handle<StandardMaterial>>,
+    by_name: HashMap<(Option<String>, Option<String>, u8), Handle<StandardMaterial>>,
     images: HashMap<(String, bool), Option<Handle<Image>>>,
     missing: usize,
+}
+
+/// Classifies a FLVER map MTD's blend / alpha-test mode (`Map_Diffuse_Alpha`, `Map_Speculer_Alpha`,
+/// `Map_Diffuse_AlphaMask`, `Map_Diffuse_Add`).
+pub(crate) fn mtd_alpha_mode(mtd: &str) -> (AlphaMode, u8) {
+    let stem = mtd
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(mtd)
+        .trim_end_matches(".mtd")
+        .to_ascii_lowercase();
+    if stem.contains("alphamask") {
+        (AlphaMode::Mask(0.5), 1)
+    } else if stem.ends_with("_alpha") || stem.contains("_alpha_") {
+        (AlphaMode::Blend, 2)
+    } else if stem.ends_with("_add") || stem.contains("_add_") {
+        (AlphaMode::Add, 3)
+    } else {
+        (AlphaMode::Opaque, 0)
+    }
 }
 
 impl Textures {
@@ -916,7 +936,8 @@ impl Textures {
         materials: &mut Assets<StandardMaterial>,
         images: &mut Assets<Image>,
     ) -> Handle<StandardMaterial> {
-        let key = (mesh.diffuse.clone(), mesh.bump.clone());
+        let (alpha_mode, alpha_kind) = mtd_alpha_mode(&mesh.mtd);
+        let key = (mesh.diffuse.clone(), mesh.bump.clone(), alpha_kind);
         if let Some(h) = self.by_name.get(&key) {
             return h.clone();
         }
@@ -938,6 +959,12 @@ impl Textures {
             normal_map_texture: normal_map,
             flip_normal_map_y: false,
             perceptual_roughness: 0.9,
+            alpha_mode,
+            cull_mode: if alpha_kind != 0 {
+                None
+            } else {
+                Some(bevy::render::render_resource::Face::Back)
+            },
             ..default()
         });
         self.by_name.insert(key, handle.clone());
