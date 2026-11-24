@@ -134,6 +134,9 @@ pub enum UiAction {
     PaintRgbDelta(usize, i16),
     PaintCamoDelta(i8),
     PaintCamoSelect(u8),
+    PaintCamoUpload,
+    PaintCustomCamoSelect(usize),
+    PaintCustomCamoDelete(usize),
     PaintExitSave,
     PaintExitDiscard,
     DecalUpload,
@@ -1064,6 +1067,8 @@ pub struct GarageState {
     pub paint_hsv_synced_channel: Option<usize>,
     /// Active mouse click-drag target in `PAINT -> PALETTE`.
     pub paint_drag: Option<PaintDragTarget>,
+    /// Session-scoped undo/redo stack for the Paint menu (cleared when leaving `GarageScreen::Paint`).
+    pub paint_history: PaintUndoHistory,
     /// Set to `true` on frames where a garage UI slider/strip consumed the mouse wheel so
     /// `update_camera` (which runs after `sync_ui`) never also zooms the 3D mech camera.
     pub wheel_consumed: bool,
@@ -1083,6 +1088,10 @@ pub struct GarageState {
     pub cam_focus: Vec3,
     pub cam_initialized: bool,
     pub cam_manual_orbit: bool,
+    /// Persistent vertical pan focus Y in `GarageScreen::Paint` (held until leaving Paint,
+    /// switching Paint tabs, or pressing `R`).
+    pub cam_pan_y: Option<f32>,
+    pub cam_pan_tab: Option<PaintTab>,
     /// Transient status banner shown inside the UI (e.g. "OVERWEIGHT", "EQUIPPED ...").
     pub banner: Option<(String, Color, f32)>,
     /// Last window logical size used to lay out the UI (triggers rebuild on resize).
@@ -1149,6 +1158,7 @@ impl GarageState {
             paint_hsv: [0.0, 0.0, 0.5],
             paint_hsv_synced_channel: None,
             paint_drag: None,
+            paint_history: PaintUndoHistory::default(),
             wheel_consumed: false,
             paint_exit_prompt: false,
             paint_exit_prompt_choice: true,
@@ -1161,6 +1171,8 @@ impl GarageState {
             cam_focus: Vec3::new(0.0, 3.2, 0.0),
             cam_initialized: false,
             cam_manual_orbit: false,
+            cam_pan_y: None,
+            cam_pan_tab: None,
             banner: None,
             last_window_size: Vec2::ZERO,
             last_ui_scale: 1.0,
@@ -1691,6 +1703,32 @@ pub fn update_camera(
         state.cam_yaw -= motion.delta.x * 0.006;
         state.cam_pitch = (state.cam_pitch + motion.delta.y * 0.005).clamp(-0.35, 1.15);
     }
+    // Clear vertical Paint pan when exiting Paint or switching Paint tabs.
+    if state.screen != GarageScreen::Paint
+        || (state.cam_pan_y.is_some() && state.cam_pan_tab != Some(state.paint_tab))
+    {
+        state.cam_pan_y = None;
+        state.cam_pan_tab = None;
+    }
+
+    // In Paint mode, holding middle mouse pans the camera focus vertically along the mech's body
+    // and holds that height until exiting Paint or switching tabs.
+    let mut panning_y = false;
+    if state.screen == GarageScreen::Paint
+        && buttons.pressed(MouseButton::Middle)
+        && motion.delta.y.abs() > 0.0
+    {
+        panning_y = true;
+        state.cam_manual_orbit = true;
+        let pan_scale = 0.008 * (state.cam_dist / 8.0).clamp(0.4, 2.0);
+        let min_y = garage.bounds.0.y.min(0.2);
+        let max_y = garage.bounds.1.y.max(2.0);
+        let base_y = state.cam_pan_y.unwrap_or(state.cam_focus.y);
+        let next_y = (base_y + motion.delta.y * pan_scale).clamp(min_y, max_y);
+        state.cam_pan_y = Some(next_y);
+        state.cam_pan_tab = Some(state.paint_tab);
+        state.cam_focus.y = next_y;
+    }
     if !in_assemble {
         let mut right_stick = Vec2::ZERO;
         for pad in &gamepads {
@@ -1726,11 +1764,16 @@ pub fn update_camera(
         state.cam_dist = (state.cam_dist * (1.0 - scroll.delta.y * 0.09)).clamp(3.2, max_d);
     }
 
+    let mut desired_focus = target.focus;
+    if let Some(pan_y) = state.cam_pan_y {
+        desired_focus.y = pan_y;
+    }
+
     if !state.cam_initialized {
         state.cam_yaw = target.yaw;
         state.cam_pitch = target.pitch;
         state.cam_dist = target.dist;
-        state.cam_focus = target.focus;
+        state.cam_focus = desired_focus;
         state.cam_initialized = true;
     } else if !state.cam_manual_orbit {
         let t = 1.0 - (-8.0 * time.delta_secs()).exp();
@@ -1738,11 +1781,11 @@ pub fn update_camera(
         state.cam_yaw += dyaw * t;
         state.cam_pitch += (target.pitch - state.cam_pitch) * t;
         state.cam_dist += (target.dist - state.cam_dist) * t;
-        state.cam_focus = state.cam_focus.lerp(target.focus, t);
-    } else {
-        // Still smoothly align focus Y if the AC height changed.
+        state.cam_focus = state.cam_focus.lerp(desired_focus, t);
+    } else if !panning_y {
+        // Smoothly align focus X/Z (and Y when not panned) if the AC height changed.
         let t = 1.0 - (-6.0 * time.delta_secs()).exp();
-        state.cam_focus = state.cam_focus.lerp(target.focus, t);
+        state.cam_focus = state.cam_focus.lerp(desired_focus, t);
     }
 
     let min_y = (ws_row.camera_min_height as f32 * 0.01).clamp(0.8, 4.5);
@@ -1796,6 +1839,7 @@ pub struct OptionsCtx<'w, 's> {
     audio_buses: Query<'w, 's, &'static AudioBus>,
     windows: Query<'w, 's, &'static mut Window, With<bevy::window::PrimaryWindow>>,
     app_exit: MessageWriter<'w, AppExit>,
+    custom_camos: ResMut<'w, paint::CustomCamoLibrary>,
 }
 
 /// Handles keyboard, gamepad, and mouse-button interaction in the 3D Garage.
@@ -1875,12 +1919,64 @@ pub fn handle_input(
         return;
     }
 
+    // Poll any pending custom camouflage file-picker result.
+    if let Some(res) = options.custom_camos.poll_picker(&mut images) {
+        match res {
+            Ok(_) => {
+                let _ = ensure_custom_color(&mut garage);
+                garage.dirty = true;
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_EQUIP);
+                let lbl = options
+                    .custom_camos
+                    .active_label()
+                    .unwrap_or("CUSTOM")
+                    .to_string();
+                state.set_banner(
+                    format!("UPLOADED CUSTOM CAMO: {lbl}"),
+                    Color::srgb(0.45, 0.92, 0.62),
+                );
+                state.ui_dirty = true;
+            }
+            Err(e) => {
+                warn!("custom camo import failed: {e:#}");
+                state.set_banner(
+                    "FAILED TO LOAD CAMO IMAGE",
+                    Color::srgb(0.96, 0.40, 0.36),
+                );
+            }
+        }
+    }
+
     // `R` resets manual camera orbit back to the active `AcsisDisplaySt` preset.
     if keys.just_pressed(KeyCode::KeyR) {
         state.cam_manual_orbit = false;
+        state.cam_pan_y = None;
+        state.cam_pan_tab = None;
+    }
+
+    // Paint menu session undo / redo (`Ctrl+Z` / `Ctrl+Shift+Z`).
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    if state.screen == GarageScreen::Paint && ctrl && keys.just_pressed(KeyCode::KeyZ) {
+        let target = if shift {
+            state.paint_history.redo().cloned()
+        } else {
+            state.paint_history.undo().cloned()
+        };
+        if let Some(snap) = target {
+            snap.apply(&mut garage, &mut decals);
+            state.paint_hsv_synced_channel = None;
+            state.ui_dirty = true;
+            let cue = if shift { CUE_MOVE } else { CUE_CANCEL };
+            sound::cue(&mut commands, &mut cues, &mut audio_assets, cue);
+        }
+        return;
     }
 
     // Mouse button clicks on UI action widgets.
+    // Defer container row selection (`SelectOptionRow`) so child `<` / `>` arrow buttons
+    // inside a slider row always take priority when clicked.
+    let mut fallback_select_row: Option<usize> = None;
     for (interaction, action) in &action_buttons {
         if !interaction.is_changed() || *interaction != Interaction::Pressed {
             continue;
@@ -1982,18 +2078,58 @@ pub fn handle_input(
                 return;
             }
             UiAction::PaintCamoDelta(delta) => {
+                options.custom_camos.active_key = None;
                 step_custom_camo(&mut garage, delta);
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_EQUIP);
                 state.ui_dirty = true;
                 return;
             }
             UiAction::PaintCamoSelect(camo_id) => {
+                options.custom_camos.active_key = None;
                 let col = ensure_custom_color(&mut garage);
                 let id = camo_id.min(11);
                 col.camo.fill(id);
                 garage.dirty = true;
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_EQUIP);
                 state.ui_dirty = true;
+                return;
+            }
+            UiAction::PaintCamoUpload => {
+                if options.custom_camos.open_file_picker() {
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_OK);
+                    state.set_banner(
+                        "SELECT A CAMO IMAGE (PNG/JPG/WEBP/BMP/GIF)...",
+                        Color::srgb(0.38, 0.86, 0.96),
+                    );
+                }
+                return;
+            }
+            UiAction::PaintCustomCamoSelect(idx) => {
+                if let Some(asset) = options.custom_camos.assets.get(idx) {
+                    let key = asset.key.clone();
+                    let label = asset.label.clone();
+                    options.custom_camos.active_key = Some(key);
+                    let _ = ensure_custom_color(&mut garage);
+                    garage.dirty = true;
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_EQUIP);
+                    state.set_banner(
+                        format!("APPLIED CUSTOM CAMO: {label}"),
+                        Color::srgb(0.45, 0.92, 0.62),
+                    );
+                    state.ui_dirty = true;
+                }
+                return;
+            }
+            UiAction::PaintCustomCamoDelete(idx) => {
+                if let Some(label) = options.custom_camos.delete_custom_camo(idx) {
+                    garage.dirty = true;
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
+                    state.set_banner(
+                        format!("REMOVED CUSTOM CAMO: {label}"),
+                        Color::srgb(0.96, 0.45, 0.36),
+                    );
+                    state.ui_dirty = true;
+                }
                 return;
             }
             UiAction::PaintExitSave => {
@@ -2123,7 +2259,7 @@ pub fn handle_input(
             }
             UiAction::DecalScaleStep(delta) => {
                 if delta == 0 {
-                    return;
+                    continue;
                 }
                 if let Some(d) = decals.selected_layer_mut() {
                     d.scale = (d.scale + delta as f32 * 0.08).clamp(0.08, 2.5);
@@ -2144,7 +2280,7 @@ pub fn handle_input(
             }
             UiAction::DecalRotateStep(delta) => {
                 if delta == 0 {
-                    return;
+                    continue;
                 }
                 if let Some(d) = decals.selected_layer_mut() {
                     d.rotation = (d.rotation + (delta as f32 * 15.0).to_radians())
@@ -2161,7 +2297,7 @@ pub fn handle_input(
             }
             UiAction::DecalOpacityStep(delta) => {
                 if delta == 0 {
-                    return;
+                    continue;
                 }
                 if let Some(d) = decals.selected_layer_mut() {
                     d.opacity = (d.opacity + delta as f32 * 0.1).clamp(0.1, 1.0);
@@ -2335,12 +2471,8 @@ pub fn handle_input(
                 return;
             }
             UiAction::SelectOptionRow(row) => {
-                if state.cursor != row {
-                    state.cursor = row;
-                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
-                    state.ui_dirty = true;
-                }
-                return;
+                fallback_select_row = Some(row);
+                continue;
             }
             UiAction::UiScaleStep(delta) => {
                 state.cursor = 1;
@@ -2467,6 +2599,14 @@ pub fn handle_input(
                 return;
             }
         }
+    }
+    if let Some(row) = fallback_select_row {
+        if state.cursor != row {
+            state.cursor = row;
+            sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+            state.ui_dirty = true;
+        }
+        return;
     }
 
     // Mouse clicks on list rows.
@@ -3798,13 +3938,173 @@ pub fn normalize_track_point(center_phys: Vec2, size_phys: Vec2, cursor_phys: Ve
     (Vec2::new(u, v), inside)
 }
 
-/// Handles click-and-drag scrubbing on the HSV (2D SV square + Hue bar) and RGB (R/G/B bars)
-/// color picker tracks in `PAINT -> PALETTE`, updating the 3D AC materials live in-place.
+const MAX_PAINT_HISTORY: usize = 64;
+
+/// Full reversible snapshot of Paint menu state (AC coloring/camo, placed decals, and emblem).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaintSnapshot {
+    pub coloring_id: u16,
+    pub custom_color: Option<acvd_formats::accolor::AcColor>,
+    pub decal_layers: Vec<decal::PlacedDecal>,
+    pub selected_decal_id: Option<u64>,
+    pub ac_emblem_key: Option<String>,
+    pub emblem_override: bool,
+}
+
+impl PaintSnapshot {
+    pub fn capture(garage: &crate::Garage, decals: &DecalState) -> Self {
+        Self {
+            coloring_id: garage.active_design.coloring_id,
+            custom_color: garage.custom_color,
+            decal_layers: decals.layers.clone(),
+            selected_decal_id: decals.selected_id,
+            ac_emblem_key: decals.ac_emblem_key.clone(),
+            emblem_override: decals.emblem_override,
+        }
+    }
+
+    pub fn apply(&self, garage: &mut crate::Garage, decals: &mut DecalState) {
+        if garage.active_design.coloring_id != self.coloring_id
+            || garage.custom_color != self.custom_color
+        {
+            garage.active_design.coloring_id = self.coloring_id;
+            garage.custom_color = self.custom_color;
+            garage.dirty = true;
+        }
+        let decals_changed = decals.layers != self.decal_layers
+            || decals.selected_id != self.selected_decal_id
+            || decals.ac_emblem_key != self.ac_emblem_key
+            || decals.emblem_override != self.emblem_override;
+        if decals_changed {
+            decals.layers = self.decal_layers.clone();
+            decals.selected_id = self.selected_decal_id;
+            decals.ac_emblem_key = self.ac_emblem_key.clone();
+            decals.emblem_override = self.emblem_override;
+            decals.emblem_texture_dirty = true;
+            for slot in decal::DecalSlot::ALL {
+                decals.mark_decal_slots_dirty(slot, false, true);
+            }
+            if let Some(did) = decals.loaded_design_id {
+                decals.save_for_design(did);
+            }
+        }
+    }
+}
+
+/// Session-scoped undo/redo stack for the Paint menu (active while in `GarageScreen::Paint`,
+/// cleared when leaving it).
+#[derive(Debug, Default)]
+pub struct PaintUndoHistory {
+    snapshots: Vec<PaintSnapshot>,
+    cursor: usize,
+    active: bool,
+}
+
+impl PaintUndoHistory {
+    pub fn reset(&mut self) {
+        self.snapshots.clear();
+        self.cursor = 0;
+        self.active = false;
+    }
+
+    pub fn begin(&mut self, initial: PaintSnapshot) {
+        self.snapshots.clear();
+        self.snapshots.push(initial);
+        self.cursor = 0;
+        self.active = true;
+    }
+
+    pub fn record(&mut self, snap: PaintSnapshot) {
+        if !self.active {
+            self.begin(snap);
+            return;
+        }
+        if self.snapshots.get(self.cursor) == Some(&snap) {
+            return;
+        }
+        self.snapshots.truncate(self.cursor + 1);
+        self.snapshots.push(snap);
+        if self.snapshots.len() > MAX_PAINT_HISTORY {
+            self.snapshots.remove(0);
+        }
+        self.cursor = self.snapshots.len() - 1;
+    }
+
+    pub fn undo(&mut self) -> Option<&PaintSnapshot> {
+        if self.active && self.cursor > 0 {
+            self.cursor -= 1;
+            self.snapshots.get(self.cursor)
+        } else {
+            None
+        }
+    }
+
+    pub fn redo(&mut self) -> Option<&PaintSnapshot> {
+        if self.active && self.cursor + 1 < self.snapshots.len() {
+            self.cursor += 1;
+            self.snapshots.get(self.cursor)
+        } else {
+            None
+        }
+    }
+}
+
+/// Tracks Paint menu session snapshots for `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo, coalescing
+/// continuous color-picker and decal drags into a single step and clearing on Paint exit.
+pub fn sync_paint_history(
+    mode: Res<Mode>,
+    mut state: ResMut<GarageState>,
+    garage: Res<crate::Garage>,
+    decals: Res<DecalState>,
+) {
+    if *mode != Mode::Garage || state.screen != GarageScreen::Paint {
+        if state.paint_history.active {
+            state.paint_history.reset();
+        }
+        return;
+    }
+    if !state.paint_history.active {
+        state
+            .paint_history
+            .begin(PaintSnapshot::capture(&garage, &decals));
+        return;
+    }
+    // Coalesce continuous drags until mouse release.
+    if state.paint_drag.is_some() || decals.dragging {
+        return;
+    }
+    let snap = PaintSnapshot::capture(&garage, &decals);
+    state.paint_history.record(snap);
+}
+
+fn current_decal_tint(decals: &DecalState) -> [u8; 4] {
+    decals
+        .selected_layer()
+        .map(|d| d.tint)
+        .unwrap_or(decals.brush_tint)
+}
+
+fn apply_decal_tint_color(decals: &mut DecalState, rgba: [u8; 4]) {
+    let rgba = [rgba[0], rgba[1], rgba[2], 255];
+    decals.brush_tint = rgba;
+    if let Some(d) = decals.selected_layer_mut() {
+        d.tint = rgba;
+        let (slot, mirror) = (d.slot, d.mirror_x);
+        decals.mark_decal_slots_dirty(slot, mirror, true);
+        if let Some(did) = decals.loaded_design_id {
+            decals.save_for_design(did);
+        }
+    }
+}
+
+/// Handles click-and-drag scrubbing (and hover-to-scroll) on the HSV (2D SV square + Hue bar) and
+/// RGB (R/G/B bars) color picker tracks in `PAINT -> PALETTE` and `PAINT -> DECALS`.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_paint_color_drag(
     mode: Res<Mode>,
     mut state: ResMut<GarageState>,
     mut garage: ResMut<crate::Garage>,
+    mut decals: ResMut<DecalState>,
     buttons: Res<ButtonInput<MouseButton>>,
     scroll: Res<AccumulatedMouseScroll>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
@@ -3814,9 +4114,10 @@ pub fn handle_paint_color_drag(
     mut picker_assets: ResMut<PaintPickerAssets>,
     mut images: ResMut<Assets<Image>>,
 ) {
+    let in_decal_tab = state.paint_tab == PaintTab::Decals;
     if *mode != Mode::Garage
         || state.screen != GarageScreen::Paint
-        || state.paint_tab != PaintTab::Custom
+        || !matches!(state.paint_tab, PaintTab::Custom | PaintTab::Decals)
     {
         state.paint_drag = None;
         return;
@@ -3830,6 +4131,19 @@ pub fn handle_paint_color_drag(
     };
     let cursor_phys = cursor_logical * window.scale_factor();
 
+    let sync_key = if in_decal_tab {
+        usize::MAX
+    } else {
+        state.paint_channel
+    };
+    let active_rgba = |garage: &crate::Garage, decals: &DecalState, ch: usize| -> [u8; 4] {
+        if in_decal_tab {
+            current_decal_tint(decals)
+        } else {
+            current_channel_color(garage, ch)
+        }
+    };
+
     // Hover-to-scroll on 1D color picker slider tracks (Hue bar and RGB gradient bars).
     if scroll.delta.y.abs() > 0.0 {
         let hovered_slider = tracks.iter().find_map(|(track, computed, tf)| {
@@ -3842,12 +4156,11 @@ pub fn handle_paint_color_drag(
         if let Some(target) = hovered_slider {
             state.wheel_consumed = true;
             let delta = wheel_step_direction(scroll.delta.y);
-            if state.paint_hsv_synced_channel != Some(state.paint_channel) {
-                state.paint_hsv =
-                    paint::rgb_to_hsv(current_channel_color(&garage, state.paint_channel));
-                state.paint_hsv_synced_channel = Some(state.paint_channel);
+            let prev_rgba = active_rgba(&garage, &decals, state.paint_channel);
+            if state.paint_hsv_synced_channel != Some(sync_key) {
+                state.paint_hsv = paint::rgb_to_hsv(prev_rgba);
+                state.paint_hsv_synced_channel = Some(sync_key);
             }
-            let prev_rgba = current_channel_color(&garage, state.paint_channel);
             let new_rgba = match target {
                 PaintDragTarget::HsvHue => {
                     state.paint_hsv[0] = (state.paint_hsv[0] + delta as f32 * 5.0).rem_euclid(360.0);
@@ -3874,13 +4187,17 @@ pub fn handle_paint_color_drag(
                 }
                 PaintDragTarget::HsvSv => prev_rgba,
             };
-            apply_custom_channel_color_live(
-                &mut garage,
-                state.paint_channel,
-                new_rgba,
-                &ac_meshes,
-                &mut paint_materials,
-            );
+            if in_decal_tab {
+                apply_decal_tint_color(&mut decals, new_rgba);
+            } else {
+                apply_custom_channel_color_live(
+                    &mut garage,
+                    state.paint_channel,
+                    new_rgba,
+                    &ac_meshes,
+                    &mut paint_materials,
+                );
+            }
             state.ui_dirty = true;
             return;
         }
@@ -3911,12 +4228,12 @@ pub fn handle_paint_color_drag(
     };
     let (uv, _) = normalize_track_point(tf.translation, computed.size(), cursor_phys);
 
-    if state.paint_hsv_synced_channel != Some(state.paint_channel) {
-        state.paint_hsv = paint::rgb_to_hsv(current_channel_color(&garage, state.paint_channel));
-        state.paint_hsv_synced_channel = Some(state.paint_channel);
+    let prev_rgba = active_rgba(&garage, &decals, state.paint_channel);
+    if state.paint_hsv_synced_channel != Some(sync_key) {
+        state.paint_hsv = paint::rgb_to_hsv(prev_rgba);
+        state.paint_hsv_synced_channel = Some(sync_key);
     }
 
-    let prev_rgba = current_channel_color(&garage, state.paint_channel);
     let prev_hsv = state.paint_hsv;
 
     let new_rgba = match active_target {
@@ -3955,13 +4272,17 @@ pub fn handle_paint_color_drag(
         || (state.paint_hsv[1] - prev_hsv[1]).abs() > 0.002
         || (state.paint_hsv[2] - prev_hsv[2]).abs() > 0.002;
     if new_rgba != prev_rgba || hsv_changed {
-        apply_custom_channel_color_live(
-            &mut garage,
-            state.paint_channel,
-            new_rgba,
-            &ac_meshes,
-            &mut paint_materials,
-        );
+        if in_decal_tab {
+            apply_decal_tint_color(&mut decals, new_rgba);
+        } else {
+            apply_custom_channel_color_live(
+                &mut garage,
+                state.paint_channel,
+                new_rgba,
+                &ac_meshes,
+                &mut paint_materials,
+            );
+        }
         state.ui_dirty = true;
     }
 }
@@ -4020,6 +4341,7 @@ pub fn sync_ui(
     garage: Res<crate::Garage>,
     settings: Res<GameSettings>,
     mut decals: ResMut<DecalState>,
+    mut custom_camos: ResMut<paint::CustomCamoLibrary>,
     mut assemble_assets: ResMut<crate::garage_assemble::AssembleUiAssets>,
     mut picker_assets: ResMut<PaintPickerAssets>,
     mut images: ResMut<Assets<Image>>,
@@ -4045,6 +4367,7 @@ pub fn sync_ui(
     state.last_window_size = win_size;
     state.last_ui_scale = settings.ui_scale;
     decals.init_assets(&mut images);
+    custom_camos.init_assets(&mut images);
     if state.screen == GarageScreen::Paint
         && matches!(state.paint_tab, PaintTab::Decals | PaintTab::Emblem)
         && decals.library_tab == DecalLibraryTab::Emblems
@@ -4182,6 +4505,7 @@ pub fn sync_ui(
             &state,
             &garage,
             &decals,
+            &custom_camos,
             &picker_assets,
             scale,
         );
@@ -4705,7 +5029,7 @@ pub fn sync_ui(
         state.screen == GarageScreen::Paint && state.paint_tab == PaintTab::Decals;
 
     if in_decal_mode {
-        spawn_garage_decal_inspector(&mut commands, root, &kit, &decals, scale);
+        spawn_garage_decal_inspector(&mut commands, root, &kit, &state, &decals, &picker_assets, scale);
     } else {
         // Right AC SPECS telemetry panel (live `AcCtrlParam` calculation + preview delta!).
         let cur_specs = AcSpecs::calculate(&garage.active_design);
@@ -5428,6 +5752,7 @@ fn spawn_garage_paint_menu(
     state: &GarageState,
     garage: &crate::Garage,
     decals: &DecalState,
+    custom_camos: &paint::CustomCamoLibrary,
     picker_assets: &PaintPickerAssets,
     scale: f32,
 ) {
@@ -5491,7 +5816,16 @@ fn spawn_garage_paint_menu(
             spawn_paint_presets_tab(commands, kit, panel, state, garage, scale);
         }
         PaintTab::Custom => {
-            spawn_paint_palette_tab(commands, kit, panel, state, garage, picker_assets, scale);
+            spawn_paint_palette_tab(
+                commands,
+                kit,
+                panel,
+                state,
+                garage,
+                custom_camos,
+                picker_assets,
+                scale,
+            );
         }
         PaintTab::Decals => {
             spawn_paint_decals_tab(commands, kit, panel, decals, scale);
@@ -5696,6 +6030,7 @@ fn spawn_paint_palette_tab(
     panel: Entity,
     state: &GarageState,
     garage: &crate::Garage,
+    custom_camos: &paint::CustomCamoLibrary,
     picker_assets: &PaintPickerAssets,
     scale: f32,
 ) {
@@ -5822,414 +6157,21 @@ fn spawn_paint_palette_tab(
 
     // Click-drag RGB / HSV Color Selector card
     let rgba = current_channel_color(garage, state.paint_channel);
-    let [h_deg, sat, val] = state.paint_hsv;
-    let picker_card = kit.spawn_panel(
+    spawn_color_picker_card(
         commands,
-        Some(panel),
-        PanelStyle::Subtle,
-        Node {
-            width: Val::Percent(100.0),
-            padding: UiRect::all(px((7.0 * scale).round())),
-            flex_direction: FlexDirection::Column,
-            row_gap: px((5.0 * scale).round()),
-            ..default()
-        },
+        panel,
+        kit,
+        state.paint_picker_mode,
+        rgba,
+        state.paint_hsv,
+        picker_assets,
+        104.0,
         scale,
     );
 
-    // Picker header: [HSV] [RGB] toggle pills + live swatch + #HEX
-    let picker_hdr = commands
-        .spawn((
-            Node {
-                width: Val::Percent(100.0),
-                flex_direction: FlexDirection::Row,
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                column_gap: px((6.0 * scale).round()),
-                ..default()
-            },
-            ChildOf(picker_card),
-        ))
-        .id();
-
-    let mode_pills = commands
-        .spawn((
-            Node {
-                flex_direction: FlexDirection::Row,
-                column_gap: px((4.0 * scale).round()),
-                ..default()
-            },
-            ChildOf(picker_hdr),
-        ))
-        .id();
-    for (pmode, lbl) in [(PaintPickerMode::Hsv, "HSV"), (PaintPickerMode::Rgb, "RGB")] {
-        let pstate = if state.paint_picker_mode == pmode {
-            ButtonState::Active
-        } else {
-            ButtonState::Normal
-        };
-        let b = spawn_kit_pill(commands, kit, mode_pills, lbl, pstate, 0.0, 10.0, 3.0, 0.88, scale);
-        commands
-            .entity(b)
-            .insert((Button, UiAction::PaintPickerMode(pmode)));
-    }
-
-    let hex_box = commands
-        .spawn((
-            Node {
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: px((6.0 * scale).round()),
-                ..default()
-            },
-            ChildOf(picker_hdr),
-        ))
-        .id();
-    kit.spawn_text(
-        commands,
-        hex_box,
-        FontRole::Small,
-        &format!("#{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2]),
-        scale * 0.90,
-        palette::TEXT_BRIGHT,
-    );
-    commands.spawn((
-        Node {
-            width: px((28.0 * scale).round()),
-            height: px((15.0 * scale).round()),
-            border: UiRect::all(px(bw)),
-            ..default()
-        },
-        BackgroundColor(Color::srgb_u8(rgba[0], rgba[1], rgba[2])),
-        BorderColor::all(Color::WHITE),
-        ChildOf(hex_box),
-    ));
-
-    match state.paint_picker_mode {
-        PaintPickerMode::Hsv => {
-            // 2D Saturation × Value drag square
-            let sv_box = commands
-                .spawn((
-                    ColorPickerTrack(PaintDragTarget::HsvSv),
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: px((104.0 * scale).round()),
-                        border: UiRect::all(px(bw)),
-                        position_type: PositionType::Relative,
-                        overflow: Overflow::clip(),
-                        ..default()
-                    },
-                    BorderColor::all(palette::BORDER_BUTTON),
-                    ChildOf(picker_card),
-                ))
-                .id();
-            if let Some(sv_img) = &picker_assets.sv_image {
-                commands.spawn((
-                    ImageNode::new(sv_img.clone()),
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: px(0.0),
-                        right: px(0.0),
-                        top: px(0.0),
-                        bottom: px(0.0),
-                        width: Val::Percent(100.0),
-                        height: Val::Percent(100.0),
-                        ..default()
-                    },
-                    ChildOf(sv_box),
-                ));
-            }
-            // High-contrast crosshair reticle at (S, 1 - V)
-            let ring_sz = (12.0 * scale).round().max(8.0);
-            let ring_half = (ring_sz * 0.5).round();
-            let ring = commands
-                .spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: Val::Percent((sat * 100.0).clamp(0.0, 100.0)),
-                        top: Val::Percent(((1.0 - val) * 100.0).clamp(0.0, 100.0)),
-                        width: px(ring_sz),
-                        height: px(ring_sz),
-                        margin: UiRect {
-                            left: px(-ring_half),
-                            top: px(-ring_half),
-                            ..default()
-                        },
-                        border: UiRect::all(px((2.0 * scale).round().max(1.0))),
-                        align_items: AlignItems::Center,
-                        justify_content: JustifyContent::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.25)),
-                    BorderColor::all(Color::WHITE),
-                    ChildOf(sv_box),
-                ))
-                .id();
-            commands.spawn((
-                Node {
-                    width: px((4.0 * scale).round().max(2.0)),
-                    height: px((4.0 * scale).round().max(2.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
-                ChildOf(ring),
-            ));
-
-            // Horizontal Hue spectrum drag bar
-            let hue_box = commands
-                .spawn((
-                    ColorPickerTrack(PaintDragTarget::HsvHue),
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: px((17.0 * scale).round()),
-                        border: UiRect::all(px(bw)),
-                        position_type: PositionType::Relative,
-                        ..default()
-                    },
-                    BorderColor::all(palette::BORDER_BUTTON),
-                    ChildOf(picker_card),
-                ))
-                .id();
-            if let Some(hue_img) = &picker_assets.hue_image {
-                commands.spawn((
-                    ImageNode::new(hue_img.clone()),
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: px(0.0),
-                        right: px(0.0),
-                        top: px(0.0),
-                        bottom: px(0.0),
-                        width: Val::Percent(100.0),
-                        height: Val::Percent(100.0),
-                        ..default()
-                    },
-                    ChildOf(hue_box),
-                ));
-            }
-            let thumb_w = (6.0 * scale).round().max(4.0);
-            commands.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Percent(((h_deg / 360.0) * 100.0).clamp(0.0, 100.0)),
-                    top: px(-2.0 * scale),
-                    bottom: px(-2.0 * scale),
-                    width: px(thumb_w),
-                    margin: UiRect::left(px(-(thumb_w * 0.5).round())),
-                    border: UiRect::all(px(bw)),
-                    ..default()
-                },
-                BackgroundColor(Color::WHITE),
-                BorderColor::all(Color::BLACK),
-                ChildOf(hue_box),
-            ));
-
-            // HSV + RGB readout strip
-            let readout = commands
-                .spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        flex_direction: FlexDirection::Row,
-                        justify_content: JustifyContent::SpaceBetween,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    ChildOf(picker_card),
-                ))
-                .id();
-            kit.spawn_text(
-                commands,
-                readout,
-                FontRole::Small,
-                &format!(
-                    "H {:3}  S {:3}%  V {:3}%",
-                    h_deg.round() as i32,
-                    (sat * 100.0).round() as i32,
-                    (val * 100.0).round() as i32,
-                ),
-                scale * 0.84,
-                palette::TEXT_PRIMARY,
-            );
-            kit.spawn_text(
-                commands,
-                readout,
-                FontRole::Small,
-                "DRAG TO PICK",
-                scale * 0.80,
-                palette::TEXT_MUTED,
-            );
-        }
-        PaintPickerMode::Rgb => {
-            // 3 click-and-drag RGB gradient slider bars + fine steppers
-            let rgb_specs = [
-                (
-                    0usize,
-                    "R",
-                    PaintDragTarget::RgbR,
-                    Color::srgb(1.0, 0.45, 0.42),
-                    Color::srgb_u8(0, rgba[1], rgba[2]),
-                    Color::srgb_u8(255, rgba[1], rgba[2]),
-                ),
-                (
-                    1usize,
-                    "G",
-                    PaintDragTarget::RgbG,
-                    Color::srgb(0.45, 0.96, 0.55),
-                    Color::srgb_u8(rgba[0], 0, rgba[2]),
-                    Color::srgb_u8(rgba[0], 255, rgba[2]),
-                ),
-                (
-                    2usize,
-                    "B",
-                    PaintDragTarget::RgbB,
-                    Color::srgb(0.45, 0.74, 1.0),
-                    Color::srgb_u8(rgba[0], rgba[1], 0),
-                    Color::srgb_u8(rgba[0], rgba[1], 255),
-                ),
-            ];
-            for (comp, lbl, target, lbl_col, min_c, max_c) in rgb_specs {
-                let row = commands
-                    .spawn((
-                        Node {
-                            width: Val::Percent(100.0),
-                            flex_direction: FlexDirection::Row,
-                            align_items: AlignItems::Center,
-                            column_gap: px((5.0 * scale).round()),
-                            ..default()
-                        },
-                        ChildOf(picker_card),
-                    ))
-                    .id();
-
-                let lbl_box = commands
-                    .spawn((
-                        Node {
-                            width: px((14.0 * scale).round()),
-                            flex_shrink: 0.0,
-                            justify_content: JustifyContent::Center,
-                            ..default()
-                        },
-                        ChildOf(row),
-                    ))
-                    .id();
-                kit.spawn_text(commands, lbl_box, FontRole::Body, lbl, scale * 0.86, lbl_col);
-
-                spawn_kit_arrow_btn(
-                    commands,
-                    kit,
-                    row,
-                    ArrowDir::Left,
-                    None,
-                    UiAction::PaintRgbDelta(comp, -8),
-                    scale * 0.86,
-                );
-
-                // Click-drag gradient bar
-                let track = commands
-                    .spawn((
-                        ColorPickerTrack(target),
-                        Node {
-                            flex_grow: 1.0,
-                            height: px((18.0 * scale).round()),
-                            border: UiRect::all(px(bw)),
-                            position_type: PositionType::Relative,
-                            ..default()
-                        },
-                        BackgroundGradient::from(LinearGradient::to_right(vec![
-                            ColorStop::auto(min_c),
-                            ColorStop::auto(max_c),
-                        ])),
-                        BorderColor::all(palette::BORDER_BUTTON),
-                        ChildOf(row),
-                    ))
-                    .id();
-
-                let pct = (rgba[comp] as f32 / 255.0) * 100.0;
-                let thumb_w = (6.0 * scale).round().max(4.0);
-                commands.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: Val::Percent(pct),
-                        top: px(-2.0 * scale),
-                        bottom: px(-2.0 * scale),
-                        width: px(thumb_w),
-                        margin: UiRect::left(px(-(thumb_w * 0.5).round())),
-                        border: UiRect::all(px(bw)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::WHITE),
-                    BorderColor::all(Color::BLACK),
-                    ChildOf(track),
-                ));
-
-                spawn_kit_arrow_btn(
-                    commands,
-                    kit,
-                    row,
-                    ArrowDir::Right,
-                    None,
-                    UiAction::PaintRgbDelta(comp, 8),
-                    scale * 0.86,
-                );
-
-                let val_box = commands
-                    .spawn((
-                        Node {
-                            width: px((28.0 * scale).round()),
-                            flex_shrink: 0.0,
-                            justify_content: JustifyContent::FlexEnd,
-                            ..default()
-                        },
-                        ChildOf(row),
-                    ))
-                    .id();
-                kit.spawn_text(
-                    commands,
-                    val_box,
-                    FontRole::Small,
-                    &format!("{:3}", rgba[comp]),
-                    scale * 0.88,
-                    palette::TEXT_BRIGHT,
-                );
-            }
-
-            let readout = commands
-                .spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        flex_direction: FlexDirection::Row,
-                        justify_content: JustifyContent::SpaceBetween,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    ChildOf(picker_card),
-                ))
-                .id();
-            kit.spawn_text(
-                commands,
-                readout,
-                FontRole::Small,
-                &format!(
-                    "H {:3}  S {:3}%  V {:3}%",
-                    h_deg.round() as i32,
-                    (sat * 100.0).round() as i32,
-                    (val * 100.0).round() as i32,
-                ),
-                scale * 0.82,
-                palette::TEXT_MUTED,
-            );
-            kit.spawn_text(
-                commands,
-                readout,
-                FontRole::Small,
-                "DRAG BARS",
-                scale * 0.80,
-                palette::TEXT_MUTED,
-            );
-        }
-    }
-
     // 12-slot Camouflage pattern selector grid (6 cols × 2 rows: `NONE` + `CA0001..CA0011`)
     let camo_id = garage.custom_color.map(|c| c.camo[0]).unwrap_or(0);
+    let has_custom_camo = custom_camos.active_key.is_some();
     let camo_grid = commands
         .spawn((
             Node {
@@ -6243,7 +6185,7 @@ fn spawn_paint_palette_tab(
         ))
         .id();
     for id in 0u8..=11 {
-        let matched = camo_id == id;
+        let matched = !has_custom_camo && camo_id == id;
         let tile = commands
             .spawn((
                 Button,
@@ -6309,8 +6251,96 @@ fn spawn_paint_palette_tab(
         }
     }
 
-    // Camouflage active readout + prev/next steppers
-    let camo_label = if camo_id == 0 {
+    // Uploaded custom camo tiles (if any), each with hover-revealed corner `X` delete button.
+    if !custom_camos.assets.is_empty() {
+        let custom_grid = commands
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    flex_wrap: FlexWrap::Wrap,
+                    row_gap: px((3.5 * scale).round()),
+                    column_gap: px((4.0 * scale).round()),
+                    ..default()
+                },
+                ChildOf(panel),
+            ))
+            .id();
+        for (idx, asset) in custom_camos.assets.iter().enumerate() {
+            let matched = custom_camos.active_key.as_deref() == Some(asset.key.as_str());
+            let tile = commands
+                .spawn((
+                    Button,
+                    UiAction::PaintCustomCamoSelect(idx),
+                    Node {
+                        width: px((57.0 * scale).round()),
+                        height: px((22.0 * scale).round()),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        overflow: Overflow::clip(),
+                        border: UiRect::all(px(if matched {
+                            (2.0 * scale).round().max(1.0)
+                        } else {
+                            bw
+                        })),
+                        ..default()
+                    },
+                    BackgroundColor(palette::BG_BAR),
+                    BorderColor::all(if matched {
+                        palette::ACCENT_AMBER
+                    } else {
+                        palette::BORDER_SUBTLE
+                    }),
+                    ChildOf(custom_grid),
+                ))
+                .id();
+            commands.spawn((
+                ImageNode::new(asset.handle.clone()),
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                ChildOf(tile),
+            ));
+            let x_sz = (13.0 * scale).round().max(10.0);
+            let x_btn = commands
+                .spawn((
+                    Button,
+                    UiAction::PaintCustomCamoDelete(idx),
+                    CustomThumbDeleteBtn { cell: tile },
+                    Visibility::Hidden,
+                    ZIndex(2),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        top: px((1.0 * scale).round()),
+                        right: px((1.0 * scale).round()),
+                        width: px(x_sz),
+                        height: px(x_sz),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(px(bw)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.18, 0.06, 0.06, 0.92)),
+                    BorderColor::all(Color::srgba(0.85, 0.28, 0.24, 0.90)),
+                    ChildOf(tile),
+                ))
+                .id();
+            kit.spawn_text(
+                commands,
+                x_btn,
+                FontRole::Small,
+                "X",
+                scale * 0.62,
+                Color::srgb(1.0, 0.90, 0.88),
+            );
+        }
+    }
+
+    // Camouflage active readout + prev/next steppers + UPLOAD button
+    let camo_label = if let Some(lbl) = custom_camos.active_label() {
+        format!("CAMO: {lbl}")
+    } else if camo_id == 0 {
         "CAMO: NONE".to_string()
     } else {
         format!("CAMO: CA{camo_id:04}")
@@ -6322,6 +6352,7 @@ fn spawn_paint_palette_tab(
                 flex_direction: FlexDirection::Row,
                 justify_content: JustifyContent::SpaceBetween,
                 align_items: AlignItems::Center,
+                column_gap: px((4.0 * scale).round()),
                 ..default()
             },
             ChildOf(panel),
@@ -6332,7 +6363,7 @@ fn spawn_paint_palette_tab(
         kit,
         camo_row,
         ArrowDir::Left,
-        Some("PREV"),
+        None,
         UiAction::PaintCamoDelta(-1),
         scale,
     );
@@ -6341,7 +6372,7 @@ fn spawn_paint_palette_tab(
         camo_row,
         FontRole::Body,
         &camo_label,
-        scale * 0.86,
+        scale * 0.84,
         palette::ACCENT_AMBER,
     );
     spawn_kit_arrow_btn(
@@ -6349,10 +6380,25 @@ fn spawn_paint_palette_tab(
         kit,
         camo_row,
         ArrowDir::Right,
-        Some("NEXT"),
+        None,
         UiAction::PaintCamoDelta(1),
         scale,
     );
+    let upload_camo_btn = spawn_kit_pill(
+        commands,
+        kit,
+        camo_row,
+        "+ UPLOAD",
+        ButtonState::Normal,
+        0.0,
+        8.0,
+        4.0,
+        0.78,
+        scale,
+    );
+    commands
+        .entity(upload_camo_btn)
+        .insert((Button, UiAction::PaintCamoUpload));
 }
 
 fn spawn_decal_library_grid(
@@ -6781,11 +6827,436 @@ fn spawn_paint_emblem_tab(
     spawn_decal_library_grid(commands, kit, panel, decals, true, scale);
 }
 
+/// Reusable click-drag + hover-scroll RGB / HSV color picker card (used by both `PAINT -> PALETTE`
+/// and the `PAINT -> DECALS` tint color selector).
+#[allow(clippy::too_many_arguments)]
+fn spawn_color_picker_card(
+    commands: &mut Commands,
+    parent: Entity,
+    kit: &AcvdUiKit,
+    picker_mode: PaintPickerMode,
+    rgba: [u8; 4],
+    hsv: [f32; 3],
+    picker_assets: &PaintPickerAssets,
+    sv_height: f32,
+    scale: f32,
+) {
+    let bw = (1.0 * scale).max(1.0);
+    let [h_deg, sat, val] = hsv;
+    let picker_card = kit.spawn_panel(
+        commands,
+        Some(parent),
+        PanelStyle::Subtle,
+        Node {
+            width: Val::Percent(100.0),
+            padding: UiRect::all(px((7.0 * scale).round())),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((5.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+
+    // Picker header: [HSV] [RGB] toggle pills + live swatch + #HEX
+    let picker_hdr = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                column_gap: px((6.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(picker_card),
+        ))
+        .id();
+
+    let mode_pills = commands
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: px((4.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(picker_hdr),
+        ))
+        .id();
+    for (pmode, lbl) in [(PaintPickerMode::Hsv, "HSV"), (PaintPickerMode::Rgb, "RGB")] {
+        let pstate = if picker_mode == pmode {
+            ButtonState::Active
+        } else {
+            ButtonState::Normal
+        };
+        let b = spawn_kit_pill(commands, kit, mode_pills, lbl, pstate, 0.0, 10.0, 3.0, 0.88, scale);
+        commands
+            .entity(b)
+            .insert((Button, UiAction::PaintPickerMode(pmode)));
+    }
+
+    let hex_box = commands
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px((6.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(picker_hdr),
+        ))
+        .id();
+    kit.spawn_text(
+        commands,
+        hex_box,
+        FontRole::Small,
+        &format!("#{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2]),
+        scale * 0.90,
+        palette::TEXT_BRIGHT,
+    );
+    commands.spawn((
+        Node {
+            width: px((28.0 * scale).round()),
+            height: px((15.0 * scale).round()),
+            border: UiRect::all(px(bw)),
+            ..default()
+        },
+        BackgroundColor(Color::srgb_u8(rgba[0], rgba[1], rgba[2])),
+        BorderColor::all(Color::WHITE),
+        ChildOf(hex_box),
+    ));
+
+    match picker_mode {
+        PaintPickerMode::Hsv => {
+            // 2D Saturation × Value drag square
+            let sv_box = commands
+                .spawn((
+                    ColorPickerTrack(PaintDragTarget::HsvSv),
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: px((sv_height * scale).round()),
+                        border: UiRect::all(px(bw)),
+                        position_type: PositionType::Relative,
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BorderColor::all(palette::BORDER_BUTTON),
+                    ChildOf(picker_card),
+                ))
+                .id();
+            if let Some(sv_img) = &picker_assets.sv_image {
+                commands.spawn((
+                    ImageNode::new(sv_img.clone()),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        right: px(0.0),
+                        top: px(0.0),
+                        bottom: px(0.0),
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        ..default()
+                    },
+                    ChildOf(sv_box),
+                ));
+            }
+            // High-contrast crosshair reticle at (S, 1 - V)
+            let ring_sz = (12.0 * scale).round().max(8.0);
+            let ring_half = (ring_sz * 0.5).round();
+            let ring = commands
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Percent((sat * 100.0).clamp(0.0, 100.0)),
+                        top: Val::Percent(((1.0 - val) * 100.0).clamp(0.0, 100.0)),
+                        width: px(ring_sz),
+                        height: px(ring_sz),
+                        margin: UiRect {
+                            left: px(-ring_half),
+                            top: px(-ring_half),
+                            ..default()
+                        },
+                        border: UiRect::all(px((2.0 * scale).round().max(1.0))),
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.25)),
+                    BorderColor::all(Color::WHITE),
+                    ChildOf(sv_box),
+                ))
+                .id();
+            commands.spawn((
+                Node {
+                    width: px((4.0 * scale).round().max(2.0)),
+                    height: px((4.0 * scale).round().max(2.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
+                ChildOf(ring),
+            ));
+
+            // Horizontal Hue spectrum drag + hover-scroll bar
+            let hue_box = commands
+                .spawn((
+                    ColorPickerTrack(PaintDragTarget::HsvHue),
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: px((17.0 * scale).round()),
+                        border: UiRect::all(px(bw)),
+                        position_type: PositionType::Relative,
+                        ..default()
+                    },
+                    BorderColor::all(palette::BORDER_BUTTON),
+                    ChildOf(picker_card),
+                ))
+                .id();
+            if let Some(hue_img) = &picker_assets.hue_image {
+                commands.spawn((
+                    ImageNode::new(hue_img.clone()),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        right: px(0.0),
+                        top: px(0.0),
+                        bottom: px(0.0),
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        ..default()
+                    },
+                    ChildOf(hue_box),
+                ));
+            }
+            let thumb_w = (6.0 * scale).round().max(4.0);
+            commands.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Percent(((h_deg / 360.0) * 100.0).clamp(0.0, 100.0)),
+                    top: px(-2.0 * scale),
+                    bottom: px(-2.0 * scale),
+                    width: px(thumb_w),
+                    margin: UiRect::left(px(-(thumb_w * 0.5).round())),
+                    border: UiRect::all(px(bw)),
+                    ..default()
+                },
+                BackgroundColor(Color::WHITE),
+                BorderColor::all(Color::BLACK),
+                ChildOf(hue_box),
+            ));
+
+            // HSV + RGB readout strip
+            let readout = commands
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    ChildOf(picker_card),
+                ))
+                .id();
+            kit.spawn_text(
+                commands,
+                readout,
+                FontRole::Small,
+                &format!(
+                    "H {:3}  S {:3}%  V {:3}%",
+                    h_deg.round() as i32,
+                    (sat * 100.0).round() as i32,
+                    (val * 100.0).round() as i32,
+                ),
+                scale * 0.84,
+                palette::TEXT_PRIMARY,
+            );
+            kit.spawn_text(
+                commands,
+                readout,
+                FontRole::Small,
+                "DRAG TO PICK",
+                scale * 0.80,
+                palette::TEXT_MUTED,
+            );
+        }
+        PaintPickerMode::Rgb => {
+            // 3 click-and-drag + hover-scroll RGB gradient slider bars + fine steppers
+            let rgb_specs = [
+                (
+                    0usize,
+                    "R",
+                    PaintDragTarget::RgbR,
+                    Color::srgb(1.0, 0.45, 0.42),
+                    Color::srgb_u8(0, rgba[1], rgba[2]),
+                    Color::srgb_u8(255, rgba[1], rgba[2]),
+                ),
+                (
+                    1usize,
+                    "G",
+                    PaintDragTarget::RgbG,
+                    Color::srgb(0.45, 0.96, 0.55),
+                    Color::srgb_u8(rgba[0], 0, rgba[2]),
+                    Color::srgb_u8(rgba[0], 255, rgba[2]),
+                ),
+                (
+                    2usize,
+                    "B",
+                    PaintDragTarget::RgbB,
+                    Color::srgb(0.45, 0.74, 1.0),
+                    Color::srgb_u8(rgba[0], rgba[1], 0),
+                    Color::srgb_u8(rgba[0], rgba[1], 255),
+                ),
+            ];
+            for (comp, lbl, target, lbl_col, min_c, max_c) in rgb_specs {
+                let row = commands
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: px((5.0 * scale).round()),
+                            ..default()
+                        },
+                        ChildOf(picker_card),
+                    ))
+                    .id();
+
+                let lbl_box = commands
+                    .spawn((
+                        Node {
+                            width: px((14.0 * scale).round()),
+                            flex_shrink: 0.0,
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        },
+                        ChildOf(row),
+                    ))
+                    .id();
+                kit.spawn_text(commands, lbl_box, FontRole::Body, lbl, scale * 0.86, lbl_col);
+
+                spawn_kit_arrow_btn(
+                    commands,
+                    kit,
+                    row,
+                    ArrowDir::Left,
+                    None,
+                    UiAction::PaintRgbDelta(comp, -8),
+                    scale * 0.86,
+                );
+
+                // Click-drag gradient bar
+                let track = commands
+                    .spawn((
+                        ColorPickerTrack(target),
+                        Node {
+                            flex_grow: 1.0,
+                            height: px((18.0 * scale).round()),
+                            border: UiRect::all(px(bw)),
+                            position_type: PositionType::Relative,
+                            ..default()
+                        },
+                        BackgroundGradient::from(LinearGradient::to_right(vec![
+                            ColorStop::auto(min_c),
+                            ColorStop::auto(max_c),
+                        ])),
+                        BorderColor::all(palette::BORDER_BUTTON),
+                        ChildOf(row),
+                    ))
+                    .id();
+
+                let pct = (rgba[comp] as f32 / 255.0) * 100.0;
+                let thumb_w = (6.0 * scale).round().max(4.0);
+                commands.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Percent(pct),
+                        top: px(-2.0 * scale),
+                        bottom: px(-2.0 * scale),
+                        width: px(thumb_w),
+                        margin: UiRect::left(px(-(thumb_w * 0.5).round())),
+                        border: UiRect::all(px(bw)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::WHITE),
+                    BorderColor::all(Color::BLACK),
+                    ChildOf(track),
+                ));
+
+                spawn_kit_arrow_btn(
+                    commands,
+                    kit,
+                    row,
+                    ArrowDir::Right,
+                    None,
+                    UiAction::PaintRgbDelta(comp, 8),
+                    scale * 0.86,
+                );
+
+                let val_box = commands
+                    .spawn((
+                        Node {
+                            width: px((28.0 * scale).round()),
+                            flex_shrink: 0.0,
+                            justify_content: JustifyContent::FlexEnd,
+                            ..default()
+                        },
+                        ChildOf(row),
+                    ))
+                    .id();
+                kit.spawn_text(
+                    commands,
+                    val_box,
+                    FontRole::Small,
+                    &format!("{:3}", rgba[comp]),
+                    scale * 0.88,
+                    palette::TEXT_BRIGHT,
+                );
+            }
+
+            let readout = commands
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    ChildOf(picker_card),
+                ))
+                .id();
+            kit.spawn_text(
+                commands,
+                readout,
+                FontRole::Small,
+                &format!(
+                    "H {:3}  S {:3}%  V {:3}%",
+                    h_deg.round() as i32,
+                    (sat * 100.0).round() as i32,
+                    (val * 100.0).round() as i32,
+                ),
+                scale * 0.82,
+                palette::TEXT_MUTED,
+            );
+            kit.spawn_text(
+                commands,
+                readout,
+                FontRole::Small,
+                "DRAG BARS",
+                scale * 0.80,
+                palette::TEXT_MUTED,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_garage_decal_inspector(
     commands: &mut Commands,
     root: Entity,
     kit: &AcvdUiKit,
+    state: &GarageState,
     decals: &DecalState,
+    picker_assets: &PaintPickerAssets,
     scale: f32,
 ) {
     let bw = (1.0 * scale).max(1.0);
@@ -6864,6 +7335,9 @@ fn spawn_garage_decal_inspector(
         scale * 0.90,
     );
     commands
+        .entity(size_slider.row)
+        .insert((Button, UiAction::DecalScaleStep(0)));
+    commands
         .entity(size_slider.dec_btn)
         .insert((Button, UiAction::DecalScaleStep(-1)));
     commands
@@ -6882,6 +7356,9 @@ fn spawn_garage_decal_inspector(
         scale * 0.90,
     );
     commands
+        .entity(rot_slider.row)
+        .insert((Button, UiAction::DecalRotateStep(0)));
+    commands
         .entity(rot_slider.dec_btn)
         .insert((Button, UiAction::DecalRotateStep(-1)));
     commands
@@ -6899,6 +7376,9 @@ fn spawn_garage_decal_inspector(
         66.0,
         scale * 0.90,
     );
+    commands
+        .entity(op_slider.row)
+        .insert((Button, UiAction::DecalOpacityStep(0)));
     commands
         .entity(op_slider.dec_btn)
         .insert((Button, UiAction::DecalOpacityStep(-1)));
@@ -6937,35 +7417,19 @@ fn spawn_garage_decal_inspector(
         commands.entity(b).insert((Button, act));
     }
 
-    // Tint color swatches
+    // Tint color RGB / HSV selector (reused from Paint Palette)
     kit.spawn_text(commands, insp, FontRole::Small, "TINT COLOR", scale * 0.84, palette::TEXT_MUTED);
-    let sw = commands
-        .spawn((
-            Node {
-                width: Val::Percent(100.0),
-                flex_wrap: FlexWrap::Wrap,
-                column_gap: px((4.0 * scale).round()),
-                row_gap: px((4.0 * scale).round()),
-                ..default()
-            },
-            ChildOf(insp),
-        ))
-        .id();
-    for (i, &(_, c)) in DECAL_TINTS.iter().enumerate() {
-        commands.spawn((
-            Button,
-            UiAction::DecalTint(i),
-            Node {
-                width: px((28.0 * scale).round()),
-                height: px((15.0 * scale).round()),
-                border: UiRect::all(px(bw)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb_u8(c[0], c[1], c[2])),
-            BorderColor::all(palette::BORDER_SUBTLE),
-            ChildOf(sw),
-        ));
-    }
+    spawn_color_picker_card(
+        commands,
+        insp,
+        kit,
+        state.paint_picker_mode,
+        current_decal_tint(decals),
+        state.paint_hsv,
+        picker_assets,
+        72.0,
+        scale * 0.88,
+    );
 
     // Duplicate / Clear All
     let act_row = commands
@@ -7882,6 +8346,42 @@ mod tests {
         );
         assert_eq!(UiAction::ToggleFullscreen.wheel_adjust(), None);
         assert_eq!(UiAction::Back.wheel_adjust(), None);
+    }
+
+    #[test]
+    fn test_paint_undo_history_lifecycle() {
+        let mk = |coloring_id: u16| PaintSnapshot {
+            coloring_id,
+            custom_color: None,
+            decal_layers: Vec::new(),
+            selected_decal_id: None,
+            ac_emblem_key: None,
+            emblem_override: false,
+        };
+        let mut hist = PaintUndoHistory::default();
+        assert_eq!(hist.undo(), None);
+        assert_eq!(hist.redo(), None);
+
+        hist.begin(mk(1));
+        hist.record(mk(1)); // duplicate is ignored
+        assert_eq!(hist.undo(), None);
+
+        hist.record(mk(2));
+        hist.record(mk(3));
+        assert_eq!(hist.undo(), Some(&mk(2)));
+        assert_eq!(hist.undo(), Some(&mk(1)));
+        assert_eq!(hist.undo(), None);
+        assert_eq!(hist.redo(), Some(&mk(2)));
+
+        // Recording after undo truncates the redo tail.
+        hist.record(mk(4));
+        assert_eq!(hist.redo(), None);
+        assert_eq!(hist.undo(), Some(&mk(2)));
+
+        // Closing Paint resets history.
+        hist.reset();
+        assert_eq!(hist.undo(), None);
+        assert_eq!(hist.redo(), None);
     }
 
     #[test]

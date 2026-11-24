@@ -208,7 +208,7 @@ pub struct DiscEmblemEntry {
 }
 
 /// One placed 3D projected decal layer on the AC (editable, draggable, serializable).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlacedDecal {
     pub id: u64,
     pub slot: DecalSlot,
@@ -1158,6 +1158,11 @@ fn load_disc_emblem(
 /// extra crate dependencies.
 #[cfg(windows)]
 fn pick_image_file_native() -> Option<PathBuf> {
+    pick_image_file_native_with_title("Upload Custom AC Decal Image")
+}
+
+#[cfg(windows)]
+pub(crate) fn pick_image_file_native_with_title(dialog_title: &str) -> Option<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -1202,7 +1207,8 @@ fn pick_image_file_native() -> Option<PathBuf> {
         "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif\0All Files (*.*)\0*.*\0\0"
             .encode_utf16()
             .collect();
-    let title: Vec<u16> = "Upload Custom AC Decal Image\0".encode_utf16().collect();
+    let mut title: Vec<u16> = dialog_title.encode_utf16().collect();
+    title.push(0);
     let mut file_buf = vec![0u16; 4096];
 
     let mut ofn = OpenFileNameW {
@@ -1245,6 +1251,11 @@ fn pick_image_file_native() -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 fn pick_image_file_native() -> Option<PathBuf> {
+    pick_image_file_native_with_title("Upload Custom AC Decal Image")
+}
+
+#[cfg(not(windows))]
+pub(crate) fn pick_image_file_native_with_title(_dialog_title: &str) -> Option<PathBuf> {
     None
 }
 

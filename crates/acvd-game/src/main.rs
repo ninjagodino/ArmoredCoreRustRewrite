@@ -463,6 +463,7 @@ fn main() {
         .init_resource::<AcTexturePacks>()
         .init_resource::<garage_assemble::AssembleUiAssets>()
         .init_resource::<garage::PaintPickerAssets>()
+        .init_resource::<paint::CustomCamoLibrary>()
         .insert_resource(decal::DecalState::new(cli_decal, cli_emblem))
     .insert_resource(decal::DecalMeshCache::default())
     .insert_resource(Garage {
@@ -510,6 +511,7 @@ fn main() {
             decal::handle_imports,
             garage::handle_input,
             garage::handle_paint_color_drag,
+            garage::sync_paint_history,
             garage::sync_ui,
             garage::update_custom_thumb_delete_hover,
             garage_assemble::populate_drb_dialogs,
@@ -956,6 +958,7 @@ struct RenderAssets<'w> {
     images: ResMut<'w, Assets<Image>>,
     bindposes: ResMut<'w, Assets<SkinnedMeshInverseBindposes>>,
     ac_packs: ResMut<'w, AcTexturePacks>,
+    custom_camos: Res<'w, paint::CustomCamoLibrary>,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1616,13 +1619,14 @@ fn show(
                 &mut missing,
             );
             let painted = accolor.as_ref().and_then(|col| {
-                paint::material(
+                paint::material_with_custom_camo(
                     &garage.disc,
                     &base,
                     &mesh,
                     part.placement.column,
                     col,
                     decal_slot.map(|s| decals.slot_handle(s)),
+                    assets.custom_camos.active_handle(),
                     packs,
                     images,
                 )

@@ -25,12 +25,243 @@ use acvd_data::generated::tuning::STATIC_DRAW_PARAM;
 use acvd_formats::accolor::{self, AcColor, GLOW_INTENSITY, OVERLAY_CHANNELS, RIM_INTENSITY};
 use acvd_formats::vfs::Disc;
 use acvd_render::{LoadedMesh, Packs};
-use bevy::asset::embedded_asset;
+use anyhow::{bail, Context, Result};
+use bevy::asset::{embedded_asset, RenderAssetUsages};
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat};
 use bevy::shader::ShaderRef;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+
+/// Local user directory (gitignored) for uploaded custom camouflage textures.
+pub const USER_CAMO_DIR: &str = "camos";
+
+const MAX_CAMO_DIM: u32 = 512;
+
+/// A decoded custom camouflage image stored in `camos/`.
+#[derive(Clone)]
+pub struct CustomCamoAsset {
+    pub key: String,
+    pub label: String,
+    pub handle: Handle<Image>,
+}
+
+/// Manages user-uploaded custom camouflage textures (`camos/` folder) and the active custom camo
+/// override (when `active_key` is `Some`, it overrides the retail `ca0001..ca0011` pattern).
+#[derive(Resource, Default)]
+pub struct CustomCamoLibrary {
+    pub assets: Vec<CustomCamoAsset>,
+    pub active_key: Option<String>,
+    pub initialized: bool,
+    picker_rx: Option<std::sync::Mutex<mpsc::Receiver<Option<PathBuf>>>>,
+}
+
+impl CustomCamoLibrary {
+    pub fn init_assets(&mut self, images: &mut Assets<Image>) {
+        if self.initialized {
+            return;
+        }
+        self.initialized = true;
+        let dir = Path::new(USER_CAMO_DIR);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file() && is_supported_camo_ext(p))
+            .collect();
+        paths.sort();
+        for p in paths {
+            if let Err(e) = self.load_custom_camo_internal(&p, false, images) {
+                warn!("camos: skipping {}: {e:#}", p.display());
+            }
+        }
+    }
+
+    /// Opens the native OS file picker on a background thread so the UI never freezes.
+    pub fn open_file_picker(&mut self) -> bool {
+        if self.picker_rx.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.picker_rx = Some(std::sync::Mutex::new(rx));
+        std::thread::spawn(move || {
+            let picked = crate::decal::pick_image_file_native_with_title(
+                "Upload Custom AC Camouflage Image",
+            );
+            let _ = tx.send(picked);
+        });
+        true
+    }
+
+    /// Polls the background file picker; if a file was chosen, imports and activates it.
+    pub fn poll_picker(&mut self, images: &mut Assets<Image>) -> Option<Result<String>> {
+        let rx = self.picker_rx.as_ref()?;
+        let recv = rx.lock().ok()?.try_recv();
+        match recv {
+            Ok(Some(path)) => {
+                self.picker_rx = None;
+                Some(self.import_image_file(&path, images))
+            }
+            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                self.picker_rx = None;
+                None
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        }
+    }
+
+    /// Imports an external image file, copies it into `camos/`, and activates it as the AC camo.
+    pub fn import_image_file(&mut self, path: &Path, images: &mut Assets<Image>) -> Result<String> {
+        let key = self.load_custom_camo_internal(path, true, images)?;
+        self.active_key = Some(key.clone());
+        Ok(key)
+    }
+
+    fn load_custom_camo_internal(
+        &mut self,
+        path: &Path,
+        copy_to_user_dir: bool,
+        images: &mut Assets<Image>,
+    ) -> Result<String> {
+        let dyn_img = image::open(path)
+            .with_context(|| format!("failed to decode camo image `{}`", path.display()))?;
+        let mut rgba = dyn_img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w == 0 || h == 0 {
+            bail!("camo image `{}` is empty", path.display());
+        }
+        if w > MAX_CAMO_DIM || h > MAX_CAMO_DIM {
+            let scale = MAX_CAMO_DIM as f32 / w.max(h) as f32;
+            let nw = ((w as f32 * scale).round() as u32).max(1);
+            let nh = ((h as f32 * scale).round() as u32).max(1);
+            rgba = image::imageops::resize(
+                &rgba,
+                nw,
+                nh,
+                image::imageops::FilterType::Triangle,
+            );
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("camo.png")
+            .to_string();
+
+        if copy_to_user_dir {
+            let dir = Path::new(USER_CAMO_DIR);
+            if std::fs::create_dir_all(dir).is_ok() {
+                let dst = dir.join(&file_name);
+                let same = std::fs::canonicalize(path)
+                    .ok()
+                    .zip(std::fs::canonicalize(&dst).ok())
+                    .is_some_and(|(a, b)| a == b);
+                if !same {
+                    let _ = std::fs::copy(path, &dst);
+                }
+            }
+        }
+
+        let (fw, fh) = rgba.dimensions();
+        let pixels = rgba.into_raw();
+        let mut img = Image::new(
+            Extent3d {
+                width: fw,
+                height: fh,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            pixels,
+            TextureFormat::Rgba8Unorm,
+            RenderAssetUsages::default(),
+        );
+        img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            address_mode_w: ImageAddressMode::Repeat,
+            mag_filter: ImageFilterMode::Linear,
+            min_filter: ImageFilterMode::Linear,
+            mipmap_filter: ImageFilterMode::Linear,
+            ..default()
+        });
+        let handle = images.add(img);
+        let key = format!("custom_camo:{file_name}");
+        let label = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&file_name)
+            .to_string();
+        let asset = CustomCamoAsset {
+            key: key.clone(),
+            label,
+            handle,
+        };
+        if let Some(existing) = self.assets.iter_mut().find(|a| a.key == key) {
+            *existing = asset;
+        } else {
+            self.assets.insert(0, asset);
+        }
+        Ok(key)
+    }
+
+    /// Removes a custom camo at `idx`, deletes its file from `camos/`, and clears `active_key`
+    /// if it was active. Returns the removed label on success.
+    pub fn delete_custom_camo(&mut self, idx: usize) -> Option<String> {
+        if idx >= self.assets.len() {
+            return None;
+        }
+        let removed = self.assets.remove(idx);
+        if let Some(file_name) = removed.key.strip_prefix("custom_camo:") {
+            if !file_name.is_empty()
+                && !file_name.contains('/')
+                && !file_name.contains('\\')
+                && !file_name.contains("..")
+            {
+                let path = Path::new(USER_CAMO_DIR).join(file_name);
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!("camos: failed to delete {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+        if self.active_key.as_deref() == Some(removed.key.as_str()) {
+            self.active_key = None;
+        }
+        Some(removed.label)
+    }
+
+    pub fn active_handle(&self) -> Option<Handle<Image>> {
+        let key = self.active_key.as_deref()?;
+        self.assets
+            .iter()
+            .find(|a| a.key == key)
+            .map(|a| a.handle.clone())
+    }
+
+    pub fn active_label(&self) -> Option<&str> {
+        let key = self.active_key.as_deref()?;
+        self.assets
+            .iter()
+            .find(|a| a.key == key)
+            .map(|a| a.label.as_str())
+    }
+}
+
+fn is_supported_camo_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tga"
+            )
+        })
+        .unwrap_or(false)
+}
 
 pub type AcPaintMaterial = ExtendedMaterial<StandardMaterial, AcPaint>;
 
@@ -276,6 +507,22 @@ pub fn material(
     packs: &mut Packs,
     images: &mut Assets<Image>,
 ) -> Option<AcPaintMaterial> {
+    material_with_custom_camo(disc, base, mesh, column, accolor, decal_map, None, packs, images)
+}
+
+/// Same as [`material`], with an optional user-uploaded custom camouflage texture override.
+#[allow(clippy::too_many_arguments)]
+pub fn material_with_custom_camo(
+    disc: &Disc,
+    base: &StandardMaterial,
+    mesh: &LoadedMesh,
+    column: &str,
+    accolor: &AcColor,
+    decal_map: Option<Handle<Image>>,
+    custom_camo: Option<Handle<Image>>,
+    packs: &mut Packs,
+    images: &mut Assets<Image>,
+) -> Option<AcPaintMaterial> {
     let is_rim = is_rim_mtd(&mesh.mtd);
     let color_map = match mesh
         .diffuse
@@ -301,21 +548,22 @@ pub fn material(
     // 360 `0x82ca9c70` (`0x82ca9e98..0x82ca9f14`) binds `ca{camo_id:04}` (`0x82460e58`) to `s15`
     // with `c190.xy = mask_size / camo_size` (`0x82461a98`), or binds `color_map` itself with
     // `c190 = (1, 1, 1, 1)` when `camo_id == 0`.
-    let (camo_map, camo_scale) =
-        if let Some(camo_h) = load_camo_map_handle(disc, packs, images, accolor.camo_id(group)) {
-            let (camo_w, camo_h_px) = images
-                .get(&camo_h)
-                .map(|img| {
-                    (
-                        (img.texture_descriptor.size.width as f32).max(1.0),
-                        (img.texture_descriptor.size.height as f32).max(1.0),
-                    )
-                })
-                .unwrap_or((1.0, 1.0));
-            (camo_h, Vec2::new(mask_size.x / camo_w, mask_size.y / camo_h_px))
-        } else {
-            (color_map.clone(), Vec2::ONE)
-        };
+    let resolved_camo = custom_camo
+        .or_else(|| load_camo_map_handle(disc, packs, images, accolor.camo_id(group)));
+    let (camo_map, camo_scale) = if let Some(camo_h) = resolved_camo {
+        let (camo_w, camo_h_px) = images
+            .get(&camo_h)
+            .map(|img| {
+                (
+                    (img.texture_descriptor.size.width as f32).max(1.0),
+                    (img.texture_descriptor.size.height as f32).max(1.0),
+                )
+            })
+            .unwrap_or((1.0, 1.0));
+        (camo_h, Vec2::new(mask_size.x / camo_w, mask_size.y / camo_h_px))
+    } else {
+        (color_map.clone(), Vec2::ONE)
+    };
 
     let (emission_map, emission) = match mesh
         .emission

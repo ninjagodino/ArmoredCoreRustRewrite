@@ -9,6 +9,7 @@
 
 # User-uploaded garage decal images and saved decal layouts.
 /decals/
+/camos/
 
 # Local player options (fullscreen / master volume).
 /settings.json
