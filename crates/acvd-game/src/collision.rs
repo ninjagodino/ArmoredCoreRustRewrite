@@ -506,6 +506,46 @@ impl Collision {
         normals
     }
 
+    /// Returns unique `(prop_id, outward_normal)` pairs for active destructible map objects
+    /// (`prop_id != 0`) currently touching either AC body sphere (`BODY` + 0.15 m contact margin).
+    /// Unlike [`push_out`], this includes sloped and top faces so walking/sliding over low ground
+    /// props (crates, barricades, fences, vehicles) registers contact (`0x82865470`).
+    pub fn body_prop_contacts(&self, feet: Vec3) -> Vec<(u32, Vec3)> {
+        const PROP_CONTACT_MARGIN: f32 = 0.15;
+        let reach = BODY.iter().map(|s| s.radius).fold(0.0, f32::max) + PROP_CONTACT_MARGIN;
+        let mut contacts: Vec<(u32, f32, Vec3)> = Vec::new();
+        for h in self.near_disc(feet.x, feet.z, reach) {
+            if h.prop_id == 0 {
+                continue;
+            }
+            for s in &BODY {
+                let centre = feet + Vec3::Y * s.height;
+                let r = s.radius + PROP_CONTACT_MARGIN;
+                let q = closest_on_tri(centre, h.a, h.b, h.c);
+                let d = centre - q;
+                let dist = d.length();
+                if dist >= r {
+                    continue;
+                }
+                let depth = r - dist;
+                let normal = if dist > 1e-5 {
+                    d / dist
+                } else {
+                    (h.b - h.a).cross(h.c - h.a).normalize_or(Vec3::Y)
+                };
+                if let Some(existing) = contacts.iter_mut().find(|(id, _, _)| *id == h.prop_id) {
+                    if depth > existing.1 {
+                        existing.1 = depth;
+                        existing.2 = normal;
+                    }
+                } else {
+                    contacts.push((h.prop_id, depth, normal));
+                }
+            }
+        }
+        contacts.into_iter().map(|(id, _, n)| (id, n)).collect()
+    }
+
     /// Wall-kick sphere query (`WallJumpHitChecker`, 360 `0x828aa500` filter `0x100042`, sphere
     /// built by `0x82858f10` from `NewAcBehavior +0x628/+0x62c` = radius 6.0 m at height 3.0 m).
     /// Returns the unit outward normal of the closest `wall_kickable` triangle within `radius`

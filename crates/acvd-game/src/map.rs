@@ -10,10 +10,11 @@ use std::collections::{HashMap, HashSet};
 
 use acvd_data::find;
 use acvd_data::generated::ac_unit::PARAM_ACOBJECTPARAM_BIN;
+use acvd_data::generated::enemy::PARAM_DESTROYAP_PARAM;
 use acvd_data::generated::sfx::PARAM_SFXSESETPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{bnd3, env as fmt_env, flver, msb, nav};
+use acvd_formats::{bnd3, env as fmt_env, flver, mlb, msb, nav};
 use acvd_render::{LoadedMesh, Packs};
 use anyhow::Result;
 use bevy::prelude::*;
@@ -140,7 +141,8 @@ impl WaterReturnPoints {
 }
 
 /// Destructible map object (`KIND_OBJECT` whose binder ships `{model}_b.flv`, 360 `0x82c02498`,
-/// `DestroyModel` `0x82c84a60`).
+/// `DestroyModel` `0x82c84a60`, durability from `{model}_m.mlb` -> `PARAM_DESTROYAP_PARAM`
+/// `0x82c01de8` / `0x82c01bd8`).
 #[derive(Component, Debug)]
 pub struct DestructibleProp {
     /// Matches `collision::Hit::prop_id` (`part_idx + 1`).
@@ -151,10 +153,13 @@ pub struct DestructibleProp {
     pub radius: f32,
     /// Remaining HP before breaking into `_b.flv` / `_b_h.hmd`.
     pub hp: f32,
-    #[allow(dead_code)]
     pub max_hp: f32,
+    /// Minimum damage threshold (`DestroyApSt.cutoff_damage`, 360 `0x829ad0f8`; `65535` = indestructible).
+    pub cutoff_damage: f32,
+    /// AC-body collision damage multiplier (`0x82c01bd8`: `(100 - collision_defensibility) * 0.01 * collision_damage_coef`).
+    /// `0.0` = immune to AC walking/sliding/boosting collision (`collision_defensibility == 100`).
+    pub collision_damage_mult: f32,
     /// Nonzero `AcObjectParam.damage_id` (e.g. explosive fuel tanks `89110..89113`).
-    #[allow(dead_code)]
     pub damage_id: i32,
     pub full: Entity,
     pub low: Option<Entity>,
@@ -165,9 +170,15 @@ pub struct DestructibleProp {
 }
 
 impl DestructibleProp {
-    /// Applies `damage` to this prop; returns `true` on the hit that breaks it.
+    /// Whether this prop can be broken by AC body collision (`0x829aabe8`: `mult >= 0.001`).
+    pub fn is_collision_destructible(&self) -> bool {
+        !self.broken && self.collision_damage_mult >= 0.001 && self.cutoff_damage < 65535.0
+    }
+
+    /// Applies weapon/explosion `damage` to this prop (`0x829ad0f8`); returns `true` on the hit
+    /// that breaks it.
     pub fn apply_damage(&mut self, damage: f32) -> bool {
-        if self.broken || damage <= 0.0 {
+        if self.broken || damage <= 0.0 || damage <= self.cutoff_damage {
             return false;
         }
         self.hp = (self.hp - damage).max(0.0);
@@ -178,6 +189,16 @@ impl DestructibleProp {
         } else {
             false
         }
+    }
+
+    /// Applies AC body collision damage (`damage_type == 2`, 360 `0x82865470` -> `0x829ad0f8`),
+    /// scaling `raw_damage` by `collision_damage_mult` (`0x82c01bd8`). Returns `true` if this
+    /// contact breaks the prop.
+    pub fn apply_collision_damage(&mut self, raw_damage: f32) -> bool {
+        if !self.is_collision_destructible() || raw_damage <= 0.0 {
+            return false;
+        }
+        self.apply_damage(raw_damage * self.collision_damage_mult)
     }
 }
 
@@ -544,6 +565,7 @@ pub fn spawn(
     let mut drawn = 0;
     let mut low_parts = 0;
     let mut destructible_parts = 0;
+    let mut destroy_ap_cache: HashMap<String, Option<u16>> = HashMap::new();
     for (part_idx, part) in parts.iter().enumerate() {
         let Some(binder) = binder(map, part) else {
             continue;
@@ -634,7 +656,29 @@ pub fn spawn(
             let damage_id = obj_id
                 .and_then(|id| find(PARAM_ACOBJECTPARAM_BIN, id))
                 .map_or(0, |r| r.data.damage_id);
-            let max_hp = if damage_id > 0 { 800.0 } else { 500.0 };
+            let destroy_ap_id = *destroy_ap_cache
+                .entry(part.model.clone())
+                .or_insert_with(|| {
+                    let mlb_path = format!("{binder}|{}_m.mlb", part.model);
+                    vfs::open(disc, &mlb_path)
+                        .ok()
+                        .and_then(|b| mlb::read_destroy_ap_ids(&b).ok())
+                        .and_then(|ids| ids.primary_id())
+                });
+            let (max_hp, cutoff_damage, collision_damage_mult) = destroy_ap_id
+                .and_then(|id| find(PARAM_DESTROYAP_PARAM, u32::from(id)))
+                .map(|r| {
+                    let d = &r.data;
+                    // 360 `0x82c01bd8`: (100 - collision_defensibility) * 0.01 * collision_damage_coef
+                    let mult = f32::from(100u8.saturating_sub(d.collision_defensibility))
+                        * 0.01
+                        * d.collision_damage_coef;
+                    (d.ap.max(1) as f32, d.cutoff_damage as f32, mult.max(0.0))
+                })
+                .unwrap_or_else(|| {
+                    let hp = if damage_id > 0 { 800.0 } else { 500.0 };
+                    (hp, 0.0, 1.0)
+                });
             commands.entity(parent).insert(DestructibleProp {
                 prop_id: (part_idx + 1) as u32,
                 model: part.model.clone(),
@@ -642,6 +686,8 @@ pub fn spawn(
                 radius: radius.max(2.0),
                 hp: max_hp,
                 max_hp,
+                cutoff_damage,
+                collision_damage_mult,
                 damage_id,
                 full,
                 low: low_entity,
@@ -787,19 +833,27 @@ pub fn lod(
     }
 }
 
-/// Handles newly broken destructible map objects (`DestructibleProp::just_broken`): flips their
-/// visual meshes (`full`/`low` -> `broken_mesh` `_b.flv`), swaps collision `_h.hmd` -> `_b_h.hmd`
-/// via `Collision::break_prop`, and spawns explosion FFX + destruction SFX (`DestroyModel`
-/// `0x82c84a60`).
+/// Handles newly broken destructible map objects (`DestructibleProp::just_broken`): hides their
+/// intact meshes, swaps collision `_h.hmd` -> `_b_h.hmd` via `Collision::break_prop`, spawns
+/// physics-driven gibs for `_b.flv` models with `break*` / `bk*` bones (falling back to the
+/// static `broken_mesh` for single-bone rubble replacements like `o2106`/`o2107`), and plays
+/// explosion FFX + destruction SFX (`DestroyModel` `0x82c84a60`).
+#[allow(clippy::too_many_arguments)]
 pub fn step_destructibles(
+    garage: Res<crate::Garage>,
     mut commands: Commands,
     mut collision: ResMut<Collision>,
-    mut props: Query<&mut DestructibleProp>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut bindposes: ResMut<Assets<bevy::mesh::skinning::SkinnedMeshInverseBindposes>>,
+    mut props: Query<(&mut DestructibleProp, &Transform)>,
     mut vis: Query<&mut Visibility>,
     mut cues: ResMut<sound::Cues>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
 ) {
-    for mut prop in &mut props {
+    let mut packs = Packs::default();
+    for (mut prop, xf) in &mut props {
         if !prop.just_broken {
             continue;
         }
@@ -809,12 +863,35 @@ pub fn step_destructibles(
         if let Some(low) = prop.low {
             set_vis(&mut vis, low, false);
         }
-        set_vis(&mut vis, prop.broken_mesh, true);
+        let broken_asset = format!("model/obj/{}/{}_m.bnd.dcx|{}_b.flv", prop.model, prop.model, prop.model);
+        let spawned_debris = crate::debris::spawn(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut images,
+            &mut bindposes,
+            &garage.disc,
+            &mut packs,
+            garage.flat,
+            &broken_asset,
+            &prop.model,
+            crate::debris::DebrisKind::Prop,
+            *xf,
+            Vec3::ZERO,
+            Vec3::ZERO,
+        )
+        .is_some();
+        set_vis(&mut vis, prop.broken_mesh, !spawned_debris);
 
-        let sfx_id = find(PARAM_SFXSESETPARAM_BIN, 502)
+        let sfx_row = if prop.max_hp <= 500.0 && prop.damage_id == 0 {
+            501
+        } else {
+            502
+        };
+        let sfx_id = find(PARAM_SFXSESETPARAM_BIN, sfx_row)
             .map(|r| r.data.sfx_id as i32)
             .filter(|&id| id > 0)
-            .unwrap_or(502);
+            .unwrap_or(sfx_row as i32);
         commands.spawn((
             sfx::Sfx::new(sfx_id),
             Transform::from_translation(prop.center),
@@ -826,8 +903,8 @@ pub fn step_destructibles(
             sound::cue(&mut commands, &mut cues, &mut audio_sources, &se);
         }
         info!(
-            "destructible prop {} (id {}) broken at ({:.1}, {:.1}, {:.1})",
-            prop.model, prop.prop_id, prop.center.x, prop.center.y, prop.center.z
+            "destructible prop {} (id {}) broken at ({:.1}, {:.1}, {:.1}) (debris={})",
+            prop.model, prop.prop_id, prop.center.x, prop.center.y, prop.center.z, spawned_debris
         );
     }
 }
@@ -1076,6 +1153,8 @@ mod tests {
             radius: 4.0,
             hp: 500.0,
             max_hp: 500.0,
+            cutoff_damage: 0.0,
+            collision_damage_mult: 0.0,
             damage_id: 89112,
             full: Entity::PLACEHOLDER,
             low: None,
@@ -1085,6 +1164,9 @@ mod tests {
         };
         assert_eq!(prop.max_hp, 500.0);
         assert_eq!(prop.damage_id, 89112);
+        // Fuel tank (collision_defensibility=100 -> mult=0.0) ignores AC body collision.
+        assert!(!prop.is_collision_destructible());
+        assert!(!prop.apply_collision_damage(9999.0));
         assert!(!prop.apply_damage(200.0));
         assert!(!prop.broken && !prop.just_broken);
         assert!((prop.hp - 300.0).abs() < 1e-4);

@@ -2134,8 +2134,114 @@ fn step_en(p: &mut Pilot) {
     p.en = (p.en + net).clamp(0.0, p.en_max);
 }
 
+/// AC-vs-MapObject collision damage before `DestroyApSt` scaling (`0x82864008`, `0x828b2b50`,
+/// `0x82865470`): `ac_rigidness * impact_speed_kmh * DAMAGE.obj_collision_damage_coef`.
+fn ac_prop_collision_raw_damage(total_weight: f32, velocity: Vec3, normal: Vec3) -> f32 {
+    let v_kmh = velocity * TICK_TO_KMH;
+    let speed_kmh = v_kmh.length();
+    if speed_kmh < 0.5 {
+        return 0.0;
+    }
+    let dmg = &acvd_data::generated::tuning::DAMAGE;
+    let v_weighted = Vec3::new(v_kmh.x, v_kmh.y * dmg.vertical_collision_coef, v_kmh.z);
+    let d = normal.dot(v_weighted.normalize_or_zero());
+    // `0x82864008` uses `-dot(normal, v_weighted.norm)` when moving into the surface (`d < 0`).
+    // When walking/sliding across the top of a low ground prop (`normal.y > 0.5`), apply a
+    // grazing floor (`0.25`) so low crates/fences/debris are crushed underfoot as on 360.
+    let alignment = if d < 0.0 {
+        -d
+    } else if normal.y > 0.5 && Vec2::new(v_kmh.x, v_kmh.z).length() >= 1.0 {
+        0.25
+    } else {
+        return 0.0;
+    };
+    let impact_speed_kmh = speed_kmh * alignment;
+    let ac_rigidness = (total_weight.max(1000.0) / 1000.0) * dmg.weight_to_rigidness;
+    ac_rigidness * impact_speed_kmh * dmg.obj_collision_damage_coef
+}
+
+/// Applies AC body collision damage to any active destructible props touching the AC right before
+/// `push_out`, and immediately disables broken props in `collision` so the AC crashes straight
+/// through without losing momentum (`0x82865890` + `0x82865470`).
+fn crush_contacted_props(
+    p: &Pilot,
+    feet: Vec3,
+    collision: &mut Collision,
+    mut apply_to_prop: impl FnMut(u32, f32) -> bool,
+) {
+    if p.velocity.length_squared() < 1e-8 {
+        return;
+    }
+    let contacts = collision.body_prop_contacts(feet);
+    for (prop_id, normal) in contacts {
+        let raw = ac_prop_collision_raw_damage(p.ctrl.total_weight, p.velocity, normal);
+        if raw > 0.0 && apply_to_prop(prop_id, raw) {
+            collision.break_prop(prop_id);
+        }
+    }
+}
+
 /// One 60 Hz tick of movement over the highest ground under the AC.
+#[cfg_attr(not(test), allow(dead_code))]
 fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision) {
+    step_inner(p, input, position, collision, |_| {});
+}
+
+/// One 60 Hz tick of movement that also applies AC body collision damage to destructible map
+/// objects (`0x82865470`) before `push_out`, letting the AC crash straight through broken props.
+fn step_with_props(
+    p: &mut Pilot,
+    input: &Input,
+    position: &mut Vec3,
+    collision: &mut Collision,
+    mut apply_to_prop: impl FnMut(u32, f32) -> bool,
+) {
+    // Run the movement integration up to `*position += p.velocity`, then crush any contacted
+    // destructibles and disable their `_h.hmd` triangles before `push_out` runs.
+    let mut crush = |pilot: &Pilot, feet: Vec3, col: &mut Collision| {
+        crush_contacted_props(pilot, feet, col, &mut apply_to_prop);
+    };
+    step_core(p, input, position, collision, Some(&mut crush));
+}
+
+fn step_inner(
+    p: &mut Pilot,
+    input: &Input,
+    position: &mut Vec3,
+    collision: &Collision,
+    _unused: impl FnMut(Vec3),
+) {
+    // Non-mutating path for unit tests that hold `&Collision`.
+    let mut dummy = None::<&mut dyn FnMut(&Pilot, Vec3, &mut Collision)>;
+    step_core_ref(p, input, position, collision, &mut dummy);
+}
+
+fn step_core(
+    p: &mut Pilot,
+    input: &Input,
+    position: &mut Vec3,
+    collision: &mut Collision,
+    mut on_move: Option<&mut dyn FnMut(&Pilot, Vec3, &mut Collision)>,
+) {
+    step_move_integrate(p, input, position, collision);
+    if let Some(f) = on_move.as_deref_mut() {
+        f(p, *position, collision);
+    }
+    step_resolve_world(p, position, collision);
+}
+
+fn step_core_ref(
+    p: &mut Pilot,
+    input: &Input,
+    position: &mut Vec3,
+    collision: &Collision,
+    _on_move: &mut Option<&mut dyn FnMut(&Pilot, Vec3, &mut Collision)>,
+) {
+    step_move_integrate(p, input, position, collision);
+    step_resolve_world(p, position, collision);
+}
+
+fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision) {
     let c = p.ctrl;
     if p.qb_cooldown >= 1.0 {
         p.qb_cooldown = (p.qb_cooldown - 1.0).max(0.0);
@@ -2384,8 +2490,12 @@ fn step(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision
         }
     }
     p.velocity = Vec3::new(horizontal.x, p.velocity.y, horizontal.y);
-    let before_y = position.y;
     *position += p.velocity;
+}
+
+fn step_resolve_world(p: &mut Pilot, position: &mut Vec3, collision: &Collision) {
+    let before_y = position.y - p.velocity.y;
+    let horizontal = Vec2::new(p.velocity.x, p.velocity.z);
     // Walls: the body spheres push the AC out sideways and lose the velocity into the wall,
     // so it slides along it (AC TEST parapet, `private/xenia/wall_walk3.jsonl`).
     for n in collision.push_out(position) {
@@ -2650,8 +2760,9 @@ pub fn check_water_return(
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
-pub struct PilotWorld<'w> {
-    collision: Res<'w, Collision>,
+pub struct PilotWorld<'w, 's> {
+    collision: ResMut<'w, Collision>,
+    props: Query<'w, 's, &'static mut crate::map::DestructibleProp>,
     area_bounds: Option<Res<'w, crate::map::AreaBounds>>,
     water_return: Option<Res<'w, crate::map::WaterReturnPoints>>,
     start: Option<Res<'w, crate::map::Start>>,
@@ -2665,7 +2776,7 @@ pub fn pilot(
     pads: Query<&Gamepad>,
     mut piloting: ResMut<Piloting>,
     garage: Res<crate::Garage>,
-    world: PilotWorld,
+    mut world: PilotWorld,
     motion: Option<ResMut<Motion>>,
     mut acs: Query<(
         &mut Pilot,
@@ -2681,7 +2792,8 @@ pub fn pilot(
     mouse: Res<bevy::input::mouse::AccumulatedMouseMotion>,
     mut mouselook: Local<bool>,
 ) {
-    let collision = &world.collision;
+    let collision = &mut *world.collision;
+    let props = &mut world.props;
     let area_bounds = &world.area_bounds;
     let water_return = &world.water_return;
     let start = &world.start;
@@ -2816,14 +2928,34 @@ pub fn pilot(
         p.accumulator -= 1.0 / TICK_RATE;
         p.cam.aim(input.look);
         let before = p.velocity;
+        let mut apply_prop = |prop_id: u32, raw_damage: f32| {
+            for mut prop in props.iter_mut() {
+                if prop.prop_id == prop_id {
+                    return prop.apply_collision_damage(raw_damage);
+                }
+            }
+            false
+        };
         if *mouselook {
             let per_tick = (p.ctrl.turn_rate / TICK_RATE).max(1e-4);
             input.turn = (p.cam.yaw_off / per_tick).clamp(-1.0, 1.0);
             let yaw_before = p.yaw;
-            step(&mut p, &input, &mut transform.translation, &collision);
+            step_with_props(
+                &mut p,
+                &input,
+                &mut transform.translation,
+                collision,
+                &mut apply_prop,
+            );
             p.cam.yaw_off -= p.yaw - yaw_before;
         } else {
-            step(&mut p, &input, &mut transform.translation, &collision);
+            step_with_props(
+                &mut p,
+                &input,
+                &mut transform.translation,
+                collision,
+                &mut apply_prop,
+            );
         }
         p.cam.accel = (p.velocity - before).with_y(0.0).length() * TICK_TO_KMH;
     }
@@ -4001,5 +4133,116 @@ mod tests {
         fire_quick_boost(&mut p, Vec2::Y, sweet_ratio);
         assert!(p.second_stage_qb);
         assert_eq!(p.last_qb_tae, 0x0C22);
+    }
+
+    #[test]
+    fn walk_and_boost_crush_destructible_props() {
+        use crate::collision::{GroundSurface, Hit, Layer, Plane};
+        use crate::map::DestructibleProp;
+
+        let design = &find(acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN, 5001)
+            .expect("design 5001")
+            .data;
+        let ctrl = AcCtrlParam::calculate(design);
+        let prop_wall = |z: f32, prop_id: u32| {
+            Collision::with_hits(
+                vec![Plane {
+                    y: 0.0,
+                    layer: Layer::Ground,
+                }],
+                vec![
+                    Hit {
+                        a: Vec3::new(-4.0, 0.0, z),
+                        b: Vec3::new(4.0, 0.0, z),
+                        c: Vec3::new(4.0, 4.0, z),
+                        layer: Layer::Ground,
+                        wall_kickable: false,
+                        blocks_fcs_los: true,
+                        blocks_ai_los: true,
+                        blocks_bullet: true,
+                        surface: GroundSurface::Concrete,
+                        prop_id,
+                        only_when_broken: false,
+                    },
+                    Hit {
+                        a: Vec3::new(-4.0, 0.0, z),
+                        b: Vec3::new(4.0, 4.0, z),
+                        c: Vec3::new(-4.0, 4.0, z),
+                        layer: Layer::Ground,
+                        wall_kickable: false,
+                        blocks_fcs_los: true,
+                        blocks_ai_los: true,
+                        blocks_bullet: true,
+                        surface: GroundSurface::Concrete,
+                        prop_id,
+                        only_when_broken: false,
+                    },
+                ],
+            )
+        };
+        let make_prop = |prop_id: u32, hp: f32, cutoff: f32, mult: f32| DestructibleProp {
+            prop_id,
+            model: "o2024".into(),
+            center: Vec3::new(0.0, 1.5, -5.0),
+            radius: 3.0,
+            hp,
+            max_hp: hp,
+            cutoff_damage: cutoff,
+            collision_damage_mult: mult,
+            damage_id: 0,
+            full: Entity::PLACEHOLDER,
+            low: None,
+            broken_mesh: Entity::PLACEHOLDER,
+            broken: false,
+            just_broken: false,
+        };
+        let walk_fwd = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
+
+        // 1. 耐久A (AP=1, collision_defensibility=0 -> mult=1.0): walking into it shatters it
+        //    and the AC passes straight past z = -5.0 without getting blocked.
+        let mut col_a = prop_wall(-5.0, 1);
+        let mut prop_a = make_prop(1, 1.0, 0.0, 1.0);
+        let mut p = Pilot::new(ctrl, 10);
+        let mut pos = Vec3::ZERO;
+        for _ in 0..90 {
+            step_with_props(&mut p, &walk_fwd, &mut pos, &mut col_a, |id, raw| {
+                id == prop_a.prop_id && prop_a.apply_collision_damage(raw)
+            });
+        }
+        assert!(prop_a.broken, "walking into 耐久A ground prop must shatter it");
+        assert!(pos.z < -6.5, "AC must crash straight through broken 耐久A prop, got z={}", pos.z);
+
+        // 2. 耐久B (AP=500, collision_defensibility=0 -> mult=1.0): boosting into it shatters it
+        //    and the AC crashes through.
+        let mut col_b = prop_wall(-5.0, 2);
+        let mut prop_b = make_prop(2, 500.0, 0.0, 1.0);
+        let mut p = Pilot::new(ctrl, 10);
+        p.boost = true;
+        let mut pos = Vec3::ZERO;
+        for _ in 0..60 {
+            step_with_props(&mut p, &walk_fwd, &mut pos, &mut col_b, |id, raw| {
+                id == prop_b.prop_id && prop_b.apply_collision_damage(raw)
+            });
+        }
+        assert!(prop_b.broken, "boosting into 耐久B prop must shatter it");
+        assert!(pos.z < -6.5, "AC must crash through broken 耐久B prop, got z={}", pos.z);
+
+        // 3. 耐久C / indestructible (collision_defensibility=100 -> mult=0.0): resists AC body
+        //    collision and blocks the AC at the wall.
+        let mut col_c = prop_wall(-5.0, 3);
+        let mut prop_c = make_prop(3, 2500.0, 0.0, 0.0);
+        let mut p = Pilot::new(ctrl, 10);
+        p.boost = true;
+        let mut pos = Vec3::ZERO;
+        for _ in 0..60 {
+            step_with_props(&mut p, &walk_fwd, &mut pos, &mut col_c, |id, raw| {
+                id == prop_c.prop_id && prop_c.apply_collision_damage(raw)
+            });
+        }
+        assert!(!prop_c.broken, "collision_defensibility=100 prop must not break on body contact");
+        assert!(pos.z > -5.0, "intact collision-immune prop must block the AC, got z={}", pos.z);
     }
 }
