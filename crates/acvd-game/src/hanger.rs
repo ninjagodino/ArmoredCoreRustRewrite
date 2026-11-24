@@ -32,6 +32,9 @@ struct Rack {
     joints: Vec<Option<Entity>>,
     /// FLVER local translation, kept while the clip replaces the rotation.
     translation: Vec<Option<Vec3>>,
+    /// Initial mount rotation of root bone 0 (`81` / `80`) on the arm socket, preserved so
+    /// the rack stays aligned with the arm shoulder.
+    root_rotation: Option<Quat>,
 }
 
 #[derive(Resource, Default)]
@@ -72,6 +75,7 @@ impl HangerPose {
                 swing_10,
                 joints,
                 translation: Vec::new(),
+                root_rotation: None,
             });
         }
         Self { racks: out }
@@ -94,10 +98,13 @@ fn bevy_quat(q: [f32; 4]) -> Quat {
     Quat::from_xyzw(q[0], -q[1], -q[2], q[3])
 }
 
-/// Idle stowed shoulder pitch on `*_hg01` (bone 1): angles the stowed barrel ~35° down-back
-/// behind the shoulder (matching retail ACVD). Blends smoothly to 0° during `f=20..150` of
-/// `a00_011`/`a00_021` so both handoffs (`f=40` seat, `f=150` grab) align with `*_armhand`.
-const STOW_PITCH_X: f32 = 100.0_f32.to_radians();
+/// Idle stowed shoulder pitch on `*_hg01` (bone 1): `a00_011`/`a00_021` f=0 starts with the
+/// stowed prong at ~23° down-back (`r_hg_b` -151° X vs `a00_000` rest -121° X). Adding +30°
+/// around parent X settles the stowed weapon at ~53° down-back behind the shoulder (matching
+/// `a00_000` and retail 360 Xenia captures symmetrically on both left and right racks), and
+/// blends smoothly to 0° during `f=20..150` so `f=40` (seat) and `f=150` (grab) align with
+/// `*_armhand`.
+const STOW_PITCH_X: f32 = 30.0_f32.to_radians();
 
 pub fn pose(
     shift: Option<Res<Shift>>,
@@ -172,7 +179,12 @@ pub fn pose(
             }
             let saved = *rack.translation[i].get_or_insert(transform.translation);
             transform.translation = saved;
-            transform.rotation = quats[i];
+            if i == 0 {
+                let base_r = *rack.root_rotation.get_or_insert(transform.rotation);
+                transform.rotation = (base_r * quats[0]).normalize();
+            } else {
+                transform.rotation = quats[i];
+            }
         }
     }
 }
@@ -282,6 +294,89 @@ mod tests {
                 barrel_dot > 0.9,
                 "f={f}: prong +Z should match r_armhand +Z (dot={barrel_dot:.3})"
             );
+        }
+    }
+
+    #[test]
+    fn rest_pose_stows_barrel_down_back_matching_360() {
+        let Ok(disc) = vfs::Disc::default_for(std::path::Path::new("../..")) else {
+            return;
+        };
+        let design = acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN
+            .iter()
+            .find(|r| r.id == 5001)
+            .unwrap();
+        let built = crate::assemble::assemble(
+            acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS,
+            &design.data,
+        );
+        let mut flvers = acvd_render::FlverCache::default();
+        let mut loaded = Vec::new();
+        let mut known = vec![None; built.placements.len()];
+        for (index, p) in built.placements.iter().enumerate() {
+            if !matches!(p.column, "legs" | "core" | "arms" | "rack_r" | "rack_l") {
+                continue;
+            }
+            let places = crate::assemble::root_places(p, &built.placements, &known);
+            let (meshes, rig) = flvers
+                .rigged_model(&disc, p.model.path, &|root| {
+                    crate::assemble::place_of(&places, root)
+                })
+                .unwrap();
+            known[index] = Some(crate::assemble::Stored {
+                places,
+                frames: rig.frames.clone(),
+            });
+            loaded.push(crate::pose::Loaded {
+                index,
+                placement: p,
+                meshes,
+                rig,
+            });
+        }
+        let rig = crate::pose::build(&disc, &loaded).unwrap();
+        for (pi, p) in loaded.iter().enumerate() {
+            if p.placement.column == "rack_r" || p.placement.column == "rack_l" {
+                let (_, tf) = rig.mount_local(pi, 0).unwrap();
+                let (ex, ey, ez) = tf.rotation.to_euler(EulerRot::XYZ);
+                eprintln!(
+                    "  {} mount_local b0: t=({:+.2},{:+.2},{:+.2}) euler=({:+6.1},{:+6.1},{:+6.1})",
+                    p.placement.column,
+                    tf.translation.x, tf.translation.y, tf.translation.z,
+                    ex.to_degrees(), ey.to_degrees(), ez.to_degrees()
+                );
+            }
+        }
+        let m = acvd_data::ac_motion(3, design.data.legs as u16).unwrap();
+        let ac_skel = open(&disc, m.set, m.skeleton).unwrap();
+        for (side, col, path, kata) in [
+            ("R", "rack_r", RIGHT, "r_kata"),
+            ("L", "rack_l", LEFT, "l_kata"),
+        ] {
+            let pi = loaded.iter().position(|p| p.placement.column == col).unwrap();
+            let (_, tf0) = rig.mount_local(pi, 0).unwrap();
+            let (_, sh_r) = eval_ani_world(&ac_skel, &ac_skel, 0.0, kata);
+            let c01 = open(&disc, path, "a00_011.ani").unwrap();
+            let stow_q = Quat::from_rotation_x(STOW_PITCH_X);
+            let q0: [Quat; 6] = std::array::from_fn(|i| {
+                bevy_quat(c01.bones[i].track.rotation(0.0).unwrap_or([0.0, 0.0, 0.0, 1.0]))
+            });
+            let end_f = c01.frames.saturating_sub(1) as f32;
+            let q1: [Quat; 6] = std::array::from_fn(|i| {
+                bevy_quat(c01.bones[i].track.rotation(end_f).unwrap_or([0.0, 0.0, 0.0, 1.0]))
+            });
+            let r0 = sh_r * tf0.rotation * q0[0] * (stow_q * q0[1]) * q0[4] * q0[5];
+            let r1 = sh_r * tf0.rotation * q1[0] * (stow_q * q1[1]) * q1[2] * q1[3];
+            let b0 = r0 * (-Vec3::Z); // weapon FLVER muzzle is -Z
+            let b1 = r1 * (-Vec3::Z);
+            let u0 = r0 * Vec3::Y;
+            eprintln!(
+                "  {side} stowed phase0: muzzle(-Z)=({:+.2},{:+.2},{:+.2}) top(+Y)=({:+.2},{:+.2},{:+.2})",
+                b0.x, b0.y, b0.z, u0.x, u0.y, u0.z
+            );
+            eprintln!("  {side} stowed phase1: muzzle(-Z)=({:+.2},{:+.2},{:+.2})", b1.x, b1.y, b1.z);
+            assert!(b0.y < -0.65 && b0.z > 0.45, "{side}: muzzle must point ~53 deg down-back (got {b0:?})");
+            assert!(b0.dot(b1) > 0.99, "{side}: phase 0 and phase 1 stowed angles should match");
         }
     }
 }
