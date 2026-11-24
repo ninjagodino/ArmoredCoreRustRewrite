@@ -133,6 +133,8 @@ pub enum UiAction {
     PaintChannel(usize),
     PaintRgbDelta(usize, i16),
     PaintCamoDelta(i8),
+    PaintExitSave,
+    PaintExitDiscard,
     DecalUpload,
     DecalLibTab(DecalLibraryTab),
     DecalLibPage(i8),
@@ -1041,6 +1043,10 @@ pub struct GarageState {
     pub paint_hsv_synced_channel: Option<usize>,
     /// Active mouse click-drag target in `PAINT -> PALETTE`.
     pub paint_drag: Option<PaintDragTarget>,
+    /// True when the "Save paint changes before exit?" modal prompt is open.
+    pub paint_exit_prompt: bool,
+    /// Selected choice in the paint exit prompt (`true` = YES / Save, `false` = NO / Discard).
+    pub paint_exit_prompt_choice: bool,
     /// Sortie launcher indices.
     pub sortie_map_idx: usize,
     pub sortie_target_idx: usize,
@@ -1119,6 +1125,8 @@ impl GarageState {
             paint_hsv: [0.0, 0.0, 0.5],
             paint_hsv_synced_channel: None,
             paint_drag: None,
+            paint_exit_prompt: false,
+            paint_exit_prompt_choice: true,
             sortie_map_idx,
             sortie_target_idx,
             parts_fmg,
@@ -1943,6 +1951,20 @@ pub fn handle_input(
                 state.ui_dirty = true;
                 return;
             }
+            UiAction::PaintExitSave => {
+                finish_paint_exit_save(&mut commands, &mut state, &mut cues, &mut audio_assets);
+                return;
+            }
+            UiAction::PaintExitDiscard => {
+                finish_paint_exit_discard(
+                    &mut commands,
+                    &mut state,
+                    &mut garage,
+                    &mut cues,
+                    &mut audio_assets,
+                );
+                return;
+            }
             UiAction::DecalUpload => {
                 if decals.open_file_picker() {
                     sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_OK);
@@ -2587,6 +2609,43 @@ pub fn handle_input(
         }
     }
 
+    if state.paint_exit_prompt {
+        let toggle = keys.just_pressed(KeyCode::ArrowLeft)
+            || keys.just_pressed(KeyCode::ArrowRight)
+            || keys.just_pressed(KeyCode::KeyA)
+            || keys.just_pressed(KeyCode::KeyD)
+            || keys.just_pressed(KeyCode::Tab)
+            || gp_left
+            || gp_right;
+        if toggle {
+            state.paint_exit_prompt_choice = !state.paint_exit_prompt_choice;
+            sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+            state.ui_dirty = true;
+            return;
+        }
+        if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) || gp_confirm {
+            if state.paint_exit_prompt_choice {
+                finish_paint_exit_save(&mut commands, &mut state, &mut cues, &mut audio_assets);
+            } else {
+                finish_paint_exit_discard(
+                    &mut commands,
+                    &mut state,
+                    &mut garage,
+                    &mut cues,
+                    &mut audio_assets,
+                );
+            }
+            return;
+        }
+        if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::Backspace) || gp_cancel {
+            state.paint_exit_prompt = false;
+            sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
+            state.ui_dirty = true;
+            return;
+        }
+        return;
+    }
+
     if state.screen == GarageScreen::ViewMode {
         if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::Backspace) || gp_cancel {
             sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
@@ -3153,6 +3212,53 @@ fn open_options_screen(
     state.ui_dirty = true;
 }
 
+/// Returns `true` when the player has modified the AC's paint preset or custom color/camo
+/// since entering `GarageScreen::Paint` (or since their last explicit Save).
+fn paint_has_unsaved_changes(state: &GarageState, garage: &crate::Garage) -> bool {
+    let color_changed = state
+        .saved_color
+        .is_some_and(|saved| garage.custom_color != saved);
+    let preset_changed = state
+        .saved_design
+        .is_some_and(|saved| garage.active_design.coloring_id != saved.coloring_id);
+    color_changed || preset_changed
+}
+
+fn finish_paint_exit_save(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+) {
+    state.paint_exit_prompt = false;
+    state.saved_design = None;
+    state.saved_color = None;
+    state.screen = GarageScreen::Top;
+    state.cursor = 0;
+    state.scroll = 0;
+    state.cam_manual_orbit = false;
+    sound::cue(commands, cues, audio_assets, CUE_OK);
+    state.set_banner("PAINT SAVED", Color::srgb(0.45, 0.92, 0.62));
+    state.ui_dirty = true;
+}
+
+fn finish_paint_exit_discard(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    garage: &mut crate::Garage,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+) {
+    state.paint_exit_prompt = false;
+    revert_preview(state, garage);
+    state.screen = GarageScreen::Top;
+    state.cursor = 0;
+    state.scroll = 0;
+    state.cam_manual_orbit = false;
+    sound::cue(commands, cues, audio_assets, CUE_CANCEL);
+    state.ui_dirty = true;
+}
+
 fn trigger_cancel(
     commands: &mut Commands,
     state: &mut GarageState,
@@ -3162,6 +3268,16 @@ fn trigger_cancel(
 ) {
     match state.screen {
         GarageScreen::Top => {}
+        GarageScreen::Paint => {
+            if paint_has_unsaved_changes(state, garage) && !state.paint_exit_prompt {
+                state.paint_exit_prompt = true;
+                state.paint_exit_prompt_choice = true;
+                sound::cue(commands, cues, audio_assets, CUE_CATEGORY);
+                state.ui_dirty = true;
+                return;
+            }
+            finish_paint_exit_discard(commands, state, garage, cues, audio_assets);
+        }
         GarageScreen::AssembleParts { .. } => {
             revert_preview(state, garage);
             state.screen = GarageScreen::Top;
@@ -3172,7 +3288,6 @@ fn trigger_cancel(
             state.ui_dirty = true;
         }
         GarageScreen::AssembleSlots
-        | GarageScreen::Paint
         | GarageScreen::Design
         | GarageScreen::GarageCustom
         | GarageScreen::SortieConfig
@@ -3342,8 +3457,8 @@ fn trigger_confirm(
                         garage.active_design.coloring_id = color_id;
                         garage.custom_color = paint::load_accolor(&garage.disc, color_id);
                         garage.dirty = true;
-                        state.saved_design = None;
-                        state.saved_color = None;
+                        state.saved_design = Some(garage.active_design);
+                        state.saved_color = Some(garage.custom_color);
                         sound::cue(commands, cues, audio_assets, CUE_EQUIP);
                         state.set_banner(
                             format!("APPLIED COLOR PRESET {:04}", color_id),
@@ -3352,8 +3467,8 @@ fn trigger_confirm(
                     }
                 }
                 PaintTab::Custom => {
-                    state.saved_design = None;
-                    state.saved_color = None;
+                    state.saved_design = Some(garage.active_design);
+                    state.saved_color = Some(garage.custom_color);
                     sound::cue(commands, cues, audio_assets, CUE_OK);
                     state.set_banner("CUSTOM PAINT SAVED", Color::srgb(0.45, 0.92, 0.62));
                 }
@@ -4480,6 +4595,139 @@ pub fn sync_ui(
         "W/S NAVIGATE   ENTER SELECT   ESC BACK   R-DRAG ORBIT   WHEEL ZOOM   V VIEW MODE   F9 MUTE BGM"
     };
     spawn_garage_footer(&mut commands, root, &kit, footer_text, scale);
+
+    if state.screen == GarageScreen::Paint && state.paint_exit_prompt {
+        spawn_paint_exit_prompt(
+            &mut commands,
+            root,
+            &kit,
+            state.paint_exit_prompt_choice,
+            scale,
+        );
+    }
+}
+
+/// Modal YES / NO confirmation prompt rendered with `AcvdUiKit` when pressing ESC in Paint
+/// with unsaved paint changes.
+fn spawn_paint_exit_prompt(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    save_selected: bool,
+    scale: f32,
+) {
+    let overlay = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(0.0),
+                left: px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            ZIndex(20),
+            BackgroundColor(Color::srgba(0.02, 0.03, 0.04, 0.68)),
+            ChildOf(root),
+        ))
+        .id();
+
+    let modal = kit.spawn_panel(
+        commands,
+        Some(overlay),
+        PanelStyle::Framed,
+        Node {
+            width: px((420.0 * scale).round()),
+            padding: UiRect::axes(px((22.0 * scale).round()), px((18.0 * scale).round())),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((12.0 * scale).round()),
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        scale,
+    );
+
+    kit.spawn_text(
+        commands,
+        modal,
+        FontRole::Header,
+        "SAVE BEFORE EXIT?",
+        scale * 1.05,
+        palette::ACCENT_AMBER,
+    );
+
+    kit.spawn_text(
+        commands,
+        modal,
+        FontRole::Body,
+        "Your paint configuration has unsaved changes.",
+        scale * 0.90,
+        palette::TEXT_PRIMARY,
+    );
+
+    let btn_row = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                margin: UiRect::top(px((4.0 * scale).round())),
+                flex_direction: FlexDirection::Row,
+                column_gap: px((10.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(modal),
+        ))
+        .id();
+
+    let yes_btn = spawn_kit_pill(
+        commands,
+        kit,
+        btn_row,
+        "YES — SAVE",
+        if save_selected {
+            ButtonState::Active
+        } else {
+            ButtonState::Normal
+        },
+        1.0,
+        14.0,
+        8.0,
+        0.94,
+        scale,
+    );
+    commands
+        .entity(yes_btn)
+        .insert((Button, UiAction::PaintExitSave));
+
+    let no_btn = spawn_kit_pill(
+        commands,
+        kit,
+        btn_row,
+        "NO — DISCARD",
+        if !save_selected {
+            ButtonState::Active
+        } else {
+            ButtonState::Normal
+        },
+        1.0,
+        14.0,
+        8.0,
+        0.94,
+        scale,
+    );
+    commands
+        .entity(no_btn)
+        .insert((Button, UiAction::PaintExitDiscard));
+
+    kit.spawn_text(
+        commands,
+        modal,
+        FontRole::Small,
+        "ENTER CONFIRM   •   LEFT/RIGHT SELECT   •   ESC CANCEL",
+        scale * 0.78,
+        palette::TEXT_MUTED,
+    );
 }
 
 fn screen_title_and_tag(screen: GarageScreen) -> (&'static str, &'static str) {
