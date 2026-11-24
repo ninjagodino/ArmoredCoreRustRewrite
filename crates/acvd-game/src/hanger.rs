@@ -193,3 +193,44 @@ pub fn pose(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acvd_formats::vfs;
+
+    #[test]
+    fn carousel_clips_alternate_prongs_continuously() {
+        let Ok(disc) = vfs::Disc::default_for(std::path::Path::new("../..")) else {
+            return;
+        };
+        let c01 = open(&disc, RIGHT, "a00_011.ani").unwrap();
+        let c10 = open(&disc, RIGHT, "a00_021.ani").unwrap();
+        assert_eq!(c01.frames, 180);
+        assert_eq!(c10.frames, 180);
+        // End of a00_011 (phase 1 idle) must match start of a00_021 seamlessly on bones 2..6.
+        for bi in 2..6 {
+            let end_01 = Quat::from_array(c01.bones[bi].track.rotation(179.0).unwrap());
+            let start_10 = Quat::from_array(c10.bones[bi].track.rotation(0.0).unwrap());
+            assert!(
+                end_01.angle_between(start_10).to_degrees() < 1.0,
+                "bone {bi} discontinuous between a00_011 end and a00_021 start"
+            );
+            let end_10 = Quat::from_array(c10.bones[bi].track.rotation(179.0).unwrap());
+            let start_01 = Quat::from_array(c01.bones[bi].track.rotation(0.0).unwrap());
+            assert!(
+                end_10.angle_between(start_01).to_degrees() < 1.0,
+                "bone {bi} discontinuous between a00_021 end and a00_011 start"
+            );
+        }
+        // In a00_011 (phase 0->1), bone 3 (r_hg_f) swings out >90 deg between f0 and f40 to
+        // receive the hand weapon while bone 5 (r_hg_b) holds the stowed weapon at the back.
+        let f_0 = Quat::from_array(c01.bones[3].track.rotation(0.0).unwrap());
+        let f_40 = Quat::from_array(c01.bones[3].track.rotation(40.0).unwrap());
+        let b_0 = Quat::from_array(c01.bones[5].track.rotation(0.0).unwrap());
+        let b_40 = Quat::from_array(c01.bones[5].track.rotation(40.0).unwrap());
+        assert!(f_0.angle_between(f_40).to_degrees() > 90.0);
+        assert!(b_0.angle_between(b_40).to_degrees() < 35.0);
+    }
+}
+

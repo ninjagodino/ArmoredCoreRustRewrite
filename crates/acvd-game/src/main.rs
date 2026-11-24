@@ -1640,7 +1640,13 @@ fn show(
             });
             if on_bay {
                 if let Some(root) = root {
-                    commands.entity(root).insert((ChildOf(parent), local));
+                    // Phase 0 (`a00_011` f=0) starts with the stowed weapon on the back prong
+                    // (`r_hg_b` / `l_hg_b`, dummy 88/86) while the front prong (`r_hg_f` / `l_hg_f`,
+                    // dummy 87/85) is empty and swings forward at f=0..40 to receive the hand weapon.
+                    let initial_prong = alt_parent.unwrap_or(parent);
+                    commands
+                        .entity(root)
+                        .insert((ChildOf(initial_prong), local));
                 }
             }
             if root.is_some() {

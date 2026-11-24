@@ -403,9 +403,9 @@ pub(crate) fn shift(
     }
 }
 
-/// Frame 40 of bay shift: parent the equipped hand weapon onto the rack's **empty** prong
-/// (`alt_parent` = `*_hg_b` in phase 0, `parent` = `*_hg_f` in phase 1) so the two weapons sit
-/// on opposite prongs during the 180° carousel spin, and update the rack's stow pitch.
+/// Frame 40 of bay shift: parent the equipped hand weapon onto the rack's **empty** prong that
+/// just swung forward to meet the hand (`parent` = `*_hg_f` in phase 0 / `a00_011`, `alt_parent` =
+/// `*_hg_b` in phase 1 / `a00_021`) so the two weapons ride opposite prongs through the 180° spin.
 fn seat(
     mut commands: Commands,
     loadout: &mut Loadout,
@@ -421,9 +421,9 @@ fn seat(
             return;
         };
         let prong = if hs.phase & 1 == 0 {
-            mount.alt_parent.unwrap_or(mount.parent)
-        } else {
             mount.parent
+        } else {
+            mount.alt_parent.unwrap_or(mount.parent)
         };
         (prong, mount.local)
     };
