@@ -12,6 +12,7 @@ use acvd_render::ui_kit::{
 };
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
 use bevy::ecs::system::SystemParam;
+use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
 use bevy::ui::{
     px, AlignItems, FlexDirection, GlobalZIndex, JustifyContent, PositionType, UiRect, Val,
@@ -114,6 +115,7 @@ pub enum PauseAction {
     ToggleFullscreen,
     SelectOptionRow(usize),
     StepUiScale(i8),
+    StepHudSway(i8),
     StepVolume(AudioChannel, i8),
     BackToMain,
 }
@@ -138,14 +140,14 @@ pub struct PauseAudioCtx<'w> {
 }
 
 const OPTION_CHANNELS: [(usize, AudioChannel); 4] = [
-    (2, AudioChannel::Master),
-    (3, AudioChannel::Music),
-    (4, AudioChannel::Sfx),
-    (5, AudioChannel::Ui),
+    (3, AudioChannel::Master),
+    (4, AudioChannel::Music),
+    (5, AudioChannel::Sfx),
+    (6, AudioChannel::Ui),
 ];
 
 fn option_row_count() -> usize {
-    7 // 0: Fullscreen, 1: UI Scale, 2: Master, 3: Music, 4: SFX, 5: Menu/UI, 6: Back
+    8 // 0: Fullscreen, 1: UI Scale, 2: HUD Sway, 3: Master, 4: Music, 5: SFX, 6: Menu/UI, 7: Back
 }
 
 fn step_cursor(cursor: usize, len: usize, delta: isize) -> usize {
@@ -195,6 +197,23 @@ fn step_ui_scale(
     state.dirty = true;
 }
 
+fn step_hud_sway(
+    commands: &mut Commands,
+    options: &mut PauseOptionsCtx,
+    audio: &mut PauseAudioCtx,
+    state: &mut PauseState,
+    delta: i8,
+) {
+    options.settings.step_hud_sway(delta);
+    options.settings.save();
+    sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_MOVE);
+    state.status_banner = Some((
+        format!("HUD SWAY: {}%", options.settings.hud_sway_percent()),
+        palette::ACCENT_TEAL,
+    ));
+    state.dirty = true;
+}
+
 fn step_volume(
     commands: &mut Commands,
     options: &mut PauseOptionsCtx,
@@ -233,13 +252,16 @@ pub fn handle_input(
     mode: Res<Mode>,
     scene: Res<crate::Scene>,
     keys: Res<ButtonInput<KeyCode>>,
+    scroll: Res<AccumulatedMouseScroll>,
     gamepads: Query<&Gamepad>,
     mut state: ResMut<PauseState>,
+    mut garage_state: ResMut<crate::garage::GarageState>,
     mut mode_switch: ResMut<ModeSwitch>,
     mut options: PauseOptionsCtx,
     mut audio: PauseAudioCtx,
     mut cursor_opts: Query<&mut bevy::window::CursorOptions, With<bevy::window::PrimaryWindow>>,
-    btn_q: Query<(&Interaction, &PauseAction), (Changed<Interaction>, With<Button>)>,
+    btn_q: Query<(Ref<Interaction>, &PauseAction), With<Button>>,
+    ui_action_q: Query<(Ref<Interaction>, &crate::garage::UiAction), With<Button>>,
 ) {
     if *mode != Mode::Sortie {
         if state.open {
@@ -303,8 +325,10 @@ pub fn handle_input(
     let items = main_items(in_test_arena);
 
     // Mouse button clicks first so clicks feel instant.
+    // Defer container row selection (`SelectOptionRow`) so child `<` / `>` arrow buttons win.
+    let mut fallback_select_row: Option<usize> = None;
     for (interaction, action) in &btn_q {
-        if *interaction != Interaction::Pressed {
+        if !interaction.is_changed() || *interaction != Interaction::Pressed {
             continue;
         }
         match *action {
@@ -324,21 +348,17 @@ pub fn handle_input(
                 return;
             }
             PauseAction::SelectOptionRow(row) => {
-                if state.cursor != row {
-                    state.cursor = row;
-                    state.dirty = true;
-                    sound::cue(
-                        &mut commands,
-                        &mut audio.cues,
-                        &mut audio.audio_assets,
-                        CUE_MOVE,
-                    );
-                }
-                return;
+                fallback_select_row = Some(row);
+                continue;
             }
             PauseAction::StepUiScale(delta) => {
                 state.cursor = 1;
                 step_ui_scale(&mut commands, &mut options, &mut audio, &mut state, delta);
+                return;
+            }
+            PauseAction::StepHudSway(delta) => {
+                state.cursor = 2;
+                step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, delta);
                 return;
             }
             PauseAction::StepVolume(channel, delta) => {
@@ -370,6 +390,133 @@ pub fn handle_input(
                     CUE_CANCEL,
                 );
                 return;
+            }
+        }
+    }
+    if let Some(row) = fallback_select_row {
+        if state.cursor != row {
+            state.cursor = row;
+            state.dirty = true;
+            sound::cue(
+                &mut commands,
+                &mut audio.cues,
+                &mut audio.audio_assets,
+                CUE_MOVE,
+            );
+        }
+        return;
+    }
+
+    // Handle clicks and hover-scroll on the shared HSV/RGB Combat HUD Color picker inside Pause Options.
+    if state.screen == PauseScreen::Options {
+        for (interaction, action) in &ui_action_q {
+            if interaction.is_changed() && *interaction == Interaction::Pressed {
+                match *action {
+                    crate::garage::UiAction::PaintPickerMode(pmode) => {
+                        garage_state.paint_picker_mode = pmode;
+                        sound::cue(
+                            &mut commands,
+                            &mut audio.cues,
+                            &mut audio.audio_assets,
+                            CUE_CATEGORY,
+                        );
+                        state.dirty = true;
+                        return;
+                    }
+                    crate::garage::UiAction::PaintRgbDelta(comp, delta) => {
+                        options.settings.hud_color[comp] =
+                            (options.settings.hud_color[comp] as i16 + delta).clamp(0, 255) as u8;
+                        options.settings.save();
+                        let hc = options.settings.hud_color;
+                        garage_state.paint_hsv = crate::paint::rgb_to_hsv([hc[0], hc[1], hc[2], 255]);
+                        garage_state.paint_hsv_synced_channel = Some(usize::MAX - 1);
+                        sound::cue(
+                            &mut commands,
+                            &mut audio.cues,
+                            &mut audio.audio_assets,
+                            CUE_MOVE,
+                        );
+                        state.dirty = true;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if scroll.delta.y.abs() > 0.0 {
+            let delta = crate::garage::wheel_step_direction(scroll.delta.y);
+            for (interaction, action) in &ui_action_q {
+                if matches!(*interaction, Interaction::Hovered | Interaction::Pressed) {
+                    if let crate::garage::UiAction::PaintRgbDelta(comp, _) = *action {
+                        options.settings.hud_color[comp] =
+                            (options.settings.hud_color[comp] as i16 + delta as i16 * 8)
+                                .clamp(0, 255) as u8;
+                        options.settings.save();
+                        let hc = options.settings.hud_color;
+                        garage_state.paint_hsv =
+                            crate::paint::rgb_to_hsv([hc[0], hc[1], hc[2], 255]);
+                        garage_state.paint_hsv_synced_channel = Some(usize::MAX - 1);
+                        sound::cue(
+                            &mut commands,
+                            &mut audio.cues,
+                            &mut audio.audio_assets,
+                            CUE_MOVE,
+                        );
+                        state.dirty = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Mouse-wheel over hovered Options sliders (UI Scale / audio volume bars) steps their value.
+    if state.screen == PauseScreen::Options && scroll.delta.y.abs() > 0.0 {
+        let delta = crate::garage::wheel_step_direction(scroll.delta.y);
+        for (interaction, action) in &btn_q {
+            if !matches!(*interaction, Interaction::Hovered | Interaction::Pressed) {
+                continue;
+            }
+            match *action {
+                PauseAction::SelectOptionRow(1) | PauseAction::StepUiScale(_) => {
+                    state.cursor = 1;
+                    step_ui_scale(&mut commands, &mut options, &mut audio, &mut state, delta);
+                    return;
+                }
+                PauseAction::SelectOptionRow(2) | PauseAction::StepHudSway(_) => {
+                    state.cursor = 2;
+                    step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, delta);
+                    return;
+                }
+                PauseAction::SelectOptionRow(row) => {
+                    if let Some(&(_, channel)) = OPTION_CHANNELS.iter().find(|&&(r, _)| r == row) {
+                        state.cursor = row;
+                        step_volume(
+                            &mut commands,
+                            &mut options,
+                            &mut audio,
+                            &mut state,
+                            channel,
+                            delta,
+                        );
+                        return;
+                    }
+                }
+                PauseAction::StepVolume(channel, _) => {
+                    if let Some((row, _)) = OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel) {
+                        state.cursor = *row;
+                    }
+                    step_volume(
+                        &mut commands,
+                        &mut options,
+                        &mut audio,
+                        &mut state,
+                        channel,
+                        delta,
+                    );
+                    return;
+                }
+                _ => {}
             }
         }
     }
@@ -451,7 +598,8 @@ pub fn handle_input(
         match state.cursor {
             0 => toggle_fullscreen(&mut commands, &mut options, &mut audio, &mut state),
             1 => step_ui_scale(&mut commands, &mut options, &mut audio, &mut state, delta),
-            2 => step_volume(
+            2 => step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, delta),
+            3 => step_volume(
                 &mut commands,
                 &mut options,
                 &mut audio,
@@ -459,7 +607,7 @@ pub fn handle_input(
                 AudioChannel::Master,
                 delta,
             ),
-            3 => step_volume(
+            4 => step_volume(
                 &mut commands,
                 &mut options,
                 &mut audio,
@@ -467,7 +615,7 @@ pub fn handle_input(
                 AudioChannel::Music,
                 delta,
             ),
-            4 => step_volume(
+            5 => step_volume(
                 &mut commands,
                 &mut options,
                 &mut audio,
@@ -475,7 +623,7 @@ pub fn handle_input(
                 AudioChannel::Sfx,
                 delta,
             ),
-            5 => step_volume(
+            6 => step_volume(
                 &mut commands,
                 &mut options,
                 &mut audio,
@@ -504,7 +652,8 @@ pub fn handle_input(
             PauseScreen::Options => match state.cursor {
                 0 => toggle_fullscreen(&mut commands, &mut options, &mut audio, &mut state),
                 1 => step_ui_scale(&mut commands, &mut options, &mut audio, &mut state, 1),
-                2 => step_volume(
+                2 => step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, 1),
+                3 => step_volume(
                     &mut commands,
                     &mut options,
                     &mut audio,
@@ -512,7 +661,7 @@ pub fn handle_input(
                     AudioChannel::Master,
                     1,
                 ),
-                3 => step_volume(
+                4 => step_volume(
                     &mut commands,
                     &mut options,
                     &mut audio,
@@ -520,7 +669,7 @@ pub fn handle_input(
                     AudioChannel::Music,
                     1,
                 ),
-                4 => step_volume(
+                5 => step_volume(
                     &mut commands,
                     &mut options,
                     &mut audio,
@@ -528,7 +677,7 @@ pub fn handle_input(
                     AudioChannel::Sfx,
                     1,
                 ),
-                5 => step_volume(
+                6 => step_volume(
                     &mut commands,
                     &mut options,
                     &mut audio,
@@ -536,7 +685,7 @@ pub fn handle_input(
                     AudioChannel::Ui,
                     1,
                 ),
-                6 => {
+                7 => {
                     state.screen = PauseScreen::Main;
                     state.cursor = items
                         .iter()
@@ -593,6 +742,8 @@ pub fn sync_ui(
     garage: Res<crate::Garage>,
     settings: Res<GameSettings>,
     assemble_assets: Res<AssembleUiAssets>,
+    mut garage_state: ResMut<crate::garage::GarageState>,
+    mut picker_assets: ResMut<crate::garage::PaintPickerAssets>,
     mut images: ResMut<Assets<Image>>,
     mut state: ResMut<PauseState>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
@@ -847,12 +998,69 @@ pub fn sync_ui(
             commands
                 .entity(ui_slider.row)
                 .insert((Button, PauseAction::SelectOptionRow(1)));
+            commands.entity(ui_slider.track).insert(
+                crate::garage::SliderTrack(crate::garage::SliderTrackTarget::UiScale),
+            );
             commands
                 .entity(ui_slider.dec_btn)
                 .insert((Button, PauseAction::StepUiScale(-1)));
             commands
                 .entity(ui_slider.inc_btn)
                 .insert((Button, PauseAction::StepUiScale(1)));
+
+            // Row 2: Crosshair HUD Sway slider (0% - 100%)
+            let sway_txt = format!("{}%", settings.hud_sway_percent());
+            let sway_slider = kit.spawn_slider_row(
+                &mut commands,
+                list,
+                "HUD SWAY",
+                &sway_txt,
+                settings.hud_sway.clamp(0.0, 1.0),
+                None,
+                state.cursor == 2,
+                118.0,
+                scale,
+            );
+            commands
+                .entity(sway_slider.row)
+                .insert((Button, PauseAction::SelectOptionRow(2)));
+            commands.entity(sway_slider.track).insert(
+                crate::garage::SliderTrack(crate::garage::SliderTrackTarget::HudSway),
+            );
+            commands
+                .entity(sway_slider.dec_btn)
+                .insert((Button, PauseAction::StepHudSway(-1)));
+            commands
+                .entity(sway_slider.inc_btn)
+                .insert((Button, PauseAction::StepHudSway(1)));
+
+            // Combat HUD Color HSV / RGB picker
+            if garage_state.paint_hsv_synced_channel != Some(usize::MAX - 1) {
+                let c = settings.hud_color;
+                garage_state.paint_hsv = crate::paint::rgb_to_hsv([c[0], c[1], c[2], 255]);
+                garage_state.paint_hsv_synced_channel = Some(usize::MAX - 1);
+            }
+            picker_assets.ensure_loaded(garage_state.paint_hsv[0], &mut images);
+            kit.spawn_text(
+                &mut commands,
+                list,
+                FontRole::Small,
+                "COMBAT HUD COLOR",
+                scale * 0.86,
+                palette::TEXT_MUTED,
+            );
+            let hc = settings.hud_color;
+            crate::garage::spawn_color_picker_card(
+                &mut commands,
+                list,
+                &kit,
+                garage_state.paint_picker_mode,
+                [hc[0], hc[1], hc[2], 255],
+                garage_state.paint_hsv,
+                &picker_assets,
+                64.0,
+                scale * 0.88,
+            );
 
             kit.spawn_trace(&mut commands, list, TraceStyle::Simple, scale);
 
@@ -882,6 +1090,9 @@ pub fn sync_ui(
                 commands
                     .entity(slider.row)
                     .insert((Button, PauseAction::SelectOptionRow(row_idx)));
+                commands.entity(slider.track).insert(
+                    crate::garage::SliderTrack(crate::garage::SliderTrackTarget::Volume(channel)),
+                );
                 commands
                     .entity(slider.dec_btn)
                     .insert((Button, PauseAction::StepVolume(channel, -1)));
@@ -893,7 +1104,7 @@ pub fn sync_ui(
             kit.spawn_trace(&mut commands, list, TraceStyle::Simple, scale);
 
             // Row 6: Back to Pause Main
-            let back_state = if state.cursor == 6 {
+            let back_state = if state.cursor == 7 {
                 ButtonState::Selected
             } else {
                 ButtonState::Normal

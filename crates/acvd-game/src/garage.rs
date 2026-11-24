@@ -134,6 +134,7 @@ pub enum UiAction {
     PaintRgbDelta(usize, i16),
     PaintCamoDelta(i8),
     PaintCamoSelect(u8),
+    PaintCamoScaleStep(i8),
     PaintCamoUpload,
     PaintCustomCamoSelect(usize),
     PaintCustomCamoDelete(usize),
@@ -171,6 +172,7 @@ pub enum UiAction {
     ToggleFullscreen,
     SelectOptionRow(usize),
     UiScaleStep(i8),
+    HudSwayStep(i8),
     VolumeStep(AudioChannel, i8),
     QuitToDesktop,
 }
@@ -179,9 +181,11 @@ pub enum UiAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WheelAdjust {
     UiScale,
+    HudSway,
     Volume(AudioChannel),
     PaintRgb(usize),
     PaintCamo,
+    PaintCamoScale,
     DecalScale,
     DecalRotate,
     DecalOpacity,
@@ -194,6 +198,7 @@ impl UiAction {
     pub fn wheel_adjust(self) -> Option<WheelAdjust> {
         match self {
             Self::SelectOptionRow(1) | Self::UiScaleStep(_) => Some(WheelAdjust::UiScale),
+            Self::SelectOptionRow(2) | Self::HudSwayStep(_) => Some(WheelAdjust::HudSway),
             Self::SelectOptionRow(row) => GARAGE_OPTION_CHANNELS
                 .iter()
                 .find(|&&(r, _)| r == row)
@@ -201,6 +206,7 @@ impl UiAction {
             Self::VolumeStep(ch, _) => Some(WheelAdjust::Volume(ch)),
             Self::PaintRgbDelta(comp, _) => Some(WheelAdjust::PaintRgb(comp)),
             Self::PaintCamoDelta(_) => Some(WheelAdjust::PaintCamo),
+            Self::PaintCamoScaleStep(_) => Some(WheelAdjust::PaintCamoScale),
             Self::DecalScaleStep(_) => Some(WheelAdjust::DecalScale),
             Self::DecalRotateStep(_) => Some(WheelAdjust::DecalRotate),
             Self::DecalOpacityStep(_) => Some(WheelAdjust::DecalOpacity),
@@ -301,6 +307,22 @@ pub enum PaintDragTarget {
 /// Tags a UI node as a click-and-drag color picker track.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ColorPickerTrack(pub PaintDragTarget);
+
+/// Target value controlled by clicking or dragging on a horizontal slider gauge bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliderTrackTarget {
+    UiScale,
+    HudSway,
+    Volume(AudioChannel),
+    PaintCamoScale,
+    DecalScale,
+    DecalRotate,
+    DecalOpacity,
+}
+
+/// Tags a slider row's gauge track node so clicking or dragging anywhere on the bar sets the value.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SliderTrack(pub SliderTrackTarget);
 
 /// Cached GPU textures for the HSV 2D SV square, 1D Hue spectrum bar, and 11 retail camo swatches.
 #[derive(Resource, Default)]
@@ -430,9 +452,10 @@ const TOP_ITEMS: &[(&str, &str, &str)] = &[
 ];
 
 /// Helpline descriptions for [`GarageScreen::Options`] rows.
-const OPTIONS_ROW_DESCS: [&str; 8] = [
+const OPTIONS_ROW_DESCS: [&str; 9] = [
     "Toggle fullscreen or windowed\ndisplay mode.",
     "Scale HUD and menu size\n(75% - 150%, default 100%).",
+    "Adjust crosshair HUD sway\nintensity (0% - 100%).",
     "Adjust master audio volume\nacross all sound channels.",
     "Adjust background music volume\nin Garage and Sortie.",
     "Adjust weapon, booster, and\ncombat sound effects volume.",
@@ -442,10 +465,10 @@ const OPTIONS_ROW_DESCS: [&str; 8] = [
 ];
 
 const GARAGE_OPTION_CHANNELS: [(usize, AudioChannel); 4] = [
-    (2, AudioChannel::Master),
-    (3, AudioChannel::Music),
-    (4, AudioChannel::Sfx),
-    (5, AudioChannel::Ui),
+    (3, AudioChannel::Master),
+    (4, AudioChannel::Music),
+    (5, AudioChannel::Sfx),
+    (6, AudioChannel::Ui),
 ];
 
 /// AC TEST target layer presets (`m4000_actest.msb`, `LAYER_PARAM_ST`).
@@ -1067,6 +1090,8 @@ pub struct GarageState {
     pub paint_hsv_synced_channel: Option<usize>,
     /// Active mouse click-drag target in `PAINT -> PALETTE`.
     pub paint_drag: Option<PaintDragTarget>,
+    /// Active click/drag target on any horizontal slider gauge bar (`SliderTrack`).
+    pub slider_drag: Option<SliderTrackTarget>,
     /// Session-scoped undo/redo stack for the Paint menu (cleared when leaving `GarageScreen::Paint`).
     pub paint_history: PaintUndoHistory,
     /// Set to `true` on frames where a garage UI slider/strip consumed the mouse wheel so
@@ -1158,6 +1183,7 @@ impl GarageState {
             paint_hsv: [0.0, 0.0, 0.5],
             paint_hsv_synced_channel: None,
             paint_drag: None,
+            slider_drag: None,
             paint_history: PaintUndoHistory::default(),
             wheel_consumed: false,
             paint_exit_prompt: false,
@@ -2062,7 +2088,14 @@ pub fn handle_input(
                 return;
             }
             UiAction::PaintRgbDelta(comp, delta) => {
-                if state.paint_tab == PaintTab::Decals {
+                if state.screen == GarageScreen::Options {
+                    options.settings.hud_color[comp] =
+                        (options.settings.hud_color[comp] as i16 + delta).clamp(0, 255) as u8;
+                    options.settings.save();
+                    let hc = options.settings.hud_color;
+                    state.paint_hsv = paint::rgb_to_hsv([hc[0], hc[1], hc[2], 255]);
+                    state.paint_hsv_synced_channel = Some(usize::MAX - 1);
+                } else if state.paint_tab == PaintTab::Decals {
                     let mut c = current_decal_tint(&decals);
                     c[comp] = (c[comp] as i16 + delta).clamp(0, 255) as u8;
                     apply_decal_tint_color(&mut decals, c);
@@ -2091,6 +2124,18 @@ pub fn handle_input(
                 col.camo.fill(id);
                 garage.dirty = true;
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_EQUIP);
+                state.ui_dirty = true;
+                return;
+            }
+            UiAction::PaintCamoScaleStep(delta) => {
+                if delta == 0 {
+                    continue;
+                }
+                options.custom_camos.step_custom_scale(delta);
+                if options.custom_camos.active_key.is_some() {
+                    garage.dirty = true;
+                }
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
                 state.ui_dirty = true;
                 return;
             }
@@ -2486,6 +2531,18 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::HudSwayStep(delta) => {
+                state.cursor = 2;
+                step_hud_sway_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
             UiAction::VolumeStep(channel, delta) => {
                 if let Some((row, _)) = GARAGE_OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel)
                 {
@@ -2718,6 +2775,17 @@ pub fn handle_input(
                         delta,
                     );
                 }
+                WheelAdjust::HudSway => {
+                    state.cursor = 2;
+                    step_hud_sway_setting(
+                        &mut commands,
+                        &mut options,
+                        &mut cues,
+                        &mut audio_assets,
+                        &mut state,
+                        delta,
+                    );
+                }
                 WheelAdjust::Volume(channel) => {
                     if let Some((row, _)) =
                         GARAGE_OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel)
@@ -2735,7 +2803,15 @@ pub fn handle_input(
                     );
                 }
                 WheelAdjust::PaintRgb(comp) => {
-                    if state.paint_tab == PaintTab::Decals {
+                    if state.screen == GarageScreen::Options {
+                        options.settings.hud_color[comp] =
+                            (options.settings.hud_color[comp] as i16 + delta as i16 * 8)
+                                .clamp(0, 255) as u8;
+                        options.settings.save();
+                        let hc = options.settings.hud_color;
+                        state.paint_hsv = paint::rgb_to_hsv([hc[0], hc[1], hc[2], 255]);
+                        state.paint_hsv_synced_channel = Some(usize::MAX - 1);
+                    } else if state.paint_tab == PaintTab::Decals {
                         let mut c = current_decal_tint(&decals);
                         c[comp] = (c[comp] as i16 + delta as i16 * 8).clamp(0, 255) as u8;
                         apply_decal_tint_color(&mut decals, c);
@@ -2757,6 +2833,14 @@ pub fn handle_input(
                 }
                 WheelAdjust::PaintCamo => {
                     step_custom_camo(&mut garage, delta);
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+                    state.ui_dirty = true;
+                }
+                WheelAdjust::PaintCamoScale => {
+                    options.custom_camos.step_custom_scale(delta);
+                    if options.custom_camos.active_key.is_some() {
+                        garage.dirty = true;
+                    }
                     sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
                     state.ui_dirty = true;
                 }
@@ -3018,13 +3102,12 @@ pub fn handle_input(
                 return;
             }
             2 => {
-                step_volume_setting(
+                step_hud_sway_setting(
                     &mut commands,
                     &mut options,
                     &mut cues,
                     &mut audio_assets,
                     &mut state,
-                    AudioChannel::Master,
                     delta,
                 );
                 return;
@@ -3036,7 +3119,7 @@ pub fn handle_input(
                     &mut cues,
                     &mut audio_assets,
                     &mut state,
-                    AudioChannel::Music,
+                    AudioChannel::Master,
                     delta,
                 );
                 return;
@@ -3048,12 +3131,24 @@ pub fn handle_input(
                     &mut cues,
                     &mut audio_assets,
                     &mut state,
-                    AudioChannel::Sfx,
+                    AudioChannel::Music,
                     delta,
                 );
                 return;
             }
             5 => {
+                step_volume_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    AudioChannel::Sfx,
+                    delta,
+                );
+                return;
+            }
+            6 => {
                 step_volume_setting(
                     &mut commands,
                     &mut options,
@@ -3155,7 +3250,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::Design => garage.designs.len(),
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
-        GarageScreen::Options => 8, // Fullscreen, UI Scale, Master, Music, SFX, Menu/UI, Back, Quit to Desktop
+        GarageScreen::Options => 9, // Fullscreen, UI Scale, HUD Sway, Master, Music, SFX, Menu/UI, Back, Quit to Desktop
         GarageScreen::ViewMode => 0,
     }
 }
@@ -3197,6 +3292,24 @@ fn step_ui_scale_setting(
     sound::cue(commands, cues, audio_assets, CUE_MOVE);
     state.set_banner(
         format!("UI SCALE: {}%", options.settings.ui_scale_percent()),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+}
+
+fn step_hud_sway_setting(
+    commands: &mut Commands,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    state: &mut GarageState,
+    delta: i8,
+) {
+    options.settings.step_hud_sway(delta);
+    options.settings.save();
+    sound::cue(commands, cues, audio_assets, CUE_MOVE);
+    state.set_banner(
+        format!("HUD SWAY: {}%", options.settings.hud_sway_percent()),
         Color::srgb(0.45, 0.92, 0.62),
     );
     state.ui_dirty = true;
@@ -3754,6 +3867,9 @@ fn trigger_confirm(
                 step_ui_scale_setting(commands, options, cues, audio_assets, state, 1);
             }
             2 => {
+                step_hud_sway_setting(commands, options, cues, audio_assets, state, 1);
+            }
+            3 => {
                 step_volume_setting(
                     commands,
                     options,
@@ -3764,7 +3880,7 @@ fn trigger_confirm(
                     1,
                 );
             }
-            3 => {
+            4 => {
                 step_volume_setting(
                     commands,
                     options,
@@ -3775,7 +3891,7 @@ fn trigger_confirm(
                     1,
                 );
             }
-            4 => {
+            5 => {
                 step_volume_setting(
                     commands,
                     options,
@@ -3786,7 +3902,7 @@ fn trigger_confirm(
                     1,
                 );
             }
-            5 => {
+            6 => {
                 step_volume_setting(
                     commands,
                     options,
@@ -3797,10 +3913,10 @@ fn trigger_confirm(
                     1,
                 );
             }
-            6 => {
+            7 => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
             }
-            7 => {
+            8 => {
                 options.app_exit.write(AppExit::Success);
             }
             _ => {}
@@ -4105,6 +4221,8 @@ pub fn handle_paint_color_drag(
     mut state: ResMut<GarageState>,
     mut garage: ResMut<crate::Garage>,
     mut decals: ResMut<DecalState>,
+    mut settings: ResMut<GameSettings>,
+    mut pause_state: ResMut<crate::pause::PauseState>,
     buttons: Res<ButtonInput<MouseButton>>,
     scroll: Res<AccumulatedMouseScroll>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
@@ -4114,10 +4232,15 @@ pub fn handle_paint_color_drag(
     mut picker_assets: ResMut<PaintPickerAssets>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let in_decal_tab = state.paint_tab == PaintTab::Decals;
-    if *mode != Mode::Garage
-        || state.screen != GarageScreen::Paint
-        || !matches!(state.paint_tab, PaintTab::Custom | PaintTab::Decals)
+    let in_hud_options = (*mode == Mode::Garage && state.screen == GarageScreen::Options)
+        || (*mode == Mode::Sortie
+            && pause_state.open
+            && pause_state.screen == crate::pause::PauseScreen::Options);
+    let in_decal_tab = !in_hud_options && state.paint_tab == PaintTab::Decals;
+    if !in_hud_options
+        && (*mode != Mode::Garage
+            || state.screen != GarageScreen::Paint
+            || !matches!(state.paint_tab, PaintTab::Custom | PaintTab::Decals))
     {
         state.paint_drag = None;
         return;
@@ -4131,18 +4254,24 @@ pub fn handle_paint_color_drag(
     };
     let cursor_phys = cursor_logical * window.scale_factor();
 
-    let sync_key = if in_decal_tab {
+    let sync_key = if in_hud_options {
+        usize::MAX - 1
+    } else if in_decal_tab {
         usize::MAX
     } else {
         state.paint_channel
     };
-    let active_rgba = |garage: &crate::Garage, decals: &DecalState, ch: usize| -> [u8; 4] {
-        if in_decal_tab {
-            current_decal_tint(decals)
-        } else {
-            current_channel_color(garage, ch)
-        }
-    };
+    let active_rgba =
+        |garage: &crate::Garage, decals: &DecalState, settings: &GameSettings, ch: usize| -> [u8; 4] {
+            if in_hud_options {
+                let c = settings.hud_color;
+                [c[0], c[1], c[2], 255]
+            } else if in_decal_tab {
+                current_decal_tint(decals)
+            } else {
+                current_channel_color(garage, ch)
+            }
+        };
 
     // Hover-to-scroll on 1D color picker slider tracks (Hue bar and RGB gradient bars).
     if scroll.delta.y.abs() > 0.0 {
@@ -4156,7 +4285,7 @@ pub fn handle_paint_color_drag(
         if let Some(target) = hovered_slider {
             state.wheel_consumed = true;
             let delta = wheel_step_direction(scroll.delta.y);
-            let prev_rgba = active_rgba(&garage, &decals, state.paint_channel);
+            let prev_rgba = active_rgba(&garage, &decals, &settings, state.paint_channel);
             if state.paint_hsv_synced_channel != Some(sync_key) {
                 state.paint_hsv = paint::rgb_to_hsv(prev_rgba);
                 state.paint_hsv_synced_channel = Some(sync_key);
@@ -4187,8 +4316,17 @@ pub fn handle_paint_color_drag(
                 }
                 PaintDragTarget::HsvSv => prev_rgba,
             };
-            if in_decal_tab {
+            if in_hud_options {
+                settings.hud_color = [new_rgba[0], new_rgba[1], new_rgba[2]];
+                settings.save();
+                if *mode == Mode::Sortie {
+                    pause_state.dirty = true;
+                } else {
+                    state.ui_dirty = true;
+                }
+            } else if in_decal_tab {
                 apply_decal_tint_color(&mut decals, new_rgba);
+                state.ui_dirty = true;
             } else {
                 apply_custom_channel_color_live(
                     &mut garage,
@@ -4197,8 +4335,8 @@ pub fn handle_paint_color_drag(
                     &ac_meshes,
                     &mut paint_materials,
                 );
+                state.ui_dirty = true;
             }
-            state.ui_dirty = true;
             return;
         }
     }
@@ -4228,7 +4366,7 @@ pub fn handle_paint_color_drag(
     };
     let (uv, _) = normalize_track_point(tf.translation, computed.size(), cursor_phys);
 
-    let prev_rgba = active_rgba(&garage, &decals, state.paint_channel);
+    let prev_rgba = active_rgba(&garage, &decals, &settings, state.paint_channel);
     if state.paint_hsv_synced_channel != Some(sync_key) {
         state.paint_hsv = paint::rgb_to_hsv(prev_rgba);
         state.paint_hsv_synced_channel = Some(sync_key);
@@ -4272,8 +4410,17 @@ pub fn handle_paint_color_drag(
         || (state.paint_hsv[1] - prev_hsv[1]).abs() > 0.002
         || (state.paint_hsv[2] - prev_hsv[2]).abs() > 0.002;
     if new_rgba != prev_rgba || hsv_changed {
-        if in_decal_tab {
+        if in_hud_options {
+            settings.hud_color = [new_rgba[0], new_rgba[1], new_rgba[2]];
+            settings.save();
+            if *mode == Mode::Sortie {
+                pause_state.dirty = true;
+            } else {
+                state.ui_dirty = true;
+            }
+        } else if in_decal_tab {
             apply_decal_tint_color(&mut decals, new_rgba);
+            state.ui_dirty = true;
         } else {
             apply_custom_channel_color_live(
                 &mut garage,
@@ -4282,8 +4429,203 @@ pub fn handle_paint_color_drag(
                 &ac_meshes,
                 &mut paint_materials,
             );
+            state.ui_dirty = true;
         }
-        state.ui_dirty = true;
+    }
+}
+
+/// Handles click-anywhere-to-set and click-and-drag scrubbing on every horizontal slider gauge bar
+/// (`SliderTrack`) across Garage Options, Pause Options, Paint Custom Camo Scale, and Decal
+/// Size/Rotate/Opacity.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_slider_track_drag(
+    mut commands: Commands,
+    mode: Res<Mode>,
+    mut state: ResMut<GarageState>,
+    mut garage: ResMut<crate::Garage>,
+    mut decals: ResMut<DecalState>,
+    mut options: OptionsCtx,
+    mut pause_state: ResMut<crate::pause::PauseState>,
+    mut cues: ResMut<Cues>,
+    mut audio_assets: ResMut<Assets<AudioSource>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    tracks: Query<(&SliderTrack, &ComputedNode, &UiGlobalTransform)>,
+) {
+    let in_pause_options = *mode == Mode::Sortie
+        && pause_state.open
+        && pause_state.screen == crate::pause::PauseScreen::Options;
+    let in_garage_sliders = *mode == Mode::Garage
+        && matches!(state.screen, GarageScreen::Options | GarageScreen::Paint);
+    if !in_pause_options && !in_garage_sliders {
+        state.slider_drag = None;
+        return;
+    }
+
+    if !buttons.pressed(MouseButton::Left) {
+        state.slider_drag = None;
+        return;
+    }
+
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(cursor_logical) = window.cursor_position() else {
+        return;
+    };
+    let cursor_phys = cursor_logical * window.scale_factor();
+
+    let just_pressed = buttons.just_pressed(MouseButton::Left);
+    if just_pressed {
+        state.slider_drag = None;
+        for (track, computed, tf) in &tracks {
+            let (_, inside) = normalize_track_point(tf.translation, computed.size(), cursor_phys);
+            if inside {
+                state.slider_drag = Some(track.0);
+                break;
+            }
+        }
+    }
+
+    let Some(active_target) = state.slider_drag else {
+        return;
+    };
+    let Some((_, computed, tf)) = tracks.iter().find(|(t, _, _)| t.0 == active_target) else {
+        return;
+    };
+    let (uv, _) = normalize_track_point(tf.translation, computed.size(), cursor_phys);
+    let fill = uv.x;
+
+    let mut changed = false;
+    match active_target {
+        SliderTrackTarget::UiScale => {
+            let prev = options.settings.ui_scale_percent();
+            options.settings.set_ui_scale_from_fill(fill);
+            if options.settings.ui_scale_percent() != prev || just_pressed {
+                options.settings.save();
+                if in_pause_options {
+                    pause_state.cursor = 1;
+                    pause_state.dirty = true;
+                } else {
+                    state.cursor = 1;
+                    state.ui_dirty = true;
+                }
+                changed = true;
+            }
+        }
+        SliderTrackTarget::HudSway => {
+            let prev = options.settings.hud_sway_percent();
+            options.settings.set_hud_sway_from_fill(fill);
+            if options.settings.hud_sway_percent() != prev || just_pressed {
+                options.settings.save();
+                if in_pause_options {
+                    pause_state.cursor = 2;
+                    pause_state.dirty = true;
+                } else {
+                    state.cursor = 2;
+                    state.ui_dirty = true;
+                }
+                changed = true;
+            }
+        }
+        SliderTrackTarget::Volume(channel) => {
+            let prev = options.settings.channel_percent(channel);
+            options.settings.set_channel_from_fill(channel, fill);
+            if options.settings.channel_percent(channel) != prev || just_pressed {
+                settings::apply_volume(
+                    &options.settings,
+                    &options.bgm,
+                    &mut cues,
+                    &mut options.global_volume,
+                    &mut options.sinks,
+                    &options.bgm_players,
+                    &options.audio_buses,
+                );
+                options.settings.save();
+                if let Some((row, _)) =
+                    GARAGE_OPTION_CHANNELS.iter().find(|&&(_, c)| c == channel)
+                {
+                    if in_pause_options {
+                        pause_state.cursor = *row;
+                    } else {
+                        state.cursor = *row;
+                    }
+                }
+                if in_pause_options {
+                    pause_state.dirty = true;
+                } else {
+                    state.ui_dirty = true;
+                }
+                changed = true;
+            }
+        }
+        SliderTrackTarget::PaintCamoScale => {
+            let prev = options.custom_camos.custom_scale_value();
+            options.custom_camos.set_custom_scale_from_fill(fill);
+            if (options.custom_camos.custom_scale_value() - prev).abs() > 1e-4 || just_pressed {
+                if options.custom_camos.active_key.is_some() {
+                    garage.dirty = true;
+                }
+                state.ui_dirty = true;
+                changed = true;
+            }
+        }
+        SliderTrackTarget::DecalScale => {
+            let next = ((0.15 + fill * 2.85) * 100.0).round() / 100.0;
+            let next = next.clamp(0.15, 3.0);
+            if let Some(d) = decals.selected_layer_mut() {
+                if (d.scale - next).abs() > 1e-4 || just_pressed {
+                    d.scale = next;
+                    let (slot, mirror) = (d.slot, d.mirror_x);
+                    decals.brush_scale = next;
+                    decals.mark_decal_slots_dirty(slot, mirror, true);
+                    if let Some(did) = decals.loaded_design_id {
+                        decals.save_for_design(did);
+                    }
+                    state.ui_dirty = true;
+                    changed = true;
+                }
+            } else if (decals.brush_scale - next).abs() > 1e-4 || just_pressed {
+                decals.brush_scale = next;
+                state.ui_dirty = true;
+                changed = true;
+            }
+        }
+        SliderTrackTarget::DecalRotate => {
+            let deg = (fill * 360.0).round().clamp(0.0, 359.0);
+            let next = deg.to_radians();
+            if let Some(d) = decals.selected_layer_mut() {
+                if (d.rotation - next).abs() > 1e-4 || just_pressed {
+                    d.rotation = next;
+                    let (slot, mirror) = (d.slot, d.mirror_x);
+                    decals.mark_decal_slots_dirty(slot, mirror, true);
+                    if let Some(did) = decals.loaded_design_id {
+                        decals.save_for_design(did);
+                    }
+                    state.ui_dirty = true;
+                    changed = true;
+                }
+            }
+        }
+        SliderTrackTarget::DecalOpacity => {
+            let next = ((fill * 100.0).round() / 100.0).clamp(0.1, 1.0);
+            if let Some(d) = decals.selected_layer_mut() {
+                if (d.opacity - next).abs() > 1e-4 || just_pressed {
+                    d.opacity = next;
+                    let (slot, mirror) = (d.slot, d.mirror_x);
+                    decals.mark_decal_slots_dirty(slot, mirror, true);
+                    if let Some(did) = decals.loaded_design_id {
+                        decals.save_for_design(did);
+                    }
+                    state.ui_dirty = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed && just_pressed {
+        sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
     }
 }
 
@@ -4481,7 +4823,22 @@ pub fn sync_ui(
     if state.screen == GarageScreen::Top {
         spawn_garage_top_menu(&mut commands, root, &kit, state.cursor, scale);
     } else if state.screen == GarageScreen::Options {
-        spawn_garage_options_menu(&mut commands, root, &kit, &settings, state.cursor, scale);
+        if state.paint_hsv_synced_channel != Some(usize::MAX - 1) {
+            let c = settings.hud_color;
+            state.paint_hsv = paint::rgb_to_hsv([c[0], c[1], c[2], 255]);
+            state.paint_hsv_synced_channel = Some(usize::MAX - 1);
+        }
+        picker_assets.ensure_loaded(state.paint_hsv[0], &mut images);
+        spawn_garage_options_menu(
+            &mut commands,
+            root,
+            &kit,
+            &settings,
+            &state,
+            &picker_assets,
+            state.cursor,
+            scale,
+        );
     } else if state.screen == GarageScreen::Paint {
         if state.paint_tab == PaintTab::Custom {
             if state.paint_hsv_synced_channel != Some(state.paint_channel) {
@@ -5446,11 +5803,14 @@ fn spawn_garage_top_menu(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_garage_options_menu(
     commands: &mut Commands,
     root: Entity,
     kit: &AcvdUiKit,
     settings: &GameSettings,
+    state: &GarageState,
+    picker_assets: &PaintPickerAssets,
     cursor: usize,
     scale: f32,
 ) {
@@ -5525,11 +5885,62 @@ fn spawn_garage_options_menu(
         .entity(ui_slider.row)
         .insert((Button, UiAction::SelectOptionRow(1)));
     commands
+        .entity(ui_slider.track)
+        .insert(SliderTrack(SliderTrackTarget::UiScale));
+    commands
         .entity(ui_slider.dec_btn)
         .insert((Button, UiAction::UiScaleStep(-1)));
     commands
         .entity(ui_slider.inc_btn)
         .insert((Button, UiAction::UiScaleStep(1)));
+
+    // Row 2: Crosshair HUD Sway slider (0% - 100%)
+    let sway_txt = format!("{}%", settings.hud_sway_percent());
+    let sway_slider = kit.spawn_slider_row(
+        commands,
+        list,
+        "HUD SWAY",
+        &sway_txt,
+        settings.hud_sway.clamp(0.0, 1.0),
+        None,
+        cursor == 2,
+        104.0,
+        scale,
+    );
+    commands
+        .entity(sway_slider.row)
+        .insert((Button, UiAction::SelectOptionRow(2)));
+    commands
+        .entity(sway_slider.track)
+        .insert(SliderTrack(SliderTrackTarget::HudSway));
+    commands
+        .entity(sway_slider.dec_btn)
+        .insert((Button, UiAction::HudSwayStep(-1)));
+    commands
+        .entity(sway_slider.inc_btn)
+        .insert((Button, UiAction::HudSwayStep(1)));
+
+    // Combat HUD Color HSV / RGB picker
+    kit.spawn_text(
+        commands,
+        list,
+        FontRole::Small,
+        "COMBAT HUD COLOR",
+        scale * 0.86,
+        palette::TEXT_MUTED,
+    );
+    let hc = settings.hud_color;
+    spawn_color_picker_card(
+        commands,
+        list,
+        kit,
+        state.paint_picker_mode,
+        [hc[0], hc[1], hc[2], 255],
+        state.paint_hsv,
+        picker_assets,
+        64.0,
+        scale * 0.88,
+    );
 
     kit.spawn_trace(commands, list, TraceStyle::Simple, scale);
 
@@ -5559,6 +5970,9 @@ fn spawn_garage_options_menu(
             .entity(slider.row)
             .insert((Button, UiAction::SelectOptionRow(row_idx)));
         commands
+            .entity(slider.track)
+            .insert(SliderTrack(SliderTrackTarget::Volume(channel)));
+        commands
             .entity(slider.dec_btn)
             .insert((Button, UiAction::VolumeStep(channel, -1)));
         commands
@@ -5568,8 +5982,8 @@ fn spawn_garage_options_menu(
 
     kit.spawn_trace(commands, list, TraceStyle::Simple, scale);
 
-    // Row 6: Back to Garage Top
-    let back_state = if cursor == 6 {
+    // Row 7: Back to Garage Top
+    let back_state = if cursor == 7 {
         ButtonState::Selected
     } else {
         ButtonState::Normal
@@ -5584,8 +5998,8 @@ fn spawn_garage_options_menu(
     );
     commands.entity(back_btn).insert((Button, UiAction::Back));
 
-    // Row 7: Quit to Desktop
-    let quit_state = if cursor == 7 {
+    // Row 8: Quit to Desktop
+    let quit_state = if cursor == 8 {
         ButtonState::Selected
     } else {
         ButtonState::Normal
@@ -6399,6 +6813,32 @@ fn spawn_paint_palette_tab(
     commands
         .entity(upload_camo_btn)
         .insert((Button, UiAction::PaintCamoUpload));
+
+    // Custom Camo Scale hover-to-scroll slider (affects uploaded custom camos only, not default CA0001..CA0011)
+    let camo_scale_txt = format!("{:.2}x", custom_camos.custom_scale_value());
+    let camo_scale_slider = kit.spawn_slider_row(
+        commands,
+        panel,
+        "CUSTOM CAMO SCALE",
+        &camo_scale_txt,
+        custom_camos.custom_scale_fill(),
+        Some(paint::CustomCamoLibrary::custom_scale_default_mark()),
+        false,
+        132.0,
+        scale * 0.86,
+    );
+    commands
+        .entity(camo_scale_slider.row)
+        .insert((Button, UiAction::PaintCamoScaleStep(0)));
+    commands
+        .entity(camo_scale_slider.track)
+        .insert(SliderTrack(SliderTrackTarget::PaintCamoScale));
+    commands
+        .entity(camo_scale_slider.dec_btn)
+        .insert((Button, UiAction::PaintCamoScaleStep(-1)));
+    commands
+        .entity(camo_scale_slider.inc_btn)
+        .insert((Button, UiAction::PaintCamoScaleStep(1)));
 }
 
 fn spawn_decal_library_grid(
@@ -6830,7 +7270,7 @@ fn spawn_paint_emblem_tab(
 /// Reusable click-drag + hover-scroll RGB / HSV color picker card (used by both `PAINT -> PALETTE`
 /// and the `PAINT -> DECALS` tint color selector).
 #[allow(clippy::too_many_arguments)]
-fn spawn_color_picker_card(
+pub(crate) fn spawn_color_picker_card(
     commands: &mut Commands,
     parent: Entity,
     kit: &AcvdUiKit,
@@ -7338,6 +7778,9 @@ fn spawn_garage_decal_inspector(
         .entity(size_slider.row)
         .insert((Button, UiAction::DecalScaleStep(0)));
     commands
+        .entity(size_slider.track)
+        .insert(SliderTrack(SliderTrackTarget::DecalScale));
+    commands
         .entity(size_slider.dec_btn)
         .insert((Button, UiAction::DecalScaleStep(-1)));
     commands
@@ -7359,6 +7802,9 @@ fn spawn_garage_decal_inspector(
         .entity(rot_slider.row)
         .insert((Button, UiAction::DecalRotateStep(0)));
     commands
+        .entity(rot_slider.track)
+        .insert(SliderTrack(SliderTrackTarget::DecalRotate));
+    commands
         .entity(rot_slider.dec_btn)
         .insert((Button, UiAction::DecalRotateStep(-1)));
     commands
@@ -7379,6 +7825,9 @@ fn spawn_garage_decal_inspector(
     commands
         .entity(op_slider.row)
         .insert((Button, UiAction::DecalOpacityStep(0)));
+    commands
+        .entity(op_slider.track)
+        .insert(SliderTrack(SliderTrackTarget::DecalOpacity));
     commands
         .entity(op_slider.dec_btn)
         .insert((Button, UiAction::DecalOpacityStep(-1)));
@@ -8310,6 +8759,14 @@ mod tests {
         );
         assert_eq!(
             UiAction::SelectOptionRow(2).wheel_adjust(),
+            Some(WheelAdjust::HudSway)
+        );
+        assert_eq!(
+            UiAction::HudSwayStep(-1).wheel_adjust(),
+            Some(WheelAdjust::HudSway)
+        );
+        assert_eq!(
+            UiAction::SelectOptionRow(3).wheel_adjust(),
             Some(WheelAdjust::Volume(AudioChannel::Master))
         );
         assert_eq!(
@@ -8346,6 +8803,35 @@ mod tests {
         );
         assert_eq!(UiAction::ToggleFullscreen.wheel_adjust(), None);
         assert_eq!(UiAction::Back.wheel_adjust(), None);
+    }
+
+    #[test]
+    fn test_slider_track_set_from_fill() {
+        let mut s = GameSettings::default();
+        s.set_ui_scale_from_fill(0.0);
+        assert_eq!(s.ui_scale_percent(), 75);
+        s.set_ui_scale_from_fill(1.0);
+        assert_eq!(s.ui_scale_percent(), 150);
+        s.set_ui_scale_from_fill(GameSettings::ui_scale_default_mark());
+        assert_eq!(s.ui_scale_percent(), 100);
+
+        s.set_hud_sway_from_fill(0.0);
+        assert_eq!(s.hud_sway_percent(), 0);
+        s.set_hud_sway_from_fill(0.5);
+        assert_eq!(s.hud_sway_percent(), 50);
+        s.set_hud_sway_from_fill(1.0);
+        assert_eq!(s.hud_sway_percent(), 100);
+
+        s.set_channel_from_fill(AudioChannel::Music, 0.37);
+        assert_eq!(s.channel_percent(AudioChannel::Music), 37);
+
+        let mut camos = paint::CustomCamoLibrary::default();
+        camos.set_custom_scale_from_fill(0.0);
+        assert!((camos.custom_scale_value() - paint::CustomCamoLibrary::SCALE_MIN).abs() < 1e-4);
+        camos.set_custom_scale_from_fill(1.0);
+        assert!((camos.custom_scale_value() - paint::CustomCamoLibrary::SCALE_MAX).abs() < 1e-4);
+        camos.set_custom_scale_from_fill(paint::CustomCamoLibrary::custom_scale_default_mark());
+        assert!((camos.custom_scale_value() - 1.0).abs() < 1e-4);
     }
 
     #[test]

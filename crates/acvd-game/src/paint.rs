@@ -54,11 +54,46 @@ pub struct CustomCamoAsset {
 pub struct CustomCamoLibrary {
     pub assets: Vec<CustomCamoAsset>,
     pub active_key: Option<String>,
+    /// Pattern scale multiplier for user-uploaded custom camos (`0.25..=4.00`, default `1.00`).
+    /// Does not affect retail `ca0001..ca0011` camos.
+    pub custom_scale: f32,
     pub initialized: bool,
     picker_rx: Option<std::sync::Mutex<mpsc::Receiver<Option<PathBuf>>>>,
 }
 
 impl CustomCamoLibrary {
+    pub const SCALE_MIN: f32 = 0.25;
+    pub const SCALE_MAX: f32 = 4.00;
+    pub const SCALE_STEP: f32 = 0.25;
+
+    pub fn custom_scale_value(&self) -> f32 {
+        if self.custom_scale <= 0.0 {
+            1.0
+        } else {
+            self.custom_scale.clamp(Self::SCALE_MIN, Self::SCALE_MAX)
+        }
+    }
+
+    pub fn custom_scale_fill(&self) -> f32 {
+        ((self.custom_scale_value() - Self::SCALE_MIN) / (Self::SCALE_MAX - Self::SCALE_MIN))
+            .clamp(0.0, 1.0)
+    }
+
+    pub fn custom_scale_default_mark() -> f32 {
+        (1.0 - Self::SCALE_MIN) / (Self::SCALE_MAX - Self::SCALE_MIN)
+    }
+
+    pub fn step_custom_scale(&mut self, delta: i8) {
+        let cur = self.custom_scale_value();
+        let next = ((cur + f32::from(delta) * Self::SCALE_STEP) * 100.0).round() / 100.0;
+        self.custom_scale = next.clamp(Self::SCALE_MIN, Self::SCALE_MAX);
+    }
+
+    pub fn set_custom_scale_from_fill(&mut self, fill: f32) {
+        let t = fill.clamp(0.0, 1.0);
+        let raw = Self::SCALE_MIN + t * (Self::SCALE_MAX - Self::SCALE_MIN);
+        self.custom_scale = ((raw * 100.0).round() / 100.0).clamp(Self::SCALE_MIN, Self::SCALE_MAX);
+    }
     pub fn init_assets(&mut self, images: &mut Assets<Image>) {
         if self.initialized {
             return;
@@ -507,7 +542,7 @@ pub fn material(
     packs: &mut Packs,
     images: &mut Assets<Image>,
 ) -> Option<AcPaintMaterial> {
-    material_with_custom_camo(disc, base, mesh, column, accolor, decal_map, None, packs, images)
+    material_with_custom_camo(disc, base, mesh, column, accolor, decal_map, None, 1.0, packs, images)
 }
 
 /// Same as [`material`], with an optional user-uploaded custom camouflage texture override.
@@ -520,6 +555,7 @@ pub fn material_with_custom_camo(
     accolor: &AcColor,
     decal_map: Option<Handle<Image>>,
     custom_camo: Option<Handle<Image>>,
+    custom_camo_scale: f32,
     packs: &mut Packs,
     images: &mut Assets<Image>,
 ) -> Option<AcPaintMaterial> {
@@ -548,6 +584,7 @@ pub fn material_with_custom_camo(
     // 360 `0x82ca9c70` (`0x82ca9e98..0x82ca9f14`) binds `ca{camo_id:04}` (`0x82460e58`) to `s15`
     // with `c190.xy = mask_size / camo_size` (`0x82461a98`), or binds `color_map` itself with
     // `c190 = (1, 1, 1, 1)` when `camo_id == 0`.
+    let is_custom_camo = custom_camo.is_some();
     let resolved_camo = custom_camo
         .or_else(|| load_camo_map_handle(disc, packs, images, accolor.camo_id(group)));
     let (camo_map, camo_scale) = if let Some(camo_h) = resolved_camo {
@@ -560,7 +597,14 @@ pub fn material_with_custom_camo(
                 )
             })
             .unwrap_or((1.0, 1.0));
-        (camo_h, Vec2::new(mask_size.x / camo_w, mask_size.y / camo_h_px))
+        let mut s = Vec2::new(mask_size.x / camo_w, mask_size.y / camo_h_px);
+        if is_custom_camo {
+            s /= custom_camo_scale.clamp(
+                CustomCamoLibrary::SCALE_MIN,
+                CustomCamoLibrary::SCALE_MAX,
+            );
+        }
+        (camo_h, s)
     } else {
         (color_map.clone(), Vec2::ONE)
     };

@@ -54,6 +54,10 @@ pub struct GameSettings {
     pub fullscreen: bool,
     /// UI & HUD scale multiplier in `0.75..=1.50` (75–150%, default 100%).
     pub ui_scale: f32,
+    /// Crosshair / lock-sight HUD sway intensity in `0.0..=1.0` (0–100%, default 100%).
+    pub hud_sway: f32,
+    /// Combat HUD (lock-sight ring, digits, gauges) RGB color (default `#00FFA5`).
+    pub hud_color: [u8; 3],
     /// Linear master volume in `0.0..=1.0` (0–100%).
     pub volume: f32,
     /// Linear music/BGM volume multiplier in `0.0..=1.0` (0–100%).
@@ -69,6 +73,8 @@ impl Default for GameSettings {
         Self {
             fullscreen: false,
             ui_scale: 1.0,
+            hud_sway: 1.0,
+            hud_color: [0x00, 0xff, 0xa5],
             volume: 1.0,
             music_volume: 1.0,
             sfx_volume: 1.0,
@@ -89,6 +95,7 @@ impl GameSettings {
 
     pub fn clamp_all(&mut self) {
         self.ui_scale = self.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+        self.hud_sway = self.hud_sway.clamp(0.0, 1.0);
         self.volume = self.volume.clamp(0.0, 1.0);
         self.music_volume = self.music_volume.clamp(0.0, 1.0);
         self.sfx_volume = self.sfx_volume.clamp(0.0, 1.0);
@@ -125,6 +132,29 @@ impl GameSettings {
         self.ui_scale = (pct.clamp(min_pct, max_pct) as f32) / 100.0;
     }
 
+    pub fn set_ui_scale_from_fill(&mut self, fill: f32) {
+        let t = fill.clamp(0.0, 1.0);
+        let min_pct = (UI_SCALE_MIN * 100.0).round() as i16;
+        let max_pct = (UI_SCALE_MAX * 100.0).round() as i16;
+        let pct = ((UI_SCALE_MIN + t * (UI_SCALE_MAX - UI_SCALE_MIN)) * 100.0).round() as i16;
+        self.ui_scale = (pct.clamp(min_pct, max_pct) as f32) / 100.0;
+    }
+
+    pub fn hud_sway_percent(&self) -> u8 {
+        (self.hud_sway.clamp(0.0, 1.0) * 100.0).round() as u8
+    }
+
+    pub fn step_hud_sway(&mut self, delta_steps: i8) {
+        let pct = self.hud_sway_percent() as i16
+            + i16::from(delta_steps) * i16::from(VOLUME_STEP_PCT);
+        self.hud_sway = (pct.clamp(0, 100) as f32) / 100.0;
+    }
+
+    pub fn set_hud_sway_from_fill(&mut self, fill: f32) {
+        let pct = (fill.clamp(0.0, 1.0) * 100.0).round().clamp(0.0, 100.0) as u8;
+        self.hud_sway = (pct as f32) / 100.0;
+    }
+
     pub fn channel_volume(&self, channel: AudioChannel) -> f32 {
         match channel {
             AudioChannel::Master => self.volume,
@@ -145,6 +175,17 @@ impl GameSettings {
         let pct = self.channel_percent(channel) as i16
             + i16::from(delta_steps) * i16::from(VOLUME_STEP_PCT);
         let next = (pct.clamp(0, 100) as f32) / 100.0;
+        match channel {
+            AudioChannel::Master => self.volume = next,
+            AudioChannel::Music => self.music_volume = next,
+            AudioChannel::Sfx => self.sfx_volume = next,
+            AudioChannel::Ui => self.ui_volume = next,
+        }
+    }
+
+    pub fn set_channel_from_fill(&mut self, channel: AudioChannel, fill: f32) {
+        let pct = (fill.clamp(0.0, 1.0) * 100.0).round().clamp(0.0, 100.0) as u8;
+        let next = (pct as f32) / 100.0;
         match channel {
             AudioChannel::Master => self.volume = next,
             AudioChannel::Music => self.music_volume = next,

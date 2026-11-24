@@ -215,6 +215,7 @@ pub struct StatDelta<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct SliderRowEntities {
     pub row: Entity,
+    pub track: Entity,
     pub dec_btn: Entity,
     pub inc_btn: Entity,
 }
@@ -297,8 +298,12 @@ impl AcvdUiKit {
     }
 
     /// Resolves the best loaded CCM font for `(role, text)`, falling back to `Body` if a specialized
-    /// font (`Header` / `Small`) is missing glyphs present in `text`.
+    /// font (`Header` / `Small`) is missing glyphs present in `text`, or when `Small` (`e16_ext`,
+    /// authored for all-caps micro-labels and carrying uneven lowercase bearings) is given lowercase text.
     pub fn resolve_font(&self, role: FontRole, text_str: &str) -> Option<&Arc<Font>> {
+        if role == FontRole::Small && text_str.chars().any(|c| c.is_ascii_lowercase()) {
+            return self.font_body.as_ref().or(self.font_small.as_ref());
+        }
         let primary = match role {
             FontRole::Header => self.font_header.as_ref(),
             FontRole::Body => self.font_body.as_ref(),
@@ -1363,6 +1368,7 @@ impl AcvdUiKit {
 
         SliderRowEntities {
             row,
+            track,
             dec_btn,
             inc_btn,
         }
@@ -1483,5 +1489,15 @@ mod tests {
             let sz = kit.measure_text(role, "AC DESIGN PRESETS 6312", 1.0);
             assert!(sz.x > 40.0 && sz.y >= 10.0, "{role:?} measured {sz:?}");
         }
+
+        // Small keeps e16_ext (16px) for all-caps micro-labels, but falls back to Body
+        // (j1_16_ext, 18px) for lowercase/mixed-case strings so uneven e16_ext lowercase
+        // bearings don't produce broken kerning.
+        let small_caps = kit.resolve_font(FontRole::Small, "PARTS VIEW").unwrap();
+        let small_lower = kit
+            .resolve_font(FontRole::Small, "Click anywhere on the AC to stamp your image.")
+            .unwrap();
+        assert!(Arc::ptr_eq(small_caps, kit.font_small.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(small_lower, kit.font_body.as_ref().unwrap()));
     }
 }

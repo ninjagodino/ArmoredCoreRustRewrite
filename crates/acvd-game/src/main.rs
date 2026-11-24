@@ -511,6 +511,7 @@ fn main() {
             decal::handle_imports,
             garage::handle_input,
             garage::handle_paint_color_drag,
+            garage::handle_slider_track_drag,
             garage::sync_paint_history,
             garage::sync_ui,
             garage::update_custom_thumb_delete_hover,
@@ -1627,6 +1628,7 @@ fn show(
                     col,
                     decal_slot.map(|s| decals.slot_handle(s)),
                     assets.custom_camos.active_handle(),
+                    assets.custom_camos.custom_scale_value(),
                     packs,
                     images,
                 )
