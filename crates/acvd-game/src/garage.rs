@@ -36,7 +36,7 @@ use acvd_formats::accolor::{
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
 use acvd_render::ui_kit::{
-    palette, AcvdUiKit, ButtonState, FontRole, PanelStyle, StatDelta, TraceStyle,
+    palette, AcvdUiKit, ArrowDir, ButtonState, FontRole, PanelStyle, StatDelta, TraceStyle,
 };
 use acvd_render::Packs;
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
@@ -207,7 +207,14 @@ const TOP_ITEMS: &[(&str, &str, &str)] = &[
     ("GARAGE CUSTOM", "BAY", "Switch between all 13 retail\n3D ACVD workshops."),
     ("AC TEST", "SORTIE", "Configure targets and sortie\ninto live combat test."),
     ("VIEW MODE", "V", "Hide HUD and inspect your AC\nfreely from any angle."),
-    ("OPTIONS", "CFG", "Toggle fullscreen display and\nadjust master volume."),
+    ("OPTIONS", "ESC", "Toggle fullscreen display and\nadjust master volume."),
+];
+
+/// Helpline descriptions for [`GarageScreen::Options`] rows (0: Fullscreen, 1: Volume, 2: Back).
+const OPTIONS_ROW_DESCS: [&str; 3] = [
+    "Toggle fullscreen or windowed\ndisplay mode.",
+    "Adjust master audio volume\nwith Left / Right or -5% / +5%.",
+    "Return to the Garage main menu.",
 ];
 
 /// AC TEST target layer presets (`m4000_actest.msb`, `LAYER_PARAM_ST`).
@@ -1572,6 +1579,7 @@ pub fn handle_input(
     let mut gp_confirm = false;
     let mut gp_cancel = false;
     let mut gp_view = false;
+    let mut gp_start = false;
     for gp in &gamepads {
         gp_up |= gp.just_pressed(GamepadButton::DPadUp);
         gp_down |= gp.just_pressed(GamepadButton::DPadDown);
@@ -1580,6 +1588,7 @@ pub fn handle_input(
         gp_confirm |= gp.just_pressed(GamepadButton::South);
         gp_cancel |= gp.just_pressed(GamepadButton::East);
         gp_view |= gp.just_pressed(GamepadButton::North);
+        gp_start |= gp.just_pressed(GamepadButton::Start);
     }
 
     // View mode toggle (`V` or Gamepad North).
@@ -1930,6 +1939,7 @@ pub fn handle_input(
                 return;
             }
             UiAction::ToggleFullscreen => {
+                state.cursor = 0;
                 toggle_fullscreen_setting(
                     &mut commands,
                     &mut options,
@@ -1940,6 +1950,7 @@ pub fn handle_input(
                 return;
             }
             UiAction::VolumeStep(delta) => {
+                state.cursor = 1;
                 step_volume_setting(
                     &mut commands,
                     &mut options,
@@ -2142,8 +2153,18 @@ pub fn handle_input(
         return;
     }
 
-    // Cancel / Back (`Esc` or `Backspace` or Gamepad East).
-    if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::Backspace) || gp_cancel {
+    // `Esc` / Gamepad `Start` toggles the Options menu from Garage Top.
+    if (keys.just_pressed(KeyCode::Escape) || gp_start) && state.screen == GarageScreen::Top {
+        open_options_screen(&mut commands, &mut state, &mut cues, &mut audio_assets);
+        return;
+    }
+
+    // Cancel / Back (`Esc` or `Backspace` or Gamepad East, or `Start` while in Options).
+    if keys.just_pressed(KeyCode::Escape)
+        || keys.just_pressed(KeyCode::Backspace)
+        || gp_cancel
+        || (gp_start && state.screen == GarageScreen::Options)
+    {
         trigger_cancel(&mut commands, &mut state, &mut garage, &mut cues, &mut audio_assets);
         return;
     }
@@ -2371,7 +2392,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::Design => garage.designs.len(),
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
-        GarageScreen::Options => 2, // Fullscreen, Volume
+        GarageScreen::Options => 3, // Fullscreen, Volume, Back
         GarageScreen::ViewMode => 0,
     }
 }
@@ -2589,6 +2610,30 @@ fn apply_cursor_preview(state: &mut GarageState, garage: &mut crate::Garage) {
         }
         _ => {}
     }
+}
+
+/// Screen transition when pressing `Esc` in the Garage:
+/// - On `Top`, opens `Options`.
+/// - On `Options` (or any sub-screen), returns to `Top`.
+fn escape_target_screen(screen: GarageScreen) -> GarageScreen {
+    match screen {
+        GarageScreen::Top => GarageScreen::Options,
+        _ => GarageScreen::Top,
+    }
+}
+
+fn open_options_screen(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+) {
+    state.screen = escape_target_screen(GarageScreen::Top);
+    state.cursor = 0;
+    state.scroll = 0;
+    state.cam_manual_orbit = false;
+    sound::cue(commands, cues, audio_assets, CUE_OK);
+    state.ui_dirty = true;
 }
 
 fn trigger_cancel(
@@ -2864,6 +2909,9 @@ fn trigger_confirm(
             1 => {
                 step_volume_setting(commands, options, cues, audio_assets, state, 1);
             }
+            2 => {
+                trigger_cancel(commands, state, garage, cues, audio_assets);
+            }
             _ => {}
         },
         GarageScreen::ViewMode => {}
@@ -3106,6 +3154,8 @@ pub fn sync_ui(
     // Left interactive menu panel.
     if state.screen == GarageScreen::Top {
         spawn_garage_top_menu(&mut commands, root, &kit, state.cursor, scale);
+    } else if state.screen == GarageScreen::Options {
+        spawn_garage_options_menu(&mut commands, root, &kit, &settings, state.cursor, scale);
     } else {
         let left_panel = kit.spawn_panel(
             &mut commands,
@@ -4217,160 +4267,7 @@ pub fn sync_ui(
 
                     spawn_back_btn(panel, "< BACK TO TOP (Esc)", bg_row, fg_cyan);
                 }
-                GarageScreen::Options => {
-                    let fs_label = if settings.fullscreen { "ON" } else { "OFF" };
-                    let vol_label = format!("{}%", settings.volume_percent());
-
-                    let sel0 = state.cursor == 0;
-                    panel
-                        .spawn((
-                            Button,
-                            UiRow(0),
-                            Node {
-                                width: Val::Percent(100.0),
-                                padding: UiRect::axes(px(10.0), px(8.0)),
-                                flex_direction: FlexDirection::Column,
-                                row_gap: px(3.0),
-                                ..default()
-                            },
-                            BackgroundColor(if sel0 { bg_sel } else { bg_row }),
-                        ))
-                        .with_children(|r| {
-                            r.spawn((
-                                Text::new("FULLSCREEN (Enter / Left / Right)"),
-                                TextFont {
-                                    font_size: FontSize::Px(11.0),
-                                    ..default()
-                                },
-                                TextColor(if sel0 { fg_dark } else { fg_cyan }),
-                            ));
-                            r.spawn((
-                                Text::new(fs_label),
-                                TextFont {
-                                    font_size: FontSize::Px(14.0),
-                                    ..default()
-                                },
-                                TextColor(if sel0 { fg_dark } else { fg_text }),
-                            ));
-                        });
-
-                    panel
-                        .spawn(Node {
-                            width: Val::Percent(100.0),
-                            column_gap: px(6.0),
-                            ..default()
-                        })
-                        .with_children(|row| {
-                            row.spawn((
-                                Button,
-                                UiAction::ToggleFullscreen,
-                                Node {
-                                    flex_grow: 1.0,
-                                    padding: UiRect::axes(px(8.0), px(4.0)),
-                                    justify_content: JustifyContent::Center,
-                                    ..default()
-                                },
-                                BackgroundColor(bg_row),
-                            ))
-                            .with_children(|b| {
-                                b.spawn((
-                                    Text::new("TOGGLE FULLSCREEN"),
-                                    TextFont {
-                                        font_size: FontSize::Px(11.0),
-                                        ..default()
-                                    },
-                                    TextColor(fg_cyan),
-                                ));
-                            });
-                        });
-
-                    let sel1 = state.cursor == 1;
-                    panel
-                        .spawn((
-                            Button,
-                            UiRow(1),
-                            Node {
-                                width: Val::Percent(100.0),
-                                padding: UiRect::axes(px(10.0), px(8.0)),
-                                flex_direction: FlexDirection::Column,
-                                row_gap: px(3.0),
-                                margin: UiRect::top(px(4.0)),
-                                ..default()
-                            },
-                            BackgroundColor(if sel1 { bg_sel } else { bg_row }),
-                        ))
-                        .with_children(|r| {
-                            r.spawn((
-                                Text::new("MASTER VOLUME (Left / Right)"),
-                                TextFont {
-                                    font_size: FontSize::Px(11.0),
-                                    ..default()
-                                },
-                                TextColor(if sel1 { fg_dark } else { fg_cyan }),
-                            ));
-                            r.spawn((
-                                Text::new(vol_label),
-                                TextFont {
-                                    font_size: FontSize::Px(14.0),
-                                    ..default()
-                                },
-                                TextColor(if sel1 { fg_dark } else { fg_text }),
-                            ));
-                        });
-
-                    panel
-                        .spawn(Node {
-                            width: Val::Percent(100.0),
-                            column_gap: px(6.0),
-                            ..default()
-                        })
-                        .with_children(|row| {
-                            row.spawn((
-                                Button,
-                                UiAction::VolumeStep(-1),
-                                Node {
-                                    flex_grow: 1.0,
-                                    padding: UiRect::axes(px(8.0), px(4.0)),
-                                    justify_content: JustifyContent::Center,
-                                    ..default()
-                                },
-                                BackgroundColor(bg_row),
-                            ))
-                            .with_children(|b| {
-                                b.spawn((
-                                    Text::new("< VOL -5%"),
-                                    TextFont {
-                                        font_size: FontSize::Px(11.0),
-                                        ..default()
-                                    },
-                                    TextColor(fg_cyan),
-                                ));
-                            });
-                            row.spawn((
-                                Button,
-                                UiAction::VolumeStep(1),
-                                Node {
-                                    flex_grow: 1.0,
-                                    padding: UiRect::axes(px(8.0), px(4.0)),
-                                    justify_content: JustifyContent::Center,
-                                    ..default()
-                                },
-                                BackgroundColor(bg_row),
-                            ))
-                            .with_children(|b| {
-                                b.spawn((
-                                    Text::new("VOL +5% >"),
-                                    TextFont {
-                                        font_size: FontSize::Px(11.0),
-                                        ..default()
-                                    },
-                                    TextColor(fg_cyan),
-                                ));
-                            });
-                        });
-
-                    spawn_back_btn(panel, "< BACK TO TOP (Esc)", bg_row, fg_cyan);
-                }
+                GarageScreen::Options => {}
                 GarageScreen::ViewMode => {}
             }
         });
@@ -4760,7 +4657,9 @@ pub fn sync_ui(
     let footer_text = if in_decal_mode {
         "L-DRAG PLACE/MOVE   R-DRAG ORBIT   SHIFT+WHEEL SIZE   CTRL+WHEEL ROTATE   M MIRROR   F FLIP   DEL REMOVE"
     } else if state.screen == GarageScreen::Options {
-        "W/S NAVIGATE   LEFT/RIGHT ADJUST   ESC BACK   R-DRAG ORBIT   F9 MUTE BGM"
+        "W/S NAVIGATE   ENTER/LEFT/RIGHT ADJUST   ESC CLOSE   R-DRAG ORBIT   F9 MUTE BGM"
+    } else if state.screen == GarageScreen::Top {
+        "W/S NAVIGATE   ENTER SELECT   ESC OPTIONS   R-DRAG ORBIT   WHEEL ZOOM   V VIEW MODE   F9 MUTE BGM"
     } else {
         "W/S NAVIGATE   ENTER SELECT   ESC BACK   R-DRAG ORBIT   WHEEL ZOOM   V VIEW MODE   F9 MUTE BGM"
     };
@@ -4993,6 +4892,208 @@ fn spawn_garage_top_menu(
         .get(cursor)
         .map(|&(_, _, d)| d)
         .unwrap_or("");
+    let help = kit.spawn_panel(
+        commands,
+        Some(panel),
+        PanelStyle::Subtle,
+        Node {
+            width: Val::Percent(100.0),
+            padding: UiRect::axes(px((10.0 * scale).round()), px((7.0 * scale).round())),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((3.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+    kit.spawn_text(
+        commands,
+        help,
+        FontRole::Small,
+        "DESCRIPTION",
+        scale * 0.9,
+        palette::TEXT_MUTED,
+    );
+    kit.spawn_text(
+        commands,
+        help,
+        FontRole::Small,
+        active_desc,
+        scale * 0.86,
+        palette::TEXT_BRIGHT,
+    );
+}
+
+fn spawn_garage_options_menu(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    settings: &GameSettings,
+    cursor: usize,
+    scale: f32,
+) {
+    let pad = (14.0 * scale).round();
+    let panel = kit.spawn_panel(
+        commands,
+        Some(root),
+        PanelStyle::Tactical,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px((20.0 * scale).round()),
+            top: px((64.0 * scale).round()),
+            width: px((336.0 * scale).round()),
+            padding: UiRect::all(px(pad)),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((8.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+
+    kit.spawn_header(commands, panel, "OPTIONS", Some("SETTINGS"), scale);
+
+    let list = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px((6.0 * scale).round()),
+                margin: UiRect::vertical(px((2.0 * scale).round())),
+                ..default()
+            },
+            ChildOf(panel),
+        ))
+        .id();
+
+    // Row 0: Fullscreen toggle
+    let fs_tag = if settings.fullscreen { "ON" } else { "OFF" };
+    let fs_state = if cursor == 0 {
+        ButtonState::Selected
+    } else {
+        ButtonState::Normal
+    };
+    let fs_btn = kit.spawn_button(commands, list, "FULLSCREEN", Some(fs_tag), fs_state, scale);
+    commands
+        .entity(fs_btn)
+        .insert((Button, UiAction::ToggleFullscreen));
+
+    // Row 1: Master Volume header + ACVD gauge + -5% / +5% stepper buttons
+    let vol_tag = format!("{}%", settings.volume_percent());
+    let vol_state = if cursor == 1 {
+        ButtonState::Selected
+    } else {
+        ButtonState::Normal
+    };
+    let vol_btn = kit.spawn_button(
+        commands,
+        list,
+        "MASTER VOLUME",
+        Some(&vol_tag),
+        vol_state,
+        scale,
+    );
+    commands.entity(vol_btn).insert((Button, UiRow(1)));
+
+    let vol_card = kit.spawn_panel(
+        commands,
+        Some(list),
+        PanelStyle::Subtle,
+        Node {
+            width: Val::Percent(100.0),
+            padding: UiRect::axes(px((10.0 * scale).round()), px((8.0 * scale).round())),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((8.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+    kit.spawn_gauge(
+        commands,
+        vol_card,
+        "LEVEL",
+        settings.volume,
+        None,
+        false,
+        scale,
+    );
+
+    let step_row = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                column_gap: px((8.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(vol_card),
+        ))
+        .id();
+
+    for (delta, label, dir) in [(-1i8, "-5%", ArrowDir::Left), (1i8, "+5%", ArrowDir::Right)] {
+        let step_btn = kit.spawn_panel(
+            commands,
+            Some(step_row),
+            PanelStyle::Framed,
+            Node {
+                flex_grow: 1.0,
+                padding: UiRect::axes(px((10.0 * scale).round()), px((4.0 * scale).round())),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                column_gap: px((6.0 * scale).round()),
+                ..default()
+            },
+            scale,
+        );
+        commands
+            .entity(step_btn)
+            .insert((Button, UiAction::VolumeStep(delta)));
+        if dir == ArrowDir::Left {
+            kit.spawn_arrow(commands, step_btn, dir, scale, palette::TEXT_PRIMARY);
+            kit.spawn_text(
+                commands,
+                step_btn,
+                FontRole::Small,
+                label,
+                scale,
+                palette::TEXT_PRIMARY,
+            );
+        } else {
+            kit.spawn_text(
+                commands,
+                step_btn,
+                FontRole::Small,
+                label,
+                scale,
+                palette::TEXT_PRIMARY,
+            );
+            kit.spawn_arrow(commands, step_btn, dir, scale, palette::TEXT_PRIMARY);
+        }
+    }
+
+    kit.spawn_trace(commands, list, TraceStyle::Simple, scale);
+
+    // Row 2: Back to Garage Top
+    let back_state = if cursor == 2 {
+        ButtonState::Selected
+    } else {
+        ButtonState::Normal
+    };
+    let back_btn = kit.spawn_button(
+        commands,
+        list,
+        "BACK TO GARAGE",
+        Some("ESC"),
+        back_state,
+        scale,
+    );
+    commands.entity(back_btn).insert((Button, UiAction::Back));
+
+    kit.spawn_trace(commands, panel, TraceStyle::Stepped, scale);
+
+    // Retail-style helpline card explaining the currently focused option.
+    let active_desc = OPTIONS_ROW_DESCS.get(cursor).copied().unwrap_or("");
     let help = kit.spawn_panel(
         commands,
         Some(panel),
@@ -5719,5 +5820,33 @@ mod tests {
                 sz.x
             );
         }
+        for (i, desc) in OPTIONS_ROW_DESCS.iter().enumerate() {
+            let sz = kit.measure_text(FontRole::Small, desc, 0.86);
+            assert!(
+                sz.x <= max_inner_w,
+                "OPTIONS_ROW_DESCS[{i}] overflows helpline box: {:.1}px > {max_inner_w}px ({desc:?})",
+                sz.x
+            );
+        }
+    }
+
+    #[test]
+    fn test_escape_toggles_garage_options() {
+        assert_eq!(
+            escape_target_screen(GarageScreen::Top),
+            GarageScreen::Options
+        );
+        assert_eq!(
+            escape_target_screen(GarageScreen::Options),
+            GarageScreen::Top
+        );
+        assert_eq!(
+            escape_target_screen(GarageScreen::Paint),
+            GarageScreen::Top
+        );
+        assert_eq!(
+            escape_target_screen(GarageScreen::ViewMode),
+            GarageScreen::Top
+        );
     }
 }

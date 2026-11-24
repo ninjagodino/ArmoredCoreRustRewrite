@@ -282,6 +282,10 @@ in order:
 
 ## Done
 
+- **Garage Options Menu `AcvdUiKit` Redesign & `Esc` Toggle (`acvd-game::garage`)**:
+  - Migrated `GarageScreen::Options` onto `AcvdUiKit` (`spawn_garage_options_menu`) matching the Garage Top Menu's `PanelStyle::Tactical` frame, `Title_Plate` header, shaded amber-focus `FULLSCREEN` / `MASTER VOLUME` / `BACK TO GARAGE` buttons, `LEVEL` volume gauge with `< -5%` / `+5% >` framed arrow steppers, stepped trace divider, and `DESCRIPTION` helpline card.
+  - Wired `Esc` (and Gamepad `Start`) in the Garage to open `GarageScreen::Options` from `GarageScreen::Top` and close it back to `Top` when already open (updating the Top menu tag and footer hints to `ESC`). Verified with `cargo test -p acvd-game -- garage` (16/16 passed, including `test_escape_toggles_garage_options` and `test_garage_top_uikit_descriptions_fit_panel`) and `--shot` (`private/shots/garage_options_uikit.png`).
+
 - **Garage Top Menu & Shared Chrome `AcvdUiKit` Redesign (`acvd-game::garage`)**:
   - Migrated the Garage landing screen (`GarageScreen::Top`) and shared garage HUD chrome (`sync_ui` top header bar, transient feedback banner, right `AC SPECS` panel, bottom key-guide footer, and `ViewMode` bar) onto `AcvdUiKit` with retail CCM bitmap fonts, `PanelStyle::Tactical` / `PanelStyle::Framed` corner reticles & brackets, `Title_Plate` headers, shaded amber-focus menu buttons with `Forcus` arrows and tactical tags, `LinePatrs_UP` stepped trace + `DESCRIPTION` helpline plate, `LOAD` / `ENERGY` capacity gauges with `I` markers, and alternating `@ParamLine` stat rows with live `PREV > NEW` deltas.
   - Added window-resize reactivity (`GarageState::last_window_size`) so the `AcvdUiKit` layout rescales cleanly on resize/fullscreen toggles. Verified with `cargo test --release -p acvd-game -- garage::tests` (9/9 passed, including `test_garage_top_uikit_descriptions_fit_panel`) and `--shot` (`private/shots/garage_top_uikit_v2.png`).
