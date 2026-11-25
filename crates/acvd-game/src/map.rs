@@ -965,6 +965,20 @@ pub(crate) fn mtd_alpha_mode(mtd: &str) -> (AlphaMode, u8) {
     }
 }
 
+/// FLVER material texture names the 360 resolves to runtime render targets instead of a TPF on the
+/// disc. `FUN_82646580` (`0x82646580`) builds the scene's named-target map at `this+0xa2010` and
+/// `FUN_82801168` (`0x82801168`, vtable `0x8208ce30` slot `0x28`) sets/erases its `movie` entry;
+/// `FUN_82bd2b00` (`0x82bd2b00`) is the name lookup, `FUN_82bd2c40` (`0x82bd2c40`) the insert.
+/// `g_Color`/`g_Decal` sit in the render-target table (`FUN_82bc0ec8` ids 1 and 6) and `movie` is
+/// the FMV player's surface (`FUN_824a8890` `0x824a8890`, global fallback `0x83a91474`). None of
+/// them exists as a texture in any TPF (`private/index` texture scan: 34,521 refs, no `movie`), so
+/// they must not be counted as missing map assets (`o0006` `signboardGrow` names `movie` twice).
+const RUNTIME_TEXTURES: [&str; 3] = ["movie", "g_color", "g_decal"];
+
+fn is_runtime_texture(name: &str) -> bool {
+    RUNTIME_TEXTURES.iter().any(|t| name.eq_ignore_ascii_case(t))
+}
+
 impl Textures {
     fn load_tex(&mut self, disc: &Disc, name: &str, linear: bool) -> Result<Image, anyhow::Error> {
         let own = format!("{}|{name}.tpf.dcx", self.own);
@@ -995,7 +1009,9 @@ impl Textures {
         let handle = match self.load_tex(disc, name, linear) {
             Ok(i) => Some(images.add(i)),
             Err(e) => {
-                if !linear {
+                // Runtime render targets are absent in AC TEST by design (no FMV playing), not
+                // missing disc assets; the white fallback is the 360's unbound-sampler result.
+                if !linear && !is_runtime_texture(name) {
                     self.missing += 1;
                 }
                 debug!("{e:#}");
@@ -1052,6 +1068,14 @@ impl Textures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_render_targets_are_not_missing_assets() {
+        assert!(is_runtime_texture("movie"));
+        assert!(is_runtime_texture("g_Color"));
+        assert!(is_runtime_texture("g_decal"));
+        assert!(!is_runtime_texture("o0006_01"));
+    }
 
     #[test]
     fn mirrored_transform_matches_mirrored_points() {

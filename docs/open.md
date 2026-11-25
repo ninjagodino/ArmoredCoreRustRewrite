@@ -22,8 +22,7 @@ Rough priority order; reorder freely.
 "AC test scene"). Gameplay should match the 360 build; menus may stay partial. Tasks toward it,
 in order:
 
-- **Map look**: lighting / fog / sky / tone map / per-draw light-set ids, area bounds (POINT kinds 100-102), destructible map props (`_b.flv` / `_b_h.hmd`), and water return (`POINT` kind 50 + `env::Scene.water_height`) are in (see below);
-  still open: the `movie` texture (a runtime video surface).
+- **Map look**: lighting / fog / sky / tone map / per-draw light-set ids, area bounds (POINT kinds 100-102), destructible map props (`_b.flv` / `_b_h.hmd`), and water return (`POINT` kind 50 + `env::Scene.water_height`) are in (see below). The `o0006` `signboardGrow` screens' `movie` texture is a runtime render target, not an asset (see below).
   - Done: `acvd-formats::env` reads `ch_env/*_env.msb` (MSB chain at version 0x00989A6C,
     EVENT_PARAM_ST only); `sheets/map_env.csv` has every field, the shader constants built from
     it (0x82c2bc48 lights, 0x82c2b4d8 fog, 0x82bd2268 gamma) and the Flver_ColDif pixel-shader
@@ -110,12 +109,25 @@ in order:
       `emissive_boost = 32.0` with `cull_mode: None`, and marks `Blend`/`Add` decals
       `NotShadowCaster` (removing the opaque black quad background on crater decals). The two
       soft white glows beside the first bridge in `ac_test_start.png` are the `o0006`
-      `signboardGrow` movie screens (`movie` texture still missing, so they fall back to a plain
-      surface); the nearby `o2135` street-lamp heads (`Map_Diffuse _Grow` / `Simple_Grow` LODs) and
-      `m0510` traffic strips share the same emission path. `Flver_ColDifEmi.fpo` squares the
-      emission texture; the display-referred boost is calibrated against the 360 shot because the
-      360 MTD keeps `g_EmissionCoef 0.3` (`material/mtd.bnd`) and Bevy's bloom weights a bright
-      pixel by screen area.
+      `signboardGrow` screens; their nearby `o2135` street-lamp heads (`Map_Diffuse _Grow` /
+      `Simple_Grow` LODs) and `m0510` traffic strips share the same emission path.
+      `Flver_ColDifEmi.fpo` squares the emission texture; the display-referred boost is calibrated
+      against the 360 shot because the lamp MTD keeps `g_EmissionCoef 0.3`, `signboardGrow.mtd`
+      keeps `1.0`, and Bevy's bloom weights a bright pixel by screen area.
+    - **`o0006` `signboardGrow` `movie` texture is a runtime render target, not a missing asset**:
+      the FLVER material (`model/obj/o0006/o0006.flv` mat 4, `signboardGrow.mtd` ->
+      `Phong_ColDifEmi.spx`) names texture path `movie` for both `g_DiffuseTexture` and
+      `g_EmissionTexture`; `o0006.tpf.dcx` holds 7 textures and the disc-wide index (34,521 texture
+      refs) has no `movie`, so it cannot be loaded. The 360 fills a scene named-target map
+      (`FUN_82646580` `0x82646580` builds it at `this+0xa2010`; insert `FUN_82bd2c40`
+      `0x82bd2c40`, lookup `FUN_82bd2b00` `0x82bd2b00`) with runtime surfaces: `g_Color` /
+      `g_Decal` from the render-target table (`FUN_82bc0ec8` ids 1/6) and `movie` from the FMV
+      player (`FUN_824a8890` `0x824a8890`, global fallback `0x83a91474`; the env class vtable
+      `0x8208ce30` slot `0x28` = `FUN_82801168` sets/erases the same `movie` key). In AC TEST no
+      FMV plays, so the sampler is unbound and the white `g_EmissionColor` (coef `1.0`) gives the
+      white glowing screens the 360 shot shows; `map.rs` recognises `movie`/`g_Color`/`g_Decal`
+      as runtime names so they are not reported as missing, and `env::relight` keeps the white
+      fallback. Real screen content would need the `movie/jp/*.wmv` VC-1 decode (see Movies).
   - Open, in order: (1) sky leftovers: which pixel shader the sky pass binds (NoLightNoFog vs
     Flver_Sky.fpo with fog; the colour already matches the 360 shot). (2) c0 / c16 / c19 / c136
     values (taken as 1, no SSAO).
@@ -321,7 +333,9 @@ in order:
   AC TEST (`ac_test_walk.txt` / `boost_vfx.txt`).
 - **Movies**: the 360 ships ASF `movie/jp/*.wmv` (WMV3 video, WMA2 / WMA Pro audio, see
   `formats.csv` `.wmv`); nothing demuxes or decodes them. A pure-Rust VC-1 decoder is a large job;
-  the WMA Pro audio could reuse `acvd-formats::xma`'s WMA Pro core.
+  the WMA Pro audio could reuse `acvd-formats::xma`'s WMA Pro core. The in-world `o0006`
+  `signboardGrow` screens sample this player's runtime `movie` render target by name, so playing a
+  movie there also needs the decoder.
 - **Mission events** (EVD), **AI** (decompiled Lua in `private/lua360` from the ISO, with the
   `LogAI` state names; no sheet yet).
 

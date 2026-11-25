@@ -938,17 +938,22 @@ fn relight(
             }
             continue;
         }
-        // `_Grow` / `_Glow` MTDs are emissive fixtures. The two soft white glows either side of
-        // the first bridge in `private/xenia/shots/ac_test_start.png` are the `o0006`
-        // `signboardGrow` movie screens (their `movie` texture is a runtime video surface, so the
-        // rewrite currently falls back to a plain surface), and the small lamps near them are the
-        // `o2135` street-lamp heads (`Map_Diffuse _Grow`, `Simple_Grow` LODs) / `m0510` traffic
-        // strips. `Flver_ColDifEmi.fpo` squares the emission texture and the 360 bloom pass turns
-        // it into the soft halo; the 360 keeps `g_EmissionCoef 0.3` (`material/mtd.bnd`), so the
-        // display-referred boost below is calibrated against that reference instead. Bevy's bloom
-        // weights a bright pixel by screen area, so a sub-metre lens/screen needs a much larger
-        // emissive to keep its halo visible at the 360 shot's viewing distance. The 360 also shows
-        // both screens glowing, so the glow quads are drawn double-sided.
+        // `_Grow` / `_Glow` MTDs are emissive fixtures. The two soft white glows beside the first
+        // bridge in `private/xenia/shots/ac_test_start.png` are the `o0006` `signboardGrow`
+        // screens: their FLVER material names the texture `movie` for both `g_DiffuseTexture` and
+        // `g_EmissionTexture`, but `movie` is not a disc asset -- it is the scene's runtime movie
+        // render target (`0x82646580` / `0x82801168` fill a named-target map alongside `g_Color` /
+        // `g_Decal`; `0x824a8890` returns the FMV surface). With no FMV playing in AC TEST the 360
+        // leaves that sampler unbound, so `Phong_ColDifEmi.spx` (white `g_EmissionColor`,
+        // `g_EmissionCoef 1.0` in `signboardGrow.mtd`) emits the white default the reference shot
+        // shows; the rewrite's white fallback matches it. The small lamps near them are the `o2135`
+        // street-lamp heads (`Map_Diffuse _Grow` / `Simple_Grow`, `g_EmissionCoef 0.3`) and the
+        // `m0510` traffic strips. `Flver_ColDifEmi.fpo` squares the emission texture and the 360
+        // bloom pass turns it into the soft halo, so the display-referred boost below is calibrated
+        // against that reference. Bevy's bloom weights a bright pixel by screen area, so a
+        // sub-metre lens/screen needs a much larger emissive to keep its halo visible at the 360
+        // shot's viewing distance. The 360 also shows both screens glowing, so the glow quads are
+        // drawn double-sided.
         let is_grow = mtd_low.contains("grow") || mtd_low.contains("glow");
         let emissive_boost: f32 = if is_grow { 32.0 } else { 0.0 };
         let diffuse2_handle = meta.and_then(|m| m.diffuse2.clone());
