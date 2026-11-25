@@ -294,6 +294,14 @@ pub struct MissileLockDialog(usize);
 #[derive(Component)]
 pub struct CombatSightRoot;
 
+/// The `BOOSTER` plate: `FE_booster` dialog 123, spawned from the `Boost` Null anchor
+/// (`[-41, 113, 41, 130]`) of `ACV_FE_LockSightCenter` (dialog 104) and shown while the AC is
+/// boosting. The 360 has no `FE_booster` / `BOOSTER_base` string, so it builds the plate from
+/// this anchor record rather than a name lookup; the English wrapper is `BOOSTER_base` (261),
+/// whose `EN` child is dialog 123 (as are FR/GE/KR/CN; IT/SP use 272/273).
+#[derive(Component)]
+pub struct BoosterPlate;
+
 /// How a Lock-Sight root dialog tracks the 3D-projected aim point (`0x829d2120` via `0x829d3a08` /
 /// `0x829d3a98`, `StaticDrawParam` 51/53 = 700 m) and aim/camera rotation (`0x829d1df0` mode 3 +
 /// `0x829d24ec` / `0x829d2740`).
@@ -473,6 +481,7 @@ pub fn layout(
         Vec2::new(x, y)
     };
     let dialog = |name: &str| hud.layout.drb.dialogs.iter().position(|d| d.name == name);
+    let mut sight_center = None;
     for (name, centered) in DIALOGS {
         let Some(index) = dialog(name) else {
             warn!("{LAYOUT}: no dialog {name}");
@@ -499,6 +508,31 @@ pub fn layout(
         ));
         if name == "ACV_LockSight_base" {
             commands.entity(root).insert(CombatSightRoot);
+        }
+        if name == "ACV_FE_LockSightCenter" {
+            sight_center = Some(root);
+        }
+    }
+    // `BOOSTER` plate: `FE_booster` dialog 123 nested under the `Boost` Null anchor of
+    // `ACV_FE_LockSightCenter` (`[-41, 113, 41, 130]`, `docs/archive.md` "BOOSTER HUD plate").
+    // The center dialog is authored around `(0, 0)` and `track_lock_sight` zeroes its box, so the
+    // anchor rect is already relative to the projected sight point; do not re-center it.
+    if let (Some(center_root), Some(center), Some(booster)) = (
+        sight_center,
+        dialog("ACV_FE_LockSightCenter"),
+        dialog("FE_booster"),
+    ) {
+        if let Some(anchor) = hud.layout.drb.dialogs[center]
+            .objects
+            .iter()
+            .find(|o| o.name == "Boost")
+        {
+            let rect = anchor.shape.rect();
+            let origin = Vec2::new(rect[0] as f32, rect[1] as f32) * scale;
+            let root = menu::spawn(&mut commands, &hud.layout, booster, origin, scale);
+            commands
+                .entity(root)
+                .insert((BoosterPlate, ChildOf(center_root), Visibility::Hidden));
         }
     }
     // Rotating outer lock-sight ring & triangles (`0x829d4e40` -> `0x829d2120`, driven by
@@ -893,6 +927,7 @@ pub fn readouts(
     status: Query<&Status>,
     arms: Query<&Armament>,
     scan_q: Query<&ScanState>,
+    pilots: Query<&Pilot>,
     mut digits: Query<
         (
             Entity,
@@ -915,17 +950,24 @@ pub fn readouts(
         Without<MenuSprite>,
     >,
     mut plates: Query<(&MenuObject, &mut Visibility), (Without<MenuSprite>, Without<MenuGauge>)>,
+    mut booster: Query<&mut Visibility, (With<BoosterPlate>, Without<MenuObject>)>,
     parents: Query<&ChildOf>,
     sight_roots: Query<(), With<LockSightTrack>>,
+    booster_roots: Query<(), With<BoosterPlate>>,
 ) {
     let Some(hud) = hud else { return };
     let hud_rgb = settings.as_ref().map(|s| s.hud_color).unwrap_or(SIGHT);
     // Only the lock-sight dialogs get the sight color: `ACV_FE_Normal` and other HUD dialogs also
-    // use generic `piece*` / `object*` names, which keep their authored colors.
+    // use generic `piece*` / `object*` names, which keep their authored colors. The `BOOSTER`
+    // plate hangs under the sight but keeps its authored orange text, dark plate and corner
+    // accents, so it is a barrier for the sight tint.
     let in_sight = |e: Entity| {
         let mut cur = e;
         while let Ok(child) = parents.get(cur) {
             cur = child.0;
+            if booster_roots.contains(cur) {
+                return false;
+            }
             if sight_roots.contains(cur) {
                 return true;
             }
@@ -934,6 +976,31 @@ pub fn readouts(
     };
     let (status, arms) = (status.single().ok(), arms.single().ok());
     let in_scan = scan_q.single().is_ok_and(|s| s.active);
+    // The 360 draws the plate from the `Boost` anchor while the booster is on (Xenia
+    // `private/xenia/shots/boost_{fwd,side,back,strafe,glide,qb,jump}.png`); Scan Mode and an
+    // active Overed Weapon hide the other Combat Mode sight parts. Instant, no fade was found.
+    // Glide requires boost mode, so `boost` covers it; a High Boost (`HighBoostState`) can fire
+    // with boost mode off (`Pilot::in_quick_boost`) but still lights the boosters.
+    let boosting = pilots
+        .single()
+        .is_ok_and(|p| p.boost || p.glide || p.in_quick_boost());
+    let ow_active = status.is_some_and(|s| {
+        matches!(
+            s.ow_phase,
+            OwPhase::Arming
+                | OwPhase::Armed
+                | OwPhase::Charging
+                | OwPhase::Charged
+                | OwPhase::Attacking
+        )
+    });
+    for mut vis in &mut booster {
+        vis.set_if_neq(if boosting && !in_scan && !ow_active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
+    }
     let arms_for_hud = (!in_scan).then_some(arms).flatten();
     let low = low_color();
     for (object, mut visibility) in &mut plates {
@@ -2233,6 +2300,68 @@ mod tests {
             d.dialog("rocksight_out_rotationInv").unwrap().size,
             [402, 402]
         );
+    }
+
+    /// The `BOOSTER` plate is the `FE_booster` dialog (123) authored under the `Boost` Null
+    /// anchor of `ACV_FE_LockSightCenter` (104); the 360 has no `FE_booster` string, so the
+    /// anchor record is the evidence for spawning it. `BOOSTER_base` (261) is the localized
+    /// wrapper whose EN/FR/GE/KR/CN children are this dialog.
+    #[test]
+    fn locksight_boost_anchor_nests_the_booster_dialog() {
+        let iso = acvd_formats::vfs::default_disc(std::path::Path::new("../.."));
+        if !iso.exists() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let d = acvd_formats::drb::read(&disc.asset(LAYOUT).unwrap()).unwrap();
+        let center = d.dialog("ACV_FE_LockSightCenter").unwrap();
+        let anchor = center
+            .objects
+            .iter()
+            .find(|o| o.name == "Boost")
+            .expect("Boost anchor in ACV_FE_LockSightCenter");
+        assert_eq!(anchor.shape.rect(), [-41, 113, 41, 130]);
+
+        let booster = d.dialog("FE_booster").unwrap();
+        assert_eq!(booster.size, [82, 17]);
+        let sprite = booster
+            .objects
+            .iter()
+            .find(|o| o.name == "booster")
+            .expect("booster sprite in FE_booster");
+        match sprite.shape {
+            acvd_formats::drb::Shape::Sprite {
+                rect,
+                uv,
+                texture,
+                color,
+                ..
+            } => {
+                assert_eq!(rect, [4, 2, 78, 15]);
+                assert_eq!(uv, [310, 159, 384, 172]);
+                assert_eq!(texture, Some(18));
+                assert_eq!(color, 0xFF40_00FF);
+            }
+            _ => panic!("booster is not a Sprite: {:?}", sprite.shape),
+        }
+        let corners: Vec<u32> = booster
+            .objects
+            .iter()
+            .filter(|o| o.name.starts_with("corner_parts"))
+            .filter_map(|o| match o.shape {
+                acvd_formats::drb::Shape::Sprite { color, .. } => Some(color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(corners, [0x00FF_A2C8; 4]);
+
+        let wrapper = d.dialog("BOOSTER_base").unwrap();
+        assert_eq!(wrapper.objects.len(), 7);
+        let en = wrapper.objects.iter().find(|o| o.name == "EN").unwrap();
+        match en.shape {
+            acvd_formats::drb::Shape::Dialog { dialog, .. } => assert_eq!(dialog, Some(123)),
+            _ => panic!("BOOSTER_base::EN is not a Dialog"),
+        }
     }
 
     #[test]
