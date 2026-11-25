@@ -22,10 +22,19 @@ Rough priority order; reorder freely.
 "AC test scene"). Gameplay should match the 360 build; menus may stay partial. Tasks toward it,
 in order:
 
-- **Sun / lens-flare look**: sprite maths now matches the 360 (see Done "360 lens-flare parity"),
-  and the visible sun is flare-only (an `ACVD_NO_FLARE` bypass leaves a plain blue sky), so any
-  remaining gap vs the 360 is tone map / bloom / exposure. Re-shoot m4000 against saved 360 crops
-  (the user's originals were not kept) before changing `env`'s tonemap values.
+- **Sun / lens-flare look**: sprite maths matches the 360 (see Done "360 lens-flare parity"), and
+  the sun is flare-only. The sprites now draw as camera-facing additive HDR quads at
+  `FLARE_DIST` 0.5 m in the 3D transparent phase, so `Bloom`, the god-ray source pass and
+  `m_ToneMapFilter` see them like the 360's sprite batch (`0x82b95c28`) instead of a post-tonemap
+  UI overlay. Same-run flare-only excess (m4000 centre view `private/shots/sun_centre_hdr.png`
+  minus the same pose yawed 60 deg off the sun, `sun_centre_off.png`): 173/105/70/46/27 luma at
+  core/0.05H/0.10H/0.20H/0.30H; sun pitch is the msb's 43 deg, so placement follows the 360.
+  The saved 360 crop (`private/shots/ref_sun_360.png`, "6007 ARENA ATK-6") is a different env with
+  a hazy, bright sky, so its absolute values (core 226 over ~114 sky) are not comparable: at equal
+  sky the flare excess is at or above the 360's, i.e. the perceived dimness is m4000's dusk sky,
+  not the sprite alpha. Still missing: a 360 m4000 capture of the sun (the 9 yaw sweep shots are
+  dusk sky with no sun) and a runtime check that the sky dome's painted glow matches the msb sun
+  angle.
 
 - **Map look**: lighting / fog / sky / tone map / per-draw light-set ids, area bounds (POINT kinds 100-102), destructible map props (`_b.flv` / `_b_h.hmd`), and water return (`POINT` kind 50 + `env::Scene.water_height`) are in (see below). The `o0006` `signboardGrow` screens' `movie` texture is a runtime render target, not an asset (see below).
   - Done: `acvd-formats::env` reads `ch_env/*_env.msb` (MSB chain at version 0x00989A6C,
@@ -171,12 +180,18 @@ in order:
     it at the feet. Which legs take `+0x380` is open.
   - The 360's real resolve (sweep + slide inside `0x82ceec98` / `HitCheckerSphereGeometry`
     `0x82cf4428`) is not decoded; the runtime pushes the deepest contact out horizontally, 3
-    passes a tick, skipping triangles with |normal.y| >= 0.7 (not game data).
+    passes a tick, skipping triangles with |normal.y| >= cos(55 degrees). Since the body spheres
+    are floor-tangent, `push_out` also skips static contacts at or below `feet + STEP_UP` (1.0 m,
+    not game data) and the grounded ray probes `travel x tan(55)` above the feet, so kerbs are
+    stepped over and 45-55 degree ramps are climbed; steeper than 55 degrees still acts as a wall
+    (see Done "AC wall collision"). The 360's own step-up/step-down height and its exact
+    walkable-slope limit are still unknown (45 degrees is only its wall-jump floor/wall split).
   - Walk speed: the 360 AC TEST AC walks at 0.12 m per tick at entity `+0x130`
     (`private/xenia/wall_walk3.jsonl`), the runtime's default design 5001 at 0.249; check
     whether that is the design (AC TEST may use another AC) or a 2x step.
-  - Slopes too steep to stand on, AC vs objects that move, AC vs AC (wall kick / `ackickrhit`
-    filter is now in, see Done "Wall Kick / Wall Jump").
+  - Slopes too steep to stand on (the runtime treats >55 degrees as a wall rather than sliding
+    down; unverified against the 360), AC vs objects that move, AC vs AC (wall kick /
+    `ackickrhit` filter is now in, see Done "Wall Kick / Wall Jump").
 - **AC test targets**: spawning, rendering, hit shapes, AP/defense damage, destruction (`_b.flv` skinned gib physics via `debris.rs` using `PARAM_DESTROYPARAM_BIN` / `PARAM_DESTROYFALL_PARAM` for both enemy corpses and destructible map props), AC TEST enemy & test-AC AI (`script/enemy/*_actest.lc`, `script/arena/actest_*.lc`), and player AC damage/stagger/respawn are in (see Done "AC TEST Enemy AI & Player Damage / AP"); still open: enemy skeletal animations, navmesh pathfinding (`HNAV`/`HTR`), and vs-UNAC (`actest7`).
 - **Boost gauge** (Lock-on / FCS, Generator EN drain & recharge, and Damage model are now in, see Done).
 

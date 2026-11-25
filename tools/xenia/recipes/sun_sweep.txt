@@ -1,0 +1,22 @@
+# After ac_test.txt: pitch the camera up to the sky and sweep the full yaw circle so a shot
+# lands on the m4000 sun (the spawn view has it above/behind the camera).
+run ac_test.txt
+wait 3
+stick R 0 1 2
+shot private/xenia/shots/sun_sweep_0.png
+stick R 1 0 1
+shot private/xenia/shots/sun_sweep_1.png
+stick R 1 0 1
+shot private/xenia/shots/sun_sweep_2.png
+stick R 1 0 1
+shot private/xenia/shots/sun_sweep_3.png
+stick R 1 0 1
+shot private/xenia/shots/sun_sweep_4.png
+stick R 1 0 1
+shot private/xenia/shots/sun_sweep_5.png
+stick R 1 0 1
+shot private/xenia/shots/sun_sweep_6.png
+stick R 1 0 1
+shot private/xenia/shots/sun_sweep_7.png
+stick R 1 0 1
+shot private/xenia/shots/sun_sweep_8.png

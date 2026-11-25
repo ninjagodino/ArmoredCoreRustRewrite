@@ -20,15 +20,10 @@ use acvd_formats::tpf;
 use acvd_formats::vfs::{self, Disc};
 use acvd_render::Packs;
 use bevy::asset::embedded_asset;
+use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::{
-    AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, RenderPipelineDescriptor,
-    ShaderType,
-};
+use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
-use bevy::ui::UiTransform;
-use bevy::ui_render::prelude::{MaterialNode, UiMaterial, UiMaterialPlugin};
-use bevy::ui_render::ui_material::UiMaterialKey;
 
 use crate::blur::ZoomBlur;
 use crate::collision::{Collision, RayFilter};
@@ -62,14 +57,10 @@ const MAX_BEAMS: usize = 2;
 const BEAM_BASE: usize = POINT_BASE + MAX_POINT_FLARES * 3;
 const POOL_SIZE: usize = BEAM_BASE + MAX_BEAMS * 2;
 
-const ADDITIVE_ONE: BlendState = BlendState {
-    color: BlendComponent {
-        src_factor: BlendFactor::One,
-        dst_factor: BlendFactor::One,
-        operation: BlendOperation::Add,
-    },
-    alpha: BlendComponent::OVER,
-};
+/// Distance of the flare quads from the camera (metres). They sit in front of the near plane and
+/// in front of all scene geometry, so the standard `AlphaMode::Add` depth test passes without
+/// depth writes while the transparent phase still draws them after the scene.
+const FLARE_DIST: f32 = 0.5;
 
 /// A fake map light beam: a screen-aligned additive streak plus a soft emitter core.
 /// `head`/`tail` are game-axes world points (`bevy = (-x, y, z)`); `width` is metres.
@@ -216,27 +207,34 @@ impl GodRayFilter {
     }
 }
 
-/// Additive UI material for `lf00`..`lf10` and `lfdust` (`lens_flare.wgsl`).
-#[derive(AsBindGroup, Asset, TypePath, Clone)]
-pub struct LensFlareMat {
-    #[uniform(0)]
-    pub tint: LinearRgba,
-    #[texture(1)]
-    #[sampler(2)]
+/// Additive HDR sprite material for `lf00`..`lf10` and `lfdust` (`lens_flare.wgsl`).
+///
+/// The 360 draws every flare sprite into the HDR scene before `Bloom` and `m_ToneMapFilter`
+/// (`0x82b95c28` sprite batch), so the rewrite renders them as camera-facing quads in the 3D
+/// transparent phase rather than a UI overlay (which would bypass both passes).
+pub type LensFlareMat = ExtendedMaterial<StandardMaterial, LensFlareLit>;
+
+#[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
+pub struct LensFlareLit {
+    /// `xyz` tint, `w` alpha (premultiplied in `lens_flare.wgsl`, `Add` blend).
+    #[uniform(100)]
+    pub tint: Vec4,
+    #[texture(101)]
+    #[sampler(102)]
     pub image: Handle<Image>,
 }
 
-impl UiMaterial for LensFlareMat {
+impl MaterialExtension for LensFlareLit {
     fn fragment_shader() -> ShaderRef {
         "embedded://acvd_game/lens_flare.wgsl".into()
     }
 
-    fn specialize(descriptor: &mut RenderPipelineDescriptor, _key: UiMaterialKey<Self>) {
-        if let Some(fragment) = descriptor.fragment.as_mut() {
-            for target in fragment.targets.iter_mut().flatten() {
-                target.blend = Some(ADDITIVE_ONE);
-            }
-        }
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn enable_shadows() -> bool {
+        false
     }
 }
 
@@ -359,7 +357,7 @@ impl Plugin for LensFlarePlugin {
             .init_resource::<ActiveLensFlare>()
             .init_resource::<SunFlareState>()
             .init_resource::<PointFlareQueue>()
-            .add_plugins(UiMaterialPlugin::<LensFlareMat>::default())
+            .add_plugins(MaterialPlugin::<LensFlareMat>::default())
             .add_systems(Startup, setup_lens_flare)
             .add_systems(
                 PostUpdate,
@@ -411,6 +409,7 @@ fn setup_lens_flare(
     mut commands: Commands,
     disc: Res<FlareDisc>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<LensFlareMat>>,
 ) {
     let assets = load_assets(&disc.0, &mut images);
@@ -421,45 +420,33 @@ fn setup_lens_flare(
         .next()
         .map(|(h, _)| h.clone())
         .unwrap_or_default();
+    let quad = meshes.add(Rectangle::new(1.0, 1.0));
 
-    // Full-screen overlay behind the HUD (`GlobalZIndex(-10)`), ignoring pointer events.
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                top: Val::Px(0.0),
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                overflow: Overflow::clip(),
+    // One camera-facing additive quad per pool slot; `update_lens_flare` places, sizes, rotates,
+    // and tints them in the 3D camera's HDR transparent phase (`FLARE_DIST`).
+    for slot in 0..POOL_SIZE {
+        let mat = mats.add(LensFlareMat {
+            base: StandardMaterial {
+                unlit: true,
+                alpha_mode: AlphaMode::Add,
+                double_sided: true,
+                cull_mode: None,
+                fog_enabled: false,
                 ..default()
             },
-            GlobalZIndex(-10),
-            Pickable::IGNORE,
-        ))
-        .with_children(|root| {
-            for slot in 0..POOL_SIZE {
-                let mat = mats.add(LensFlareMat {
-                    tint: LinearRgba::new(0.0, 0.0, 0.0, 0.0),
-                    image: fallback_img.clone(),
-                });
-                root.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: Val::Px(0.0),
-                        top: Val::Px(0.0),
-                        width: Val::Px(0.0),
-                        height: Val::Px(0.0),
-                        ..default()
-                    },
-                    UiTransform::IDENTITY,
-                    MaterialNode(mat),
-                    Visibility::Hidden,
-                    Pickable::IGNORE,
-                    FlareSlot(slot),
-                ));
-            }
+            extension: LensFlareLit {
+                tint: Vec4::ZERO,
+                image: fallback_img.clone(),
+            },
         });
+        commands.spawn((
+            Mesh3d(quad.clone()),
+            MeshMaterial3d(mat),
+            Transform::from_xyz(0.0, 0.0, -FLARE_DIST).with_scale(Vec3::ZERO),
+            Visibility::Hidden,
+            FlareSlot(slot),
+        ));
+    }
 
     commands.insert_resource(assets);
 }
@@ -583,21 +570,22 @@ fn update_lens_flare(
     scene: Option<Res<crate::Scene>>,
     mode: Option<Res<crate::garage::Mode>>,
     shot_mark: Option<Res<acvd_render::app::ShotMark>>,
-    ac_q: Query<&GlobalTransform, With<Ac>>,
+    ac_q: Query<&GlobalTransform, (With<Ac>, Without<FlareSlot>)>,
     mut cam_q: Query<
-        (&Camera, &GlobalTransform, Option<&mut ZoomBlur>),
+        (&Camera, &GlobalTransform, &Projection, Option<&mut ZoomBlur>),
         (
             With<Camera3d>,
             Without<crate::env::WaterReflectionCamera>,
             Without<crate::garage_assemble::PartPreviewCamera>,
+            Without<FlareSlot>,
         ),
     >,
     mut slots: Query<(
         &FlareSlot,
-        &mut Node,
-        &mut UiTransform,
+        &mut Transform,
+        &mut GlobalTransform,
         &mut Visibility,
-        &MaterialNode<LensFlareMat>,
+        &MeshMaterial3d<LensFlareMat>,
     )>,
     mut mats: ResMut<Assets<LensFlareMat>>,
 ) {
@@ -607,7 +595,7 @@ fn update_lens_flare(
     let Some(assets) = assets else {
         return;
     };
-    let Ok((camera, cam_gt, mut god_ray_filter)) = cam_q.single_mut() else {
+    let Ok((camera, cam_gt, projection, mut god_ray_filter)) = cam_q.single_mut() else {
         return;
     };
     let Some(vp_size) = camera.logical_viewport_size() else {
@@ -616,6 +604,11 @@ fn update_lens_flare(
     if vp_size.x <= 1.0 || vp_size.y <= 1.0 {
         return;
     }
+    let Projection::Perspective(persp) = projection else {
+        return;
+    };
+    // World units per logical screen pixel at `FLARE_DIST` in front of the camera.
+    let world_per_px = 2.0 * FLARE_DIST * (persp.fov * 0.5).tan() / vp_size.y;
 
     if active.dirty {
         state.settled = false;
@@ -943,21 +936,32 @@ fn update_lens_flare(
         }
     }
 
-    // Apply pool draw commands to the UI nodes.
+    // Apply pool draw commands to the camera-facing HDR quads.
     let mut visible_count = 0usize;
-    for (slot, mut node, mut xform, mut vis, mat_node) in &mut slots {
+    let cam_rot = cam_gt.rotation();
+    let cam_pos = cam_gt.translation();
+    for (slot, mut xform, mut gt, mut vis, mat_handle) in &mut slots {
         if let Some(cmd) = cmds[slot.0].take() {
             visible_count += 1;
-            node.left = Val::Px(cmd.center.x - cmd.size.x * 0.5);
-            node.top = Val::Px(cmd.center.y - cmd.size.y * 0.5);
-            node.width = Val::Px(cmd.size.x);
-            node.height = Val::Px(cmd.size.y);
-            *xform = UiTransform::from_rotation(Rot2::radians(cmd.rot));
+            let x = (cmd.center.x - vp_size.x * 0.5) * world_per_px;
+            let y = (vp_size.y * 0.5 - cmd.center.y) * world_per_px;
+            let local = Vec3::new(x, y, -FLARE_DIST);
+            *xform = Transform {
+                translation: cam_pos + cam_rot * local,
+                rotation: cam_rot * Quat::from_rotation_z(-cmd.rot),
+                scale: Vec3::new(cmd.size.x * world_per_px, cmd.size.y * world_per_px, 1.0),
+            };
+            *gt = GlobalTransform::from(*xform);
             *vis = Visibility::Visible;
-            if let Some(mut m) = mats.get_mut(&mat_node.0) {
-                m.tint = cmd.tint;
-                if m.image != cmd.img {
-                    m.image = cmd.img;
+            if let Some(mut m) = mats.get_mut(&mat_handle.0) {
+                m.extension.tint = Vec4::new(
+                    cmd.tint.red,
+                    cmd.tint.green,
+                    cmd.tint.blue,
+                    cmd.tint.alpha,
+                );
+                if m.extension.image != cmd.img {
+                    m.extension.image = cmd.img;
                 }
             }
         } else if *vis != Visibility::Hidden {
