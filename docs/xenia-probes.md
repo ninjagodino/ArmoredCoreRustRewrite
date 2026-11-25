@@ -257,7 +257,7 @@ $m = (0..15 | ForEach-Object { "[r4+0x{0:x}]:f32" -f ($_ * 4) }) -join ' '
 
 ## Worked example: where does the 360 put the sky dome?
 
-The question (`docs/status.md`, Map look) could not be answered statically because the matrix
+The question (`docs/open.md`, Map look) could not be answered statically because the matrix
 maths is VMX128. The chain that answered it, in five runs of `ac_test.txt`:
 
 1. `acvd-index q const Sky` → the Map_Sky material hook `0x82bd5278`; it calls `0x827d1d90`,
@@ -301,7 +301,7 @@ Device shader-constant shadow: `[[dev+0x384]+0x10]` + `0x780 + 16*n` is vertex c
 5. `.\tools\xenia\run.ps1 private\xenia\TASK.txt -Recipe <recipe>` and wait.
 6. Read the `.jsonl`. If the gate probe has hits and yours does not, the instruction did not
    run in that state — that is a finding, not a tool failure.
-7. Put 360 addresses + the probe file in the sheet row and `docs/status.md`. Record a failed
+7. Put 360 addresses + the probe file in the sheet row and `docs/open.md`. Record a failed
    reach as `Xenia re-check pending` plus the recipe path.
 
 ## Pitfalls

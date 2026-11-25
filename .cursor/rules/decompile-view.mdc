@@ -83,7 +83,7 @@ write a recipe that starts with `run ac_test.txt` and run it yourself (`walkabou
 `tools\xenia\setup.ps1` rebuilds the emulator if `external/xenia-canary` is missing.
 
 When Xenia cannot reach a state, say so in the sheet row ("Xenia re-check pending") and record
-the probe recipe in `docs/status.md`; there is no other emulator fallback.
+the probe recipe in `docs/open.md`; there is no other emulator fallback.
 
 Sheet evidence cites 360 addresses and probe files only (a probe log line is evidence: cite the
 probe file). Preflight rejects PS3 addresses, RPCS3, EBOOT and TOC references in any sheet cell.

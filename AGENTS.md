@@ -1,44 +1,46 @@
-# Armored Core: Verdict Day — Rust rewrite
+# ACVD Rust Rewrite — Agent Reference & Tool Manual
 
-Source-only Rust/Bevy reconstruction of ACVD (Xbox 360, title 4E4D0864), reverse-engineered from
-the owned 360 disc image. `README.md` covers the legal boundary and the sheet pipeline in full.
+Source-only Rust/Bevy 0.19 clean-room reconstruction of *Armored Core: Verdict Day* (Xbox 360, title `4E4D0864`, `default.xex` -> `private/x360/vd/ACV2.pe`, image base `0x82000000`, `file_offset = addr - 0x82000000`). `README.md` covers the legal boundary and the sheet pipeline in full.
 
-## Working style
+- **Open work:** `docs/open.md` — the task list, and the file the next chat reads first.
+- **Finished work:** `docs/archive.md` — completed tasks with their findings.
+- This file is the single source of truth for invariants, layout, and tooling. Do not copy it into a second rules file; point at it instead.
 
-- **One task per chat.** Pick one item from `docs/status.md`, finish it, then update that file
-  (status, findings, 360 addresses, open questions) before the chat ends. The next chat starts
-  from that file, not from chat history.
-- **Commit and push at the end of every task**, after updating `docs/status.md` and with the
-  build and tests passing: stage only the files this task touched (other chats may be editing
-  in parallel), one commit describing the task, then `git pull --rebase` and `git push`. The
-  GitHub repo is public: never `git add -f` or commit anything under the gitignored disc-derived
-  paths (`armoredcoredumps/`, `ACVD Unbound/`, `private/`, `external/`, `crates/acvd-data/src/generated/`).
-- Spreadsheet-first: game facts live in `sheets/*.csv`, each row with its evidence (360 address,
-  disc file, or breakpoint). Code reads sheets or generated data; don't hard-code constants
-  without a sheet row or a comment citing the 360 address.
-- Static RE uses the Xbox 360 build (see `.cursor/rules/decompile-view.mdc`). Runtime questions
-  on the 360 ("does this path fire?") go to the project's Xenia probes (`tools/xenia/run.ps1`,
-  full guide in `docs/xenia-probes.md`); runtime tracing on the rewrite goes to Rust scene probes
-  first (see `.cursor/rules/rust-probing.mdc`: `--shot` + `SHOT` telemetry and headless Bevy
-  `World` / disc-asset tests). The PS3 executable is never read or cited.
+## Working Style
+
+- **One task per chat.** Pick one item from `docs/open.md`, finish it, then before the chat ends update that file with the findings (status, 360 addresses, file layouts, dead ends) and move the finished task to `docs/archive.md` with a one-line summary. The next chat starts from `docs/open.md`, not from chat history.
+- **Commit and push at the end of every task**, after updating `docs/open.md`/`docs/archive.md` and with the build and tests passing: stage only the files this task touched (other chats may be editing in parallel), one commit describing the task, then `git pull --rebase` and `git push`. The GitHub repo is public: never `git add -f` or commit anything under the gitignored disc-derived paths (`armoredcoredumps/`, `ACVD Unbound/`, `private/`, `external/`, `crates/acvd-data/src/generated/`, `settings.json`).
+- Spreadsheet-first: game facts live in `sheets/*.csv`, each row with its evidence (360 address, disc file, or breakpoint). Code reads sheets or generated data; don't hard-code constants without a sheet row or a comment citing the 360 address.
+- Static RE uses the Xbox 360 build (see `.cursor/rules/decompile-view.mdc`). Runtime questions on the 360 ("does this path fire?") go to the project's Xenia probes (`tools/xenia/run.ps1`, full guide in `docs/xenia-probes.md`); runtime tracing on the rewrite goes to Rust scene probes first (see `.cursor/rules/rust-probing.mdc`: `--shot` + `SHOT` telemetry and headless Bevy `World` / disc-asset tests). The PS3 executable is never read or cited.
 - Before any `cargo` command, set `CARGO_TARGET_DIR` (see `.cursor/rules/cargo-target.mdc`).
 
-## Layout
+## Hard Invariants (NEVER Violate)
 
-| path | what |
-|---|---|
-| `crates/acvd-formats` | disc format readers: DCX, BND3, FLVER, TPF (+ Xenos untile), PARAM/PARAMDEF, `.ani`, `.dbp`, `acvparts.bin`, FSB/XMA, the 360 ISO (XDVDFS, BHD5/BDT, BHF3), VFS (`vfs::Disc`, `path|entry` asset paths) |
-| `crates/acvd-data` | generated structs/rows from the sheets (`src/generated/` is never committed) |
-| `crates/acvd-render` | disc → Bevy meshes/textures, orbit camera, `--shot` screenshot mode |
-| `crates/acvd-viewer` | FLVER model browser |
-| `crates/acvd-game` | runtime: AC assembly (`assemble`), posing/motion (`pose`), piloting + follow camera (`control`), map models and start point (`map`, default the AC test map m4000), map `.hmd` collision (`collision`), DRB lock-sight HUD (`hud`) |
-| `tools/acvd-sheets` | `extract` → `preflight` → `gen` (`all` runs every step); preflight errors block gen |
-| `tools/acvd-index` | static fact index of `ACV2.pe` (`build` → `private/index`, `q ...` lookups, `audit` of sheet citations) |
-| `tools/ghidra` | Ghidra scripts (`X360Pdata.java`, `DecompileRefs.java`, ...) |
-| `tools/xenia` | the project's Xenia Canary fork (`acvd-probe.patch`, built into `external/xenia-canary`): `setup.ps1` builds it, `run.ps1` boots the 360 disc and logs probe hits |
-| `sheets/` | committed source-of-truth CSVs (`systems.csv` = per-system status) |
-| `private/` | gitignored: disc-derived data, Ghidra projects, `x360/vd/ACV2.pe`, `lua/` (decompiled scripts), `tmp/` (RE helper scripts, debug shots) |
-| `armoredcoredumps/` | the disc images (gitignored); every tool reads the 360 ISO in it. `ACVD Unbound/` (old PS3 dump, gitignored) is no longer read |
+1. **Xbox 360 ONLY**: Never read, run, or cite PS3 / RPCS3 / `EBOOT` / `TOC` / `01.02` / `FUN_00..` / `FUN_01..`. `acvd-sheets preflight` & `acvd-index audit` fail on PS3 citations. `ACVD Unbound/` (old PS3 dump) is no longer read.
+2. **Public Repo Legal Boundary**: NEVER `git add -f` or commit anything in `armoredcoredumps/`, `ACVD Unbound/`, `private/`, `external/`, `crates/acvd-data/src/generated/`, or `settings.json`.
+3. **Spreadsheet-First**: Never edit `crates/acvd-data/src/generated/` directly. Add verified game facts + 360 evidence to `sheets/*.csv` and run `acvd-sheets all`. Don't hard-code game constants without a sheet row or 360 address comment.
+4. **Cargo Target Dir**: Before ANY `cargo` command in a shell session, run:
+   `$env:CARGO_TARGET_DIR = "$PWD\target"; $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"`
+   (Workspace `[profile.dev]` already has `opt-level = 1` + optimized `acvd-formats`/`acvd-render`, running ~120 fps in debug.)
+5. **Token Hygiene**: NEVER read `docs/open.md`, `docs/archive.md`, `sheets/*.csv`, or `.jsonl` logs in full. Always grep/filter with `Select-String`, `acvd-index q`, or PowerShell slices. Use `--message-format=short` on `cargo check` and filter `cargo test -p <crate> -- <filter>`.
+6. **Coordinates & Endianness**: All 360 disc formats are **big-endian**. FLVER is left-handed CW; `acvd-render` mirrors X (`[-x, y, z]`) into Bevy right-handed CCW. FLVER semantic 6 (`TangentS8`) stores bitangent `+dP/dv` with `w = ±1`; all normal maps use `flip_normal_map_y: false`.
+7. **UI Sliders**: Any slider/gauge/stepper must support hover-to-scroll (`garage::wheel_step_direction` / `UiAction::wheel_adjust()`) and set `state.wheel_consumed = true` so the 3D garage camera never zooms.
+8. **Task End**: Update `docs/open.md` + `docs/archive.md` (and `sheets/systems.csv` if system status changed), run tests + `acvd-index audit`, stage ONLY touched files, commit, `git pull --rebase`, `git push`.
+
+## Workspace Map
+
+- `crates/acvd-formats`: Big-endian disc readers (`xdvdfs`, `bhd5`, `bnd3`, `dcx` DFLT+EDGE, `vfs::Disc` w/ `path|entry` + 192MiB LRU, `flver`, `tpf`+Xenos untile/DXN/CTX1/HT-BC3, `param`/`paramdef`/`layout`, `acv_parts`, `accolor`, `ani`, `tae`, `dbp`, `drb`, `env`, `ffx`, `fmg`, `ccm`/`fontdef`, `fsb`/`fev`/`xma`, `hmd`, `jcon`, `mlb`, `msb`, `nav` HNAV+HTR).
+- `crates/acvd-data`: Generated structs/statics from `sheets/` + disc (`src/generated/` gitignored). O(1) `OnceLock` lookup helpers (`ac_part`, `part_field`, `ac_state`, `tuning`, `model`, `textures_named`, `assets_in`).
+- `crates/acvd-render`: Disc -> Bevy meshes/textures (`Packs`, `FlverCache`, `menu`, `text` bicubic CCM, `ui_kit` `AcvdUiKit`, `app` orbit/`--shot`).
+- `crates/acvd-viewer`: FLVER model browser (`acvd-viewer`, plus `acvd-menu` for DRB menu/HUD layouts).
+- `crates/acvd-game`: Full runtime (`garage`, `garage_assemble`, `assemble`, `paint`, `decal`, `pose`, `boost`, `hanger`, `bay`, `control`, `collision`, `fcs`, `scan`, `weapons`, `damage`, `targets`, `ai`, `map`, `env`, `blur`, `lens_flare`, `debris`, `sfx`, `sound`, `hud`, `pause`, `settings`).
+- `tools/acvd-sheets`: `extract` -> `preflight` -> `gen` (`all` runs all 3; `dump <asset>` extracts to `private/dump/`).
+- `tools/acvd-index`: Static fact index over `ACV2.pe` (`build` -> `private/index/*.csv`, `q ...`, `audit` -> `private/index/audit.md`).
+- `tools/ghidra`: Ghidra scripts (`X360Pdata.java`, `DecompileRefs.java`, ...).
+- `tools/xenia`: The project's Xenia Canary fork (`acvd-probe.patch`, built into `external/xenia-canary`): `setup.ps1` builds it, `run.ps1` boots the 360 disc and logs probe hits.
+- `sheets/`: Committed source-of-truth CSVs (`systems.csv` = per-system status).
+- `private/`: Gitignored: disc-derived data, Ghidra projects, `x360/vd/ACV2.pe`, `lua360/` (decompiled scripts), `tmp/` (RE helper scripts, debug shots).
+- `armoredcoredumps/`: The disc images (gitignored); every tool reads the 360 ISO in it.
 
 ## Commands
 
@@ -53,3 +55,84 @@ cargo run -p acvd-viewer --bin acvd-menu -- [layout] [dialog] # DRB menu/HUD lay
 
 `acvd-game` flags and controls are documented at the top of `crates/acvd-game/src/main.rs`.
 Verify visual changes with `--shot` and look at the PNG.
+
+## Tool Playbook (ALWAYS Run Existing Tools — Never Guess Offsets)
+
+### 1. Static RE: Fact Index FIRST (instant, tiny output)
+```powershell
+$x = "target\release\acvd-index.exe"   # build: cargo build --release -p acvd-index
+& $x q func 0x82821af0                 # function bounds containing ADDR
+& $x q callers 0x82821af0              # direct calls, vtable slots, const refs
+& $x q callees 0x82821af0              # outgoing calls from FUNC
+& $x q field 0x284 [FUNC]              # struct reads/writes at +0x284
+& $x q const 0x82004408 [FUNC]         # address or ASCII string refs (q const kosi)
+& $x q imm 0x38 [FUNC]                 # immediate li/cmpwi/cmplwi
+& $x q slot 0x820958d0 0x4c            # read 360 word at TABLE+OFF
+& $x q vcall 0xd0 [FUNC]               # virtual calls to slot +0xd0
+& $x q switch FUNC|SITE                # jump tables & cases
+& $x q name EyeDist                    # search PARAMDEF / .dbp / Lua param names
+& $x audit                             # REQUIRED after editing sheets/*.csv
+```
+
+Always pass `--limit 40` on broad queries to save context.
+
+### 2. Decompile / Disassemble (sub-second via resident ghidra-cli)
+```powershell
+$g = "$PWD\external\ghidra-cli\ghidra.exe"
+& $g status
+# If stopped, NEVER run `& $g start` inline (it hangs stdout). Always detach:
+Start-Process $g start -WindowStyle Hidden -RedirectStandardOutput private\tmp\bridge.out -RedirectStandardError private\tmp\bridge.err
+& $g decompile 0x82bf7878              # or by renamed symbol
+& $g x-ref to 0x8285cf68
+& $g rename FUN_82bf7878 CamFx_sideMoving
+# Stop bridge before any headless Ghidra script: `& $g stop`
+```
+
+- **VMX128 / "bad instruction data"**: Ghidra fails on VMX128. Immediately use `py private\tmp\x360dis.py LO HI` (bounds: `py private\tmp\x360func.py ADDR`).
+- **Xenos shaders** (`.vpo`/`.fpo`): Extract with `cargo run --release -q -p acvd-formats --example discls -- --members shader/flver_shader.bnd private\tmp\flvsh`, disassemble with `py private\tmp\xenosdis.py <file>`.
+- **Decompiled Lua 5.0**: Already in `private\lua360\` (Select-String there; rebuild via `.\tools\decompile-lua.ps1`).
+
+### 3. Runtime Truth on 360: Unattended Xenia Probes
+
+Use ONLY when static RE cannot determine runtime values, units, call frequency, or VMX matrices.
+
+Write the probe list to `private\xenia\TASK.txt` (1 probe per PC, gate sortie probes on `env_bgm`):
+
+```
+0x82800128 env_bgm max=1 r4
+0x82822ea0 my_probe max=40 every=2 after=env_bgm r3 f1 [r3+0x88]:f32 [[r3+0x4]+0x1bc]:u32
+```
+
+Types: `u8 u16 u32 s8 s16 s32 f32 f64` (big-endian; NO VMX register reads). PPC ABI: r3=this/arg0, r4..r10=args, lr=caller.
+
+Run unattended (takes ~150–200 s; never run two Xenia instances at once):
+
+```powershell
+.\tools\xenia\run.ps1 private\xenia\TASK.txt -Recipe tools\xenia\recipes\ac_test.txt
+```
+
+Recipes in `tools\xenia\recipes\`: `ac_test.txt`, `ac_test_walk.txt`, `boost_vfx.txt`, `boost_glide.txt`, `en_drain.txt`, `quick_boost.txt`, `wall_kick.txt`. For custom actions, write a small recipe starting with `run ac_test.txt`.
+
+Filter `private\xenia\TASK.jsonl` with PowerShell (`ConvertFrom-Json | Select-Object -First 20`), never dump huge logs raw. Cite the probe file in `sheets/*.csv`.
+
+### 4. Rust Rewrite Probing & Verification
+
+Headless tests (fastest, works even while `acvd-game.exe` is open):
+
+```
+cargo test -p acvd-game -- <test_name> --nocapture
+```
+
+Live scene telemetry + shot:
+
+```
+cargo run -p acvd-game -- [design_id] --shot private\shots\x.png --wait 2 [--hold w,shift] [--hold-delay 1.0] [--garage] [--garage-screen <top|assemble|paint|decals|emblem|view|options>] [--view-action <walk|boost|r_arm|r_bay|shoulder>] [--map m4000] [--test actest2] [--burst 4]
+```
+
+Filter `SHOT` / `PERF` lines from stderr to inspect exact live entity states/timers/FPS.
+
+Sheets rebuild (after editing `sheets/*.csv`):
+
+```
+cargo run --release -p acvd-sheets -- all
+```
