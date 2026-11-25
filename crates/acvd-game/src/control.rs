@@ -2675,15 +2675,19 @@ fn step_resolve_world(p: &mut Pilot, position: &mut Vec3, collision: &Collision)
     // Boosters on make the AC skim the water surface instead of dropping in. Water is a separate
     // collision class (the water probe `0x829e7be0` masks `0x200002`; the AC body sphere filters
     // `0x100022` / `0x4100022` at `0x82863ba4` / `0x82863bcc` do not include its `0x200000` class),
-    // so an airborne boost has to clamp its own fall to the surface. Boosters off keeps falling
-    // through to the water return in `pilot`.
+    // so an airborne boost has to clamp its own fall to the surface. The clamp also recovers a
+    // tick that sank a little while moving (up to the wading depth), otherwise a solo crossing
+    // check lets the AC walk itself under the surface over several ticks; deeper than that is a
+    // real drop and is handled by the water return in `pilot`. Boosters off keeps falling through.
     if p.airborne && (p.boost || p.glide) && p.velocity.y <= 0.0 {
         if let Some(wy) = collision.ray_down(
             *position + Vec3::Y * RAY_HALF,
             position.y - RAY_HALF,
             Layer::Water,
         ) {
-            if before_y >= wy && position.y < wy {
+            let sank = position.y <= wy
+                && (before_y >= wy || wy - position.y <= WATER_RETURN_DEPTH);
+            if sank {
                 position.y = wy;
                 p.velocity.y = 0.0;
             }
@@ -4267,17 +4271,39 @@ mod tests {
             Vec::new(),
         );
 
-        // Boosters on: the falling AC is caught at the 10 m surface and stays there.
+        // Boosters on: a falling, moving AC is caught at the 10 m surface and stays there (the
+        // horizontal move must not walk it under over time).
+        let moving = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
         let mut p = Pilot::new(ctrl, 0);
         p.airborne = true;
         p.boost = true;
         p.velocity = Vec3::new(0.0, -5.0, 0.0);
         let mut pos = Vec3::new(0.0, 12.0, 0.0);
-        for _ in 0..30 {
-            step(&mut p, &Input::default(), &mut pos, &collision);
-            assert!(pos.y >= 10.0 - 1e-3, "boosted AC sank to {}", pos.y);
+        for _ in 0..120 {
+            step(&mut p, &moving, &mut pos, &collision);
+            assert!(
+                pos.y >= 10.0 - 1e-3,
+                "boosted AC sank to {} while moving",
+                pos.y
+            );
         }
         assert!((pos.y - 10.0).abs() < 1e-2, "expected hover at 10 m, got {}", pos.y);
+
+        // A tick that dipped under the surface while moving is pulled back up.
+        let mut p = Pilot::new(ctrl, 0);
+        p.airborne = true;
+        p.boost = true;
+        p.velocity = Vec3::ZERO;
+        let mut pos = Vec3::new(0.0, 9.0, 0.0);
+        step(&mut p, &moving, &mut pos, &collision);
+        assert!(
+            (pos.y - 10.0).abs() < 1e-3,
+            "under-surface recovery should hold 10 m, got {}",
+            pos.y
+        );
 
         // Boosters off: it falls through the water layer towards the 0 m ground.
         let mut p = Pilot::new(ctrl, 0);
