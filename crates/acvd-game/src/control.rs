@@ -2783,10 +2783,19 @@ pub fn ow_locomotion_row(name: &str, dir: Option<u8>) -> Option<u32> {
     }
 }
 
-/// Checks if the AC at `pos` has dropped below `water_height` (`env::Scene.water_height` from
-/// `m####_env.msb` sub-block 0 `+0x08`, 360 `0x827ffa80`, or `--water <y>`). When submerged,
-/// teleports the AC to the nearest `POINT_WATER_RETURN` (`50`) point, zeroes velocity, and
-/// clears active dash/air/melee states. Returns `true` if a water-return respawn occurred.
+/// Submersion (m) the AC tolerates before a water return: its feet may sit this far under the
+/// surface while it wades, glides or hovers over water (`--plane --water 2` leaves the AC 2 m
+/// under). Anchored to the lower body sphere's centre height above the feet
+/// (`collision::BODY[0].height`, built from tuning record 0 `0x82330c38` `+0x234`; Xenia probe
+/// `private/xenia/wall_walk4.txt`), i.e. the water returns the AC once it reaches its torso.
+const WATER_RETURN_DEPTH: f32 = crate::collision::BODY[0].height;
+
+/// Checks if the AC at `pos` has sunk deep into water (`env::Scene.water_height` from
+/// `m####_env.msb` sub-block 0 `+0x08`, 360 `0x827ffa80`, or `--water <y>`). Feet within
+/// [`WATER_RETURN_DEPTH`] of the surface are shallow water the AC can wade, glide and hover
+/// over, and floating above the surface never returns. Deep water teleports the AC to the
+/// nearest `POINT_WATER_RETURN` (`50`) point, zeroes velocity, and clears active dash/air/melee
+/// states. Returns `true` if a water-return respawn occurred.
 pub fn check_water_return(
     p: &mut Pilot,
     pos: &mut Vec3,
@@ -2797,7 +2806,7 @@ pub fn check_water_return(
     let Some(wy) = water_return.water_height else {
         return false;
     };
-    if pos.y >= wy {
+    if pos.y + WATER_RETURN_DEPTH >= wy {
         return false;
     }
     p.water_splash_at = Some(Vec3::new(pos.x, wy, pos.z));
@@ -3980,12 +3989,17 @@ mod tests {
         };
         let ground = Collision::default();
 
-        // Above water: no respawn.
+        // Floating above the surface, or wading/hovering with the feet within
+        // WATER_RETURN_DEPTH of it (here 3 m), never returns: this is the `--plane --water 2`
+        // case where the AC glides 2 m under the test surface.
         let mut above = Vec3::new(-45.0, 5.0, 12.0);
         assert!(!check_water_return(&mut p, &mut above, &wr, fallback, &ground));
+        let mut wading = Vec3::new(-45.0, 1.0, 12.0);
+        assert!(!check_water_return(&mut p, &mut wading, &wr, fallback, &ground));
 
-        // Below water_height (3.0): teleports to nearest return point (-50, 15, 10).
-        let mut submerged = Vec3::new(-45.0, 2.5, 12.0);
+        // Sunk past the torso (feet more than WATER_RETURN_DEPTH under 3.0): teleports to the
+        // nearest return point (-50, 15, 10).
+        let mut submerged = Vec3::new(-45.0, -1.0, 12.0);
         assert!(check_water_return(
             &mut p,
             &mut submerged,
