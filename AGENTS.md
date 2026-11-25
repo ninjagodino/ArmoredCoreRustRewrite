@@ -12,6 +12,7 @@ Source-only Rust/Bevy 0.19 clean-room reconstruction of *Armored Core: Verdict D
 - **Commit and push at the end of every task**, after updating `docs/open.md`/`docs/archive.md` and with the build and tests passing: stage only the files this task touched (other chats may be editing in parallel), one commit describing the task, then `git pull --rebase` and `git push`. The GitHub repo is public: never `git add -f` or commit anything under the gitignored disc-derived paths (`armoredcoredumps/`, `ACVD Unbound/`, `private/`, `external/`, `crates/acvd-data/src/generated/`, `settings.json`).
 - Spreadsheet-first: game facts live in `sheets/*.csv`, each row with its evidence (360 address, disc file, or breakpoint). Code reads sheets or generated data; don't hard-code constants without a sheet row or a comment citing the 360 address.
 - Static RE uses the Xbox 360 build (see `.cursor/rules/decompile-view.mdc`). Runtime questions on the 360 ("does this path fire?") go to the project's Xenia probes (`tools/xenia/run.ps1`, full guide in `docs/xenia-probes.md`); runtime tracing on the rewrite goes to Rust scene probes first (see `.cursor/rules/rust-probing.mdc`: `--shot` + `SHOT` telemetry and headless Bevy `World` / disc-asset tests). The PS3 executable is never read or cited.
+- **Never place effects from screenshots.** Light shafts, beams, lens flares, and any world-space effect must be traced from the 360 build, not back-projected from a screenshot pixel: one view leaves the depth unknown, so the object lands at the wrong spot from every other angle. Trace the count and positions with `acvd-index q` xrefs first, then `py tools\x360dis\x360dis.py --func <addr>` (`tools/x360dis/ppc_vmx128.py` decodes Xenon VMX128 that Ghidra cannot), then a Xenia probe only for runtime values. Screenshots are the final appearance check (`tools\shot-check.ps1` / `acvd-shot diff`), never the source of a placement.
 - Before any `cargo` command, set `CARGO_TARGET_DIR` (see `.cursor/rules/cargo-target.mdc`).
 
 ## Hard Invariants (NEVER Violate)
@@ -36,7 +37,9 @@ Source-only Rust/Bevy 0.19 clean-room reconstruction of *Armored Core: Verdict D
 - `crates/acvd-game`: Full runtime (`garage`, `garage_assemble`, `assemble`, `paint`, `decal`, `pose`, `boost`, `hanger`, `bay`, `control`, `collision`, `fcs`, `scan`, `weapons`, `damage`, `targets`, `ai`, `map`, `env`, `blur`, `lens_flare`, `debris`, `sfx`, `sound`, `hud`, `pause`, `settings`).
 - `tools/acvd-sheets`: `extract` -> `preflight` -> `gen` (`all` runs all 3; `dump <asset>` extracts to `private/dump/`).
 - `tools/acvd-index`: Static fact index over `ACV2.pe` (`build` -> `private/index/*.csv`, `q ...`, `audit` -> `private/index/audit.md`).
-- `tools/ghidra`: Ghidra scripts (`X360Pdata.java`, `DecompileRefs.java`, ...).
+- `tools/acvd-shot`: Numeric screenshot comparison (`diff <ref.png> <cand.png>`): resizes onto the reference canvas, optional translation search, per-tile tone/edge metrics, writes `_diff.png` / `_side.png` / `_compare.json`, exits 1 on threshold miss.
+- `tools/x360dis`: Xenon/VMX128 disassembler straight from the disc image (`py tools\x360dis\x360dis.py --func 0xADDR [--refs|--trace|--stats]`); `ppc_vmx128.py` + `vmx128.txt` decode the VMX128 encodings Ghidra drops.
+- `tools/ghidra`: Ghidra scripts (`X360Pdata.java`, `DecompileRefs.java`, `X360Vmx128.java` — annotates VMX128 words with correct text + constant-pool xrefs, `--fix` restores 4-byte alignment in desynced functions).
 - `tools/xenia`: The project's Xenia Canary fork (`acvd-probe.patch`, built into `external/xenia-canary`): `setup.ps1` builds it, `run.ps1` boots the 360 disc and logs probe hits.
 - `sheets/`: Committed source-of-truth CSVs (`systems.csv` = per-system status).
 - `private/`: Gitignored: disc-derived data, Ghidra projects, `x360/vd/ACV2.pe`, `lua360/` (decompiled scripts), `tmp/` (RE helper scripts, debug shots).
@@ -50,11 +53,16 @@ cargo run --release -p acvd-sheets -- all          # after editing sheets
 cargo run -p acvd-game -- [design id] [--shot private\shots\x.png --wait 2] [--water <y>] [--hold w,shift]
 cargo run -p acvd-viewer -- [model name]
 cargo run -p acvd-viewer --bin acvd-menu -- [layout] [dialog] # DRB menu/HUD layouts
+cargo run -p acvd-shot -- diff private\xenia\shots\ac_test_start.png private\shots\x.png
+.\tools\shot-check.ps1 -Ref private\xenia\shots\ac_test_start.png -Shot private\shots\x.png -GameArgs '--map','m4000'
 .\demo.bat                               # manual-test menu: rebuilds, then launches a scenario
 ```
 
 `acvd-game` flags and controls are documented at the top of `crates/acvd-game/src/main.rs`.
-Verify visual changes with `--shot` and look at the PNG.
+Verify visual changes with `--shot`; compare it against the 360 guest shot with `acvd-shot diff`
+(or `tools\shot-check.ps1`, which runs both) instead of eyeballing. Screenshots are the final
+appearance check: numeric values still come from `sheets/*.csv` / `acvd-index`, and UI/menu ground
+truth is the DRB + TPF assets rendered by `acvd-menu`.
 
 ## Tool Playbook (ALWAYS Run Existing Tools — Never Guess Offsets)
 
@@ -88,7 +96,7 @@ Start-Process $g start -WindowStyle Hidden -RedirectStandardOutput private\tmp\b
 # Stop bridge before any headless Ghidra script: `& $g stop`
 ```
 
-- **VMX128 / "bad instruction data"**: Ghidra fails on VMX128. Immediately use `py private\tmp\x360dis.py LO HI` (bounds: `py private\tmp\x360func.py ADDR`).
+- **VMX128 / "bad instruction data"**: Ghidra fails on VMX128. Immediately use `py tools\x360dis\x360dis.py --func 0xADDR [--refs|--trace|--stats]` (decoder: `tools\x360dis\ppc_vmx128.py`, table `vmx128.txt`); `--range LO HI` for arbitrary spans. `vmx128.txt` is generated from Xenia's `ppc-instructions.xml` by `tools\x360dis\gen_vmx128_table.py` and reproduces its LookupOpcode group order (primary 4/5/6 mix Altivec, VMX128 and VX128-only forms). Ghidra itself cannot be taught VMX128 with a language: SLEIGH token fields are one contiguous bit range (`slghparse.y` `fielddef`), while VMX128 scatters v0-v127 across the Altivec XO field. Use `& $g script run tools\ghidra\X360Vmx128.java -- tools\x360dis\vmx128.txt <func...> [--fix]` to write the correct text as comments and create READ/WRITE refs for `lv*128`/`st*128` constant pools (`--dump-refs` shows the `lis/addi` chain; refs are only made when the chain is lis-derived and Ghidra's scalar disassembly is 4-byte aligned).
 - **Xenos shaders** (`.vpo`/`.fpo`): Extract with `cargo run --release -q -p acvd-formats --example discls -- --members shader/flver_shader.bnd private\tmp\flvsh`, disassemble with `py private\tmp\xenosdis.py <file>`.
 - **Decompiled Lua 5.0**: Already in `private\lua360\` (Select-String there; rebuild via `.\tools\decompile-lua.ps1`).
 

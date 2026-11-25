@@ -17,3 +17,6 @@
 /target/
 *.gpr
 *.rep/
+
+__pycache__/
+*.pyc
