@@ -126,6 +126,13 @@ in order:
       collide. Global name lookup stays as the fallback for shared textures with no per-model
       entry. Verified with `private/shots/fence_fixed_b.png`; test
       `map::tests::object_textures_resolve_from_their_own_pack`.
+      Broken `_b.flv` gibs (`debris.rs`) built their materials with the same bare-name
+      `acvd_render::material`, so `e0010_01` / `o2070_01` / crate names resolved to an unrelated
+      brighter pack and the chunks drew white/checkered. `acvd_render::material_in_pack` now tries
+      the `model/obj|ene/{m}/{m}.tpf.dcx` derived from the `_m.bnd.dcx` asset first (name-only
+      lookup as fallback), and gib materials reuse `map::mtd_alpha_mode` so
+      `Map_Diffuse_Alpha`/`AlphaMask` scrap no longer renders as solid quads
+      (`debris::tests::gib_textures_resolve_inside_the_model_pack`).
     - **`o0006` `signboardGrow` `movie` texture is a runtime render target, not a missing asset**:
       the FLVER material (`model/obj/o0006/o0006.flv` mat 4, `signboardGrow.mtd` ->
       `Phong_ColDifEmi.spx`) names texture path `movie` for both `g_DiffuseTexture` and

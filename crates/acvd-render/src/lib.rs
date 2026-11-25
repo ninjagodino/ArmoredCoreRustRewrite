@@ -461,17 +461,38 @@ pub fn best_texture_ref(name: &str) -> Option<&'static TextureRef> {
 
 /// The material for `part`: its diffuse and normal-map textures, or flat grey when it has none,
 /// `flat` is set, or the texture fails to load (reported to stderr and counted in `missing`).
+///
+/// Textures resolve by bare name; callers that know the model's own TPF use
+/// [`material_in_pack`] instead.
 pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut Assets<Image>, flat: bool, missing: &mut usize) -> StandardMaterial {
-    let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| match packs.image_handle(disc, images, name) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            *missing += 1;
-            eprintln!("{e:#}");
-            None
+    material_in_pack(disc, None, part, packs, images, flat, missing)
+}
+
+/// Like [`material`], but resolves `part`'s textures inside `pack` (a model's own
+/// `{model}.tpf.dcx`) when it has a matching entry, falling back to the name-only global lookup
+/// otherwise. Object/enemy models reuse texture names (`net`, `o2036`, `e0010_01`, ...) across
+/// maps, so a global lookup on a broken `_b.flv` can pick another model's brighter pack.
+pub fn material_in_pack(
+    disc: &Disc,
+    pack: Option<&str>,
+    part: &LoadedMesh,
+    packs: &mut Packs,
+    images: &mut Assets<Image>,
+    flat: bool,
+    missing: &mut usize,
+) -> StandardMaterial {
+    let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| {
+        match pack_image_handle(disc, pack, name, false, packs, images) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                *missing += 1;
+                eprintln!("{e:#}");
+                None
+            }
         }
     });
     let normal_map = part.bump.as_deref().filter(|_| !flat).and_then(|name| {
-        packs.linear_image_handle(disc, images, name).ok()
+        pack_image_handle(disc, pack, name, true, packs, images).ok()
     });
     StandardMaterial {
         base_color: if texture.is_some() { Color::WHITE } else { Color::srgb(0.6, 0.6, 0.62) },
@@ -480,6 +501,28 @@ pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut 
         flip_normal_map_y: false,
         perceptual_roughness: 0.7,
         ..Default::default()
+    }
+}
+
+/// Cached handle for texture `name`: the entry in `pack` when it exists there, else the name-only
+/// global lookup.
+fn pack_image_handle(
+    disc: &Disc,
+    pack: Option<&str>,
+    name: &str,
+    linear: bool,
+    packs: &mut Packs,
+    images: &mut Assets<Image>,
+) -> Result<Handle<Image>> {
+    if let Some(tpf) = pack {
+        if let Some(index) = packs.find(disc, tpf, name).ok().flatten() {
+            return packs.texture_handle_at(disc, images, tpf, index, name, linear);
+        }
+    }
+    if linear {
+        packs.linear_image_handle(disc, images, name)
+    } else {
+        packs.image_handle(disc, images, name)
     }
 }
 
