@@ -91,17 +91,17 @@ struct MapBeam {
 const M4000_BEAMS: [MapBeam; MAX_BEAMS] = [
     MapBeam {
         head: [-711.0, 32.4, 569.0],
-        tail: [-711.0, 27.5, 566.2],
+        tail: [-711.0, 27.2, 567.6],
         width: 1.4,
         color: [1.0, 1.0, 1.0],
-        alpha: 0.85,
+        alpha: 0.75,
     },
     MapBeam {
         head: [-910.0, 32.4, 576.0],
         tail: [-910.0, 26.5, 568.0],
         width: 2.0,
         color: [1.0, 1.0, 1.0],
-        alpha: 0.85,
+        alpha: 0.75,
     },
 ];
 
@@ -894,7 +894,7 @@ fn update_lens_flare(
     if mode.as_deref() == Some(&crate::garage::Mode::Sortie)
         && scene.as_ref().and_then(|s| s.map.as_deref()) == Some("m4000")
     {
-        let streak = assets.sprites[9].as_ref().map(|(img, _)| img.clone());
+        let streak = assets.sprites[10].as_ref().map(|(img, _)| img.clone());
         let core = assets.sprites[0].as_ref().map(|(img, _)| img.clone());
         if let (Some(streak), Some(core)) = (streak, core) {
             for (i, beam) in M4000_BEAMS.iter().enumerate() {
@@ -920,21 +920,23 @@ fn update_lens_flare(
                 let width_px = (beam.width * len_px / len_m).max(1.0);
                 let base = BEAM_BASE + i * 2;
                 let a = (beam.alpha * ef).clamp(0.0, 1.5);
-                let tint = LinearRgba::new(beam.color[0], beam.color[1], beam.color[2], a);
+                // `lf10` is a soft white disc; stretched along the shaft it reads as the 360's
+                // soft near-white beam, with the `lf00` core providing the bright emitter end.
+                let streak_tint = LinearRgba::new(beam.color[0], beam.color[1], beam.color[2], a);
                 cmds[base] = Some(DrawCmd {
                     img: streak.clone(),
                     center: mid,
-                    size: Vec2::new(len_px, width_px),
+                    size: Vec2::new(len_px * 1.15, width_px * 2.2),
                     rot: along.y.atan2(along.x),
-                    tint,
+                    tint: streak_tint,
                 });
-                let c = (width_px * 2.6).max(3.0);
+                let c = (width_px * 2.4).max(3.0);
                 cmds[base + 1] = Some(DrawCmd {
                     img: core.clone(),
                     center: h,
                     size: Vec2::splat(c),
                     rot: 0.0,
-                    tint: LinearRgba::new(beam.color[0], beam.color[1], beam.color[2], a * 0.9),
+                    tint: LinearRgba::new(beam.color[0], beam.color[1], beam.color[2], a * 0.6),
                 });
                 dbg_beams += 1;
             }

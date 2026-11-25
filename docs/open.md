@@ -113,9 +113,11 @@ in order:
       `env::relight` routes `_Add`/`NoLight` to unlit `SkyMaterial`, `_Grow`/`_Glow` to
       `emissive_boost = 32.0` with `cull_mode: None`, and marks `Blend`/`Add` decals
       `NotShadowCaster` (removing the opaque black quad background on crater decals). The two
-      soft white glows beside the first bridge in `ac_test_start.png` are the `o0006`
-      `signboardGrow` screens; their nearby `o2135` street-lamp heads (`Map_Diffuse _Grow` /
-      `Simple_Grow` LODs) and `m0510` traffic strips share the same emission path.
+      soft white diagonal dashes beside the first bridge in `ac_test_start.png` are fake additive
+      light-beam billboards (an illusion, not dynamic volumetrics; user correction), drawn by
+      `lens_flare::M4000_BEAMS` (`sheets/map_env.csv` `beam.m4000.*`); nearby `o2135` street-lamp
+      heads (`Map_Diffuse _Grow` / `Simple_Grow` LODs) and `m0510` traffic strips share the
+      `_Grow` emission path.
       `Flver_ColDifEmi.fpo` squares the emission texture; the display-referred boost is calibrated
       against the 360 shot because the lamp MTD keeps `g_EmissionCoef 0.3`, `signboardGrow.mtd`
       keeps `1.0`, and Bevy's bloom weights a bright pixel by screen area.
