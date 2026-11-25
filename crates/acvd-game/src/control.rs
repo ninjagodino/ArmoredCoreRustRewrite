@@ -1839,6 +1839,23 @@ fn approach(v: Vec2, target: Vec2, step: f32) -> Vec2 {
     }
 }
 
+/// Glide Boost velocity update (360 `0x8281e408`, called from the move integrator `0x82822ea0`
+/// for states 4/5). It adds the per-tick acceleration along the stick, then:
+/// - below `max`: the new length clamps to `max` (`normalize(v + a) * min(|v + a|, max)`);
+/// - at or above `max`: the speed is **held** (`normalize(v + a) * |v|`), only the direction
+///   changes. It does not brake: entering a glide above glide max (from High Boost) keeps that
+///   speed for the whole glide. Xenia probe `private/xenia/glide_move.jsonl` measured the glide
+///   holding `sqrt(vx^2 + vz^2) = 0.4630` m/tick (`100.0 km/h`) across states 4 and 5.
+fn glide_thrust(v: Vec2, accel: Vec2, max: f32) -> Vec2 {
+    let speed = v.length();
+    let next = v + accel;
+    if speed < max {
+        next.clamp_length_max(max)
+    } else {
+        next.normalize_or(v / speed) * speed
+    }
+}
+
 /// One tick of the move integrator (360 0x82822ea0) with a move action held: at or under `max`
 /// the acceleration adds and the speed clamps to `max`; above it the acceleration only steers,
 /// and the speed falls by `decel` per tick, not below `max`.
@@ -2472,20 +2489,15 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
             let _ = p.try_drain_en(c.boost_ep_tick);
         }
         // After a high boost ends, speed sits above the boost/walk max; `integrate` keeps steering
-        // with the stick while speed decays by `over_max_decel_tick` per tick.
-        let (max, accel) = if p.glide {
-            (c.glide_max_tick, c.glide_acc_tick)
-        } else if p.boost {
+        // with the stick while speed decays by `over_max_decel_tick` per tick. A glide is the
+        // special path `0x8281e408`: thrust along the stick, speed held above glide max.
+        let (max, accel) = if p.boost {
             (c.boost_max_tick, c.boost_acc_tick)
         } else {
             (c.walk_max_tick, c.walk_acc_tick)
         };
         horizontal = if p.glide {
-            approach(
-                horizontal,
-                wish * max,
-                if speed <= max { accel } else { brake },
-            )
+            glide_thrust(horizontal, wish * c.glide_acc_tick, c.glide_max_tick)
         } else if moving && !p.airborne {
             integrate(horizontal, wish * accel, max, c.over_max_decel_tick)
         } else if !p.airborne {
@@ -3693,6 +3705,22 @@ mod tests {
         let low_en = p.en;
         assert!(!start_quick_boost(&mut p));
         assert_eq!(p.en, low_en);
+    }
+
+    #[test]
+    fn glide_holds_speed_above_max_and_accelerates_below() {
+        // 0x8281e408: thrust adds below max; at/above max the speed is held and only steered.
+        let max = 0.463;
+        let below = glide_thrust(Vec2::new(0.0, 0.40), Vec2::new(0.0, 0.01), max);
+        assert!((below.length() - 0.41).abs() < 1e-4, "below max adds the thrust");
+        let at_cap = glide_thrust(Vec2::new(0.0, max), Vec2::new(0.01, 0.0), max);
+        assert!((at_cap.length() - max).abs() < 1e-4, "at max the speed stays capped");
+        assert!(at_cap.x > 0.0, "at max a perpendicular thrust steers");
+        let above = glide_thrust(Vec2::new(0.0, 0.60), Vec2::new(0.01, 0.0), max);
+        assert!(
+            (above.length() - 0.60).abs() < 1e-4,
+            "above glide max the entry speed is held, not braked"
+        );
     }
 
     #[test]

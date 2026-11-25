@@ -160,8 +160,13 @@ in order:
 - **Movement leftovers** (360 movement vtable `0x8208fea0`, builder `0x828212f8`, integrator
   `0x82822ea0`):
   - Non-boost air steering: struct index 0x14 (Lua param 50; not yet in `ac_ctrl_calc.csv`).
-  - Glide: states 4/5 take a separate integrator path (`0x8281e408`); the runtime still brakes
-    above the glide max. Done: the vertical update `0x82820168` skips the gravity loop
+  - Glide: states 4/5 take the separate mover path `0x82822ea0` -> `0x8281e408` with the working
+    block `+0x288` (9 words copied from object `+0x8c..0xac`), max `block+8` = object `+0x94` x
+    scale `+0x270`, accel at `+0x2cc` (built by `0x8281deb8`: `rot(stick) x speed x 60 x scale`).
+    Below max it is `v = normalize(v + a) * min(|v + a|, max)`; at/above max it is
+    `normalize(v + a) * |v|`, so the glide **holds** its entry speed (no brake) and only steers.
+    Probe `private/xenia/glide_move.jsonl`: 0.4630 m/tick = 100.0 km/h held through states 4 and 5.
+    Done: the vertical update `0x82820168` skips the gravity loop
     (`0x8281f960`) in states 4/5 (`0x8281f3d0` at `0x828201b4`), so a glide holds its height
     and now carries on over a drop; `0x8281dd28` caps rising at glide block (+0x288) +0x0 +
     +0x2c (not modelled, a glide never rises). On the ground: `glide_start` (acmotion row 217)
@@ -169,7 +174,10 @@ in order:
     (rows 223-230, anims 63-70, 30 frames, sector `0x82825918` / builder `0x82883c80`) then
     `glide_air` (row 222 空中浮遊, anim 62, 360-frame wheel, booster clip 3, builder
     `0x82883d30`). Camera action 26, cue b00000006 (taken as the start). Glide EN drain and
-    depletion end are now in (see Done "Generator Energy (EN) drain & recharge"). The damage rows 239-242 / 246-247 are not played.
+    depletion end are in (see Done "Generator Energy (EN) drain & recharge"). Left: the
+    glide-start direction gate (`0x8281ea30` / `0x8281e898` returns 0 when the stick heading is
+    beyond `sin(object +0xac)` of the current heading), the air-glide entry `0x8281f8c0` seeding
+    velocity from `+0x2cc`, action-40 ribbon trails, and damage rows 239-242 / 246-247 (not played).
   - High Boost / Boost Charge leftovers (burst phases, charge curve, decay, re-fire, and EN drain done; see
     Done "High Boost and Boost Charge" and "Generator Energy (EN) drain & recharge"): the
     boost-off ground walk-brake gate (`0x8283fc10` -> `0x82845590` -> `0x8283f3d0`, which holds
