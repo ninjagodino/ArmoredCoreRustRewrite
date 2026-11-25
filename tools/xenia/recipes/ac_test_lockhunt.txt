@@ -1,0 +1,31 @@
+# After ac_test.txt: raise the camera to level/slightly up and sweep it through a full 360
+# degrees in 45-degree steps, shooting each stop, to catch the AC TEST units (tanks, helis, MTs)
+# inside the lock sight and capture the retail per-enemy lock-on cursor box.
+# NOTE: AC TEST's default start has only allies in view, so this usually locks nothing. Spawn a
+# hostile layer in the arena (or move into the units) before capturing a retail reference.
+run ac_test.txt
+wait 5
+stick R 0 1 0.2
+shot private/xenia/shots/lock_yaw_0.png
+stick R 1 0 0.6
+wait 1.5
+shot private/xenia/shots/lock_yaw_1.png
+stick R 1 0 0.6
+wait 1.5
+shot private/xenia/shots/lock_yaw_2.png
+stick R 1 0 0.6
+wait 1.5
+shot private/xenia/shots/lock_yaw_3.png
+stick R 1 0 0.6
+wait 1.5
+shot private/xenia/shots/lock_yaw_4.png
+stick R 1 0 0.6
+wait 1.5
+shot private/xenia/shots/lock_yaw_5.png
+stick R 1 0 0.6
+wait 1.5
+shot private/xenia/shots/lock_yaw_6.png
+stick R 1 0 0.6
+wait 1.5
+shot private/xenia/shots/lock_yaw_7.png
+release

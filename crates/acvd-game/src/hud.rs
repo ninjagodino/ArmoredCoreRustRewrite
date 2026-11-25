@@ -273,8 +273,9 @@ impl Status {
 #[derive(Component)]
 pub struct Panel(usize);
 
-/// Screen-space target lock-on cursor wing from `sortie.drb` (`ACV_OutLine_LockCursor_E`,
-/// `_R`, `_L`; `0x829d1b40` / `0x829d1910`).
+/// One 128x64 quadrant of the target lock-on cursor from `sortie.drb`. The four dialogs tile a
+/// 256x128 box centered on the target; each `CursorLine` tip is the quadrant's outer corner
+/// (`R` (0,0), `L` (128,0), `T` (0,64), `E` (128,64)).
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub enum LockCursorWing {
     /// `ACV_OutLine_LockCursor_E` (bottom-right: `CursorLine`, `EnemyName`, `EnemyAP`).
@@ -283,12 +284,31 @@ pub enum LockCursorWing {
     RightArm,
     /// `ACV_OutLine_LockCursor_L` (top-right: Left-arm `CursorLine`, `LockOnText`, `ReloadBar`).
     LeftArm,
+    /// `ACV_OutLine_LockCursor_T` (bottom-left: Shoulder `CursorLine`, `LockOnText`, `ReloadBar`,
+    /// `MissileLock1..6` pips).
+    Shoulder,
 }
 
-/// Per-target multi-lock missile cursor dialog from `sortie.drb` (`ACV_OutLine_LockCursor_T`:
-/// `CursorLine`, `LockOnText`, `MissileLock1..6`, `0x829d1910` / `0x829d1a10`), indexed `0..6`.
+/// Simultaneous per-enemy lock cursor boxes: one 256x128 box per enemy in the FCS lock cone
+/// (retail reuses the `0x829d4b88` quadrant group as a draw command per candidate, `0x829d4e40`).
+const MAX_LOCK_BOXES: usize = 8;
+
+/// One pooled lock cursor box: a root whose four [`LockBoxQuadrant`] dialogs tile a 256x128 box
+/// centred on the target. Only the FCS-selected target's box carries text, bars and missile pips.
 #[derive(Component)]
-pub struct MissileLockDialog(usize);
+pub struct LockBox(usize);
+
+/// One 128x64 quadrant dialog of a [`LockBox`] (`sortie.drb` `ACV_OutLine_LockCursor_*`).
+#[derive(Component, Clone, Copy)]
+pub struct LockBoxQuadrant {
+    slot: usize,
+    wing: LockCursorWing,
+}
+
+/// Per-target multi-lock marker from `sortie.drb` (`ACV_OutLine_LockCursor_Target`, 32x32:
+/// `LockColor1st` / `LockColor2nd`), indexed `0..6`.
+#[derive(Component)]
+pub struct MissileLockTarget(usize);
 
 /// Marker on the Combat Mode `ACV_LockSight_base` root (hidden while Scan Mode is active).
 #[derive(Component)]
@@ -339,6 +359,16 @@ pub fn sight_ring_rotation(yaw_rad: f32, pitch_rad: f32) -> f32 {
 /// Top-left logical pixel origin for a `LockSightTrack` root given the projected screen point.
 pub fn sight_root_origin(sight_vp: Vec2, center_offset: Vec2) -> Vec2 {
     sight_vp - center_offset
+}
+
+/// Places a UI node so its `anchor` (a point in that dialog's layout pixels) lands on `vp`
+/// (logical viewport pixels). The shared form of the world-projected HUD dialogs:
+/// `ACV_Scan_Cur_Center`'s `CenterFrame [20, 20]` (`0x825a5978`), `ACV_MapScan_SubTargetS`'s
+/// `[137, 137, 183, 183]` center `(160, 160)`, and each `ACV_OutLine_LockCursor_*` quadrant's
+/// `CursorLine` tip (`0x829d4b88`).
+pub fn place_centered(node: &mut Node, vp: Vec2, anchor: Vec2, scale: f32) {
+    node.left = px(vp.x - anchor.x * scale);
+    node.top = px(vp.y - anchor.y * scale);
 }
 
 /// Marker on the Scan Mode `ACV_ScanModeLockSight` root (`0x825a26a0`, 1280×720 centered).
@@ -715,25 +745,63 @@ pub fn layout(
                 .insert((ReconEnemyMarker(slot), Visibility::Hidden));
         }
     }
-    // Spawn the actual in-game `sortie.drb` target lock-on cursor wings:
-    // `_E` (bottom-right: enemy name/AP), `_R` (top-left: right arm), `_L` (top-right: left arm),
-    // and 6x `_T` (bottom-left: per-target `MissileLock1..6`, `0x829d1910` / `0x829d1a10`).
-    for (name, wing) in [
-        ("ACV_OutLine_LockCursor_E", LockCursorWing::Enemy),
-        ("ACV_OutLine_LockCursor_R", LockCursorWing::RightArm),
-        ("ACV_OutLine_LockCursor_L", LockCursorWing::LeftArm),
-    ] {
-        if let Some(dlg) = dialog(name) {
-            let root = menu::spawn(&mut commands, &hud.layout, dlg, Vec2::ZERO, scale);
-            commands.entity(root).insert((wing, Visibility::Hidden));
+    // In-game `sortie.drb` multi-target lock cursor: one 256x128 box per enemy in the FCS cone,
+    // built from the four quadrant dialogs `_E` (bottom-right: enemy name/AP), `_R` (top-left:
+    // right arm), `_L` (top-right: left arm), `_T` (bottom-left: shoulder + `MissileLock1..6`
+    // pips). The 360 finds these as one group (`0x829d4b88`) and draws it per candidate
+    // (`0x829d4558`), so a pool of groups matches retail; see `hud::lock_cursor`.
+    const QUADRANTS: [(&str, LockCursorWing, Vec2); 4] = [
+        (
+            "ACV_OutLine_LockCursor_R",
+            LockCursorWing::RightArm,
+            Vec2::new(0.0, 0.0),
+        ),
+        (
+            "ACV_OutLine_LockCursor_L",
+            LockCursorWing::LeftArm,
+            Vec2::new(128.0, 0.0),
+        ),
+        (
+            "ACV_OutLine_LockCursor_T",
+            LockCursorWing::Shoulder,
+            Vec2::new(0.0, 64.0),
+        ),
+        (
+            "ACV_OutLine_LockCursor_E",
+            LockCursorWing::Enemy,
+            Vec2::new(128.0, 64.0),
+        ),
+    ];
+    for slot in 0..MAX_LOCK_BOXES {
+        let group = commands
+            .spawn((
+                MenuRoot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    ..Default::default()
+                },
+                LockBox(slot),
+                Visibility::Hidden,
+            ))
+            .id();
+        for (name, wing, origin) in QUADRANTS {
+            if let Some(dlg) = dialog(name) {
+                let root = menu::spawn(&mut commands, &hud.layout, dlg, origin * scale, scale);
+                commands.entity(root).remove::<MenuRoot>().insert((
+                    ChildOf(group),
+                    LockBoxQuadrant { slot, wing },
+                    Visibility::Inherited,
+                ));
+            }
         }
     }
-    if let Some(msl_dlg) = dialog("ACV_OutLine_LockCursor_T") {
+    // 32x32 per-target multi-lock markers `_Target` (`LockColor1st` / `LockColor2nd`).
+    if let Some(target_dlg) = dialog("ACV_OutLine_LockCursor_Target") {
         for slot in 0..6 {
-            let root = menu::spawn(&mut commands, &hud.layout, msl_dlg, Vec2::ZERO, scale);
+            let root = menu::spawn(&mut commands, &hud.layout, target_dlg, Vec2::ZERO, scale);
             commands
                 .entity(root)
-                .insert((MissileLockDialog(slot), Visibility::Hidden));
+                .insert((MissileLockTarget(slot), Visibility::Hidden));
         }
     }
 }
@@ -1525,8 +1593,7 @@ pub fn scan_hud(
             continue;
         };
         vis.set_if_neq(Visibility::Inherited);
-        node.left = px(vp.x - 20.0 * scale);
-        node.top = px(vp.y - 20.0 * scale);
+        place_centered(&mut node, vp, Vec2::splat(20.0), scale);
         for child in children.iter_descendants(root) {
             let Ok((obj, _, _, text, _, _)) = objects.get_mut(child) else {
                 continue;
@@ -1930,32 +1997,38 @@ pub fn recon_hud(
         };
         vis.set_if_neq(Visibility::Inherited);
         // `SubTarget_S` rect is [137, 137, 183, 183] -> center (160, 160).
-        node.left = px(vp.x - 160.0 * scale);
-        node.top = px(vp.y - 160.0 * scale);
+        place_centered(&mut node, vp, Vec2::splat(160.0), scale);
     }
 }
 
-/// Projects the FCS-locked target(s) onto the viewport and updates the actual `sortie.drb`
-/// lock-on dialogs:
-/// - `ACV_OutLine_LockCursor_E` (`EnemyName`, `EnemyAP`, `CursorLine`, `0x829d1b40`)
-/// - `ACV_OutLine_LockCursor_R` / `_L` (per-arm `LockOnText`, `ReloadBar`, `CursorLine`)
-/// - `ACV_OutLine_LockCursor_T` (per-target `MissileLock1..6`, `LockOnText`, `CursorLine`,
-///   `0x829d1910` / `0x829d1a10`).
+/// Projects the FCS lock candidates onto the viewport and updates the actual `sortie.drb`
+/// lock-on dialogs: one 256x128 box per candidate enemy, each tiled from the four quadrants
+/// - `ACV_OutLine_LockCursor_E` (bottom-right: `EnemyName`, `EnemyAP`)
+/// - `ACV_OutLine_LockCursor_R` / `_L` (top-left / top-right: per-arm `LockOnText`, `ReloadBar`)
+/// - `ACV_OutLine_LockCursor_T` (bottom-left: shoulder `LockOnText`, `ReloadBar`, `MissileLock1..6`)
+/// - `ACV_OutLine_LockCursor_Target` (32x32 `LockColor1st`/`LockColor2nd` per missile-locked target)
+///
+/// Only the FCS-selected target's box carries the readouts; every other candidate box shows the
+/// authored red `CursorLine` bracket. The 360 reuses one quadrant group per candidate
+/// (`0x829d4b88` group, `0x829d4558` per-candidate draw), so pooling groups is retail-faithful.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn lock_cursor(
     hud: Option<Res<Sortie>>,
+    mark: Option<Res<ShotMark>>,
     cameras: Query<
         (&Camera, &GlobalTransform),
         (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
     >,
     fcs_q: Query<&Fcs>,
-    mut wings: Query<
-        (Entity, &LockCursorWing, &mut Node, &mut Visibility),
-        (Without<MissileLockDialog>, Without<MenuObject>),
+    arms_q: Query<&Armament>,
+    mut boxes: Query<
+        (&LockBox, &mut Node, &mut Visibility),
+        (Without<LockBoxQuadrant>, Without<MissileLockTarget>),
     >,
-    mut msl_dialogs: Query<
-        (Entity, &MissileLockDialog, &mut Node, &mut Visibility),
-        (Without<LockCursorWing>, Without<MenuObject>),
+    quadrants: Query<(Entity, &LockBoxQuadrant)>,
+    mut markers: Query<
+        (Entity, &MissileLockTarget, &mut Node, &mut Visibility),
+        (Without<LockBox>, Without<LockBoxQuadrant>),
     >,
     children: Query<&Children>,
     mut objects: Query<
@@ -1965,31 +2038,99 @@ pub fn lock_cursor(
             Option<&mut MenuText>,
             Option<&mut MenuGauge>,
         ),
-        (Without<LockCursorWing>, Without<MissileLockDialog>),
+        (
+            Without<LockBox>,
+            Without<LockBoxQuadrant>,
+            Without<MissileLockTarget>,
+        ),
     >,
+    mut shot_logged: Local<bool>,
 ) {
     let Some(hud) = hud else { return };
     let scale = hud.scale;
     let fcs = fcs_q.single().ok();
+    let arms = arms_q.single().ok();
     let cam_pair = cameras.single().ok();
     let locked = fcs.and_then(|f| f.locked.as_ref());
-    let projected = locked.and_then(|lock| {
-        let (cam, cam_gt) = cam_pair?;
-        let vp = cam.world_to_viewport(cam_gt, lock.world_pos).ok()?;
-        Some((lock, vp))
-    });
 
-    for (root, &wing, mut node, mut vis) in &mut wings {
-        let Some((lock, vp)) = projected else {
+    // The FCS candidate list is already center-most first (`fcs::rank_candidates`).
+    let mut projected: Vec<(Entity, Vec2)> = fcs
+        .map(|f| f.candidates.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|candidate| {
+            let (cam, cam_gt) = cam_pair?;
+            let vp = cam.world_to_viewport(cam_gt, candidate.world_pos).ok()?;
+            Some((candidate.entity, vp))
+        })
+        .take(MAX_LOCK_BOXES)
+        .collect();
+    let selected = locked.map(|lock| lock.entity);
+    // The locked target can linger in the +2 deg outer cone; keep its box even when it did not
+    // make this frame's candidate list.
+    if let Some(lock) = locked {
+        if !projected.iter().any(|&(entity, _)| entity == lock.entity) {
+            if let Some((cam, cam_gt)) = cam_pair {
+                if let Ok(vp) = cam.world_to_viewport(cam_gt, lock.world_pos) {
+                    projected.push((lock.entity, vp));
+                }
+            }
+        }
+    }
+    while projected.len() > MAX_LOCK_BOXES {
+        let Some(pos) = projected
+            .iter()
+            .rposition(|&(entity, _)| Some(entity) != selected)
+        else {
+            break;
+        };
+        projected.remove(pos);
+    }
+    let assigned = projected.len();
+
+    for (slot, mut node, mut vis) in &mut boxes {
+        let Some(&(_, vp)) = projected.get(slot.0) else {
             vis.set_if_neq(Visibility::Hidden);
             continue;
         };
         vis.set_if_neq(Visibility::Inherited);
-        match wing {
+        // The four 128x64 dialogs tile a 256x128 box centred on the target (each `CursorLine`
+        // tip is the quadrant's outer corner: R (0,0), L (128,0), T (0,64), E (128,64)).
+        place_centered(&mut node, vp, Vec2::new(128.0, 64.0), scale);
+    }
+
+    for (root, quadrant) in &quadrants {
+        if quadrant.slot >= assigned {
+            continue;
+        }
+        let is_selected = Some(projected[quadrant.slot].0) == selected;
+        if !is_selected {
+            // Candidate: full authored-red bracket, no text/bars/pips.
+            for child in children.iter_descendants(root) {
+                let Ok((obj, mut cvis, _, gauge)) = objects.get_mut(child) else {
+                    continue;
+                };
+                let show = match obj.0.as_str() {
+                    "CursorLine" => {
+                        if let Some(mut g) = gauge {
+                            g.fill = 1.0;
+                            g.color = lock_cursor_red();
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                cvis.set_if_neq(if show {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                });
+            }
+            continue;
+        }
+        let Some(lock) = locked else { continue };
+        match quadrant.wing {
             LockCursorWing::Enemy => {
-                // `CursorLine` at (14,37)-(128,64) -> bottom-right wing below target center.
-                node.left = px(vp.x - 14.0 * scale);
-                node.top = px(vp.y - 24.0 * scale);
                 let col = lock_color(lock.any_secondary());
                 for child in children.iter_descendants(root) {
                     let Ok((obj, mut cvis, text, gauge)) = objects.get_mut(child) else {
@@ -2030,46 +2171,56 @@ pub fn lock_cursor(
                     });
                 }
             }
-            LockCursorWing::RightArm | LockCursorWing::LeftArm => {
-                let hand = usize::from(wing == LockCursorWing::LeftArm);
-                if wing == LockCursorWing::RightArm {
-                    // `CursorLine` at (0,0)-(104,27) -> top-left wing above target center.
-                    node.left = px(vp.x - 104.0 * scale);
-                    node.top = px(vp.y - 42.0 * scale);
-                } else {
-                    // `CursorLine` at (24,0)-(128,27) -> top-right wing above target center.
-                    node.left = px(vp.x - 24.0 * scale);
-                    node.top = px(vp.y - 42.0 * scale);
-                }
-                let prog = lock.progress(hand);
-                let ready = lock.secondary[hand];
-                let col = lock_color(ready);
+            LockCursorWing::Shoulder => {
+                let col = lock_color(lock.any_secondary());
+                let pips = fcs.map_or(0, |f| f.missile_locks.len().min(6)) as u8;
+                let reloading = arms.is_some_and(|a| a.shoulder.cooldown > 0.0);
                 for child in children.iter_descendants(root) {
-                    let Ok((obj, mut cvis, text, gauge)) = objects.get_mut(child) else {
+                    let Ok((obj, mut cvis, _, gauge)) = objects.get_mut(child) else {
                         continue;
                     };
                     let show = match obj.0.as_str() {
                         "CursorLine" => {
                             if let Some(mut g) = gauge {
-                                g.fill = prog.max(0.25);
+                                g.fill = 1.0;
                                 g.color = col;
                             }
                             true
                         }
-                        "LockOnText" => {
-                            if let Some(mut t) = text {
-                                let s = if ready {
-                                    "LOCK ON".to_string()
-                                } else {
-                                    format!("{}%", (prog * 100.0).round() as u32)
-                                };
-                                if t.text != s {
-                                    t.text = s;
-                                }
+                        "LockOnText" => pips > 0,
+                        "ReloadBar" => reloading,
+                        name => name
+                            .strip_prefix("MissileLock")
+                            .and_then(|s| s.parse::<u8>().ok())
+                            .is_none_or(|n| n <= pips),
+                    };
+                    cvis.set_if_neq(if show {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    });
+                }
+            }
+            LockCursorWing::RightArm | LockCursorWing::LeftArm => {
+                let hand = usize::from(quadrant.wing == LockCursorWing::LeftArm);
+                let prog = lock.progress(hand);
+                let ready = lock.secondary[hand];
+                let col = lock_color(ready);
+                let reloading = arms.is_some_and(|a| a.hands[hand].cooldown > 0.0);
+                for child in children.iter_descendants(root) {
+                    let Ok((obj, mut cvis, _, gauge)) = objects.get_mut(child) else {
+                        continue;
+                    };
+                    let show = match obj.0.as_str() {
+                        "CursorLine" => {
+                            if let Some(mut g) = gauge {
+                                g.fill = prog.max(0.05);
+                                g.color = col;
                             }
                             true
                         }
-                        "ReloadBar" => !ready,
+                        "LockOnText" => ready,
+                        "ReloadBar" => reloading,
                         name if name.starts_with("MissileLock") => false,
                         _ => true,
                     };
@@ -2083,59 +2234,35 @@ pub fn lock_cursor(
         }
     }
 
-    // Update per-target `ACV_OutLine_LockCursor_T` dialogs (`MissileLock1..6`, `0x829d1910` / `0x829d1a10`).
-    let msl_targets: Vec<(Vec2, u8)> = fcs
+    // Per-target multi-lock markers (`ACV_OutLine_LockCursor_Target`, 32x32).
+    let msl_targets: Vec<(Entity, Vec2, u8)> = fcs
         .into_iter()
         .flat_map(Fcs::missile_targets)
-        .filter_map(|(_, pos, count)| {
+        .filter_map(|(entity, pos, count)| {
             let (cam, cam_gt) = cam_pair?;
             let vp = cam.world_to_viewport(cam_gt, pos).ok()?;
-            Some((vp, count))
+            Some((entity, vp, count))
         })
         .take(6)
         .collect();
-    let msl_col = lock_color(true);
-    for (root, dlg, mut node, mut vis) in &mut msl_dialogs {
-        let Some(&(vp, count)) = msl_targets.get(dlg.0) else {
+    for (root, marker, mut node, mut vis) in &mut markers {
+        let Some(&(_, vp, count)) = msl_targets.get(marker.0) else {
             vis.set_if_neq(Visibility::Hidden);
             continue;
         };
         vis.set_if_neq(Visibility::Inherited);
-        // `CursorLine` at (0,37)-(104,64) -> bottom-left wing below target center.
-        node.left = px(vp.x - 104.0 * scale);
-        node.top = px(vp.y - 24.0 * scale);
+        // 32x32 marker centered on the target; `LockColor1st` for the first missile on it,
+        // `LockColor2nd` once a second missile is locked onto the same target.
+        place_centered(&mut node, vp, Vec2::splat(16.0), scale);
+        let second = count > 1;
         for child in children.iter_descendants(root) {
-            let Ok((obj, mut cvis, text, gauge)) = objects.get_mut(child) else {
+            let Ok((obj, mut cvis, _, _)) = objects.get_mut(child) else {
                 continue;
             };
             let show = match obj.0.as_str() {
-                "CursorLine" => {
-                    if let Some(mut g) = gauge {
-                        g.fill = 1.0;
-                        g.color = msl_col;
-                    }
-                    true
-                }
-                "LockOnText" => {
-                    if let Some(mut t) = text {
-                        let s = format!("MSL x{count}");
-                        if t.text != s {
-                            t.text = s;
-                        }
-                    }
-                    true
-                }
-                "ReloadBar" => false,
-                name => {
-                    if let Some(n) = name
-                        .strip_prefix("MissileLock")
-                        .and_then(|s| s.parse::<u8>().ok())
-                    {
-                        n <= count
-                    } else {
-                        true
-                    }
-                }
+                "LockColor1st" => !second,
+                "LockColor2nd" => second,
+                _ => false,
             };
             cvis.set_if_neq(if show {
                 Visibility::Inherited
@@ -2144,6 +2271,26 @@ pub fn lock_cursor(
             });
         }
     }
+
+    if mark.is_some_and(|m| m.path.is_some()) && !*shot_logged {
+        *shot_logged = true;
+        eprintln!(
+            "SHOT lock_boxes={} selected={:?} vps=[{}]",
+            assigned,
+            selected,
+            projected
+                .iter()
+                .map(|(_, vp)| format!("{:.0},{:.0}", vp.x, vp.y))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+}
+
+/// `ACV_OutLine_LockCursor_*` `CursorLine` authored colour (`sortie.drb`: `0xff4000ff`, the same
+/// red as `ACV_OutLine_LockCursor_Target::LockColor2nd`); candidate boxes keep it.
+fn lock_cursor_red() -> Color {
+    Color::srgba_u8(0xFF, 0x40, 0x00, 0xFF)
 }
 
 /// Projects the Lock-Sight billboard 700 m along the AC's aim direction (`0x829d2120` via

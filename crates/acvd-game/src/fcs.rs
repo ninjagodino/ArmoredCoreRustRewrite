@@ -117,11 +117,36 @@ impl LockedTarget {
     }
 }
 
+/// One enemy in the lock-sight cone this frame, for the HUD lock boxes (`hud::lock_cursor`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LockCandidate {
+    pub entity: Entity,
+    /// World-space center of the target's primary hit sphere.
+    pub world_pos: Vec3,
+    /// Aim score: lower is closer to the sight center (same scale as `fcs::update`'s `best`).
+    pub score: f32,
+}
+
+/// Sorts candidates by aim score (center-most first), keeping one entry per entity.
+pub fn rank_candidates(mut candidates: Vec<LockCandidate>) -> Vec<LockCandidate> {
+    candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
+    let mut ranked: Vec<LockCandidate> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if ranked.iter().all(|r| r.entity != candidate.entity) {
+            ranked.push(candidate);
+        }
+    }
+    ranked
+}
+
 /// Per-AC FCS runtime state (`AcFcs` component on the piloted AC).
 #[derive(Component, Clone, Debug)]
 pub struct Fcs {
     pub spec: FcsSpec,
     pub locked: Option<LockedTarget>,
+    /// Every enemy the FCS can acquire this frame (inner cone + LOS, plus the lingering current
+    /// target in the outer cone), sorted center-most first. Drives the per-enemy lock boxes.
+    pub candidates: Vec<LockCandidate>,
     /// Accumulated multi-target missile lock slots (`0x82858638`, up to 6).
     pub missile_locks: Vec<Entity>,
     /// Elapsed seconds toward the next missile lock slot (`0x82857688`).
@@ -137,6 +162,7 @@ impl Fcs {
         Self {
             spec: FcsSpec::from_ctrl(ctrl),
             locked: None,
+            candidates: Vec::new(),
             missile_locks: Vec::new(),
             missile_lock_timer: 0.0,
             missile_lock_max: 0,
@@ -382,6 +408,7 @@ pub fn update(
     };
     if pilot.scan_mode || pilot.ow_lockout {
         fcs.locked = None;
+        fcs.candidates.clear();
         fcs.missile_locks.clear();
         fcs.missile_lock_timer = 0.0;
         fcs.missile_target_pos.clear();
@@ -400,6 +427,7 @@ pub fn update(
     // Track target velocities and collect all candidates in the inner/outer lock-sight cones.
     let mut best: Option<(f32, Entity, String, String, Vec3, Vec3, f32, f32, f32)> = None;
     let mut inner_candidates: Vec<(Entity, f32)> = Vec::new();
+    let mut candidates: Vec<LockCandidate> = Vec::new();
     let mut valid_targets: HashMap<Entity, Vec3> = HashMap::new();
     for (entity, target, health, tf) in &targets {
         let center = tf.translation + Vec3::Y * health.center_offset_y();
@@ -461,6 +489,11 @@ pub fn update(
         } else {
             continue;
         };
+        candidates.push(LockCandidate {
+            entity,
+            world_pos: center,
+            score,
+        });
 
         let dist = (center - ac_pos).length();
         if best.as_ref().is_none_or(|b| score < b.0) {
@@ -477,6 +510,8 @@ pub fn update(
             ));
         }
     }
+
+    fcs.candidates = rank_candidates(candidates);
 
     // Multi-target missile lock accumulation (`0x82858638` + `0x82857688`):
     // supports shoulder missiles as well as missile weapon arms (`am7210`/`am7220`).
@@ -699,6 +734,35 @@ mod tests {
         step_missile_locks(&mut locks, &mut timer, &inner2, &valid, 5, step, true, 0.01);
         assert_eq!(locks.iter().filter(|&&e| e == e2).count(), 0);
         assert_eq!(locks.len(), 3);
+    }
+
+    #[test]
+    fn lock_candidates_rank_by_score_and_dedup() {
+        let a = Entity::from_bits(1);
+        let b = Entity::from_bits(2);
+        let ranked = rank_candidates(vec![
+            LockCandidate {
+                entity: b,
+                world_pos: Vec3::ZERO,
+                score: 0.6,
+            },
+            LockCandidate {
+                entity: a,
+                world_pos: Vec3::X,
+                score: 0.2,
+            },
+            LockCandidate {
+                entity: b,
+                world_pos: Vec3::Y,
+                score: 0.1,
+            },
+        ]);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].entity, b);
+        assert_eq!(ranked[0].score, 0.1);
+        assert_eq!(ranked[0].world_pos, Vec3::Y);
+        assert_eq!(ranked[1].entity, a);
+        assert_eq!(ranked[1].score, 0.2);
     }
 
     #[test]

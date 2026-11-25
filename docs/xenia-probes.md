@@ -172,6 +172,7 @@ Committed recipes:
 | `tools/xenia/recipes/ac_test.txt` | boot → workshop → AC TEST, standing at m4000 start, one shot |
 | `tools/xenia/recipes/walkabout.txt` | after AC TEST: stand, walk, look, jump, more shots |
 | `tools/xenia/recipes/ac_test_walk.txt` | `run ac_test.txt` then `run walkabout.txt` |
+| `tools/xenia/recipes/ac_test_lockhunt.txt` | after AC TEST: level the camera and sweep it through a full 360° in 8 steps, shooting the lock sight each stop (default start has only allies, so it finds no lockable enemy) |
 
 Reuse `ac_test.txt` and append your own recipe (`run ac_test.txt` then extra steps) rather than
 re-encoding the boot sequence. Waits in `ac_test.txt` include shader-compile slack on a cold
