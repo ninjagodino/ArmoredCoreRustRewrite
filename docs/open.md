@@ -114,6 +114,18 @@ in order:
       `Flver_ColDifEmi.fpo` squares the emission texture; the display-referred boost is calibrated
       against the 360 shot because the lamp MTD keeps `g_EmissionCoef 0.3`, `signboardGrow.mtd`
       keeps `1.0`, and Bevy's bloom weights a bright pixel by screen area.
+    - **Per-model map texture pack (`map.rs` `texture_pack` / `Textures::load_tex`)**: object
+      models (`KIND_OBJECT`, e.g. the road fence `o2076`) resolved every texture name through the
+      disc-wide `best_texture_ref`, so `net`/`barbed_wire`/`o2036` came from unrelated packs
+      (`net` exists nowhere in `m4000_htdcx.bnd`; the global pick was `m3200_htdcx.bnd`'s dense
+      256x256 bright lattice, RGB 69-142) and the fence drew as thick white mesh/posts.
+      `model/obj/o2076/o2076.tpf.dcx` holds its own thin 128x128 `net` (index 1, RGB 8-60) beside
+      `barbed_wire` (0) and `o2036` (2); `map.rs` now opens `model/obj/{model}/{model}.tpf.dcx`
+      first for object parts (map pieces keep the `{name}.tpf.dcx` members of `{map}_htdcx.bnd`)
+      and keys the image/material caches by pack so same-named textures in different packs never
+      collide. Global name lookup stays as the fallback for shared textures with no per-model
+      entry. Verified with `private/shots/fence_fixed_b.png`; test
+      `map::tests::object_textures_resolve_from_their_own_pack`.
     - **`o0006` `signboardGrow` `movie` texture is a runtime render target, not a missing asset**:
       the FLVER material (`model/obj/o0006/o0006.flv` mat 4, `signboardGrow.mtd` ->
       `Phong_ColDifEmi.spx`) names texture path `movie` for both `g_DiffuseTexture` and

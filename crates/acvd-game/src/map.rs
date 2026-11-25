@@ -50,6 +50,18 @@ pub fn binder(map: &str, part: &msb::Part) -> Option<String> {
     }
 }
 
+/// TPF holding `part`'s textures, or `None` for map pieces whose textures live as
+/// `{name}.tpf.dcx` members of `{map}_htdcx.bnd`. Object models keep their textures in their own
+/// `model/obj/{model}/{model}.tpf.dcx`; many objects share texture names (`net`, `o2036`, ...) with
+/// other maps, so a name-only global lookup picks an unrelated, brighter pack.
+pub fn texture_pack(disc: &Disc, part: &msb::Part) -> Option<String> {
+    if part.kind != KIND_OBJECT {
+        return None;
+    }
+    let pack = format!("model/obj/{0}/{0}.tpf.dcx", part.model);
+    disc.exists(&pack).then_some(pack)
+}
+
 /// The part's placement in FLVER (game) axes.
 pub fn xform(part: &msb::Part) -> flver::Xform {
     flver::Xform::local(
@@ -571,6 +583,8 @@ pub fn spawn(
             continue;
         };
         let asset = format!("{binder}|{}.flv", part.model);
+        let pack = texture_pack(disc, part);
+        let pack = pack.as_deref();
         let Some(list) = load_model(
             &mut models,
             &mut textures,
@@ -579,6 +593,7 @@ pub fn spawn(
             images,
             disc,
             &asset,
+            pack,
         ) else {
             continue;
         };
@@ -596,6 +611,7 @@ pub fn spawn(
                 images,
                 disc,
                 &format!("{binder}|{low_file}"),
+                pack,
             )
         } else {
             None
@@ -612,6 +628,7 @@ pub fn spawn(
                 images,
                 disc,
                 &format!("{binder}|{broken_file}"),
+                pack,
             )
         } else {
             None
@@ -716,6 +733,7 @@ fn load_model(
     images: &mut Assets<Image>,
     disc: &Disc,
     asset: &str,
+    pack: Option<&str>,
 ) -> Option<Vec<Loaded>> {
     if let Some(cached) = models.get(asset) {
         return cached.clone();
@@ -724,13 +742,13 @@ fn load_model(
         Ok(list) => Some(
             list.into_iter()
                 .map(|m| {
-                    let material = textures.material(disc, &m, materials, images);
+                    let material = textures.material(disc, pack, &m, materials, images);
                     let meta = MapMeshMeta {
                         mtd: m.mtd.clone(),
                         diffuse2: m
                             .diffuse2
                             .as_deref()
-                            .and_then(|n| textures.image_handle(disc, n, false, images)),
+                            .and_then(|n| textures.image_handle(disc, pack, n, false, images)),
                     };
                     (
                         meshes.add(m.mesh),
@@ -940,8 +958,8 @@ pub(crate) fn bevy_transform(xf: &flver::Xform) -> Transform {
 struct Textures {
     own: String,
     packs: Packs,
-    by_name: HashMap<(Option<String>, Option<String>, u8), Handle<StandardMaterial>>,
-    images: HashMap<(String, bool), Option<Handle<Image>>>,
+    by_name: HashMap<(Option<String>, Option<String>, Option<String>, u8), Handle<StandardMaterial>>,
+    images: HashMap<(String, String, bool), Option<Handle<Image>>>,
     missing: usize,
 }
 
@@ -980,15 +998,34 @@ fn is_runtime_texture(name: &str) -> bool {
 }
 
 impl Textures {
-    fn load_tex(&mut self, disc: &Disc, name: &str, linear: bool) -> Result<Image, anyhow::Error> {
-        let own = format!("{}|{name}.tpf.dcx", self.own);
-        if disc.exists(&own) {
-            if linear {
-                self.packs.linear_texture_at(disc, &own, 0, name)
-            } else {
-                self.packs.texture_at(disc, &own, 0, name)
+    fn load_tex(
+        &mut self,
+        disc: &Disc,
+        pack: Option<&str>,
+        name: &str,
+        linear: bool,
+    ) -> Result<Image, anyhow::Error> {
+        if let Some(tpf) = pack {
+            // Object model textures are named entries of its own `{model}.tpf.dcx`.
+            if let Some(index) = self.packs.find(disc, tpf, name).ok().flatten() {
+                return if linear {
+                    self.packs.linear_texture_at(disc, tpf, index, name)
+                } else {
+                    self.packs.texture_at(disc, tpf, index, name)
+                };
             }
-        } else if linear {
+        } else {
+            let own = format!("{}|{name}.tpf.dcx", self.own);
+            if disc.exists(&own) {
+                return if linear {
+                    self.packs.linear_texture_at(disc, &own, 0, name)
+                } else {
+                    self.packs.texture_at(disc, &own, 0, name)
+                };
+            }
+        }
+        // Shared texture with no per-model/per-map entry: global name lookup.
+        if linear {
             self.packs.linear_image(disc, name)
         } else {
             self.packs.image(disc, name)
@@ -998,15 +1035,16 @@ impl Textures {
     fn image_handle(
         &mut self,
         disc: &Disc,
+        pack: Option<&str>,
         name: &str,
         linear: bool,
         images: &mut Assets<Image>,
     ) -> Option<Handle<Image>> {
-        let key = (name.to_string(), linear);
+        let key = (pack.unwrap_or("").to_string(), name.to_string(), linear);
         if let Some(cached) = self.images.get(&key) {
             return cached.clone();
         }
-        let handle = match self.load_tex(disc, name, linear) {
+        let handle = match self.load_tex(disc, pack, name, linear) {
             Ok(i) => Some(images.add(i)),
             Err(e) => {
                 // Runtime render targets are absent in AC TEST by design (no FMV playing), not
@@ -1025,23 +1063,29 @@ impl Textures {
     fn material(
         &mut self,
         disc: &Disc,
+        pack: Option<&str>,
         mesh: &LoadedMesh,
         materials: &mut Assets<StandardMaterial>,
         images: &mut Assets<Image>,
     ) -> Handle<StandardMaterial> {
         let (alpha_mode, alpha_kind) = mtd_alpha_mode(&mesh.mtd);
-        let key = (mesh.diffuse.clone(), mesh.bump.clone(), alpha_kind);
+        let key = (
+            pack.map(str::to_string),
+            mesh.diffuse.clone(),
+            mesh.bump.clone(),
+            alpha_kind,
+        );
         if let Some(h) = self.by_name.get(&key) {
             return h.clone();
         }
         let image = mesh
             .diffuse
             .as_deref()
-            .and_then(|name| self.image_handle(disc, name, false, images));
+            .and_then(|name| self.image_handle(disc, pack, name, false, images));
         let normal_map = mesh
             .bump
             .as_deref()
-            .and_then(|name| self.image_handle(disc, name, true, images));
+            .and_then(|name| self.image_handle(disc, pack, name, true, images));
         let handle = materials.add(StandardMaterial {
             base_color: if image.is_some() {
                 Color::WHITE
@@ -1102,8 +1146,47 @@ mod tests {
     }
 
     #[test]
-    fn lod_bands_match_the_actest_pieces() {
-        // m0012 sits on the start camera (full). m0010 is a few hundred metres out (_l1).
+    fn object_textures_resolve_from_their_own_pack() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let mut part = msb::Part {
+            name: String::new(),
+            model: "o2076".into(),
+            kind: KIND_OBJECT,
+            translation: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: [1.0; 3],
+            light_set: 0,
+            follow_camera_xz: false,
+            is_sky: false,
+            layer_index: None,
+            layer: None,
+            ac_design_id: None,
+        };
+        assert_eq!(
+            texture_pack(&disc, &part).as_deref(),
+            Some("model/obj/o2076/o2076.tpf.dcx")
+        );
+        // The fence's `net` is a thin dark lattice inside o2076's own pack; the global
+        // name lookup would have picked the dense, brighter m3200 copy instead.
+        let mut packs = Packs::default();
+        assert_eq!(
+            packs
+                .find(&disc, "model/obj/o2076/o2076.tpf.dcx", "net")
+                .unwrap(),
+            Some(1)
+        );
+        // Map pieces use `{name}.tpf.dcx` members of `{map}_htdcx.bnd`.
+        part.kind = KIND_PIECE;
+        assert!(texture_pack(&disc, &part).is_none());
+    }
+
+    #[test]
+    fn lod_bands_match_the_actest_pieces() {        // m0012 sits on the start camera (full). m0010 is a few hundred metres out (_l1).
         let near = lod_metric(36.0, 144.0);
         let far = lod_metric(242.0, 128.0);
         assert!(near < 0.1, "{near}");
