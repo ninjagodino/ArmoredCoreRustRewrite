@@ -174,10 +174,15 @@ in order:
     (rows 223-230, anims 63-70, 30 frames, sector `0x82825918` / builder `0x82883c80`) then
     `glide_air` (row 222 空中浮遊, anim 62, 360-frame wheel, booster clip 3, builder
     `0x82883d30`). Camera action 26, cue b00000006 (taken as the start). Glide EN drain and
-    depletion end are in (see Done "Generator Energy (EN) drain & recharge"). Left: the
-    glide-start direction gate (`0x8281ea30` / `0x8281e898` returns 0 when the stick heading is
-    beyond `sin(object +0xac)` of the current heading), the air-glide entry `0x8281f8c0` seeding
-    velocity from `+0x2cc`, action-40 ribbon trails, and damage rows 239-242 / 246-247 (not played).
+    depletion end are in (see Done "Generator Energy (EN) drain & recharge"). The start/keep
+    heading gate is in: `0x8281ea30` (state 4) and `0x8281e898` (state 5, via `0x8281f8c0`)
+    return 0 and end the glide when `cos(stick - velocity) < -sin(block +0x20)`; the block angle
+    is a 10 deg allowance (Xenia probe `private/xenia/glide_gate.jsonl`: 0.17453292 rad at both
+    entries), so the stick may sit up to 100 deg off the current velocity
+    (`sheets/ac_ctrl_calc.csv` `glide_turn_cone`). The air entry also seeds the mover: horizontal
+    acceleration from the thrust block `+0x2cc` (recomputed per tick here) and vertical speed
+    `+0x1e8` from `+0x2dc` = 0, so an air glide holds a flat height. Left: action-40 ribbon
+    trails (f0000134, 3 starts from `0x828a8088`) and damage rows 239-242 / 246-247 (not played).
   - High Boost / Boost Charge leftovers (burst phases, charge curve, decay, re-fire, and EN drain done; see
     Done "High Boost and Boost Charge" and "Generator Energy (EN) drain & recharge"): the
     boost-off ground walk-brake gate (`0x8283fc10` -> `0x82845590` -> `0x8283f3d0`, which holds

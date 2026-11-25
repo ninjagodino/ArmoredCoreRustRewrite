@@ -1856,6 +1856,21 @@ fn glide_thrust(v: Vec2, accel: Vec2, max: f32) -> Vec2 {
     }
 }
 
+/// Glide heading gate (`0x8281ea30` for state 4, `0x8281e898` for state 5): both return 0 and
+/// end the glide when `cos(stick heading - velocity heading) < -sin(block +0x20)`. The block
+/// angle is a 10 degree allowance (`private/xenia/glide_gate.jsonl` reads 0.17453292 rad at both
+/// entries), so the stick may sit up to 100 degrees off the current velocity. The comparison is
+/// frame-invariant, so world directions work; at a standstill the 360 heading is local forward
+/// (`atan2(0, 0) = 0`), i.e. the body forward here.
+fn glide_heading_ok(wish: Vec2, horizontal: Vec2, forward: Vec3, cone: f32) -> bool {
+    let v = if horizontal.length_squared() > 0.0 {
+        horizontal.normalize_or_zero()
+    } else {
+        Vec2::new(forward.x, forward.z).normalize_or_zero()
+    };
+    wish.normalize_or_zero().dot(v) >= -cone.sin()
+}
+
 /// One tick of the move integrator (360 0x82822ea0) with a move action held: at or under `max`
 /// the acceleration adds and the speed clamps to `max`; above it the acceleration only steers,
 /// and the speed falls by `decel` per tick, not below `max`.
@@ -2480,6 +2495,12 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
         // `WallJumpState` Phase 0 (Prep) or Phase 2 (After): coast with air drag.
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     } else if !p.airborne || p.glide {
+        // The glide action returns 0 (and the glide ends) when the stick heading leaves the
+        // turn cone around the current velocity, before the EN check (`0x8281ea30` /
+        // `0x8281e898`).
+        if p.glide && !glide_heading_ok(wish, horizontal, forward, c.glide_turn_cone) {
+            p.glide = false;
+        }
         // Glide Boost (`0x8281ea30` / `0x8281e9d4`) drains `glide_en_tick` (`BST__HI_EN / 60`)
         // each tick and ends immediately when `en < glide_en_tick` (`private/xenia/en_drain2.jsonl`).
         if p.glide && !p.try_drain_en(c.glide_en_tick) {
@@ -2538,6 +2559,11 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
             // The vertical update 0x82820168 skips the gravity loop (0x8281f960) in the glide
             // states 4/5 (0x8281f3d0 at 0x828201b4): the vertical speed holds. 0x8281dd28 only
             // caps rising (block +0x288), which a glide off the ground never does.
+            // The air entry 0x8281f8c0 seeds the mover from 0x8281e898: horizontal acceleration
+            // +0x1d8 from the thrust block +0x2cc (recomputed every tick here) and vertical speed
+            // +0x1e8 from +0x2dc, which the glide update zeroes, so an air glide holds a flat
+            // height with no residual rise or fall.
+            p.velocity.y = 0.0;
         } else {
             // Boost gravity (movement +0x284) only while boost mode is on and the AC falls; it
             // rises under full gravity (Xenia probe private/xenia/vertical.txt).
@@ -3721,6 +3747,66 @@ mod tests {
             (above.length() - 0.60).abs() < 1e-4,
             "above glide max the entry speed is held, not braked"
         );
+    }
+
+    #[test]
+    fn glide_heading_gate_allows_100_degrees_and_ends_beyond() {
+        // 0x8281ea30 / 0x8281e898: pass while cos(stick - velocity) >= -sin(10 deg), i.e. the
+        // stick may sit up to 100 deg off the current velocity (private/xenia/glide_gate.jsonl).
+        let cone = 0.174532925_f32;
+        let forward = Vec3::NEG_Z;
+        let at = |deg: f32| Vec2::new(deg.to_radians().sin(), deg.to_radians().cos());
+        let velocity = Vec2::Y; // world +Z; at() measures the stick away from it
+        assert!(glide_heading_ok(at(99.5), velocity, forward, cone));
+        assert!(!glide_heading_ok(at(100.5), velocity, forward, cone));
+        assert!(!glide_heading_ok(at(180.0), velocity, forward, cone));
+        // At a standstill the 360 heading is local forward (atan2(0, 0) = 0), world -Z here.
+        assert!(glide_heading_ok(
+            Vec2::new(0.0, -1.0),
+            Vec2::ZERO,
+            forward,
+            cone
+        ));
+        assert!(!glide_heading_ok(
+            Vec2::new(0.0, 1.0),
+            Vec2::ZERO,
+            forward,
+            cone
+        ));
+    }
+
+    #[test]
+    fn reverse_stick_ends_the_glide() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        let collision = Collision::default();
+        let mut p = Pilot::new(ctrl, 0);
+        let mut pos = Vec3::ZERO;
+        p.boost = true;
+        p.glide = true;
+        p.en = ctrl.en_capacity;
+        p.velocity = Vec3::new(0.0, 0.0, -0.4); // gliding toward world -Z
+
+        // Forward stick stays inside the cone.
+        let forward = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
+        step(&mut p, &forward, &mut pos, &collision);
+        assert!(p.glide, "forward stick keeps the glide");
+
+        // Reversing the stick is outside the 100 degree cone -> the action ends the glide.
+        let backward = Input {
+            stick: -Vec2::Y,
+            ..Input::default()
+        };
+        step(&mut p, &backward, &mut pos, &collision);
+        assert!(!p.glide, "a reverse stick ends the glide");
     }
 
     #[test]
