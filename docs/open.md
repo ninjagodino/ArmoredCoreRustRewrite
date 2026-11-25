@@ -350,7 +350,7 @@ in order:
     `0x8287f33c sniper_ctrl r30`.
 - **UI leftovers**: PINA keyframe values (the DRB clip names and lengths are decoded in
   `sheets/ui_anim.csv` and replayed by `acvd-render::ui_kit` `UiTween`/`UiClip`); runtime image slots (emblems,
-  maps, movies); `NoiseSprite` and the other undecoded shape classes; Dialog color tint (inferred,
+  maps, movies); the other undecoded shape classes; Dialog color tint (inferred,
   see Notes). Open: Text word +0x0c (0, 502, 1000-1004, 1030, 1200-1204; not a scale), Text flags
   byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0).
   HUD: the lock-sight show scale
@@ -403,10 +403,14 @@ in order:
   camera-effects view builder, the offset-row lerp. All of these are reachable unattended in
   AC TEST (`ac_test_walk.txt` / `boost_vfx.txt`).
 - **Movies**: the 360 ships ASF `movie/jp/*.wmv` (WMV3 video, WMA2 / WMA Pro audio, see
-  `formats.csv` `.wmv`); nothing demuxes or decodes them. A pure-Rust VC-1 decoder is a large job;
-  the WMA Pro audio could reuse `acvd-formats::xma`'s WMA Pro core. The in-world `o0006`
-  `signboardGrow` screens sample this player's runtime `movie` render target by name, so playing a
-  movie there also needs the decoder.
+  `formats.csv` `.wmv`); nothing decodes them in Rust. The boot intro now uses the FFmpeg cache
+  (`tools/acvd-movies` -> `private/movies/`, played by `acvd-game::movie`); a pure-Rust VC-1
+  decoder is still a large job, and the WMA Pro audio could reuse `acvd-formats::xma`'s WMA Pro
+  core. The in-world `o0006` `signboardGrow` screens sample this player's runtime `movie` render
+  target by name, so playing a movie there also needs the decoder. Untraced: the 360 flow past
+  the offline CAUTION dialog's OK (main-menu NEW GAME / LOAD GAME lives in `title.drb`, not the
+  press-start `gameboot.drb`), and the front-end BGM event (the `0x82800128` `env_bgm` hit in
+  `private/xenia/TASK.jsonl` was not resolved to an id; the rewrite plays menu theme `grg`).
 - **Mission events** (EVD), **AI** (decompiled Lua in `private/lua360` from the ISO, with the
   `LogAI` state names; no sheet yet).
 

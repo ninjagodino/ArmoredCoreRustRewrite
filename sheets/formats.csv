@@ -41,7 +41,7 @@ extension,magic,format,system,parser,evidence
 .tsmap,PARAM header,PARAM (AI_MESSAGE_SOUND_MAP),params;sound,done,type string AI_MESSAGE_SOUND_MAP at 0x0C
 .txt,text,plain text lists,config,todo,system/deletechar.txt (UTF-16LE); oneshotsfxlist.txt
 .vpo,10 2A 11 xx,Xenos vertex shader microcode,shaders,todo,inside binders only: shader/*.bnd (Font.vpo; ZoomBlur_* in shader/filter_shader.bnd); 853 entries
-.wmv,30 26 B2 75 (ASF),Windows Media video,movies,todo,"movie/jp/*.wmv (23) loose on the ISO: ASF, WMV3 video 512x256 (512x512 emblems), WMA2 0x161 2ch 48 kHz; prologue and inisettings 1280x720 with WMA Pro 0x162 6ch; 1.7 or 10.3 Mbps"
+.wmv,30 26 B2 75 (ASF),Windows Media video,movies,tools/acvd-movies (ffmpeg transcode cache),"movie/jp/*.wmv (23) loose on the ISO: ASF, WMV3 video 512x256 (512x512 emblems), WMA2 0x161 2ch 48 kHz; prologue and inisettings 1280x720 with WMA Pro 0x162 6ch; 1.7 or 10.3 Mbps. Rewrite path: acvd-movies cache spawns ffmpeg/ffprobe once and writes JPEG frames + stereo 48 kHz PCM WAV + manifest.json under the gitignored private/movies/; acvd-game::movie plays that cache (ffprobe: prologue/inisettings wmv3 1280x720 30000/1001, wmapro 48000 Hz 6ch)"
 .xex,XEX2,Xbox 360 executable,executable,done,default.xex on the 360 ISO; unpacked to private/x360/vd/ACV2.pe (base 0x82000000) for static RE
 .xml,<?xml,XML definitions,missions;config;fonts,"partial: font/fontdef.xml read by acvd-formats::fontdef (ID -> CcmFile, RefFontID); others todo","mission (154); model (131); param (4); font (2); system (2); shader/flver_shader.bnd FlverShader.xml"
 .xpr,XPR2,Xbox packed resource (360 texture),textures,todo,inside binders only on the 360 disc: model/break/*/*_t.bnd (b9000.xpr 67596 bytes ...); 11 entries

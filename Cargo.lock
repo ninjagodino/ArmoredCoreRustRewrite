@@ -126,6 +126,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "acvd-movies"
+version = "0.1.0"
+dependencies = [
+ "acvd-formats",
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "acvd-render"
 version = "0.1.0"
 dependencies = [

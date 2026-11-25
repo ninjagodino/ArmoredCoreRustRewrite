@@ -160,6 +160,16 @@ pub enum Shape {
         mask: Option<u16>,
         mirror: bool,
     },
+    /// A full-screen animated film-grain overlay. Only `NoiseSprite` uses it (gameboot.drb
+    /// `@BackImage` object2): +0x08 `flags`, +0x10 ARGB `color` (alpha 0x28/255 on the 360),
+    /// +0x14 `kind` (7 here, meaning unverified), +0x18..+0x30 six floats (1, 1, 1, 10, 10, 0).
+    NoiseSprite {
+        rect: Rect,
+        flags: u32,
+        color: u32,
+        kind: u32,
+        params: [f32; 6],
+    },
     Other {
         class: String,
         rect: Rect,
@@ -178,6 +188,7 @@ impl Shape {
             | Shape::Text { rect, .. }
             | Shape::Dialog { rect, .. }
             | Shape::AlphaAnimSprite { rect, .. }
+            | Shape::NoiseSprite { rect, .. }
             | Shape::Other { rect, .. } => *rect,
         }
     }
@@ -348,6 +359,20 @@ impl<'a> Ctx<'a> {
                     mirror: r.u8(o + 0x26)? != 0,
                 }
             }
+            "NoiseSprite" => Shape::NoiseSprite {
+                rect,
+                flags: r.u32(o + 8)?,
+                color: r.u32(o + 0x10)?,
+                kind: r.u32(o + 0x14)?,
+                params: [
+                    r.f32(o + 0x18)?,
+                    r.f32(o + 0x1c)?,
+                    r.f32(o + 0x20)?,
+                    r.f32(o + 0x24)?,
+                    r.f32(o + 0x28)?,
+                    r.f32(o + 0x2c)?,
+                ],
+            },
             _ => Shape::Other { class, rect },
         })
     }
@@ -531,6 +556,84 @@ mod tests {
     }
 
     #[test]
+    fn reads_noise_sprite() {
+        let names = ["Root", "NoiseSprite", "Static", "Back", "c:\\Back_TM.tga", "BG"];
+        let mut off = Vec::new();
+        let mut strings = Vec::new();
+        for n in names {
+            off.push(strings.len() as u32);
+            strings.extend(utf16(n));
+        }
+        // gameboot.drb `@BackImage` object2: rect (-68,-78)-(1334,814), flags 0x01000000,
+        // alpha 0x28, kind 7, params 1/1/1/10/10/0.
+        let noise = words(&[
+            0xffbc_ffb2,
+            0x0536_032e,
+            0x0100_0000,
+            0,
+            0xffff_ff28,
+            7,
+            1.0f32.to_bits(),
+            1.0f32.to_bits(),
+            1.0f32.to_bits(),
+            10.0f32.to_bits(),
+            10.0f32.to_bits(),
+            0.0f32.to_bits(),
+        ]);
+        let mut file = section(b"\0BRD", 1, &[0; 16]);
+        file.extend(section(b"\0RTS", names.len() as u32, &strings));
+        file.extend(section(b"IXET", 1, &words(&[off[3], off[4], 0, 0])));
+        file.extend(section(b"RPHS", 1, &noise));
+        file.extend(section(b"PAHS", 1, &words(&[off[1], 0])));
+        file.extend(section(b"LRTC", 1, &words(&[off[2], 0])));
+        file.extend(section(b"OGLD", 1, &words(&[off[5], 0, 0, 0, 0, 0, 0, 0])));
+        file.extend(section(
+            b"\0GLD",
+            1,
+            &words(&[
+                off[0],
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0x0500_02d0,
+                0,
+                0,
+                0,
+                0,
+            ]),
+        ));
+        file.extend(section(b"\0DNE", 0, &[]));
+        let d = read(&file).unwrap();
+        let Shape::NoiseSprite {
+            rect,
+            flags,
+            color,
+            kind,
+            params,
+        } = d.dialog("Root").unwrap().objects[0].shape
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (rect, flags, color, kind, params),
+            (
+                [-68, -78, 1334, 814],
+                0x0100_0000,
+                0xffff_ff28,
+                7,
+                [1.0, 1.0, 1.0, 10.0, 10.0, 0.0]
+            )
+        );
+    }
+
+    #[test]
     fn disc_layouts() {
         let Some(disc) = crate::vfs::test_disc() else {
             return;
@@ -671,5 +774,32 @@ mod tests {
             panic!("Gauge_EN")
         };
         assert_eq!((flags, mask, mirror), (0x102, Some(16), true));
+        // Press-start splash: the grain overlay lives on `@BackImage` object2.
+        let d = read(&disc.asset("lang/jp/menu/gameboot.drb.dcx").unwrap()).unwrap();
+        let noise = d
+            .dialog("@BackImage")
+            .unwrap()
+            .objects
+            .iter()
+            .find_map(|o| match o.shape {
+                Shape::NoiseSprite {
+                    rect,
+                    flags,
+                    color,
+                    kind,
+                    params,
+                } => Some((rect, flags, color, kind, params)),
+                _ => None,
+            });
+        assert_eq!(
+            noise,
+            Some((
+                [-68, -78, 1334, 814],
+                0x0100_0000,
+                0xffff_ff28,
+                7,
+                [1.0, 1.0, 1.0, 10.0, 10.0, 0.0]
+            ))
+        );
     }
 }

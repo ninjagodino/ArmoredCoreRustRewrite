@@ -325,6 +325,12 @@ impl BgmState {
         self.muted
     }
 
+    /// Enables BGM after a silent front end (`SoundPlugin { play_bgm: false }`); the next
+    /// [`switch_bgm`] then spawns the decode thread.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
     fn spawn_decode(disc: &Disc, map: Option<&str>) -> Self {
         let Some((cue, wave)) = resolve_bgm_wave(disc, map) else {
             return Self {

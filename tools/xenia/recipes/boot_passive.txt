@@ -1,0 +1,17 @@
+# Boot -> title, no input. Captures what the 360 shows from power-on.
+wait 6
+shot private/xenia/shots/boot_06.png
+wait 4
+shot private/xenia/shots/boot_10.png
+wait 5
+shot private/xenia/shots/boot_15.png
+wait 5
+shot private/xenia/shots/boot_20.png
+wait 5
+shot private/xenia/shots/boot_25.png
+wait 5
+shot private/xenia/shots/boot_30.png
+wait 10
+shot private/xenia/shots/boot_40.png
+wait 10
+shot private/xenia/shots/boot_50.png

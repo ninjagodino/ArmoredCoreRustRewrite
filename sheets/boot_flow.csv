@@ -1,0 +1,10 @@
+step,asset,trigger,input,duration,next,evidence
+startup_subscene,startup scene,"boot_subscene 0x825dce60","none","2.32 s after power-on (Xenia wall clock)","press_scene","Xenia private/xenia/boot.jsonl: 0x825dce60 hit 1 at 2325 ms"
+press_start_scene,press scene,"press_scene 0x82b292c8","none","0.11 s later","scene_finish","private/xenia/boot.jsonl: 0x82b292c8 hit at 2437 ms (lr 0x82b28bc8)"
+title_layout,"lang/jp/menu/gameboot.drb.dcx + gameboot.tpf.dcx","gameboot_layout 0x82b28db8; press_dialog 0x82b29040","none","6.4 s after scene_finish (Xenia wall clock)","press_start","private/xenia/boot.jsonl: 0x825e43d0 scene_finish cycles 2.44-5.14 s, 0x82b28db8 hit at 8878 ms, 0x82b29040 at 8944 ms"
+press_start_steady,"gameboot.drb @PressStart (@Trial_PressStart dim variant)","layout drawn","none","steady (no blink)","press_start","private/xenia/shots/boot_25/30/40/50.png: PRESS START region mean 39.0/40.0/45.4/40.8, max 148-153 (grain only)"
+start_press,"gameboot.drb @PressStart object","press START on the title","START","immediate","live_caution","tools/xenia/recipes/boot_title.txt + private/xenia/shots/title_start_02..20.png"
+live_caution,CAUTION dialog (menu system, not gameboot),"offline boot after START","none","shown from title_start_02 onward","unknown (not traced past OK)","private/xenia/shots/title_start_09.png: 'You are not connected to Xbox LIVE. Cannot access online features.'"
+no_boot_movie,AppMenuMoviePlayer 0x824a8de0,"boot and post-START","none","no hits in the whole probe","-","private/xenia/boot.jsonl: 0x824a8de0 movie_start, 0x824a8e58 movie_req, 0x825bd6e8 movie_row all unhit"
+intro_movie,"movie/jp/prologue.wmv (param/movieplayinfo.bin row 100)","rewrite post-Start intro (scope choice; the 360 offline path shows the CAUTION dialog)","START, then skip with Start/Space/Enter/Esc after 0.6 s","49.09 s","garage","movieplayinfo row 100 play_type 0 1280x720; ffprobe: WMV3 1280x720 30000/1001, WMA Pro 48000 Hz 6ch, 59034770 bytes; cache private/movies/prologue/manifest.json"
+garage_handoff,acvd-game garage,"movie end or skip","none","-","garage","acvd-game::frontend BootStage::Done; capture private/tmp/boot_garage3.png"

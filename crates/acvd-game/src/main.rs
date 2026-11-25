@@ -49,6 +49,15 @@
 //! Boosters, muzzle flashes, tracers and hits play FFX effects (see `sfx`); `--sfx <id>` keeps
 //! effect `id` playing in front of the AC. Shots, boost and jump play their FMOD cues (see
 //! `sound`). `--burst <n>` makes `--shot` save `n` frames 0.05 s apart (`<stem>_<i>.png`).
+//! Boot: with no world/`--shot` args the game starts on the retail press-start splash
+//! (`lang/jp/menu/gameboot.drb.dcx`, text from `lang/<lang>/text/menu/menu.fmg`, console clock in
+//! the runtime `Data` text), then plays the cached opening movie (`prologue` by default, see
+//! `acvd-movies cache`), then drops into the garage. Start/Space/Enter/Esc skips the movie after
+//! 0.6 s. `--boot`/`--no-boot` force it on/off, `--boot-stage title|movie|done|garage` starts at
+//! one stage (also implied by `--movie-frame`, which pauses the movie on that frame for a shot),
+//! `--boot-auto <seconds>` auto-presses Start, `--boot-lang <en|jp|..>` changes the text bank,
+//! `--movie <name>`/`--no-movie` pick or skip the movie, and `--movies-dir <dir>` points at the
+//! cache (default `private/movies`). World/garage/`--map`/`--shot` args imply `--boot garage`.
 
 mod ai;
 mod assemble;
@@ -61,6 +70,7 @@ mod damage;
 mod decal;
 mod env;
 mod fcs;
+mod frontend;
 mod garage;
 mod garage_assemble;
 mod hanger;
@@ -68,6 +78,7 @@ mod hud;
 mod lens_flare;
 mod map;
 mod debris;
+mod movie;
 mod paint;
 mod pause;
 mod pose;
@@ -211,6 +222,26 @@ fn not_paused_in_sortie(mode: Res<garage::Mode>, pause: Res<pause::PauseState>) 
     *mode != garage::Mode::Sortie || !pause.open
 }
 
+fn frontend_active(cfg: Res<frontend::BootConfig>) -> bool {
+    cfg.enabled
+}
+
+fn world_ready(world: Res<frontend::WorldReady>) -> bool {
+    world.0
+}
+
+/// The deferred 3D world spawns once: after the front end releases it and before `WorldSpawned`.
+#[derive(Resource, Default)]
+struct WorldSpawned(bool);
+
+fn world_needs_setup(world: Res<frontend::WorldReady>, spawned: Res<WorldSpawned>) -> bool {
+    world.0 && !spawned.0
+}
+
+fn mark_world_spawned(mut spawned: ResMut<WorldSpawned>) {
+    spawned.0 = true;
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut wanted, mut disc, mut shot, mut flat, mut yaw, mut pitch, mut pos_override) =
@@ -247,8 +278,70 @@ fn main() {
     let mut hanger_r_override: Option<i16> = None;
     let mut hanger_l_override: Option<i16> = None;
     let mut start_view_action: Option<garage::GarageViewAction> = None;
+    let mut boot_flag: Option<bool> = None;
+    let mut boot_movie = "prologue".to_string();
+    let mut boot_lang = "en".to_string();
+    let mut boot_stage = frontend::BootStage::Title;
+    let mut movie_frame: Option<u32> = None;
+    let mut skip_movie = false;
+    let mut boot_auto: Option<f32> = None;
+    let mut movies_dir: Option<PathBuf> = None;
+    let mut world_args = false;
     while let Some(a) = args.next() {
+        if matches!(
+            a.as_str(),
+            "--map"
+                | "--layout"
+                | "--test"
+                | "--hits"
+                | "--plane"
+                | "--water"
+                | "--sfx"
+                | "--clip"
+                | "--frame"
+                | "--garage"
+                | "--garage-id"
+                | "--garage-screen"
+                | "--view-action"
+                | "--pause"
+                | "--pause-options"
+                | "--pause-options-sound"
+                | "--cam"
+                | "--pos"
+                | "--hold"
+                | "--hanger-r"
+                | "--hanger-l"
+                | "--decal"
+                | "--emblem"
+                | "--shadow-dist"
+        ) {
+            world_args = true;
+        }
         match a.as_str() {
+            "--boot" => boot_flag = Some(true),
+            "--no-boot" => boot_flag = Some(false),
+            "--movie" => boot_movie = args.next().unwrap_or(boot_movie),
+            "--boot-lang" => boot_lang = args.next().unwrap_or(boot_lang),
+            "--boot-stage" => {
+                if let Some(raw) = args.next() {
+                    boot_stage = if raw.eq_ignore_ascii_case("movie") {
+                        frontend::BootStage::Movie
+                    } else if raw.eq_ignore_ascii_case("done") || raw.eq_ignore_ascii_case("garage") {
+                        frontend::BootStage::Done
+                    } else {
+                        frontend::BootStage::Title
+                    };
+                }
+            }
+            "--movie-frame" => {
+                movie_frame = args.next().and_then(|s| s.parse().ok());
+                if movie_frame.is_some() {
+                    boot_stage = frontend::BootStage::Movie;
+                }
+            }
+            "--no-movie" => skip_movie = true,
+            "--boot-auto" => boot_auto = args.next().and_then(|s| s.parse().ok()),
+            "--movies-dir" => movies_dir = args.next().map(PathBuf::from),
             "--disc" => disc = args.next().map(PathBuf::from),
             "--shot" => shot = args.next().map(|p| Shot::new(PathBuf::from(p))),
             "--flat" => flat = true,
@@ -395,10 +488,16 @@ fn main() {
                     .next()
                     .and_then(|s| settings::ShadowDistance::from_cli(&s));
             }
-            _ => wanted = a.parse::<u32>().ok(),
+            _ => {
+                wanted = a.parse::<u32>().ok();
+                if wanted.is_some() {
+                    world_args = true;
+                }
+            }
         }
     }
-    let initial_mode = if start_garage {
+    let boot_enabled = boot_flag.unwrap_or(!world_args && shot.is_none());
+    let initial_mode = if start_garage || boot_enabled {
         garage::Mode::Garage
     } else {
         garage::Mode::Sortie
@@ -407,7 +506,7 @@ fn main() {
         eye,
         look: cam_look.unwrap_or(eye + Vec3::X * 100.0),
     });
-    let piloting = !start_garage && clip.is_none() && frame.is_none() && cam_override.is_none();
+    let piloting = !start_garage && !boot_enabled && clip.is_none() && frame.is_none() && cam_override.is_none();
     // Piloting starts behind the AC, the browser in front of it.
     let start_aim = StartAim { yaw, pitch };
     let yaw = yaw.unwrap_or(if piloting { 0.25 } else { 2.6 });
@@ -534,7 +633,7 @@ fn main() {
         }),
         ..default()
     }))
-    .add_plugins((blur::BlurPlugin, paint::PaintPlugin, acvd_render::menu::MenuPlugin))
+    .add_plugins((blur::BlurPlugin, paint::PaintPlugin, acvd_render::menu::MenuPlugin, frontend::FrontendPlugin))
     .add_plugins(sfx::SfxPlugin { disc: disc.clone() })
     .add_plugins(sound::SoundPlugin {
         disc: disc.clone(),
@@ -543,7 +642,7 @@ fn main() {
         } else {
             map.clone().filter(|_| !plane && !hits)
         },
-        play_bgm: shot.is_none(),
+        play_bgm: shot.is_none() && !boot_enabled,
     })
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
     .add_plugins(lens_flare::LensFlarePlugin { disc: disc.clone() })
@@ -556,6 +655,19 @@ fn main() {
     .insert_resource(initial_mode)
     .insert_resource(garage::ModeSwitch::default())
     .insert_resource(garage_state)
+    .insert_resource(frontend::WorldReady(!boot_enabled))
+    .insert_resource(WorldSpawned(!boot_enabled))
+    .insert_resource(frontend::BootConfig {
+        enabled: boot_enabled,
+        disc: disc.clone(),
+        lang: boot_lang,
+        movie: boot_movie,
+        movies_dir: movies_dir.unwrap_or_else(|| root.join("private/movies")),
+        start: boot_stage,
+        frame: movie_frame,
+        skip_movie,
+        auto_start: boot_auto,
+    })
     .insert_resource(pause_state)
         .init_resource::<AcTexturePacks>()
         .init_resource::<garage_assemble::AssembleUiAssets>()
@@ -604,7 +716,13 @@ fn main() {
         keys: if hold_delay > 0.0 { held } else { Vec::new() },
     })
     .insert_resource(ShowHud(!no_hud))
-    .add_systems(Startup, (setup, weapons::setup))
+    .add_systems(Startup, (setup, weapons::setup).run_if(not(frontend_active)))
+    .add_systems(
+        PreUpdate,
+        (setup, weapons::setup, mark_world_spawned)
+            .chain()
+            .run_if(world_needs_setup),
+    )
     .add_systems(
         Update,
         (
@@ -629,7 +747,8 @@ fn main() {
             settings::sync_shadow_distance,
         )
             .chain()
-            .before(show),
+            .before(show)
+            .run_if(world_ready),
     )
     .add_systems(
         Update,
@@ -680,7 +799,8 @@ fn main() {
             )
                 .chain(),
         )
-            .chain(),
+            .chain()
+            .run_if(world_ready),
     )
     .add_systems(
         Update,
@@ -702,7 +822,8 @@ fn main() {
                 .run_if(in_active_sortie),
         )
             .chain()
-            .after(reframe),
+            .after(reframe)
+            .run_if(world_ready),
     );
     if let Some(id) = preview {
         app.insert_resource(sfx::Preview(id));

@@ -1,0 +1,6 @@
+movie,row,file,size,video,audio,width,height,fps,duration,play_type,evidence
+acv_opening,0,missing,n/a,n/a,n/a,1280,720,n/a,n/a,0,"param/movieplayinfo.bin row 0 (1280x720, play_type 0); no movie/jp/acv_opening.wmv on the 360 ISO (only 23 .wmv files, listed by discls movie/jp)"
+staffroll,1,missing,n/a,n/a,n/a,1280,720,n/a,n/a,0,"param/movieplayinfo.bin row 1 (1280x720, play_type 0); no movie/jp/staffroll.wmv on the 360 ISO"
+IniSettings_BG,10,missing,n/a,n/a,n/a,1280,720,n/a,n/a,2,"param/movieplayinfo.bin row 10 (1280x720, play_type 2); no movie/jp/inisettings_bg.wmv on the 360 ISO"
+IniSettings,11,movie/jp/inisettings.wmv,10818504,WMV3,WMA Pro 6ch,1280,720,29.97,8.543,2,"param/movieplayinfo.bin row 11; ffprobe of the extracted file: wmv3 1280x720 30000/1001, wmapro 48000 Hz 6ch"
+prologue,100,movie/jp/prologue.wmv,59034770,WMV3,WMA Pro 6ch,1280,720,29.97,49.09,0,"param/movieplayinfo.bin row 100 (1280x720, play_type 0, disable_user_bgm_override 1, system_memory_size 29696); ffprobe: wmv3 1280x720 30000/1001, wmapro 48000 Hz 6ch; cache manifest private/movies/prologue/manifest.json (1470 frames)"

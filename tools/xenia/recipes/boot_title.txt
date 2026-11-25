@@ -1,0 +1,13 @@
+# Boot -> title -> START. Records what follows the press-start screen (offline boot flow).
+run boot_passive.txt
+press START 120
+wait 2
+shot private/xenia/shots/title_start_02.png
+wait 3
+shot private/xenia/shots/title_start_05.png
+wait 4
+shot private/xenia/shots/title_start_09.png
+wait 5
+shot private/xenia/shots/title_start_14.png
+wait 6
+shot private/xenia/shots/title_start_20.png

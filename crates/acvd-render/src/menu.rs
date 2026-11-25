@@ -12,7 +12,9 @@
 //! [`MenuText`] for game code to fill; they start blank unless [`Layout::placeholders`] is set
 //! (then they show the object name, or `000` in fonts without its letters). Sprite blend 1 is
 //! alpha, blend 2 additive ([`AdditiveSprite`]; apps add [`MenuPlugin`]). `AlphaAnimSprite`
-//! gauges are [`MenuGauge`]s. Not yet: runtime image slots (emblems, maps, movies), `NoiseSprite`.
+//! gauges are [`MenuGauge`]s. Runtime image slots (emblems, maps, movies) map to `MenuObject`
+//! names for game code. `NoiseSprite` draws the animated film grain from `gameboot.drb`. PINA
+//! keyframes are still undecoded.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,9 +46,27 @@ pub struct Layout {
     pub fonts: HashMap<u8, Arc<Font>>,
     pub messages: Option<Fmg>,
     pub placeholders: bool,
+    /// Film-grain frames for `NoiseSprite` (4 x 256x256, cycled while the layout is shown).
+    pub noise: Vec<Handle<Image>>,
 }
 
 pub fn load(disc: &Disc, path: &str, images: &mut Assets<Image>) -> Result<Layout> {
+    load_with_text(disc, path, None, images)
+}
+
+/// Like [`load`], but takes the `menu.fmg` bank from `lang/<lang>/text/menu/menu.fmg` instead of
+/// the language in the layout's own path. The press-start layout only ships as
+/// `lang/jp/menu/gameboot.drb.dcx` while its text changes with the game language.
+pub fn load_in_lang(disc: &Disc, path: &str, lang: &str, images: &mut Assets<Image>) -> Result<Layout> {
+    load_with_text(disc, path, Some(lang), images)
+}
+
+fn load_with_text(
+    disc: &Disc,
+    path: &str,
+    lang: Option<&str>,
+    images: &mut Assets<Image>,
+) -> Result<Layout> {
     let drb = drb::read(&disc.asset(path)?).with_context(|| format!("reading {path}"))?;
     let pack = path.strip_suffix(".drb.dcx").map(|p| format!("{p}.tpf.dcx")).with_context(|| format!("{path} is not a .drb.dcx"))?;
     let mut packs = Packs::default();
@@ -97,7 +117,10 @@ pub fn load(disc: &Disc, path: &str, images: &mut Assets<Image>) -> Result<Layou
         }
         Err(e) => eprintln!("font/fontdef.xml: {e:#}"),
     }
-    let menu_fmg = path.split_once("/menu/").map(|(lang, _)| format!("{lang}/text/menu/menu.fmg"));
+    let menu_fmg = match lang {
+        Some(lang) => Some(format!("lang/{lang}/text/menu/menu.fmg")),
+        None => path.split_once("/menu/").map(|(lang, _)| format!("{lang}/text/menu/menu.fmg")),
+    };
     let messages = menu_fmg.and_then(|p| match disc.asset(&p).and_then(|d| acvd_formats::fmg::read(&d)) {
         Ok(f) => Some(f),
         Err(e) => {
@@ -105,7 +128,49 @@ pub fn load(disc: &Disc, path: &str, images: &mut Assets<Image>) -> Result<Layou
             None
         }
     });
-    Ok(Layout { drb, textures, fonts, messages, placeholders: false })
+    let noise = if drb.dialogs.iter().flat_map(|d| &d.objects).any(|o| matches!(o.shape, Shape::NoiseSprite { .. })) {
+        noise_images(images)
+    } else {
+        Vec::new()
+    };
+    Ok(Layout { drb, textures, fonts, messages, placeholders: false, noise })
+}
+
+/// Four 256x256 white-noise frames tinted by `ImageNode::color` when a layout's `NoiseSprite`
+/// is drawn. The 360 shape takes its alpha from the shape color (0x28/255 on `gameboot`).
+fn noise_images(images: &mut Assets<Image>) -> Vec<Handle<Image>> {
+    let mut state = 0x1234_5678u32;
+    (0..4)
+        .map(|frame| {
+            let mut image = Image::new(
+                bevy::render::render_resource::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 },
+                bevy::render::render_resource::TextureDimension::D2,
+                vec![0; 256 * 256 * 4],
+                bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                bevy::asset::RenderAssetUsages::default(),
+            );
+            if let Some(data) = image.data.as_mut() {
+                for i in 0..256 * 256 {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    // The 360 grain is subtle: shape color alpha 0x28 over a mid-grey range,
+                    // measured against the Xenia press-start capture (`boot_25.png`):
+                    // ~mean 31, std ~7.7 in flat regions at 720p.
+                    let r = (state >> 24) as f32;
+                    let v = (42.2 + (r - 127.5) * 0.56).clamp(0.0, 255.0) as u8;
+                    let px = &mut data[i * 4..i * 4 + 4];
+                    px[0] = v;
+                    px[1] = v;
+                    px[2] = v;
+                    px[3] = 255;
+                }
+            }
+            image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
+            let _ = frame;
+            images.add(image)
+        })
+        .collect()
 }
 
 /// Marker on the root node of a spawned layout.
@@ -127,6 +192,14 @@ pub struct MenuSprite {
     pub flip_x: bool,
     pub flip_y: bool,
     pub additive: bool,
+}
+
+/// A `NoiseSprite` film-grain overlay. Cycles the four generated noise frames while shown.
+#[derive(Component)]
+pub struct MenuNoise {
+    frames: Vec<Handle<Image>>,
+    frame: usize,
+    timer: f32,
 }
 
 /// Sprite drawn with additive blending (source times alpha plus destination), the DRB sprite
@@ -314,7 +387,19 @@ impl Plugin for MenuPlugin {
             UiMaterialPlugin::<GlyphSprite>::default(),
             crate::ui_kit::UiAnimationPlugin,
         ))
-        .add_systems(PostUpdate, (draw_sprites, draw_gauges, (draw_texts, draw_glyphs).chain()));
+        .add_systems(PostUpdate, (draw_sprites, draw_gauges, (draw_texts, draw_glyphs).chain(), animate_noise));
+    }
+}
+
+fn animate_noise(time: bevy::prelude::Res<bevy::prelude::Time>, mut noise: Query<(&mut MenuNoise, &mut ImageNode)>) {
+    for (mut grain, mut image) in &mut noise {
+        grain.timer += time.delta_secs();
+        if grain.timer < 0.05 || grain.frames.len() < 2 {
+            continue;
+        }
+        grain.timer = 0.0;
+        grain.frame = (grain.frame + 1) % grain.frames.len();
+        image.image = grain.frames[grain.frame].clone();
     }
 }
 
@@ -584,6 +669,15 @@ fn spawn_dialog(
                 write_glyphs(commands, boxed, f, &string, *align, size, scale, rgba(*color));
                 boxed
             }
+            &Shape::NoiseSprite { rect, color, .. } if !layout.noise.is_empty() => {
+                let mut n = node(map(rect), scale);
+                n.overflow = bevy::ui::Overflow::visible();
+                let mut image = ImageNode::new(layout.noise[0].clone());
+                image.color = rgba(color);
+                image.image_mode = NodeImageMode::Tiled { tile_x: true, tile_y: true, stretch_value: 2.0 };
+                let noise = MenuNoise { frames: layout.noise.clone(), frame: 0, timer: 0.0 };
+                commands.spawn((n, image, noise, ChildOf(parent))).id()
+            }
             &Shape::Dialog { rect, dialog: Some(d), flags, color } => {
                 let rect = map(rect);
                 let child = commands.spawn((snapped_node(rect, scale), ChildOf(parent))).id();
@@ -630,5 +724,35 @@ mod tests {
 
         // Full-span child stretches to full target dimensions
         assert_eq!(remap_nine_slice([0, 0, 21, 21], src, dst_name), [0, 0, 387, 34]);
+    }
+
+    #[test]
+    fn gameboot_layout_takes_english_text_from_en_fmg() {
+        let path = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        if !path.is_file() {
+            return;
+        }
+        let disc = Disc::open(&path).unwrap();
+        let mut images = Assets::<Image>::default();
+        let layout =
+            load_in_lang(&disc, "lang/jp/menu/gameboot.drb.dcx", "en", &mut images).unwrap();
+        let messages = layout.messages.as_ref().expect("menu.fmg");
+        assert_eq!(messages.get(204), Some("PRESS START"));
+        assert_eq!(messages.get(205), Some("MAIN SYSTEM IS READY TO ACTIVATE"));
+        assert!(messages.get(5).unwrap().contains("Verdict Day"));
+        assert_eq!(layout.noise.len(), 4);
+        assert!(layout
+            .drb
+            .dialogs
+            .iter()
+            .flat_map(|d| &d.objects)
+            .any(|o| matches!(
+                o.shape,
+                Shape::NoiseSprite {
+                    color: 0xffff_ff28,
+                    kind: 7,
+                    ..
+                }
+            )));
     }
 }
