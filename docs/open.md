@@ -254,24 +254,19 @@ in order:
     `+0x1e8` from `+0x2dc` = 0, so an air glide holds a flat height. Done: the action-40 ribbon
     trails (f0000134, 3 starts from `0x828a8088`, dummies 153/155/156/213/218/223 in TAE anims
     63-70) render in `sfx.rs`. Left: damage rows 239-242 / 246-247 (not played).
-  - **Glide Boost VFX 1:1** (action-40 ribbon `f0000134`, `acvd-game::sfx`): the three white
-    trails render (see Done) but the strip is still an approximation: it samples the parent
-    dummy translation once per interval, decimates the 1 s history to 16 spans, stretches
-    s1847 once along the strip and fades vertex alpha by tail index (`Look::Ribbon` draw).
-    Traced from the disc param tree (test `glide_ribbon_reads_f0000134_action_40`): texture
-    s1847, additive, width 0.06 m, sample interval 1/60 s, life 1.0 s, 16 segments, white
-    alpha 0.235; root action 34 spins about Y at 201 rad/s; the TAE builds 3 copies at scale
-    1.5 (Xenia `private/xenia/glide_ids.jsonl` n=73-75, caller `0x828a816c`, routine
-    `0x828a8088`). Lead: the 360 PE's five `FXParticleAppearance_*` class-name strings are
-    Model, Billboard, Distortion, RadialBlur and Tracer, matching actions 61/59/43/107, so
-    action 40 should be the Tracer (`FXParticleAppearance_Tracer` string at `0x8223104f`);
-    locate its vtable/update/draw (`q const` finds no xref, try Ghidra strings/x-refs) to
-    settle per-sample width/colour vs current age, UV stretch vs repeat, how the sample point
-    is formed (dummy world position vs node transform plus the action-34 spin), the segment
-    decimation, and the fade. Verify against the 360 captures `private/xenia/shots/glide_1s6.png`,
-    `glide_2s6.png`, `glide_3s6.png` with matched `--map m4000 --yaw -90 --hold v,w,ctrl
-    --hold-delay 7 --burst` shots. `--sfx 134` preview is a dead end: it spawns 20 m ahead but
-    the shot dumps `total_active_sfx=0`.
+  - **Glide Boost VFX 1:1** (action-40 ribbon `f0000134`, `acvd-game::sfx`): action 40 is the
+    Tracer, traced (see Done "Glide Boost start ascent & ribbon trail"): registered at
+    `0x83198538`, def reader `0x835b3e10`, per-segment update `0x83197e90` -> `0x835b48f0` ->
+    strip emitter `0x83110dd0` / `0x83118b68`; width/colour/UV are evaluated per emitted sample
+    and alpha fades over slot 15 (`def+0x1c`, 0.5 s). `Look::Ribbon` now does this
+    (`ribbon_batch`, tests `glide_ribbon_reads_f0000134_action_40` and
+    `ribbon_batch_fades_and_sizes_each_sample_by_its_age`). Remaining: confirm the live 360
+    values with `private/xenia/ribbon_seg.txt` (the `boost_glide` recipe did not reach the glide
+    that run: `glide=0`, no `f134`), settle the cross-section orientation (the 360 crosses two
+    tangents; the rewrite uses the camera) and compare to `private/xenia/shots/glide_{1,2,3}s6.png`.
+    The CLI cannot stagger Ctrl after boost (`--hold v,w,ctrl` leaves `glide=0`), so the live
+    capture needs a recipe or a staged input. `--sfx 134` preview is a dead end (spawns 20 m
+    ahead, `total_active_sfx=0`).
   - High Boost / Boost Charge leftovers (burst phases, charge curve, decay, re-fire, and EN drain done; see
     Done "High Boost and Boost Charge" and "Generator Energy (EN) drain & recharge"): the
     boost-off ground walk-brake gate (`0x8283fc10` -> `0x82845590` -> `0x8283f3d0`, which holds

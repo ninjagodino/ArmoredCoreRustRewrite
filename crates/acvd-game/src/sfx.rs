@@ -798,6 +798,8 @@ enum Look {
         interval: f32,
         life: f32,
         segments: usize,
+        /// Seconds of sample age the segment alpha fades over (slot 15, `def+0x1c`).
+        fade: f32,
         color: ColorCurve,
     },
 }
@@ -846,10 +848,87 @@ fn look(id: i32, l: &ParamList) -> Option<Look> {
             interval: tick(l, 9).max(1.0 / 240.0),
             life: tick(l, 10).max(0.0),
             segments: int(l, 12).max(1) as usize,
+            // Slot 15 is the age span the segment alpha fades over (`def+0x1c`, 0x83197e90:
+            // `1 - clamp((cur - prev) / def[0x1c])`). f0000134 stores 0.5 s.
+            fade: tick(l, 15),
             color: color_curve(p(16)),
         },
         _ => return None,
     })
+}
+
+/// Build the action-40 Tracer strip from time-stamped history samples.
+///
+/// The 360 per-segment update (`0x83197e90`) writes one vertex pair per `segments` sample and
+/// evaluates width, colour and alpha from *that sample's* age (`r5+0x10`), not from the node's
+/// current age; the alpha fades over `def[0x1c]` (`slot 15`). The strip UVs are
+/// `(u across width, v along length)` (`0x83110dd0`: both side vertices share `V`). Vertices are
+/// relative to `head`, which is the current effect-point world position.
+#[allow(clippy::too_many_arguments)]
+fn ribbon_batch(
+    pts: &[(f32, Vec3)],
+    head: Vec3,
+    t: f32,
+    life: f32,
+    fade_span: f32,
+    segments: usize,
+    width: &Curve,
+    color: &ColorCurve,
+    k: f32,
+    camera: Vec3,
+) -> Batch {
+    let mut b = Batch::default();
+    let n = pts.len();
+    if n < 2 {
+        return b;
+    }
+    // Keep at most `segments` spans by walking the history at an even stride.
+    let count = (segments.max(1) + 1).min(n);
+    let pick = |i: usize| -> (f32, Vec3) {
+        if count == n {
+            pts[i]
+        } else {
+            pts[(i * (n - 1)) / (count - 1)]
+        }
+    };
+    for i in 0..count {
+        let (st, p) = pick(i);
+        let (_, prev) = pick(i.saturating_sub(1));
+        let (_, next) = pick((i + 1).min(count - 1));
+        let age = (t - st).clamp(0.0, life);
+        let mut side = (next - prev).cross(camera - p);
+        if side.length_squared() < 1e-8 {
+            side = (next - prev).cross(Vec3::Y);
+        }
+        if side.length_squared() < 1e-8 {
+            side = Vec3::X;
+        }
+        let half = (width.at(age) * k).max(0.0) * 0.5;
+        let side = side.normalize() * half;
+        let v = if life > 0.0 {
+            (age / life).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let c = color.at(age);
+        let a = if fade_span > 0.0 {
+            (1.0 - age / fade_span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let col = [c.x, c.y, c.z, c.w * a];
+        b.pos.push((p - head - side).to_array());
+        b.pos.push((p - head + side).to_array());
+        b.uv.push([0.0, v]);
+        b.uv.push([1.0, v]);
+        b.color.push(vertex_color(col));
+        b.color.push(vertex_color(col));
+    }
+    for i in 0..count - 1 {
+        let a = (i * 2) as u32;
+        b.index.extend([a, a + 1, a + 2, a + 1, a + 3, a + 2]);
+    }
+    b
 }
 
 #[derive(Clone, Debug)]
@@ -1873,6 +1952,7 @@ impl NodeRt {
                 interval,
                 life,
                 segments,
+                fade,
                 color,
             } => {
                 // Sample the parent effect point (the dummy), not this node's own offset:
@@ -1890,55 +1970,23 @@ impl NodeRt {
                 }
                 let floor = t - life;
                 self.ribbon.retain(|(st, _)| *st >= floor);
-                let mut pts: Vec<Vec3> = self.ribbon.iter().map(|(_, p)| *p).collect();
-                if emit && pts.last().is_none_or(|p| p.distance_squared(anchor) > 1e-6) {
-                    pts.push(anchor);
+                // Keep the live head even between interval samples so the strip reaches the
+                // nozzle instead of lagging one sample behind.
+                let mut pts: Vec<(f32, Vec3)> = self.ribbon.clone();
+                if emit && pts.last().is_none_or(|(_, p)| p.distance_squared(anchor) > 1e-6) {
+                    pts.push((t, anchor));
                 }
                 if pts.len() < 2 {
                     return;
                 }
-                // Keep at most `segments` spans by walking the history at an even stride.
-                let spans = (*segments).max(1);
-                let n = pts.len();
-                let count = (spans + 1).min(n);
-                let pick = |i: usize| -> Vec3 {
-                    if count == n {
-                        pts[i]
-                    } else {
-                        pts[(i * (n - 1)) / (count - 1)]
-                    }
-                };
-                let col = color.at(t);
-                let half = (width.at(t) * k).max(0.0) * 0.5;
-                let mut b = Batch::default();
-                for i in 0..count {
-                    let p = pick(i);
-                    let prev = pick(i.saturating_sub(1));
-                    let next = pick((i + 1).min(count - 1));
-                    let mut side = (next - prev).cross(cx.camera - p);
-                    if side.length_squared() < 1e-8 {
-                        side = (next - prev).cross(Vec3::Y);
-                    }
-                    if side.length_squared() < 1e-8 {
-                        side = Vec3::X;
-                    }
-                    let side = side.normalize() * half;
-                    let u = i as f32 / (count - 1) as f32;
-                    // The texture is a soft radial puff: stretching it once along the trail
-                    // gives a fuzzy line that fades at both ends; the vertex alpha also fades
-                    // the oldest samples so the strip vanishes when its life runs out.
-                    let c = [col.x, col.y, col.z, col.w * u];
-                    b.pos.push((p - anchor - side).to_array());
-                    b.pos.push((p - anchor + side).to_array());
-                    b.uv.push([u, 1.0]);
-                    b.uv.push([u, 0.0]);
-                    b.color.push(vertex_color(c));
-                    b.color.push(vertex_color(c));
-                }
-                for i in 0..count - 1 {
-                    let a = (i * 2) as u32;
-                    b.index.extend([a, a + 1, a + 2, a + 1, a + 3, a + 2]);
-                }
+                // 0x83197e90 -> 0x835b48f0 evaluates width, colour and fade *per emitted
+                // sample* from that sample's own age (`r5+0x10`), not from the node's current
+                // age. The segment alpha is `1 - clamp(age / def[0x1c])`; f0000134's slot 15
+                // (`def+0x1c`) is 0.5 s, so only the newest half of the 1 s history is opaque.
+                let fade_span = if *fade > 0.0 { *fade } else { *life };
+                let b = ribbon_batch(
+                    &pts, anchor, t, *life, fade_span, *segments, width, color, k, cx.camera,
+                );
                 if self.visual.is_none() {
                     let tex = cx.lib.texture(*texture, cx.images);
                     let material = cx.shared_material(tex, *blend, Vec4::ONE);
@@ -3098,11 +3146,12 @@ mod tests {
 
     use acvd_data::find;
     use acvd_data::generated::sfx::{PARAM_ENVSFXPARAM_BIN, PARAM_MAPSFXPARAM_BIN};
-    use bevy::prelude::{Assets, Image, StandardMaterial, Vec2, Vec4};
+    use bevy::prelude::{Assets, Image, StandardMaterial, Vec2, Vec3, Vec4};
 
     use super::{
-        cached_material, ground_sfx_id, qb_sfx_id, qb_tae_ffx, rear_stick, Blend, GROUND_ROW_KICK,
-        GROUND_ROW_LAND, GROUND_ROW_SLIDE, GROUND_ROW_WALK, QB_LARGE_SCALE, QB_SHORTAGE_SCALE,
+        cached_material, ground_sfx_id, qb_sfx_id, qb_tae_ffx, rear_stick, ribbon_batch, Blend,
+        ColorCurve, Curve, GROUND_ROW_KICK, GROUND_ROW_LAND, GROUND_ROW_SLIDE, GROUND_ROW_WALK,
+        QB_LARGE_SCALE, QB_SHORTAGE_SCALE,
     };
     use crate::collision::GroundSurface;
 
@@ -3417,6 +3466,7 @@ mod tests {
             interval,
             life,
             segments,
+            fade,
             color,
         }) = find_ribbon(&roots)
         else {
@@ -3428,10 +3478,62 @@ mod tests {
         assert!((interval - 1.0 / 60.0).abs() < 1e-5, "one tick sample");
         assert!((life - 1.0).abs() < 1e-5, "1 s trail life");
         assert_eq!(*segments, 16);
+        assert!((*fade - 0.5).abs() < 1e-5, "0.5 s segment alpha fade (slot 15)");
         let c = color.at(0.0);
         assert!(
             (c.x - 1.0).abs() < 1e-3 && (c.w - 0.235).abs() < 1e-3,
             "white alpha 0.235, got {c:?}"
         );
+    }
+
+    #[test]
+    fn ribbon_batch_fades_and_sizes_each_sample_by_its_age() {
+        // Width 0 m at age 0 -> 1 m at age 1 s; constant white.
+        let width = Curve {
+            keys: vec![(0.0, 0.0), (1.0, 1.0)],
+            step: false,
+            cyclic: false,
+        };
+        let color = ColorCurve {
+            keys: vec![(0.0, Vec4::new(1.0, 1.0, 1.0, 0.8))],
+            step: false,
+            cyclic: false,
+        };
+        // History at ages 1.0, 0.5 and 0.0 s behind the head (t = 1.0), straight along -Z.
+        let pts = [
+            (0.0, Vec3::new(0.0, 0.0, 0.0)),
+            (0.5, Vec3::new(0.0, 0.0, -1.0)),
+            (1.0, Vec3::new(0.0, 0.0, -2.0)),
+        ];
+        let b = ribbon_batch(
+            &pts,
+            Vec3::ZERO,
+            1.0,
+            1.0,
+            0.5,
+            2,
+            &width,
+            &color,
+            1.0,
+            Vec3::new(0.0, 10.0, 0.0),
+        );
+        assert_eq!(b.pos.len(), 6, "3 samples x 2 side vertices");
+        assert_eq!(b.uv.len(), 6);
+        let width_at = |i: usize| {
+            (Vec3::from_array(b.pos[i * 2]) - Vec3::from_array(b.pos[i * 2 + 1])).length()
+        };
+        // Width from the per-sample age, not the node's current age (which would be 0 m).
+        assert!((width_at(0) - 1.0).abs() < 1e-4, "age 1.0 s -> 1 m");
+        assert!((width_at(1) - 0.5).abs() < 1e-4, "age 0.5 s -> 0.5 m");
+        assert!((width_at(2) - 0.0).abs() < 1e-4, "age 0 s -> 0 m");
+        // Alpha `1 - age / 0.5 s`, clamped: the two older samples are fully faded.
+        assert!((b.color[0][3] - 0.0).abs() < 1e-4);
+        assert!((b.color[2][3] - 0.0).abs() < 1e-4);
+        assert!((b.color[4][3] - 0.8).abs() < 1e-4);
+        // UV: U across the width, V advances with age (0 newest -> 1 oldest).
+        assert_eq!(b.uv[0], [0.0, 1.0]);
+        assert_eq!(b.uv[1], [1.0, 1.0]);
+        assert_eq!(b.uv[4], [0.0, 0.0]);
+        assert_eq!(b.uv[5], [1.0, 0.0]);
     }
 }
