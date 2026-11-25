@@ -189,6 +189,7 @@ pub enum UiAction {
     DisplayParamStep(DisplayParam, i8),
     ShadowDistanceStep(i8),
     VolumeStep(AudioChannel, i8),
+    ComVoiceStep(i8),
     ViewAction(GarageViewAction),
     ToggleViewUi,
     QuitToDesktop,
@@ -339,6 +340,7 @@ pub enum WheelAdjust {
     DisplayParam(DisplayParam),
     ShadowDistance,
     Volume(AudioChannel),
+    ComVoice,
     PaintRgb(usize),
     PaintCamo,
     PaintCamoScale,
@@ -367,6 +369,9 @@ impl UiAction {
             }
             Self::SelectOptionRow(OptionRow::Volume(ch)) | Self::VolumeStep(ch, _) => {
                 Some(WheelAdjust::Volume(ch))
+            }
+            Self::SelectOptionRow(OptionRow::ComVoice) | Self::ComVoiceStep(_) => {
+                Some(WheelAdjust::ComVoice)
             }
             Self::PaintRgbDelta(comp, _) => Some(WheelAdjust::PaintRgb(comp)),
             Self::PaintCamoDelta(_) => Some(WheelAdjust::PaintCamo),
@@ -480,6 +485,7 @@ pub enum SliderTrackTarget {
     DisplayParam(DisplayParam),
     ShadowDistance,
     Volume(AudioChannel),
+    ComVoice,
     PaintCamoScale,
     DecalScale,
     DecalRotate,
@@ -665,8 +671,9 @@ fn options_row_desc(tab: OptionsTab, cursor: usize) -> &'static str {
             1 => "Adjust background music volume\nin Garage and Sortie.",
             2 => "Adjust weapon, booster, and\ncombat sound effects volume.",
             3 => "Adjust menu navigation and\nUI feedback sound volume.",
-            4 => "Return to the Garage main menu.",
-            5 => "Exit the game and return\nto the desktop.",
+            4 => "Select the CPU voice that reports\nAP, energy, and combat status.",
+            5 => "Return to the Garage main menu.",
+            6 => "Exit the game and return\nto the desktop.",
             _ => "",
         },
     }
@@ -2899,6 +2906,18 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::ComVoiceStep(delta) => {
+                state.cursor = OptionRow::ComVoice.cursor_index();
+                step_com_voice_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
             UiAction::QuitToDesktop => {
                 options.app_exit.write(AppExit::Success);
                 return;
@@ -3167,6 +3186,17 @@ pub fn handle_input(
                         &mut audio_assets,
                         &mut state,
                         channel,
+                        delta,
+                    );
+                }
+                WheelAdjust::ComVoice => {
+                    state.cursor = OptionRow::ComVoice.cursor_index();
+                    step_com_voice_setting(
+                        &mut commands,
+                        &mut options,
+                        &mut cues,
+                        &mut audio_assets,
+                        &mut state,
                         delta,
                     );
                 }
@@ -3646,6 +3676,17 @@ pub fn handle_input(
                 );
                 return;
             }
+            (OptionsTab::Sound, 4) => {
+                step_com_voice_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
             _ => {}
         }
     }
@@ -3744,7 +3785,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
         GarageScreen::Options => match state.options_tab {
             OptionsTab::Graphics => 9, // Fullscreen, UI Scale, HUD Sway, Gamma, Brightness, Contrast, Shadow Dist, Back, Quit
-            OptionsTab::Sound => 6,    // Master, Music, SFX, Menu/UI, Back, Quit to Desktop
+            OptionsTab::Sound => 7, // Master, Music, SFX, Menu/UI, COM Voice, Back, Quit to Desktop
         },
         GarageScreen::ViewMode => 0,
     }
@@ -3881,6 +3922,29 @@ fn step_volume_setting(
             channel.label(),
             options.settings.channel_percent(channel)
         ),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+}
+
+fn step_com_voice_setting(
+    commands: &mut Commands,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    state: &mut GarageState,
+    delta: i8,
+) {
+    let before = options.settings.com_voice();
+    options.settings.step_com_voice(delta);
+    options.settings.save();
+    sound::cue(commands, cues, audio_assets, CUE_MOVE);
+    let after = options.settings.com_voice();
+    if after != 0 && after != before {
+        cues.com_voice(commands, audio_assets, after, crate::voice::msg::PREVIEW);
+    }
+    state.set_banner(
+        format!("COM VOICE: {}", options.settings.com_voice_label()),
         Color::srgb(0.45, 0.92, 0.62),
     );
     state.ui_dirty = true;
@@ -5176,6 +5240,31 @@ pub fn handle_slider_track_drag(
                 } else {
                     state.cursor = row;
                     state.ui_dirty = true;
+                }
+                changed = true;
+            }
+        }
+        SliderTrackTarget::ComVoice => {
+            let prev = options.settings.com_voice();
+            options.settings.set_com_voice_from_fill(fill);
+            let next = options.settings.com_voice();
+            if next != prev || just_pressed {
+                options.settings.save();
+                let row = OptionRow::ComVoice.cursor_index();
+                if in_pause_options {
+                    pause_state.cursor = row;
+                    pause_state.dirty = true;
+                } else {
+                    state.cursor = row;
+                    state.ui_dirty = true;
+                }
+                if next != 0 && next != prev {
+                    cues.com_voice(
+                        &mut commands,
+                        &mut audio_assets,
+                        next,
+                        crate::voice::msg::PREVIEW,
+                    );
                 }
                 changed = true;
             }
@@ -7075,7 +7164,33 @@ fn spawn_garage_options_menu(
                     .insert((Button, UiAction::VolumeStep(channel, 1)));
             }
 
-            (4, 5)
+            // Row 4: COM / operator voice pack (OFF, Type 1..5 on disc; sheets/voice.csv).
+            let cv_row = OptionRow::ComVoice.cursor_index();
+            let cv_slider = kit.spawn_slider_row(
+                commands,
+                list,
+                "COM VOICE",
+                settings.com_voice_label(),
+                settings.com_voice_fill(),
+                None,
+                cursor == cv_row,
+                104.0,
+                scale,
+            );
+            commands
+                .entity(cv_slider.row)
+                .insert((Button, UiAction::SelectOptionRow(OptionRow::ComVoice)));
+            commands
+                .entity(cv_slider.track)
+                .insert(SliderTrack(SliderTrackTarget::ComVoice));
+            commands
+                .entity(cv_slider.dec_btn)
+                .insert((Button, UiAction::ComVoiceStep(-1)));
+            commands
+                .entity(cv_slider.inc_btn)
+                .insert((Button, UiAction::ComVoiceStep(1)));
+
+            (5, 6)
         }
     };
 
@@ -10765,7 +10880,7 @@ mod tests {
                 sz.x
             );
         }
-        for (tab, count) in [(OptionsTab::Graphics, 9usize), (OptionsTab::Sound, 6usize)] {
+        for (tab, count) in [(OptionsTab::Graphics, 9usize), (OptionsTab::Sound, 7usize)] {
             for i in 0..count {
                 let desc = options_row_desc(tab, i);
                 assert!(!desc.is_empty(), "options_row_desc({tab:?}, {i}) is empty");
@@ -10847,6 +10962,14 @@ mod tests {
         assert_eq!(
             UiAction::VolumeStep(AudioChannel::Music, 1).wheel_adjust(),
             Some(WheelAdjust::Volume(AudioChannel::Music))
+        );
+        assert_eq!(
+            UiAction::SelectOptionRow(OptionRow::ComVoice).wheel_adjust(),
+            Some(WheelAdjust::ComVoice)
+        );
+        assert_eq!(
+            UiAction::ComVoiceStep(-1).wheel_adjust(),
+            Some(WheelAdjust::ComVoice)
         );
         assert_eq!(
             UiAction::PaintRgbDelta(0, 16).wheel_adjust(),

@@ -89,6 +89,7 @@ mod settings;
 mod sfx;
 mod sound;
 mod targets;
+mod voice;
 mod weapons;
 
 use std::path::PathBuf;
@@ -672,6 +673,7 @@ fn main() {
         },
         play_bgm: shot.is_none() && !boot_enabled,
     })
+    .add_plugins(voice::ComVoicePlugin)
     .add_plugins(env::EnvPlugin { disc: disc.clone() })
     .add_plugins(lens_flare::LensFlarePlugin { disc: disc.clone() })
     .insert_resource(ClearColor(Color::srgb(0.32, 0.36, 0.42)))

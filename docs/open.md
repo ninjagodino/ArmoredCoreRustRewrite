@@ -418,3 +418,14 @@ in order:
 - **Mission events** (EVD), **AI** (decompiled Lua in `private/lua360` from the ISO, with the
   `LogAI` state names; no sheet yet).
 
+
+- **COM / operator voice follow-ups** (`acvd-game::voice`, `sheets/voice.csv`): only the on-disc
+  Type 1..5 packs (`acv2_voice_com_00..04.fev`) are selectable; Type 6..18 are DLC (`com_05..17`,
+  `dlc_sound:/%s_com_%02d.fev` `0x82001f94`) and need the DLC mount. The callout set is the
+  reliable combat subset (energy/AP thresholds, scan/combat mode, AC disabled, beginning
+  operation); the mission-only lines (beacon, objective, enemy AC weight class, operation
+  pattern) need the mission/AI message dispatcher. AC TEST did not fire the `AI_MESSAGE_SOUND_MAP`
+  path (`0x82449518` / `0x824493d0`) in the Xenia probe (`private/xenia/voice_en.jsonl`); a
+  real mission run would confirm the offset->event table live. Voice currently rides the SFX
+  bus; a dedicated Voice Volume slider (the 360 `@VoiceVolumeSl`/`@VoiceVolumeValue` strings,
+  `0x8204c8c4`/`0x8204c8d4`) is not exposed yet.

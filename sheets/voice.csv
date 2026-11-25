@@ -1,0 +1,46 @@
+topic,key,value,evidence
+packs,off,0 = OFF (no COM voice),VoiceNo save key 0x82002418 (read 0x82308738 / write 0x823088a8); 0xFF is the UI's no-selection sentinel in ComVoicePlayObj 0x82675378
+packs,on_disc,"Type 1..Type 5 = acv2_voice_com_00.fev .. acv2_voice_com_04.fev, bank com_00.fsb .. com_04.fsb (com_00#0 is sample 0010001.wav)",disc sound/acv2_voice_com_00..04.fev and sound/com_00..04.fsb; path format dlc_sound:/%s_com_%02d.fev (0x82001f94) with %s=acv2_voice
+packs,dlc,"Type 6..Type 18 = DLC com_05 .. com_17 (not on this disc as voice FEVs)","lang/en/text/menu/menu.fmg ids 1570..1582 (Type 6..18); dlc voice path 0x82001f94; on-disc sound/com_05..17.fsb are the mission operator banks (acv2_com_NN_*.fev)"
+labels,base,"OFF, Type 1, Type 2, Type 3, Type 4, Type 5","lang/en/text/menu/menu.fmg 1540 OFF, 1541..1545 Type 1..5; 1566 CPU Voice"
+labels,dlc,"Type 6..Type 18","lang/en/text/menu/menu.fmg 1570..1573 Type 6..9 and 1574..1582 Type 10..18"
+title,com_voice,"Select the CPU voice you want to use.","lang/en/text/menu/menu.fmg 1566 CPU Voice; lang/en/text/menu/linehelp_xbox.fmg 22019; system settings builder 0x825e1d80 adds @ComVoiceCombText (0x8204c818) with help id 0x5603=22019"
+project,acv2_voice,project index 3 in the sound project-name table,project names 0x8371c658 (acv2 / acv2_bgm / acv2_bgm_menu / acv2_voice / acv2_strem / scene / rain / ow_charge / Boss / delay / owvoice); project loader 0x82b48098
+format,voice_event,%08d,format table 0x8371c688 index 8 (%08d at 0x820e7880); Sound_formatCue 0x82b47758; play by name 0x82b47850
+paramdef,AI_MESSAGE_SOUND_MAP,text_id u32 +0x0 voice_offset0 u32 +0x4 voice_offset1 u32 +0x8 voice_offset2 u32 +0xc b_use_call_sign u8 +0x10,param/def/aimessagesoundmap.def (PARAMDEF format 104); rows param/aisys.bin
+tsmap,lang/en/text/ai/aisys.tsmap,row id = AI message id 0..44; every row b_use_call_sign=1,lang/en/text/ai/aisys.tsmap (loaded 0x82449bd8)
+text,lang/en/text/ai/aisys.fmg,text_id 9001..9044 says the line,lang/en/text/ai/aisys.fmg
+voice,playback,"each offset>0 becomes event %08d: offset 1..37 -> 10000+offset; 38 -> 10101; 39 -> 10201; 40 -> 10202; 41 -> 10203; 42 -> 20101; 43 -> 20102; 44 -> 20103","AI message voice wrapper 0x82449518 -> 0x824492c0; FEV event sets of acv2_voice_com_00..04 (all contain 10001..10037 + 10101 + 10201..10203 + 20101..20103); probe private/xenia/voice.jsonl"
+messages,1,"offset 1 = AP 50% (text 9018)","lang/en/text/ai/aisys.tsmap row 18; aisys.fmg 9018"
+messages,2,"offset 2 = AP 30% (text 9019)",aisys.tsmap row 19
+messages,3,"offset 3 = AC disabled (text 9020)",aisys.tsmap row 20
+messages,14,"offset 14 = Enemy AC destroyed (text 9026)",aisys.tsmap row 26
+messages,15,"offset 15 = Damage critical (text 9027)",aisys.tsmap row 27
+messages,16,"offset 16 = Beacon detected (text 9028)",aisys.tsmap row 28
+messages,17,"offset 17 = Arriving at objective (text 9029)",aisys.tsmap row 29
+messages,18,"offset 18 = Target confirmed (text 9030)",aisys.tsmap row 30
+messages,19,"offset 19 = Beginning operation (text 9031)",aisys.tsmap row 31
+messages,20,"offset 20 = Operation successful (text 9032)",aisys.tsmap row 32
+messages,21,"offset 21 = Operation failed (text 9033)",aisys.tsmap row 33
+messages,22,"offset 22 = Energy at 30% (text 9014)",aisys.tsmap row 14; aisys.fmg 9014
+messages,23,"offset 23 = Energy depleted (text 9015)",aisys.tsmap row 15; aisys.fmg 9015
+messages,24,"offset 24 = Target sighted. Engaging. (text 9001)",aisys.tsmap row 1; aisys.fmg 9001
+messages,25,"offset 25 = Target destroyed (text 9006)",aisys.tsmap row 6; aisys.fmg 9006
+messages,26,"offset 26 = System: Scan Mode (text 9016)",aisys.tsmap row 16; aisys.fmg 9016
+messages,27,"offset 27 = System: Combat Mode (text 9017)",aisys.tsmap row 17; aisys.fmg 9017
+messages,29,"offset 29 = AC power impaired (text 9010)",aisys.tsmap row 10; aisys.fmg 9010
+messages,30,"offset 30 = Energy output impaired (text 9011)",aisys.tsmap row 11; aisys.fmg 9011
+messages,31,"offset 31 = Computational power impaired (text 9012)",aisys.tsmap row 12; aisys.fmg 9012
+messages,32,"offset 32 = Camera impaired (text 9013)",aisys.tsmap row 13; aisys.fmg 9013
+messages,33,"offset 33 = Enemy AC sighted (text 9034..9040 prefix)",aisys.tsmap rows 34..40 voice_offset0
+messages,34,"offset 34 = Medium-Weight Bipedal (text 9034)",aisys.tsmap row 34 voice_offset1; aisys.fmg 9034
+messages,35,"offset 35 = Lightweight Bipedal (text 9035)",aisys.tsmap row 35 voice_offset1; aisys.fmg 9035
+messages,36,"offset 36 = Heavyweight Bipedal (text 9036)",aisys.tsmap row 36 voice_offset1; aisys.fmg 9036
+messages,37,"offset 37 = Lightweight Reverse Jointed (text 9037)",aisys.tsmap row 37 voice_offset1; aisys.fmg 9037
+messages,38,"offset 38 = Heavyweight Reverse Jointed (text 9038)",aisys.tsmap row 38 voice_offset1; aisys.fmg 9038
+messages,39,"offset 39 = Tetrapod (text 9039)",aisys.tsmap row 39 voice_offset1; aisys.fmg 9039
+messages,40,"offset 40 = Tank (text 9040)",aisys.tsmap row 40 voice_offset1; aisys.fmg 9040
+messages,41,"offset 41 = Operation change: pattern 1 (text 9041)",aisys.tsmap row 41; aisys.fmg 9041
+messages,42,"offset 42 = Operation change: pattern 2 (text 9042)",aisys.tsmap row 42; aisys.fmg 9042
+messages,43,"offset 43 = Operation change: pattern 3 (text 9043)",aisys.tsmap row 43; aisys.fmg 9043
+messages,44,"offset 44 = Test OK. Continuing operation. (text 9044)",aisys.tsmap row 44; aisys.fmg 9044

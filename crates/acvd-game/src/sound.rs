@@ -47,6 +47,8 @@ pub enum AudioBus {
 pub struct Cues {
     disc: Disc,
     projects: Vec<(fev::Project, AudioBus)>,
+    /// Lazily loaded COM voice projects, keyed by pack index (`1..=5` → `acv2_voice_com_00..04`).
+    voices: HashMap<u8, fev::Project>,
     banks: HashMap<String, fsb::Bank>,
     decoded: HashMap<(String, u32), Handle<AudioSource>>,
     missing: HashSet<String>,
@@ -77,6 +79,7 @@ impl Cues {
         Self {
             disc: disc.clone(),
             projects,
+            voices: HashMap::new(),
             banks: HashMap::new(),
             decoded: HashMap::new(),
             missing: HashSet::new(),
@@ -116,6 +119,17 @@ impl Cues {
             }
             return Vec::new();
         }
+        self.play_waves(commands, assets, waves, bus, looping)
+    }
+
+    fn play_waves(
+        &mut self,
+        commands: &mut Commands,
+        assets: &mut Assets<AudioSource>,
+        waves: Vec<fev::Wave>,
+        bus: AudioBus,
+        looping: bool,
+    ) -> Vec<Entity> {
         let bus_vol = match bus {
             AudioBus::Sfx => self.sfx_volume,
             AudioBus::Ui => self.ui_volume,
@@ -133,6 +147,54 @@ impl Cues {
             spawned.push(commands.spawn((AudioPlayer(handle), settings, bus)).id());
         }
         spawned
+    }
+
+    /// Plays one COM / operator voice line: `voice` is the pack index (`1..=5` → on-disc
+    /// `acv2_voice_com_00..04.fev`) and `offset` is the `AI_MESSAGE_SOUND_MAP` voice offset
+    /// (`sheets/voice.csv`). Returns the spawned audio entities.
+    pub fn com_voice(
+        &mut self,
+        commands: &mut Commands,
+        assets: &mut Assets<AudioSource>,
+        voice: u8,
+        offset: u32,
+    ) -> Vec<Entity> {
+        let Some(id) = crate::voice::event_id(offset) else {
+            return Vec::new();
+        };
+        let cue = format!("{id:08}");
+        let waves = {
+            let Some(project) = self.voice_project(voice) else {
+                return Vec::new();
+            };
+            project.waves(&cue).into_iter().cloned().collect::<Vec<_>>()
+        };
+        self.play_waves(commands, assets, waves, AudioBus::Sfx, false)
+    }
+
+    fn voice_project(&mut self, voice: u8) -> Option<&fev::Project> {
+        if voice == 0 || voice > crate::settings::COM_VOICE_MAX {
+            return None;
+        }
+        if !self.voices.contains_key(&voice) {
+            let name = format!("acv2_voice_com_{:02}.fev", voice - 1);
+            match self
+                .disc
+                .read(&format!("sound/{name}"))
+                .and_then(|b| fev::read(&b))
+            {
+                Ok(project) => {
+                    self.voices.insert(voice, project);
+                }
+                Err(err) => {
+                    if self.missing.insert(name.clone()) {
+                        eprintln!("sound: {name}: {err:#}");
+                    }
+                    return None;
+                }
+            }
+        }
+        self.voices.get(&voice)
     }
 
     fn source(

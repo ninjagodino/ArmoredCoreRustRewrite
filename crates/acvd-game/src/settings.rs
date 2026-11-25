@@ -27,6 +27,14 @@ pub const DISPLAY_PARAM_MIN: f32 = 0.50;
 /// Maximum multiplier for Gamma / Brightness / Contrast (150%).
 pub const DISPLAY_PARAM_MAX: f32 = 1.50;
 
+/// Highest COM / operator voice pack selectable from the on-disc set (Type 5 =
+/// `acv2_voice_com_04.fev`; Type 6..18 are DLC). `0` is OFF. `sheets/voice.csv`.
+pub const COM_VOICE_MAX: u8 = 5;
+
+fn default_com_voice() -> u8 {
+    1
+}
+
 /// Post-process display tone adjustments exposed in the Graphics Options tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayParam {
@@ -205,6 +213,7 @@ pub enum OptionRow {
     DisplayParam(DisplayParam),
     ShadowDistance,
     Volume(AudioChannel),
+    ComVoice,
 }
 
 impl OptionRow {
@@ -221,6 +230,7 @@ impl OptionRow {
             Self::Volume(AudioChannel::Music) => 1,
             Self::Volume(AudioChannel::Sfx) => 2,
             Self::Volume(AudioChannel::Ui) => 3,
+            Self::ComVoice => 4,
         }
     }
 }
@@ -283,6 +293,10 @@ pub struct GameSettings {
     pub sfx_volume: f32,
     /// Linear menu/UI cue volume multiplier in `0.0..=1.0` (0–100%).
     pub ui_volume: f32,
+    /// COM / operator voice pack: `0` = OFF, `1..=5` = the on-disc `acv2_voice_com_00..04`
+    /// packs (Type 1..5). Retail save key `VoiceNo` (`0x82002418`); `sheets/voice.csv`.
+    #[serde(default = "default_com_voice")]
+    pub com_voice: u8,
 }
 
 impl Default for GameSettings {
@@ -300,6 +314,7 @@ impl Default for GameSettings {
             music_volume: 1.0,
             sfx_volume: 1.0,
             ui_volume: 1.0,
+            com_voice: default_com_voice(),
         }
     }
 }
@@ -324,6 +339,7 @@ impl GameSettings {
         self.music_volume = self.music_volume.clamp(0.0, 1.0);
         self.sfx_volume = self.sfx_volume.clamp(0.0, 1.0);
         self.ui_volume = self.ui_volume.clamp(0.0, 1.0);
+        self.com_voice = self.com_voice.min(COM_VOICE_MAX);
     }
 
     pub fn save(&self) {
@@ -480,6 +496,34 @@ impl GameSettings {
         }
     }
 
+    /// COM voice pack clamped to the selectable range (0 = OFF, 1..=5 = Type 1..5).
+    pub fn com_voice(&self) -> u8 {
+        self.com_voice.min(COM_VOICE_MAX)
+    }
+
+    /// Display label for the current COM voice pack (`OFF`, `TYPE 1`..`TYPE 5`).
+    pub fn com_voice_label(&self) -> &'static str {
+        crate::voice::com_voice_label(self.com_voice())
+    }
+
+    /// Normalized `0.0..=1.0` gauge fill across `OFF..=TYPE 5`.
+    pub fn com_voice_fill(&self) -> f32 {
+        f32::from(self.com_voice()) / f32::from(COM_VOICE_MAX)
+    }
+
+    /// Cycles the COM voice pack through `OFF` then `TYPE 1..TYPE 5` (wraps both ways).
+    pub fn step_com_voice(&mut self, delta_steps: i8) {
+        let count = i16::from(COM_VOICE_MAX) + 1;
+        let next = (i16::from(self.com_voice()) + i16::from(delta_steps)).rem_euclid(count);
+        self.com_voice = next as u8;
+    }
+
+    /// Sets the COM voice pack from a `0.0..=1.0` slider fill.
+    pub fn set_com_voice_from_fill(&mut self, fill: f32) {
+        let last = f32::from(COM_VOICE_MAX);
+        self.com_voice = (fill.clamp(0.0, 1.0) * last).round().clamp(0.0, last) as u8;
+    }
+
     #[cfg(test)]
     pub fn volume_percent(&self) -> u8 {
         self.channel_percent(AudioChannel::Master)
@@ -557,6 +601,22 @@ pub fn apply_volume<'w, 's>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn com_voice_steps_wrap_and_clamp() {
+        let mut s = GameSettings::default();
+        s.com_voice = COM_VOICE_MAX;
+        s.step_com_voice(1);
+        assert_eq!(s.com_voice(), 0);
+        s.step_com_voice(-1);
+        assert_eq!(s.com_voice(), COM_VOICE_MAX);
+        s.com_voice = 99;
+        assert_eq!(s.com_voice(), COM_VOICE_MAX);
+        s.set_com_voice_from_fill(1.0);
+        assert_eq!(s.com_voice(), COM_VOICE_MAX);
+        s.set_com_voice_from_fill(0.0);
+        assert_eq!(s.com_voice(), 0);
+    }
 
     #[test]
     fn volume_steps_clamp_to_percent_range() {
