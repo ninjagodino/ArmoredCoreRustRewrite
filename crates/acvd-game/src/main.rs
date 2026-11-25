@@ -3,7 +3,7 @@
 //!
 //! `acvd-game [design id] [--disc <360 ISO>] [--shot <png>] [--flat] [--yaw <degrees>]
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
-//! [--water <y>]`
+//! [--water <y>] [--cam <x,y,z> --look <x,y,z>]`
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, V boost mode, Space jump,
 //! Shift high boost (quick boost) / hold Shift (or K, gamepad □ + HOLD) Boost Charge Kick, Ctrl glide boost while boosting on the ground
 //! (air clips once it leaves the ground);
@@ -159,6 +159,23 @@ pub struct StartAim {
     pub pitch: Option<f32>,
 }
 
+/// `--cam <x,y,z> --look <x,y,z>`: pin the main camera (Bevy axes) for inspecting effects.
+#[derive(Resource)]
+struct CamOverride {
+    eye: Vec3,
+    look: Vec3,
+}
+
+fn pin_camera(
+    over: Option<Res<CamOverride>>,
+    mut cams: Query<&mut Transform, (With<Camera3d>, Without<env::WaterReflectionCamera>)>,
+) {
+    let Some(over) = over else { return };
+    if let Ok(mut cam) = cams.single_mut() {
+        *cam = Transform::from_translation(over.eye).looking_at(over.look, Vec3::Y);
+    }
+}
+
 /// The map whose models are drawn (`None`: draw the hit meshes or the floor plane).
 #[derive(Resource)]
 pub struct Scene {
@@ -200,6 +217,8 @@ fn main() {
         (None, None, None, false, None, None, None::<Vec3>);
     let (mut clip, mut frame, mut held, mut hold_delay, mut wait) =
         (None, None, Vec::new(), 0.0f32, 0.0);
+    let mut cam_eye: Option<Vec3> = None;
+    let mut cam_look: Option<Vec3> = None;
     let (mut map, mut plane, mut water) = (Some("m4000".to_string()), false, None);
     let (mut layout, mut hits) = (Some("actest".to_string()), false);
     let mut test = targets::TestMode::default();
@@ -247,6 +266,18 @@ fn main() {
             }
             "--pos" => {
                 pos_override = args.next().and_then(|s| {
+                    let v: Vec<f32> = s.split(',').filter_map(|p| p.parse().ok()).collect();
+                    (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
+                });
+            }
+            "--cam" => {
+                cam_eye = args.next().and_then(|s| {
+                    let v: Vec<f32> = s.split(',').filter_map(|p| p.parse().ok()).collect();
+                    (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
+                });
+            }
+            "--look" => {
+                cam_look = args.next().and_then(|s| {
                     let v: Vec<f32> = s.split(',').filter_map(|p| p.parse().ok()).collect();
                     (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
                 });
@@ -372,7 +403,11 @@ fn main() {
     } else {
         garage::Mode::Sortie
     };
-    let piloting = !start_garage && clip.is_none() && frame.is_none();
+    let cam_override = cam_eye.map(|eye| CamOverride {
+        eye,
+        look: cam_look.unwrap_or(eye + Vec3::X * 100.0),
+    });
+    let piloting = !start_garage && clip.is_none() && frame.is_none() && cam_override.is_none();
     // Piloting starts behind the AC, the browser in front of it.
     let start_aim = StartAim { yaw, pitch };
     let yaw = yaw.unwrap_or(if piloting { 0.25 } else { 2.6 });
@@ -641,6 +676,7 @@ fn main() {
                 debris::probe_shot.run_if(in_sortie),
                 orbit.run_if(in_active_sortie),
                 reframe.run_if(in_active_sortie),
+                pin_camera.run_if(in_active_sortie),
             )
                 .chain(),
         )
@@ -683,6 +719,9 @@ fn main() {
                     .chain()
                     .after(pose::animate),
             );
+    }
+    if let Some(o) = cam_override {
+        app.insert_resource(o);
     }
     app.run();
 }

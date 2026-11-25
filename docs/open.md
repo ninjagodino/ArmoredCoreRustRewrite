@@ -106,9 +106,16 @@ in order:
       `Map_Diffuse_alpha` (3), `Map_Diffuse_AlphaMask` (1, `net`), `Map_Diffuse_Add` (41,
       `m0100_03`), `Map_Diffuse _Grow` (2), and `Map_NoLight` (2). `map.rs` now keys its material
       cache by alpha kind and sets `AlphaMode::{Blend, Mask(0.5), Add}` + `cull_mode: None`, and
-      `env::relight` routes `_Add`/`NoLight` to unlit `SkyMaterial`, `_Grow` to `emissive_boost =
-      1.6`, and marks `Blend`/`Add` decals `NotShadowCaster` (removing the opaque black quad
-      background on crater decals).
+      `env::relight` routes `_Add`/`NoLight` to unlit `SkyMaterial`, `_Grow`/`_Glow` to
+      `emissive_boost = 32.0` with `cull_mode: None`, and marks `Blend`/`Add` decals
+      `NotShadowCaster` (removing the opaque black quad background on crater decals). The two
+      soft white glows beside the first bridge in `ac_test_start.png` are the `o0006`
+      `signboardGrow` movie screens (`movie` texture still missing, so they fall back to a plain
+      surface); the nearby `o2135` street-lamp heads (`Map_Diffuse _Grow` / `Simple_Grow` LODs) and
+      `m0510` traffic strips share the same emission path. `Flver_ColDifEmi.fpo` squares the
+      emission texture; the display-referred boost is calibrated against the 360 shot because the
+      360 MTD keeps `g_EmissionCoef 0.3` (`material/mtd.bnd`) and Bevy's bloom weights a bright
+      pixel by screen area.
   - Open, in order: (1) sky leftovers: which pixel shader the sky pass binds (NoLightNoFog vs
     Flver_Sky.fpo with fog; the colour already matches the 360 shot). (2) c0 / c16 / c19 / c136
     values (taken as 1, no SSAO).

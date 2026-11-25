@@ -938,11 +938,19 @@ fn relight(
             }
             continue;
         }
-        let emissive_boost: f32 = if mtd_low.contains("grow") || mtd_low.contains("glow") {
-            1.6
-        } else {
-            0.0
-        };
+        // `_Grow` / `_Glow` MTDs are emissive fixtures. The two soft white glows either side of
+        // the first bridge in `private/xenia/shots/ac_test_start.png` are the `o0006`
+        // `signboardGrow` movie screens (their `movie` texture is a runtime video surface, so the
+        // rewrite currently falls back to a plain surface), and the small lamps near them are the
+        // `o2135` street-lamp heads (`Map_Diffuse _Grow`, `Simple_Grow` LODs) / `m0510` traffic
+        // strips. `Flver_ColDifEmi.fpo` squares the emission texture and the 360 bloom pass turns
+        // it into the soft halo; the 360 keeps `g_EmissionCoef 0.3` (`material/mtd.bnd`), so the
+        // display-referred boost below is calibrated against that reference instead. Bevy's bloom
+        // weights a bright pixel by screen area, so a sub-metre lens/screen needs a much larger
+        // emissive to keep its halo visible at the 360 shot's viewing distance. The 360 also shows
+        // both screens glowing, so the glow quads are drawn double-sided.
+        let is_grow = mtd_low.contains("grow") || mtd_low.contains("glow");
+        let emissive_boost: f32 = if is_grow { 32.0 } else { 0.0 };
         let diffuse2_handle = meta.and_then(|m| m.diffuse2.clone());
         let diffuse2_id = diffuse2_handle.as_ref().map(Handle::id);
         let handle = env
@@ -951,6 +959,10 @@ fn relight(
             .or_insert_with(|| {
                 let has_d1 = base.base_color_texture.is_some();
                 let has_d2 = diffuse2_handle.is_some();
+                let mut lit = base.clone();
+                if is_grow {
+                    lit.cull_mode = None;
+                }
                 let diffuse1 = base
                     .base_color_texture
                     .clone()
@@ -959,7 +971,7 @@ fn relight(
                     .clone()
                     .unwrap_or_else(|| env.white_srgb.clone());
                 materials.add(EnvMaterial {
-                    base: base.clone(),
+                    base: lit,
                     extension: EnvLit {
                         params: params(set, has_d1, has_d2, false, emissive_boost),
                         diffuse1,
