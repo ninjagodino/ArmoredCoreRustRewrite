@@ -2633,6 +2633,23 @@ fn step_resolve_world(p: &mut Pilot, position: &mut Vec3, collision: &Collision)
             None => p.airborne = true,
         }
     }
+    // Boosters on make the AC skim the water surface instead of dropping in. Water is a separate
+    // collision class (the water probe `0x829e7be0` masks `0x200002`; the AC body sphere filters
+    // `0x100022` / `0x4100022` at `0x82863ba4` / `0x82863bcc` do not include its `0x200000` class),
+    // so an airborne boost has to clamp its own fall to the surface. Boosters off keeps falling
+    // through to the water return in `pilot`.
+    if p.airborne && (p.boost || p.glide) && p.velocity.y <= 0.0 {
+        if let Some(wy) = collision.ray_down(
+            *position + Vec3::Y * RAY_HALF,
+            position.y - RAY_HALF,
+            Layer::Water,
+        ) {
+            if before_y >= wy && position.y < wy {
+                position.y = wy;
+                p.velocity.y = 0.0;
+            }
+        }
+    }
     step_en(p);
 }
 
@@ -4125,6 +4142,55 @@ mod tests {
         assert_eq!(p.yaw, -1.0);
         assert_eq!(p.velocity, Vec3::ZERO);
         assert!(!p.airborne && !p.glide);
+    }
+
+    /// Boosters on hold the AC on the water surface; boosters off let it fall through into the
+    /// water return.
+    #[test]
+    fn boost_hovers_over_water() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        let collision = Collision::with_hits(
+            vec![
+                crate::collision::Plane {
+                    y: 0.0,
+                    layer: Layer::Ground,
+                },
+                crate::collision::Plane {
+                    y: 10.0,
+                    layer: Layer::Water,
+                },
+            ],
+            Vec::new(),
+        );
+
+        // Boosters on: the falling AC is caught at the 10 m surface and stays there.
+        let mut p = Pilot::new(ctrl, 0);
+        p.airborne = true;
+        p.boost = true;
+        p.velocity = Vec3::new(0.0, -5.0, 0.0);
+        let mut pos = Vec3::new(0.0, 12.0, 0.0);
+        for _ in 0..30 {
+            step(&mut p, &Input::default(), &mut pos, &collision);
+            assert!(pos.y >= 10.0 - 1e-3, "boosted AC sank to {}", pos.y);
+        }
+        assert!((pos.y - 10.0).abs() < 1e-2, "expected hover at 10 m, got {}", pos.y);
+
+        // Boosters off: it falls through the water layer towards the 0 m ground.
+        let mut p = Pilot::new(ctrl, 0);
+        p.airborne = true;
+        p.boost = false;
+        p.velocity = Vec3::new(0.0, -5.0, 0.0);
+        let mut pos = Vec3::new(0.0, 12.0, 0.0);
+        for _ in 0..30 {
+            step(&mut p, &Input::default(), &mut pos, &collision);
+        }
+        assert!(pos.y < 10.0, "boosters off should drop below the surface, got {}", pos.y);
     }
 
     #[test]
