@@ -330,6 +330,15 @@ in order:
     `0x82cb4d98`: base angle = TraceAng + (LockAng − TraceAng) × weight, then aimed at the target
     within LockMin/Max X/Y at LimitRotAngVel 180°/s. Next: the virtual `+0x90` caller that
     computes the weight and the lower-after-idle timer.
+    - **Restored 2026-11-25**: `bay` now keeps a persistent `Shift` resource, so the old
+      `if body.shift.is_none()` gate skipped the whole aim/recoil block on every frame and the
+      hand-arm raise (and its shot kick) never stepped. The block now runs each frame and skips
+      only the hand whose bay shift is active (`Shift::is_active`). Trace with `--shot`: the new
+      `weapons::probe_shot` logs `SHOT ... aim r=(hold weight frame limit turn err aim_y)` per
+      hand every frame (`--hold f --pitch 35` on design 5001: `weight=1.00 frame=1 err=0.0`,
+      `turn` stays 0 while Core Control already holds the barrel on the camera aim). Test
+      `hand_arm_aim_notes_the_jcondata_shoulder` pins the `gun_$(LR)` `_arm01` shoulder, its
+      85 deg LockMaxX, and that the shoulder is a recoil bone.
   - Shot kick (done, see Done): read from `param/jcondata.bin` (`acvd-formats::jcon`), not the
     stale `jcondata.xml`. Open: (1) which weapons take `sniper_$(LR)`: bit 31 from `0x82456f68`
     is set when `0x82479820` (weapon record byte +0x13c == 3) is false and `0x82475ac0`

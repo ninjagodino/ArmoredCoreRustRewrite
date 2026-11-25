@@ -1006,6 +1006,10 @@ struct ArmAim {
     hold: f32,
     weight: f32,
     frame: Option<AimFrame>,
+    /// Degrees the barrel still misses the aim by after the limit and weight (for `SHOT aim`).
+    err: f32,
+    /// Degrees the shoulder is turned this frame (0 when no aim is applied), for `SHOT aim`.
+    turn_deg: f32,
 }
 
 /// Last frame's world rotation of the shoulder's parent, the barrel in shoulder space, and the
@@ -1918,6 +1922,13 @@ pub fn fire(
     }
     let aim = pilot.aim_direction();
     let frames = dt * TICK_RATE;
+    // A shifting hand's weapon is on the rack: its arm overlay owns the bones, and the other
+    // hand keeps aiming normally. `Shift` is a persistent resource, so test the hands, not the
+    // resource's presence.
+    let shifting = body
+        .shift
+        .as_ref()
+        .map_or([false, false], |s| [s.is_active(Hand::Right), s.is_active(Hand::Left)]);
     let sniper_hand = (0..2).find(|&i| arms.hands[i].stance && want[i]).map(|i| {
         if i == 0 {
             Hand::Right
@@ -2320,6 +2331,9 @@ pub fn fire(
                 let hand_aim = fcs
                     .as_deref()
                     .map_or(aim, |f| f.aim_for_hand(0, origin, arms.hands[0].init_speed, aim));
+                if shifting[i] {
+                    continue;
+                }
                 let arm = &mut anims.aim[i];
                 arm.sniper = arms.hands[0].sniper;
                 arm.step(want_wa && arms.hands[0].kind != Kind::Skip && arms.hands[0].kind != Kind::Blade, frames);
@@ -2327,7 +2341,7 @@ pub fn fire(
                     .shoulder
                     .and_then(|s| rigging.aim_frame(s, hand, muzzle, hand_aim));
             }
-            anims.apply_recoil(frames, &mut posed);
+            anims.apply_recoil(frames, shifting, &mut posed);
         }
         return;
     }
@@ -2692,35 +2706,36 @@ pub fn fire(
             arms.salvo_timer = arms.shoulder.burst_interval.max(3.0);
         }
     }
-    if body.shift.is_none() {
-        if let Some(anims) = body.anims.as_mut() {
-            for (i, gun) in arms.hands.iter().enumerate() {
-                let (hand, column) = if i == 0 {
-                    (Hand::Right, "armwep_r")
-                } else {
-                    (Hand::Left, "armwep_l")
-                };
-                let muzzle = points
-                    .iter()
-                    .find(|(_, p, _)| p.column == column && p.id == MUZZLE_POINT)
-                    .map(|(e, _, _)| e);
-                let origin = rigging
-                    .hardpoints
-                    .iter()
-                    .find(|(h, _)| h.hand == hand)
-                    .map_or(ac_tf.translation, |(_, t)| t.translation());
-                let hand_aim = fcs
-            .as_deref()
-            .map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
-                let arm = &mut anims.aim[i];
-                arm.sniper = gun.sniper;
-                arm.step(want[i] && gun.kind != Kind::Skip && !gun.stance, frames);
-                arm.frame = arm
-                    .shoulder
-                    .and_then(|s| rigging.aim_frame(s, hand, muzzle, hand_aim));
+    if let Some(anims) = body.anims.as_mut() {
+        for (i, gun) in arms.hands.iter().enumerate() {
+            let (hand, column) = if i == 0 {
+                (Hand::Right, "armwep_r")
+            } else {
+                (Hand::Left, "armwep_l")
+            };
+            let muzzle = points
+                .iter()
+                .find(|(_, p, _)| p.column == column && p.id == MUZZLE_POINT)
+                .map(|(e, _, _)| e);
+            let origin = rigging
+                .hardpoints
+                .iter()
+                .find(|(h, _)| h.hand == hand)
+                .map_or(ac_tf.translation, |(_, t)| t.translation());
+            let hand_aim = fcs
+                .as_deref()
+                .map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
+            if shifting[i] {
+                continue;
             }
-            anims.apply_recoil(frames, &mut posed);
+            let arm = &mut anims.aim[i];
+            arm.sniper = gun.sniper;
+            arm.step(want[i] && gun.kind != Kind::Skip && !gun.stance, frames);
+            arm.frame = arm
+                .shoulder
+                .and_then(|s| rigging.aim_frame(s, hand, muzzle, hand_aim));
         }
+        anims.apply_recoil(frames, shifting, &mut posed);
     }
 }
 
@@ -5374,18 +5389,25 @@ impl WeaponAnims {
     fn apply_recoil(
         &mut self,
         frames: f32,
+        // A bay shift's arm overlay owns that hand's bones, so its aim and kick wait.
+        skip: [bool; 2],
         posed: &mut Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
     ) {
         for bone in &mut self.recoil_bones {
             let angle = bone.kick.step(frames);
+            if skip[bone.hand as usize] {
+                continue;
+            }
             let Ok((mut transform, _)) = posed.get_mut(bone.entity) else {
                 continue;
             };
             bone.rebase(&transform);
-            let aim = &self.aim[bone.hand as usize];
+            let aim = &mut self.aim[bone.hand as usize];
             let turn = if aim.shoulder == Some(bone.entity) && aim.sniper == bone.sniper {
                 aim.turn(bone.base)
             } else {
+                aim.err = 0.0;
+                aim.turn_deg = 0.0;
                 Quat::IDENTITY
             };
             bone.write(&mut transform, angle, turn);
@@ -5441,7 +5463,7 @@ impl WeaponAnims {
                 wa.tick(want, want, fired, frames);
                 wa.apply(posed);
             }
-            self.apply_recoil(frames, posed);
+            self.apply_recoil(frames, [false, false], posed);
             return;
         }
         for (i, hand) in [Hand::Right, Hand::Left].into_iter().enumerate() {
@@ -5461,7 +5483,7 @@ impl WeaponAnims {
                 arm.apply(posed);
             }
         }
-        self.apply_recoil(frames, posed);
+        self.apply_recoil(frames, [false, false], posed);
     }
 
     /// Resets all weapon, shoulder-pod, weapon-arm, and recoil animations back to their stowed
@@ -5491,6 +5513,8 @@ impl WeaponAnims {
             aim.hold = 0.0;
             aim.weight = 0.0;
             aim.frame = None;
+            aim.err = 0.0;
+            aim.turn_deg = 0.0;
         }
         for bone in &mut self.recoil_bones {
             bone.kick.clock = None;
@@ -5516,6 +5540,40 @@ impl WeaponAnims {
             .chain(self.weapon_arm.iter().flat_map(WeaponArmRig::sample))
             .collect()
     }
+}
+
+/// Logs each hand's arm-raise state during a `--shot` run, so the raise can be traced
+/// (`SHOT aim r=(hold=.. weight=.. err=..)`).
+pub(crate) fn probe_shot(shot: Option<Res<acvd_render::app::Shot>>, anims: Option<Res<WeaponAnims>>) {
+    let Some(shot) = shot else {
+        return;
+    };
+    let Some(anims) = anims else {
+        return;
+    };
+    let path = &shot.path;
+    let side = |a: &ArmAim| {
+        format!(
+            "shoulder={} sniper={} hold={:.0} weight={:.2} frame={} limit={:.0} turn={:.1} err={:.1} aim_y={:.2}",
+            a.shoulder.is_some() as u8,
+            a.sniper as u8,
+            a.hold,
+            a.weight,
+            a.frame.is_some() as u8,
+            a.limit,
+            a.turn_deg,
+            a.err,
+            a.frame.map_or(0.0, |f| f.aim.y)
+        )
+    };
+    // One string per call: probes on other threads write stderr concurrently.
+    let line = format!(
+        "SHOT {} aim r=({}) l=({})",
+        path.display(),
+        side(&anims.aim[0]),
+        side(&anims.aim[1])
+    );
+    eprintln!("{line}");
 }
 
 /// True when any key's rotation or translation differs from the first key.
@@ -5578,7 +5636,9 @@ impl ArmAim {
 
     /// Parent-space turn of the shoulder whose unaimed rotation is `base`, bringing the barrel
     /// toward `aim`, scaled by the weight and clamped to the joint's LockMin/MaxX.
-    fn turn(&self, base: Quat) -> Quat {
+    fn turn(&mut self, base: Quat) -> Quat {
+        self.err = 0.0;
+        self.turn_deg = 0.0;
         let Some(frame) = self.frame.filter(|_| self.weight > 0.0) else {
             return Quat::IDENTITY;
         };
@@ -5594,7 +5654,10 @@ impl ArmAim {
             full
         };
         let world = Quat::IDENTITY.slerp(full, self.weight);
-        frame.parent.inverse() * world * frame.parent
+        self.err = (world * barrel).angle_between(frame.aim).to_degrees();
+        let turn = frame.parent.inverse() * world * frame.parent;
+        self.turn_deg = turn.angle_between(Quat::IDENTITY).to_degrees();
+        turn
     }
 }
 
@@ -6830,5 +6893,62 @@ mod tests {
             wa.tick(false, false, false, 1.0);
         }
         assert_eq!(wa.phase, WeaponArmPhase::Stowed);
+    }
+
+    /// The hand-arm aim needs a `gun_$(LR)` `*_arm01` joint and its LockMin/MaxX from
+    /// `param/jcondata.bin`; without them `apply_recoil` has nothing to turn.
+    #[test]
+    fn hand_arm_aim_notes_the_jcondata_shoulder() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let design = &find(PARAM_ACASSEMBLYDRAWING_BIN, 5001)
+            .expect("design 5001")
+            .data;
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
+        let arms_pl = built
+            .placements
+            .iter()
+            .find(|p| p.column == "arms")
+            .expect("arms placement");
+        let (_, rig) =
+            acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| assemble::place_of(&[], None))
+                .expect("rigged_model");
+        let mut world = World::new();
+        let joints: Vec<Entity> = (0..rig.bones.len()).map(|_| world.spawn_empty().id()).collect();
+        let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
+        let mut anims = WeaponAnims::default();
+        anims.load(&disc, arms_pl, &rig, &joints, leg_type);
+        for hand in [Hand::Right, Hand::Left] {
+            let aim = &anims.aim[hand as usize];
+            assert!(
+                aim.shoulder.is_some(),
+                "{hand:?} arm aim must find a gun_$(LR) *_arm01 shoulder"
+            );
+            assert!(
+                aim.limit > 1.0 && aim.limit <= 90.0,
+                "{hand:?} aim limit {} must come from LockMin/MaxX",
+                aim.limit
+            );
+            assert!(
+                !aim.sniper,
+                "the starter rifle must turn the gun_ arm, not the sniper_ control"
+            );
+            let shoulder = aim.shoulder.unwrap();
+            assert!(
+                anims
+                    .recoil_bones
+                    .iter()
+                    .any(|b| b.entity == shoulder && b.hand == hand && !b.sniper),
+                "{hand:?} shoulder must also be a gun recoil bone, or the turn is never written"
+            );
+        }
     }
 }

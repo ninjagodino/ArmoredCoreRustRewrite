@@ -781,6 +781,7 @@ fn main() {
                 bay::shift.run_if(in_active_sortie),
                 bay::probe_shot.run_if(in_active_sortie),
                 weapons::fire.run_if(in_active_sortie),
+                weapons::probe_shot.run_if(in_active_sortie),
                 weapons::step_overed_weapon.run_if(in_active_sortie),
                 weapons::step_melee.run_if(in_active_sortie),
                 ai::update.run_if(in_active_sortie),
