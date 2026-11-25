@@ -312,6 +312,7 @@ impl Plugin for MenuPlugin {
             UiMaterialPlugin::<AdditiveSprite>::default(),
             UiMaterialPlugin::<GaugeSprite>::default(),
             UiMaterialPlugin::<GlyphSprite>::default(),
+            crate::ui_kit::UiAnimationPlugin,
         ))
         .add_systems(PostUpdate, (draw_sprites, draw_gauges, (draw_texts, draw_glyphs).chain()));
     }

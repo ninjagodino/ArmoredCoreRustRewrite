@@ -36,7 +36,8 @@ use acvd_formats::accolor::{
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
 use acvd_render::ui_kit::{
-    palette, AcvdUiKit, ArrowDir, ButtonState, FontRole, PanelStyle, StatDelta, TraceStyle,
+    palette, AcvdUiKit, ArrowDir, ButtonState, FontRole, PanelStyle, StatDelta, TraceStyle, UiClip,
+    UiEase, UiPose, UiRepeat, UiTween,
 };
 use acvd_render::Packs;
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
@@ -1283,6 +1284,10 @@ pub struct GarageState {
     pub view_ui_hidden: bool,
     /// True when the UI tree needs rebuilding.
     pub ui_dirty: bool,
+    /// Screen for which the current entrance animation has already played (`None` = first build).
+    pub ui_anim_screen: Option<GarageScreen>,
+    /// Cursor at the previous UI rebuild, used to pulse the newly focused row.
+    pub ui_focus_cursor: usize,
 }
 
 impl GarageState {
@@ -1364,6 +1369,8 @@ impl GarageState {
             view_anim: GarageViewAnimState::default(),
             view_ui_hidden: false,
             ui_dirty: true,
+            ui_anim_screen: None,
+            ui_focus_cursor: 0,
         }
     }
 
@@ -5216,6 +5223,11 @@ pub fn sync_ui(
     state.ui_dirty = false;
     state.last_window_size = win_size;
     state.last_ui_scale = settings.ui_scale;
+    // Entrance animations play once per screen; cursor moves only pulse the newly focused row.
+    let animate_enter = state.ui_anim_screen != Some(state.screen);
+    state.ui_anim_screen = Some(state.screen);
+    let focus_moved = !animate_enter && state.ui_focus_cursor != state.cursor;
+    state.ui_focus_cursor = state.cursor;
     decals.init_assets(&mut images);
     custom_camos.init_assets(&mut images);
     if state.screen == GarageScreen::Paint
@@ -5340,7 +5352,15 @@ pub fn sync_ui(
 
     // Left interactive menu panel.
     if state.screen == GarageScreen::Top {
-        spawn_garage_top_menu(&mut commands, root, &kit, state.cursor, scale);
+        spawn_garage_top_menu(
+            &mut commands,
+            root,
+            &kit,
+            state.cursor,
+            animate_enter,
+            focus_moved,
+            scale,
+        );
     } else if state.screen == GarageScreen::Options {
         if state.options_tab == OptionsTab::Graphics {
             if state.paint_hsv_synced_channel != Some(usize::MAX - 1) {
@@ -6241,6 +6261,8 @@ fn spawn_garage_top_menu(
     root: Entity,
     kit: &AcvdUiKit,
     cursor: usize,
+    animate_enter: bool,
+    focus_moved: bool,
     scale: f32,
 ) {
     let pad = (14.0 * scale).round();
@@ -6261,7 +6283,48 @@ fn spawn_garage_top_menu(
         scale,
     );
 
-    kit.spawn_header(commands, panel, "GARAGE MENU", Some("SELECT"), scale);
+    // `start_@Acsis` (`LDCS`, 37 frames) is the retail garage-front transition: the whole
+    // menu chrome fades in while the row items stagger over their 10-frame `FadeIn_10f`.
+    if animate_enter {
+        let from = UiPose {
+            alpha: 0.0,
+            offset: Vec2::new(-14.0 * scale, 0.0),
+            scale: 0.985,
+            rotation_deg: 0.0,
+        };
+        kit.attach_tween(
+            commands,
+            panel,
+            UiTween::new(
+                from,
+                UiPose::default(),
+                UiClip::FadeIn10f.frames(),
+                UiEase::OutCubic,
+                0,
+                UiRepeat::Once,
+            ),
+        );
+    }
+
+    let header = kit.spawn_header(commands, panel, "GARAGE MENU", Some("SELECT"), scale);
+    if animate_enter {
+        let from = UiPose {
+            offset: Vec2::new(-8.0 * scale, 0.0),
+            ..Default::default()
+        };
+        kit.attach_tween(
+            commands,
+            header,
+            UiTween::new(
+                from,
+                UiPose::default(),
+                UiClip::FadeIn10f.frames(),
+                UiEase::OutCubic,
+                2,
+                UiRepeat::Once,
+            ),
+        );
+    }
 
     let list = commands
         .spawn((
@@ -6284,6 +6347,44 @@ fn spawn_garage_top_menu(
         };
         let btn = kit.spawn_button(commands, list, title, Some(tag), btn_state, scale);
         commands.entity(btn).insert((Button, UiRow(idx)));
+
+        if animate_enter {
+            // 2-frame stagger, matching the `start_@Acsis` per-item 10-frame fades.
+            let from = UiPose {
+                offset: Vec2::new(-10.0 * scale, 0.0),
+                ..Default::default()
+            };
+            kit.attach_tween(
+                commands,
+                btn,
+                UiTween::new(
+                    from,
+                    UiPose::default(),
+                    UiClip::MoveRight.frames(),
+                    UiEase::OutCubic,
+                    idx as u32 * 2 + 2,
+                    UiRepeat::Once,
+                ),
+            );
+        } else if focus_moved && cursor == idx {
+            // Retail `@FOCUS` cursor settle: a short scale pop on the newly selected row.
+            let from = UiPose {
+                scale: 1.04,
+                ..Default::default()
+            };
+            kit.attach_tween(
+                commands,
+                btn,
+                UiTween::new(
+                    from,
+                    UiPose::default(),
+                    UiClip::FadeIn5f.frames(),
+                    UiEase::OutBack,
+                    0,
+                    UiRepeat::Once,
+                ),
+            );
+        }
     }
 
     kit.spawn_trace(commands, panel, TraceStyle::Stepped, scale);
@@ -6306,6 +6407,24 @@ fn spawn_garage_top_menu(
         },
         scale,
     );
+    if animate_enter {
+        let from = UiPose {
+            offset: Vec2::new(0.0, 10.0 * scale),
+            ..Default::default()
+        };
+        kit.attach_tween(
+            commands,
+            help,
+            UiTween::new(
+                from,
+                UiPose::default(),
+                UiClip::Frame.frames(),
+                UiEase::OutCubic,
+                TOP_ITEMS.len() as u32 * 2 + 4,
+                UiRepeat::Once,
+            ),
+        );
+    }
     kit.spawn_text(
         commands,
         help,

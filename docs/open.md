@@ -254,7 +254,8 @@ in order:
     `0x82bee808 kick_start r3 f1 f2 lr`, `0x82beeb38 kick_weight max=400 r31 f30 [r31+0x8]:f32 [r31+0x10]:f32`,
     `0x82c42048 blend_time max=200 r3 f1 lr`, `0x8287f348 gun_ctrl r30`,
     `0x8287f33c sniper_ctrl r30`.
-- **UI leftovers**: DRB animation tables (PINA/KINA/OINA/MINA); runtime image slots (emblems,
+- **UI leftovers**: PINA keyframe values (the DRB clip names and lengths are decoded in
+  `sheets/ui_anim.csv` and replayed by `acvd-render::ui_kit` `UiTween`/`UiClip`); runtime image slots (emblems,
   maps, movies); `NoiseSprite` and the other undecoded shape classes; Dialog color tint (inferred,
   see Notes). Open: Text word +0x0c (0, 502, 1000-1004, 1030, 1200-1204; not a scale), Text flags
   byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0).

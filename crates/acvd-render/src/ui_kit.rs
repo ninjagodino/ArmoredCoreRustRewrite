@@ -15,15 +15,15 @@ use anyhow::Result;
 use bevy::asset::{Assets, Handle};
 use bevy::color::Color;
 use bevy::image::Image;
-use bevy::math::{Rect, Vec2};
+use bevy::math::{Rect, Rot2, Vec2};
 use bevy::prelude::*;
 use bevy::ui::{
-    px, AlignItems, BackgroundGradient, ColorStop, FlexDirection, JustifyContent, LinearGradient,
-    PositionType, UiRect, Val,
+    px, AlignItems, BackgroundGradient, ColorStop, FlexDirection, Gradient, JustifyContent,
+    LinearGradient, PositionType, UiRect, UiSystems, UiTransform, Val, Val2,
 };
 
 use crate::menu::{self, Layout, MenuSprite};
-use crate::text::{self, Font};
+use crate::text::{self, Font, GlyphNode};
 
 /// Retail DRB layout that supplies the shared menu chrome sprites and fonts.
 pub const KIT_DRB_PATH: &str = "lang/en/menu/assemble.drb.dcx";
@@ -200,6 +200,477 @@ pub enum ArrowDir {
     Right,
     Up,
     Down,
+}
+
+// ---------------------------------------------------------------------------
+// Retail menu motion
+//
+// The 360 menu layouts store their motion in the DRB `MINA`/`OINA`/`KINA`/`PINA` sections
+// (`lang/jp/menu/garage.drb.dcx` has 13 named clips: `FadeIn_10f`, `FadeIn_15f`, `FadeIn_5f`,
+// `FadeIn_20f`, `FadeIn`, `FadeIn_10f_rv`, `Frame`, `Frame1`, `Frame1_grayout`,
+// `タイトル枠右`, `タイトル枠下`, `Move_Left`, `Move_Right`). Each clip's duration comes from its
+// `MINA` record; the per-dialog `LDCS` start/exit schedule (`start_@Acsis`, `Exit_Acsis`, ...)
+// uses 10-frame item animations and a 37-frame focus cursor. The `KINA` keys name the
+// interpolation family (`animkey1`..`animkey8`), which the clips below map to the closest
+// Bevy easing curve.
+// ---------------------------------------------------------------------------
+
+/// Interpolation family used by a [`UiClip`]. The retail names are `animkey1`..`animkey8`;
+/// the DRB stores the numeric family in `KINA` +0x04 and the key values in `PINA`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiEase {
+    /// `animkey1`: constant velocity.
+    Linear,
+    /// Quadratic ease-in.
+    In,
+    /// Quadratic ease-out.
+    Out,
+    /// Symmetric quadratic ease-in-out.
+    InOut,
+    /// Cubic ease-out (the look of `Move_Left` / `Move_Right`).
+    OutCubic,
+    /// Sine ease-in-out (`Frame1_grayout`).
+    InOutSine,
+    /// Overshooting cubic ease-out, used for focus pops.
+    OutBack,
+}
+
+impl UiEase {
+    /// Maps normalized progress `0..=1` to eased `0..=1`.
+    pub fn apply(self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            UiEase::Linear => t,
+            UiEase::In => t * t,
+            UiEase::Out => 1.0 - (1.0 - t) * (1.0 - t),
+            UiEase::InOut => {
+                if t < 0.5 {
+                    2.0 * t * t
+                } else {
+                    1.0 - (-2.0 * t + 2.0).powi(2) / 2.0
+                }
+            }
+            UiEase::OutCubic => 1.0 - (1.0 - t).powi(3),
+            UiEase::InOutSine => -((std::f32::consts::PI * t).cos() - 1.0) / 2.0,
+            UiEase::OutBack => {
+                const C1: f32 = 1.70158;
+                const C3: f32 = C1 + 1.0;
+                1.0 + C3 * (t - 1.0).powi(3) + C1 * (t - 1.0).powi(2)
+            }
+        }
+    }
+}
+
+/// Visual pose of an animated UI subtree. `alpha` multiplies every tint in the subtree;
+/// `offset` and `scale` drive `UiTransform`, which Bevy inherits down the node tree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiPose {
+    pub alpha: f32,
+    pub offset: Vec2,
+    pub scale: f32,
+    pub rotation_deg: f32,
+}
+
+impl Default for UiPose {
+    fn default() -> Self {
+        Self {
+            alpha: 1.0,
+            offset: Vec2::ZERO,
+            scale: 1.0,
+            rotation_deg: 0.0,
+        }
+    }
+}
+
+impl UiPose {
+    fn lerp(self, to: Self, t: f32) -> Self {
+        Self {
+            alpha: self.alpha + (to.alpha - self.alpha) * t,
+            offset: self.offset.lerp(to.offset, t),
+            scale: self.scale + (to.scale - self.scale) * t,
+            rotation_deg: self.rotation_deg + (to.rotation_deg - self.rotation_deg) * t,
+        }
+    }
+}
+
+/// Playback behaviour of a [`UiTween`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiRepeat {
+    /// Play once, then remove the tween (final pose stays).
+    Once,
+    /// Restart from `from` every cycle.
+    Loop,
+    /// Reverse back to `from` every cycle.
+    PingPong,
+}
+
+#[derive(Clone, Default)]
+struct UiBaseTint {
+    bg: Option<Color>,
+    border: Option<BorderColor>,
+    gradient: Option<BackgroundGradient>,
+    glyph: Option<Color>,
+    text: Option<Color>,
+    sprite: Option<Color>,
+}
+
+/// A time-driven UI animation. Attach with [`AcvdUiKit::attach_tween`] (or reserve the entity
+/// and add it manually); [`UiAnimationPlugin`] applies it in `PostUpdate` before layout.
+///
+/// The tween snapshots the tint of its whole subtree on the first frame, so one tween on a
+/// panel fades every child (glyphs, sprites, gradients, borders) without touching the children.
+#[derive(Component, Clone)]
+pub struct UiTween {
+    /// Seconds since the tween was attached.
+    pub elapsed: f32,
+    /// Seconds before the tween starts.
+    pub delay: f32,
+    /// Seconds for one pass.
+    pub duration: f32,
+    pub ease: UiEase,
+    pub from: UiPose,
+    pub to: UiPose,
+    pub repeat: UiRepeat,
+    bases: Option<Vec<(Entity, UiBaseTint)>>,
+    last_alpha: Option<f32>,
+}
+
+impl UiTween {
+    /// Frames are authored at the game's 60 Hz menu tick (`LDCS`/`MINA` durations are frame counts).
+    pub const FPS: f32 = 60.0;
+
+    pub fn new(
+        from: UiPose,
+        to: UiPose,
+        frames: u32,
+        ease: UiEase,
+        delay_frames: u32,
+        repeat: UiRepeat,
+    ) -> Self {
+        Self {
+            elapsed: 0.0,
+            delay: delay_frames as f32 / Self::FPS,
+            duration: frames.max(1) as f32 / Self::FPS,
+            ease,
+            from,
+            to,
+            repeat,
+            bases: None,
+            last_alpha: None,
+        }
+    }
+
+    /// Convenience constructor for a one-shot retail clip with an optional stagger.
+    pub fn clip(clip: UiClip, delay_frames: u32) -> Self {
+        clip.tween(delay_frames)
+    }
+
+    /// The initial `UiTransform` for this tween (`from` pose), inserted with the component so
+    /// the first rendered frame already sits at the animation start.
+    pub fn initial_transform(&self) -> UiTransform {
+        UiTransform {
+            translation: Val2::px(self.from.offset.x, self.from.offset.y),
+            scale: Vec2::splat(self.from.scale),
+            rotation: Rot2::degrees(self.from.rotation_deg),
+        }
+    }
+
+    fn touches_alpha(&self) -> bool {
+        (self.from.alpha - 1.0).abs() > 1e-4 || (self.to.alpha - 1.0).abs() > 1e-4
+    }
+}
+
+/// Retail-named menu clips. Durations are the `MINA` record frame counts from
+/// `lang/jp/menu/garage.drb.dcx` / `menusystem.drb.dcx`; the slide distances are the closest
+/// Bevy equivalent (PINA key values are not yet decoded into absolute pixel offsets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiClip {
+    /// `FadeIn_5f` (5 frames).
+    FadeIn5f,
+    /// `FadeIn_10f` (10 frames) — the garage `start_@Acsis` per-item duration.
+    FadeIn10f,
+    /// `FadeIn_15f` (15 frames).
+    FadeIn15f,
+    /// `FadeIn_20f` (20 frames).
+    FadeIn20f,
+    /// `Move_Left` (15 frames): enters from the right.
+    MoveLeft,
+    /// `Move_Right` (15 frames): enters from the left.
+    MoveRight,
+    /// `Move_UP` (15 frames): enters from below.
+    MoveUp,
+    /// `Scale_anime` (10 frames).
+    ScaleAnime,
+    /// `Scale_anime15f` (15 frames).
+    ScaleAnime15f,
+    /// `Frame` (9 frames): fade + tiny scale settle.
+    Frame,
+    /// `FrameExit` (4 frames).
+    FrameExit,
+    /// `Frame1_grayout` (9 frames): fade toward a disabled tint.
+    GrayOut,
+    /// `タイトル枠右` (14 frames): title frame enters from the right.
+    TitleRight,
+    /// `タイトル枠下` (14 frames): title frame enters from below.
+    TitleBottom,
+    /// `Rotate_connect` (60 frames).
+    RotateConnect,
+}
+
+impl UiClip {
+    pub fn frames(self) -> u32 {
+        match self {
+            UiClip::FadeIn5f => 5,
+            UiClip::FadeIn10f => 10,
+            UiClip::FadeIn15f => 15,
+            UiClip::FadeIn20f => 20,
+            UiClip::MoveLeft | UiClip::MoveRight | UiClip::MoveUp => 15,
+            UiClip::ScaleAnime => 10,
+            UiClip::ScaleAnime15f => 15,
+            UiClip::Frame | UiClip::GrayOut => 9,
+            UiClip::FrameExit => 4,
+            UiClip::TitleRight | UiClip::TitleBottom => 14,
+            UiClip::RotateConnect => 60,
+        }
+    }
+
+    pub fn ease(self) -> UiEase {
+        match self {
+            UiClip::FadeIn5f => UiEase::Out,
+            UiClip::GrayOut => UiEase::InOutSine,
+            UiClip::MoveLeft
+            | UiClip::MoveRight
+            | UiClip::MoveUp
+            | UiClip::TitleRight
+            | UiClip::TitleBottom
+            | UiClip::RotateConnect => UiEase::OutCubic,
+            _ => UiEase::OutCubic,
+        }
+    }
+
+    pub fn from_pose(self) -> UiPose {
+        match self {
+            UiClip::FadeIn5f | UiClip::FadeIn10f | UiClip::FadeIn15f | UiClip::FadeIn20f => {
+                UiPose {
+                    alpha: 0.0,
+                    ..Default::default()
+                }
+            }
+            UiClip::MoveLeft => UiPose {
+                offset: Vec2::new(48.0, 0.0),
+                ..Default::default()
+            },
+            UiClip::MoveRight => UiPose {
+                offset: Vec2::new(-48.0, 0.0),
+                ..Default::default()
+            },
+            UiClip::MoveUp => UiPose {
+                offset: Vec2::new(0.0, 32.0),
+                ..Default::default()
+            },
+            UiClip::ScaleAnime | UiClip::ScaleAnime15f => UiPose {
+                scale: 0.86,
+                ..Default::default()
+            },
+            UiClip::Frame => UiPose {
+                alpha: 0.0,
+                scale: 0.97,
+                ..Default::default()
+            },
+            UiClip::FrameExit => UiPose::default(),
+            UiClip::GrayOut => UiPose::default(),
+            UiClip::TitleRight => UiPose {
+                offset: Vec2::new(320.0, 0.0),
+                ..Default::default()
+            },
+            UiClip::TitleBottom => UiPose {
+                offset: Vec2::new(0.0, 120.0),
+                ..Default::default()
+            },
+            UiClip::RotateConnect => UiPose {
+                rotation_deg: -90.0,
+                ..Default::default()
+            },
+        }
+    }
+
+    pub fn to_pose(self) -> UiPose {
+        match self {
+            UiClip::FrameExit => UiPose {
+                alpha: 0.0,
+                ..Default::default()
+            },
+            UiClip::GrayOut => UiPose {
+                alpha: 0.45,
+                ..Default::default()
+            },
+            _ => UiPose::default(),
+        }
+    }
+
+    pub fn tween(self, delay_frames: u32) -> UiTween {
+        UiTween::new(
+            self.from_pose(),
+            self.to_pose(),
+            self.frames(),
+            self.ease(),
+            delay_frames,
+            UiRepeat::Once,
+        )
+    }
+}
+
+/// Applies [`UiTween`]s to `UiTransform` and subtree tints in `PostUpdate` before UI layout.
+pub struct UiAnimationPlugin;
+
+impl Plugin for UiAnimationPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(PostUpdate, animate_ui_tweens.before(UiSystems::Layout));
+    }
+}
+
+fn collect_subtree(entity: Entity, children: &Query<&Children>, out: &mut Vec<Entity>) {
+    out.push(entity);
+    if let Ok(ch) = children.get(entity) {
+        for child in ch.iter() {
+            collect_subtree(child, children, out);
+        }
+    }
+}
+
+fn tint_gradient(gradient: &mut BackgroundGradient, factor: f32) {
+    for g in &mut gradient.0 {
+        match g {
+            Gradient::Linear(x) => {
+                for stop in &mut x.stops {
+                    stop.color = stop.color.with_alpha(stop.color.alpha() * factor);
+                }
+            }
+            Gradient::Radial(x) => {
+                for stop in &mut x.stops {
+                    stop.color = stop.color.with_alpha(stop.color.alpha() * factor);
+                }
+            }
+            Gradient::Conic(x) => {
+                for stop in &mut x.stops {
+                    stop.color = stop.color.with_alpha(stop.color.alpha() * factor);
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn animate_ui_tweens(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut tweens: Query<(Entity, &mut UiTween)>,
+    children: Query<&Children>,
+    mut backgrounds: Query<&mut BackgroundColor>,
+    mut gradients: Query<&mut BackgroundGradient>,
+    mut borders: Query<&mut BorderColor>,
+    mut glyphs: Query<&mut GlyphNode>,
+    mut texts: Query<&mut TextColor>,
+    mut sprites: Query<&mut MenuSprite>,
+    mut transforms: Query<&mut UiTransform>,
+) {
+    let dt = time.delta_secs();
+    for (root, mut tween) in &mut tweens {
+        if tween.bases.is_none() {
+            let mut list = Vec::new();
+            collect_subtree(root, &children, &mut list);
+            let mut bases = Vec::with_capacity(list.len());
+            for entity in list {
+                bases.push((
+                    entity,
+                    UiBaseTint {
+                        bg: backgrounds.get(entity).ok().map(|c| c.0),
+                        border: borders.get(entity).ok().cloned(),
+                        gradient: gradients.get(entity).ok().cloned(),
+                        glyph: glyphs.get(entity).ok().map(|g| g.color),
+                        text: texts.get(entity).ok().map(|t| t.0),
+                        sprite: sprites.get(entity).ok().map(|s| s.color),
+                    },
+                ));
+            }
+            tween.bases = Some(bases);
+        }
+
+        let active = (tween.elapsed - tween.delay).max(0.0);
+        let cycle = tween.duration.max(1.0 / UiTween::FPS);
+        let (progress, finished) = match tween.repeat {
+            UiRepeat::Once => ((active / cycle).min(1.0), active >= cycle),
+            UiRepeat::Loop => ((active % cycle) / cycle, false),
+            UiRepeat::PingPong => {
+                let m = active % (cycle * 2.0);
+                (if m <= cycle { m / cycle } else { 2.0 - m / cycle }, false)
+            }
+        };
+        let pose = tween.from.lerp(tween.to, tween.ease.apply(progress));
+
+        match transforms.get_mut(root) {
+            Ok(mut xf) => {
+                xf.translation = Val2::px(pose.offset.x, pose.offset.y);
+                xf.scale = Vec2::splat(pose.scale);
+                xf.rotation = Rot2::degrees(pose.rotation_deg);
+            }
+            Err(_) => {
+                commands.entity(root).insert(UiTransform {
+                    translation: Val2::px(pose.offset.x, pose.offset.y),
+                    scale: Vec2::splat(pose.scale),
+                    rotation: Rot2::degrees(pose.rotation_deg),
+                });
+            }
+        }
+
+        if tween.touches_alpha() && tween.last_alpha.is_none_or(|a| (a - pose.alpha).abs() > 1e-4) {
+            if let Some(bases) = &tween.bases {
+                for (entity, base) in bases {
+                    if let Some(color) = base.bg {
+                        if let Ok(mut c) = backgrounds.get_mut(*entity) {
+                            c.0 = color.with_alpha(color.alpha() * pose.alpha);
+                        }
+                    }
+                    if let Some(border) = &base.border {
+                        if let Ok(mut b) = borders.get_mut(*entity) {
+                            b.top = border.top.with_alpha(border.top.alpha() * pose.alpha);
+                            b.right = border.right.with_alpha(border.right.alpha() * pose.alpha);
+                            b.bottom = border.bottom.with_alpha(border.bottom.alpha() * pose.alpha);
+                            b.left = border.left.with_alpha(border.left.alpha() * pose.alpha);
+                        }
+                    }
+                    if let Some(gradient) = &base.gradient {
+                        if let Ok(mut g) = gradients.get_mut(*entity) {
+                            *g = gradient.clone();
+                            tint_gradient(&mut g, pose.alpha);
+                        }
+                    }
+                    if let Some(color) = base.glyph {
+                        if let Ok(mut g) = glyphs.get_mut(*entity) {
+                            g.color = color.with_alpha(color.alpha() * pose.alpha);
+                        }
+                    }
+                    if let Some(color) = base.text {
+                        if let Ok(mut t) = texts.get_mut(*entity) {
+                            t.0 = color.with_alpha(color.alpha() * pose.alpha);
+                        }
+                    }
+                    if let Some(color) = base.sprite {
+                        if let Ok(mut s) = sprites.get_mut(*entity) {
+                            s.color = color.with_alpha(color.alpha() * pose.alpha);
+                        }
+                    }
+                }
+            }
+            tween.last_alpha = Some(pose.alpha);
+        }
+
+        if finished {
+            commands.entity(root).remove::<UiTween>();
+        } else {
+            tween.elapsed += dt;
+        }
+    }
 }
 
 /// Optional comparison delta shown on the right side of [`AcvdUiKit::spawn_stat_row`].
@@ -1456,12 +1927,180 @@ impl AcvdUiKit {
             true,
         ))
     }
+
+    /// Attaches a [`UiTween`] and its initial `UiTransform` to `entity`.
+    ///
+    /// `UiAnimationPlugin` (registered by [`crate::menu::MenuPlugin`]) drives the tween in
+    /// `PostUpdate` before layout, so a clip attached during `Update` starts on the same frame.
+    pub fn attach_tween(&self, commands: &mut Commands, entity: Entity, tween: UiTween) {
+        let transform = tween.initial_transform();
+        commands.entity(entity).insert((tween, transform));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use acvd_formats::vfs;
+    use bevy::MinimalPlugins;
+
+    #[test]
+    fn ui_ease_endpoints_and_clip_durations_are_stable() {
+        for ease in [
+            UiEase::Linear,
+            UiEase::In,
+            UiEase::Out,
+            UiEase::InOut,
+            UiEase::OutCubic,
+            UiEase::InOutSine,
+            UiEase::OutBack,
+        ] {
+            assert!(ease.apply(0.0).abs() < 1e-5, "{ease:?} start");
+            assert!((ease.apply(1.0) - 1.0).abs() < 1e-5, "{ease:?} end");
+        }
+        // Durations traced from the `MINA` records in lang/jp/menu/garage.drb.dcx.
+        assert_eq!(UiClip::FadeIn5f.frames(), 5);
+        assert_eq!(UiClip::FadeIn10f.frames(), 10);
+        assert_eq!(UiClip::FadeIn15f.frames(), 15);
+        assert_eq!(UiClip::FadeIn20f.frames(), 20);
+        assert_eq!(UiClip::MoveLeft.frames(), 15);
+        assert_eq!(UiClip::MoveRight.frames(), 15);
+        assert_eq!(UiClip::Frame.frames(), 9);
+        assert_eq!(UiClip::GrayOut.frames(), 9);
+        assert_eq!(UiClip::TitleRight.frames(), 14);
+    }
+
+    #[test]
+    fn tween_fades_subtree_then_finishes() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(UiAnimationPlugin);
+
+        let root = app
+            .world_mut()
+            .spawn(UiTween::clip(UiClip::FadeIn10f, 0))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((BackgroundColor(Color::WHITE), ChildOf(root)))
+            .id();
+
+        app.update();
+        let a = app
+            .world()
+            .get::<BackgroundColor>(child)
+            .expect("child tint")
+            .0
+            .alpha();
+        assert!(a < 0.01, "first frame should be transparent, got {a}");
+
+        app.world_mut()
+            .get_mut::<UiTween>(root)
+            .expect("tween exists")
+            .elapsed = 1.0;
+        app.update();
+        let a = app
+            .world()
+            .get::<BackgroundColor>(child)
+            .expect("child tint")
+            .0
+            .alpha();
+        assert!((a - 1.0).abs() < 0.01, "finished frame should be opaque, got {a}");
+        assert!(app.world().get::<UiTween>(root).is_none(), "one-shot tween removed");
+
+        // `Move_Right` starts at -48 px and settles at 0, giving the retail cursor/row travel.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(UiAnimationPlugin);
+        let moving = app
+            .world_mut()
+            .spawn((UiTween::clip(UiClip::MoveRight, 0), UiTransform::IDENTITY))
+            .id();
+        app.update();
+        let x0 = match app.world().get::<UiTransform>(moving).map(|t| t.translation.x) {
+            Some(Val::Px(x)) => x,
+            other => panic!("initial translation: {other:?}"),
+        };
+        assert!(x0 <= -47.9, "Move_Right starts off-screen-ish, got {x0}");
+        app.world_mut()
+            .get_mut::<UiTween>(moving)
+            .expect("tween exists")
+            .elapsed = UiClip::MoveRight.frames() as f32 / UiTween::FPS;
+        app.update();
+        let x1 = match app.world().get::<UiTransform>(moving).map(|t| t.translation.x) {
+            Some(Val::Px(x)) => x,
+            other => panic!("final translation: {other:?}"),
+        };
+        assert!(x1.abs() < 0.01, "Move_Right settles at 0, got {x1}");
+    }
+
+    /// Traces the retail garage-front motion data: 13 `MINA` clips with their frame durations.
+    /// Skips when the disc image is absent (source-only checkouts).
+    #[test]
+    fn garage_drb_mina_clips_are_traced() {
+        let iso = vfs::repo_root().join(vfs::X360_ISO);
+        if !iso.is_file() {
+            return;
+        }
+        let disc = Disc::open(&iso).unwrap();
+        let data = disc.asset("lang/jp/menu/garage.drb.dcx").unwrap();
+
+        // Section table: 4-byte tag, u32 body size, u32 count, u32 zero; 16-byte aligned data.
+        let mut at = 0usize;
+        let mut sections = std::collections::HashMap::new();
+        loop {
+            let tag = String::from_utf8_lossy(&data[at..at + 4]).replace('\0', "");
+            let size = u32::from_be_bytes(data[at + 4..at + 8].try_into().unwrap()) as usize;
+            let count = u32::from_be_bytes(data[at + 8..at + 12].try_into().unwrap()) as usize;
+            sections.insert(tag.clone(), (at + 16, size, count));
+            at += 16 + size;
+            if tag == "DNE" {
+                break;
+            }
+        }
+        let (rts, _, _) = sections["RTS"];
+        let (mina, _, count) = sections["MINA"];
+        assert_eq!(count, 13, "garage MINA clip count");
+
+        let read_rts = |off: usize| -> String {
+            let mut s = String::new();
+            let mut i = rts + off;
+            loop {
+                let c = u16::from_be_bytes(data[i..i + 2].try_into().unwrap());
+                if c == 0 {
+                    break;
+                }
+                s.push(char::from_u32(c as u32).unwrap_or('?'));
+                i += 2;
+            }
+            s
+        };
+
+        let mut clips = Vec::new();
+        for i in 0..count {
+            let rec = mina + i * 48;
+            let name = u32::from_be_bytes(data[rec..rec + 4].try_into().unwrap()) as usize;
+            let frames = u32::from_be_bytes(data[rec + 12..rec + 16].try_into().unwrap());
+            clips.push((read_rts(name), frames));
+        }
+        // `MINA` +0x0c is the clip duration in frames (the `OINA` group's track-2 value).
+        for (name, frames) in [
+            ("FadeIn_10f", 9),
+            ("FadeIn_15f", 14),
+            ("FadeIn_5f", 4),
+            ("FadeIn_20f", 19),
+            ("Move_Left", 15),
+            ("Move_Right", 15),
+            ("Frame1_grayout", 9),
+            ("Frame", 9),
+        ] {
+            let got = clips
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("missing MINA clip {name}: {clips:?}"));
+            assert_eq!(got.1, frames, "{name} frame count");
+        }
+    }
 
     #[test]
     fn ui_kit_loads_retail_fonts_and_chrome_sprites_from_disc() {
