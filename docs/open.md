@@ -199,8 +199,13 @@ in order:
     Probe `private/xenia/glide_move.jsonl`: 0.4630 m/tick = 100.0 km/h held through states 4 and 5.
     Done: the vertical update `0x82820168` skips the gravity loop
     (`0x8281f960`) in states 4/5 (`0x8281f3d0` at `0x828201b4`), so a glide holds its height
-    and now carries on over a drop; `0x8281dd28` caps rising at glide block (+0x288) +0x0 +
-    +0x2c (not modelled, a glide never rises). On the ground: `glide_start` (acmotion row 217)
+    and carries on over a drop. The activation itself ascends by a fixed amount: `0x8281dd28`
+    clamps the rise at glide block (+0x288) word +0x0 = **5.0 m** (`glide_lift_height`, built
+    from the param table `+0x468` x f30 by `0x82821af0`) above the activation height (block
+    +0x2c = object `+0x2b4`, seeded by `0x8281f8c0`), stepping at `glide_rise_tick` = 0.1 m/tick
+    (Xenia probe `private/xenia/glide_cap.jsonl`: height 23.230 -> 28.230 over 374 ms, then
+    flat). The runtime lifts by that fixed amount from the activation point and then holds it;
+    leaving a ledge adds no ascent. On the ground: `glide_start` (acmotion row 217)
     then `glide` (row 218, 360-frame wheel, booster clip 1). In the air: one directional entry
     (rows 223-230, anims 63-70, 30 frames, sector `0x82825918` / builder `0x82883c80`) then
     `glide_air` (row 222 空中浮遊, anim 62, 360-frame wheel, booster clip 3, builder
@@ -212,8 +217,9 @@ in order:
     entries), so the stick may sit up to 100 deg off the current velocity
     (`sheets/ac_ctrl_calc.csv` `glide_turn_cone`). The air entry also seeds the mover: horizontal
     acceleration from the thrust block `+0x2cc` (recomputed per tick here) and vertical speed
-    `+0x1e8` from `+0x2dc` = 0, so an air glide holds a flat height. Left: action-40 ribbon
-    trails (f0000134, 3 starts from `0x828a8088`) and damage rows 239-242 / 246-247 (not played).
+    `+0x1e8` from `+0x2dc` = 0, so an air glide holds a flat height. Done: the action-40 ribbon
+    trails (f0000134, 3 starts from `0x828a8088`, dummies 153/155/156/213/218/223 in TAE anims
+    63-70) render in `sfx.rs`. Left: damage rows 239-242 / 246-247 (not played).
   - High Boost / Boost Charge leftovers (burst phases, charge curve, decay, re-fire, and EN drain done; see
     Done "High Boost and Boost Charge" and "Generator Energy (EN) drain & recharge"): the
     boost-off ground walk-brake gate (`0x8283fc10` -> `0x82845590` -> `0x8283f3d0`, which holds

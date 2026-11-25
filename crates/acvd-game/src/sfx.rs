@@ -57,6 +57,11 @@ const GLIDE_SFX_SCALE: f32 = 0.6;
 /// or 303 (`private/xenia/glide_ids.jsonl`).
 const GLIDE_MAIN: i32 = 131;
 const GLIDE_FOOT: i32 = 120;
+/// Air-glide ribbon trails: `f0000134` (action 40) fires on the air-entry dummies from TAE
+/// anims 63..70 frame 15-18 (`tae/ac/motion_ow_disarm/own*.tae`), then follows the glide until
+/// it ends. Design 5010 has three of the six sockets (core 213/218, arm 223), matching the three
+/// starts in `private/xenia/glide_ids.jsonl`.
+const GLIDE_TRAIL: i32 = 134;
 /// Main nozzles, the booster light on them, leg back nozzles, and the side-booster pairs.
 /// Built in `0x82893ec0` and selected by `0x82892f08`.
 const MAIN_NOZZLES: std::ops::RangeInclusive<u8> = 31..=34;
@@ -783,6 +788,18 @@ enum Look {
     /// -> `0x835b3658`, `FXParticleAppearance_RadialBlur.cpp`). Post-process radial blur ring,
     /// not a world-space additive billboard.
     RadialBlur,
+    /// Action 40 ribbon trail: a camera-facing strip left by the parent's world position. Slots
+    /// follow `sheets/ffx_actions.csv` row `40` (f0000134: texture s1847, 0.06 m wide, sample
+    /// every 1/60 s, 1 s life, 16 segments, white alpha 0.235).
+    Ribbon {
+        texture: i32,
+        blend: Blend,
+        width: Curve,
+        interval: f32,
+        life: f32,
+        segments: usize,
+        color: ColorCurve,
+    },
 }
 
 fn look(id: i32, l: &ParamList) -> Option<Look> {
@@ -818,6 +835,18 @@ fn look(id: i32, l: &ParamList) -> Option<Look> {
             width: float_curve(p(3)),
             height: float_curve(p(4)),
             spin: float_curve(p(13)),
+        },
+        // f0000134 child node: s1847 cloud texture, 0.06 m wide, sample every tick, 1 s trail
+        // life, 16 segments, white alpha 0.235. The camera-facing strip trails the parent
+        // effect point (a core/arm dummy during the air glide).
+        40 => Look::Ribbon {
+            texture: int(l, 0),
+            blend: blend(int(l, 6)),
+            width: float_curve(p(7)),
+            interval: tick(l, 9).max(1.0 / 240.0),
+            life: tick(l, 10).max(0.0),
+            segments: int(l, 12).max(1) as usize,
+            color: color_curve(p(16)),
         },
         _ => return None,
     })
@@ -1374,6 +1403,8 @@ struct NodeRt {
     emissions: i32,
     particles: Vec<Particle>,
     batch: Option<Visual>,
+    /// Action-40 ribbon history: `(age, world position)` samples, oldest first.
+    ribbon: Vec<(f32, Vec3)>,
 }
 
 /// Per-frame context while stepping an effect.
@@ -1517,6 +1548,7 @@ fn look_span(def: &NodeDef) -> f32 {
             .max(curve_end(height))
             .max(curve_end(spin)),
         Look::RadialBlur => 0.0,
+        Look::Ribbon { .. } => 0.0,
     }
 }
 
@@ -1557,6 +1589,7 @@ impl NodeRt {
             emissions: 0,
             particles: Vec::new(),
             batch: None,
+            ribbon: Vec::new(),
         }
     }
 
@@ -1594,8 +1627,11 @@ impl NodeRt {
                 Vec3::Z * self.travel,
             );
         let world = parent * local;
-        match (&def.look, own) {
-            (Some(look), true) => self.draw(look, t, world, cx),
+        // A stopped action-40 ribbon keeps drawing its remaining history until the samples age
+        // past the trail life.
+        let ribbon_has = !self.ribbon.is_empty();
+        match (&def.look, own || ribbon_has) {
+            (Some(look), true) => self.draw(look, t, parent, world, cx, own),
             _ => {
                 if let Some(v) = self.visual.take() {
                     cx.despawn(v);
@@ -1656,7 +1692,7 @@ impl NodeRt {
             }
             live
         });
-        alive || !self.children.is_empty()
+        alive || !self.children.is_empty() || !self.ribbon.is_empty()
     }
 
     fn clear(&mut self, cx: &mut Cx) {
@@ -1671,7 +1707,15 @@ impl NodeRt {
         }
     }
 
-    fn draw(&mut self, look: &Look, t: f32, world: Affine3A, cx: &mut Cx) {
+    fn draw(
+        &mut self,
+        look: &Look,
+        t: f32,
+        parent: Affine3A,
+        world: Affine3A,
+        cx: &mut Cx,
+        emit: bool,
+    ) {
         let (_, rot, pos) = world.to_scale_rotation_translation();
         let k = scale_of(world);
         match look {
@@ -1821,6 +1865,101 @@ impl NodeRt {
                 if let Some(v) = self.visual.take() {
                     cx.despawn(v);
                 }
+            }
+            Look::Ribbon {
+                texture,
+                blend,
+                width,
+                interval,
+                life,
+                segments,
+                color,
+            } => {
+                // Sample the parent effect point (the dummy), not this node's own offset:
+                // f0000134's outer action 34 spins about Y at 201 rad/s, which would alias a
+                // 0.1 m offset into noise.
+                let anchor = Vec3::from(parent.translation);
+                if emit {
+                    let due = self
+                        .ribbon
+                        .last()
+                        .is_none_or(|(st, _)| t - *st >= *interval);
+                    if due {
+                        self.ribbon.push((t, anchor));
+                    }
+                }
+                let floor = t - life;
+                self.ribbon.retain(|(st, _)| *st >= floor);
+                let mut pts: Vec<Vec3> = self.ribbon.iter().map(|(_, p)| *p).collect();
+                if emit && pts.last().is_none_or(|p| p.distance_squared(anchor) > 1e-6) {
+                    pts.push(anchor);
+                }
+                if pts.len() < 2 {
+                    return;
+                }
+                // Keep at most `segments` spans by walking the history at an even stride.
+                let spans = (*segments).max(1);
+                let n = pts.len();
+                let count = (spans + 1).min(n);
+                let pick = |i: usize| -> Vec3 {
+                    if count == n {
+                        pts[i]
+                    } else {
+                        pts[(i * (n - 1)) / (count - 1)]
+                    }
+                };
+                let col = color.at(t);
+                let half = (width.at(t) * k).max(0.0) * 0.5;
+                let mut b = Batch::default();
+                for i in 0..count {
+                    let p = pick(i);
+                    let prev = pick(i.saturating_sub(1));
+                    let next = pick((i + 1).min(count - 1));
+                    let mut side = (next - prev).cross(cx.camera - p);
+                    if side.length_squared() < 1e-8 {
+                        side = (next - prev).cross(Vec3::Y);
+                    }
+                    if side.length_squared() < 1e-8 {
+                        side = Vec3::X;
+                    }
+                    let side = side.normalize() * half;
+                    let u = i as f32 / (count - 1) as f32;
+                    // The texture is a soft radial puff: stretching it once along the trail
+                    // gives a fuzzy line that fades at both ends; the vertex alpha also fades
+                    // the oldest samples so the strip vanishes when its life runs out.
+                    let c = [col.x, col.y, col.z, col.w * u];
+                    b.pos.push((p - anchor - side).to_array());
+                    b.pos.push((p - anchor + side).to_array());
+                    b.uv.push([u, 1.0]);
+                    b.uv.push([u, 0.0]);
+                    b.color.push(vertex_color(c));
+                    b.color.push(vertex_color(c));
+                }
+                for i in 0..count - 1 {
+                    let a = (i * 2) as u32;
+                    b.index.extend([a, a + 1, a + 2, a + 1, a + 3, a + 2]);
+                }
+                if self.visual.is_none() {
+                    let tex = cx.lib.texture(*texture, cx.images);
+                    let material = cx.shared_material(tex, *blend, Vec4::ONE);
+                    let mesh = cx.meshes.add(Batch::default().mesh());
+                    let e = cx.spawn(
+                        (Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())),
+                        Transform::from_translation(anchor),
+                    );
+                    self.visual = Some(Visual {
+                        entities: vec![e],
+                        material,
+                        shared_material: true,
+                        mesh: Some(mesh),
+                    });
+                }
+                let v = self.visual.as_ref().unwrap();
+                if let Some(mut m) = v.mesh.as_ref().and_then(|h| cx.meshes.get_mut(h)) {
+                    *m = b.mesh();
+                }
+                cx.moves
+                    .push((v.entities[0], Transform::from_translation(anchor), None));
             }
         }
     }
@@ -2519,6 +2658,15 @@ pub fn boosters(
     };
     let stick = pilot.command;
     let glide = pilot.glide && pilot.boost;
+    // f0000134 ribbon trails belong to the air glide. Stop them when it ends; each node keeps
+    // its remaining second of samples while they age out.
+    if !glide {
+        for mut s in &mut effects {
+            if s.id == GLIDE_TRAIL {
+                s.stop();
+            }
+        }
+    }
     let wj_accel = pilot.in_wall_jump_accel();
     let kicking = pilot.in_kick();
     let blade_dash = pilot.in_blade_dash();
@@ -3226,6 +3374,64 @@ mod tests {
         assert_eq!(
             b_alive, 2,
             "f0000300 at 2.5s should keep only its 2 infinite booster nodes (flame + haze), not the 0.5s smoke puff or 0.33s flash"
+        );
+    }
+
+    #[test]
+    fn glide_ribbon_reads_f0000134_action_40() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let Ok(disc) = acvd_formats::vfs::Disc::default_for(root) else {
+            return;
+        };
+        let bytes = acvd_formats::vfs::open(&disc, &format!("{}|f0000134.ffx", super::EFFECTS))
+            .expect("f0000134 ffx entry");
+        let eff = acvd_formats::ffx::read(&bytes).expect("parse f0000134");
+        let roots: Vec<_> = eff
+            .states
+            .first()
+            .into_iter()
+            .flat_map(|s| &s.actions)
+            .flat_map(|a| super::nodes(&a.params))
+            .collect();
+        fn find_ribbon<'a>(
+            ns: &'a [std::sync::Arc<super::NodeDef>],
+        ) -> Option<&'a super::Look> {
+            for n in ns {
+                if let Some(l @ super::Look::Ribbon { .. }) = &n.look {
+                    return Some(l);
+                }
+                if let Some(l) = find_ribbon(&n.children) {
+                    return Some(l);
+                }
+            }
+            None
+        }
+        let Some(super::Look::Ribbon {
+            texture,
+            blend,
+            width,
+            interval,
+            life,
+            segments,
+            color,
+        }) = find_ribbon(&roots)
+        else {
+            panic!("f0000134 must parse an action-40 ribbon node");
+        };
+        assert_eq!(*texture, 1847, "s1847 cloud texture");
+        assert_eq!(*blend, super::Blend::Add);
+        assert!((width.at(0.0) - 0.06).abs() < 1e-4, "0.06 m wide");
+        assert!((interval - 1.0 / 60.0).abs() < 1e-5, "one tick sample");
+        assert!((life - 1.0).abs() < 1e-5, "1 s trail life");
+        assert_eq!(*segments, 16);
+        let c = color.at(0.0);
+        assert!(
+            (c.x - 1.0).abs() < 1e-3 && (c.w - 0.235).abs() < 1e-3,
+            "white alpha 0.235, got {c:?}"
         );
     }
 }

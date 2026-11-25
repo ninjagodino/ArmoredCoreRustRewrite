@@ -276,6 +276,14 @@ pub struct Pilot {
     pub yaw: f32,
     pub boost: bool,
     pub glide: bool,
+    pub glide: bool,
+    /// Remaining height of the Glide Boost start ascent (m); set to `glide_lift_height` at
+    /// activation and spent at `glide_rise_tick` per tick.
+    glide_lift_left: f32,
+    /// True while the fixed Glide Boost start ascent is applying.
+    glide_lifting: bool,
+    /// True once the current glide captured its start height and began the ascent.
+    glide_lift_started: bool,
     pub airborne: bool,
     /// True while Scan Mode is active (`AC + 0xdb0 != 0`, `0x828b41a0`). Switches passive EN
     /// drain to `scan_passive_en_drain_tick` (`0x8286a558` / `0x828bef18`) and locks out firing.
@@ -1363,6 +1371,10 @@ impl Pilot {
             yaw: 0.0,
             boost: false,
             glide: false,
+            glide: false,
+            glide_lift_left: 0.0,
+            glide_lifting: false,
+            glide_lift_started: false,
             airborne: false,
             scan_mode: false,
             ow_active: false,
@@ -2335,6 +2347,20 @@ fn step_core_ref(
 
 fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision) {
     let c = p.ctrl;
+    let c = p.ctrl;
+    // Glide Boost begins with a fixed ascent (`0x8281dd28` clamps the rise to block+0x0 above
+    // the activation height, `object+0x2b4`): 5.0 m at ~6 m/s, so the AC lifts off even on flat
+    // ground. The lift itself runs in the vertical block below; it stays on the ground clip
+    // (movement state 4) until the 5.0 m are spent.
+    if !p.glide {
+        p.glide_lifting = false;
+        p.glide_lift_started = false;
+        p.glide_lift_left = 0.0;
+    } else if !p.glide_lift_started {
+        p.glide_lift_started = true;
+        p.glide_lifting = true;
+        p.glide_lift_left = c.glide_lift_height;
+    }
     if p.qb_cooldown >= 1.0 {
         p.qb_cooldown = (p.qb_cooldown - 1.0).max(0.0);
     }
@@ -2551,18 +2577,27 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
     }
     p.jump_queued = false;
 
-    if p.airborne && !qb_hopped && !wj_accelerated && !melee_skip_gravity {
+    // Glide Boost opens with the fixed start ascent of `glide_lift_height` (object+0x8c = 5.0 m,
+    // clamped by 0x8281dd28 to `block+0x0 + block+0x2c` = activation height + 5.0 m) at
+    // `glide_rise_tick`. It runs while the AC is still in the ground glide (movement state 4),
+    // so the start clip keeps playing; when the 5.0 m are spent the AC is airborne and the air
+    // entry follows. Xenia probe private/xenia/glide_cap.jsonl: 23.230 -> 28.230 m in 374 ms.
+    if p.glide && p.glide_lifting {
+        let step = c.glide_rise_tick.min(p.glide_lift_left);
+        p.glide_lift_left = (p.glide_lift_left - step).max(0.0);
+        p.velocity.y = step;
+        if p.glide_lift_left <= 0.0 {
+            p.glide_lifting = false;
+            p.airborne = true;
+        }
+    } else if p.airborne && !qb_hopped && !wj_accelerated && !melee_skip_gravity {
         if p.takeoff > 0.0 {
             p.velocity.y += c.jump_accel_tick * p.takeoff.min(1.0);
             p.takeoff = (p.takeoff - 1.0).max(0.0);
         } else if p.glide {
             // The vertical update 0x82820168 skips the gravity loop (0x8281f960) in the glide
-            // states 4/5 (0x8281f3d0 at 0x828201b4): the vertical speed holds. 0x8281dd28 only
-            // caps rising (block +0x288), which a glide off the ground never does.
-            // The air entry 0x8281f8c0 seeds the mover from 0x8281e898: horizontal acceleration
-            // +0x1d8 from the thrust block +0x2cc (recomputed every tick here) and vertical speed
-            // +0x1e8 from +0x2dc, which the glide update zeroes, so an air glide holds a flat
-            // height with no residual rise or fall.
+            // states 4/5 (0x8281f3d0 at 0x828201b4): after the start ascent the glide holds its
+            // height (a glide that leaves a ledge does not rise).
             p.velocity.y = 0.0;
         } else {
             // Boost gravity (movement +0x284) only while boost mode is on and the AC falls; it
@@ -2624,6 +2659,10 @@ fn step_resolve_world(p: &mut Pilot, position: &mut Vec3, collision: &Collision)
             p.landings += 1;
             (position.y, p.velocity.y, p.airborne, p.landed, p.wj) = (g, 0.0, false, true, None);
         }
+    } else if p.glide_lifting {
+        // Glide Boost start ascent (`glide_lift_height`): the ground snap must not undo the lift
+        // while the movement state is still the ground glide; the vertical block marks the AC
+        // airborne once the fixed 5.0 m are spent.
     } else {
         match ground.filter(|&(g, _)| g >= position.y - lift) {
             Some((g, surf)) => {
@@ -3748,6 +3787,65 @@ mod tests {
         let low_en = p.en;
         assert!(!start_quick_boost(&mut p));
         assert_eq!(p.en, low_en);
+    }
+
+    #[test]
+    fn glide_boost_starts_with_a_fixed_ascent() {
+        // 0x8281dd28 clamps the start rise to block+0x0 + block+0x2c, the activation height
+        // (object+0x2b4) plus the 5.0 m lift (object+0x8c). Xenia probe
+        // private/xenia/glide_cap.jsonl: 23.230 -> 28.230 over 374 ms (0.1 m/tick), then flat.
+        let ctrl = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        assert!((ctrl.glide_lift_height - 5.0).abs() < 1e-6);
+        assert!((ctrl.glide_rise_tick - 0.1).abs() < 1e-6);
+
+        let ground = Collision::with_hits(
+            vec![crate::collision::Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            Vec::new(),
+        );
+        let mut p = Pilot::new(ctrl, 0);
+        p.boost = true;
+        p.glide = true;
+        p.velocity = Vec3::NEG_Z * 0.4;
+        let mut pos = Vec3::ZERO;
+        let input = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
+        // Activation lifts off the ground immediately, even on flat terrain, while the ground
+        // glide clip still drives the pose.
+        step(&mut p, &input, &mut pos, &ground);
+        assert!(!p.airborne, "the lift runs in the ground glide state");
+        assert!(pos.y > 0.0, "the first tick of the glide already rises");
+        // 5.0 m at 0.1 m/tick: about 50 ticks, then the fixed amount is spent.
+        for _ in 0..80 {
+            step(&mut p, &input, &mut pos, &ground);
+        }
+        assert!(p.airborne, "the AC is airborne once the lift is spent");
+        assert!(
+            (pos.y - 5.0).abs() < 0.11,
+            "the start ascent is a fixed 5.0 m, got {}",
+            pos.y
+        );
+        assert_eq!(p.velocity.y, 0.0, "after the ascent the glide holds height");
+        // Gliding off a ledge afterwards must not add any further ascent.
+        let void = Collision::default();
+        for _ in 0..40 {
+            step(&mut p, &input, &mut pos, &void);
+        }
+        assert!(
+            (pos.y - 5.0).abs() < 0.11,
+            "stepping off a ledge must not ascend, got {}",
+            pos.y
+        );
+        assert!(p.glide, "the glide itself keeps running");
     }
 
     #[test]
