@@ -12,6 +12,9 @@
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex = textureSample(image, image_sampler, in.uv);
+    // `tint.a` is the sprite fade the draw supplies (sun/ghost/dust: the smoothed sun
+    // visibility; point flares and beams: their envelope), not the per-slot alpha the 360 keeps
+    // in the vertex alpha. The solid glare look comes from that split (`0x82b96490`).
     let rgb = tex.rgb * tint.rgb * tint.a;
     // `AlphaMode::Add` premultiplies by alpha and zeroes alpha in the stock PBR shader; do the
     // same here (rgb already includes `tint.a`) so the blend is plain `src + dst`.

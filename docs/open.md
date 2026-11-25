@@ -23,18 +23,20 @@ Rough priority order; reorder freely.
 in order:
 
 - **Sun / lens-flare look**: sprite maths matches the 360 (see Done "360 lens-flare parity"), and
-  the sun is flare-only. The sprites now draw as camera-facing additive HDR quads at
-  `FLARE_DIST` 0.5 m in the 3D transparent phase, so `Bloom`, the god-ray source pass and
-  `m_ToneMapFilter` see them like the 360's sprite batch (`0x82b95c28`) instead of a post-tonemap
-  UI overlay. Same-run flare-only excess (m4000 centre view `private/shots/sun_centre_hdr.png`
-  minus the same pose yawed 60 deg off the sun, `sun_centre_off.png`): 173/105/70/46/27 luma at
-  core/0.05H/0.10H/0.20H/0.30H; sun pitch is the msb's 43 deg, so placement follows the 360.
-  The saved 360 crop (`private/shots/ref_sun_360.png`, "6007 ARENA ATK-6") is a different env with
-  a hazy, bright sky, so its absolute values (core 226 over ~114 sky) are not comparable: at equal
-  sky the flare excess is at or above the 360's, i.e. the perceived dimness is m4000's dusk sky,
-  not the sprite alpha. Still missing: a 360 m4000 capture of the sun (the 9 yaw sweep shots are
-  dusk sky with no sun) and a runtime check that the sky dome's painted glow matches the msb sun
-  angle.
+  the sun is flare-only. The sprites draw as camera-facing additive HDR quads at `FLARE_DIST`
+  0.5 m in the 3D transparent phase, so `Bloom`, the god-ray source pass and `m_ToneMapFilter` see
+  them like the 360's sprite batch (`0x82b95c28`) instead of a post-tonemap UI overlay. The sprite
+  RGB is **not** premultiplied by the per-slot alpha (`0x82b96490` packs colour and fade
+  separately); that alpha only gates the draw, and `tint.a` carries the fade: the smoothed sun
+  visibility for glares/ghosts/dust, the envelope for point flares/beams. Premultiplying was what
+  made the sun look dim/washed (`sun_offset_hdr.png`, core 208); the solid sprite look is
+  `sun_offset_fade.png` = `sun_offset_noalpha.png`, core 255 and 204 luma at 0.10H (2560x1440,
+  `--cam 424.65,77.84,649.50 --look 424.65,700,1200 --no-hud`). The saved 360 crop
+  (`private/shots/ref_sun_360.png`, "6007 ARENA ATK-6") is a different env with a hazy, bright sky
+  (core 226 over ~114 luma), so absolute values are not comparable; sun pitch is the msb's 43 deg,
+  so placement follows the 360. Still missing: a 360 m4000 capture of the sun (the 9 yaw sweep
+  shots are dusk sky with no sun) and a runtime check that the sky dome's painted glow matches the
+  msb sun angle.
 
 - **Map look**: lighting / fog / sky / tone map / per-draw light-set ids, area bounds (POINT kinds 100-102), destructible map props (`_b.flv` / `_b_h.hmd`), and water return (`POINT` kind 50 + `env::Scene.water_height`) are in (see below). The `o0006` `signboardGrow` screens' `movie` texture is a runtime render target, not an asset (see below).
   - Done: `acvd-formats::env` reads `ch_env/*_env.msb` (MSB chain at version 0x00989A6C,

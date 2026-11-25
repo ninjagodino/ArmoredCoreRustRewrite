@@ -740,7 +740,9 @@ fn update_lens_flare(
                     center: sun_pos,
                     size,
                     rot: if g_slot.rotate { angle } else { 0.0 },
-                    tint: LinearRgba::new(glare_rgb.x, glare_rgb.y, glare_rgb.z, a),
+                    // The sprite RGB is not alpha-premultiplied (`0x82b96490`): the per-slot
+                    // alpha only gates the draw, the sprite fades with the sun visibility.
+                    tint: LinearRgba::new(glare_rgb.x, glare_rgb.y, glare_rgb.z, vis),
                 });
             }
 
@@ -768,7 +770,7 @@ fn update_lens_flare(
                     center: pos,
                     size,
                     rot: if gh.rotate { angle } else { 0.0 },
-                    tint: LinearRgba::new(tint.x, tint.y, tint.z, a),
+                    tint: LinearRgba::new(tint.x, tint.y, tint.z, vis),
                 });
             }
 
@@ -795,7 +797,7 @@ fn update_lens_flare(
                                 dust_rgb.x.min(1.0),
                                 dust_rgb.y.min(1.0),
                                 dust_rgb.z.min(1.0),
-                                intensity,
+                                vis,
                             ),
                         });
                     }
