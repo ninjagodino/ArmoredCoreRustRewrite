@@ -147,7 +147,12 @@ in order:
   `cat-10 +0x16c` `snipe_turn_scale` via `0x8287b658` <- `0x82478e00`), and 30 Hz speed-blur
   step rate (`BLUR_RATE = 30.0`, `FollowCam::blur_step` matching `0x82bfb748` -> `0x82bfa9f0`;
   the probed `BlurRate == 2` row is row `19` `ドリフト`) are now implemented in `control.rs` /
-  `weapons.rs` / `damage.rs`. Remaining open points: `dash_inv` (msg `0x66` `0x8285cf48`),
+  `weapons.rs` / `damage.rs`. Follow-camera wall clip (`CamFx_stateFollow` `0x82bfb238` ->
+  `0x82bfaef0`: camera ray `0x82c4d680` filter `8`, sphere probe `0x82bf9a28`, distance blend
+  `0x82bfa740`) is `FollowCam::clip` (`RayFilter::Camera`, `Hit::blocks_camera`), using a 0.3 m
+  margin and a 0.5 m minimum instead of the 360's 4 m minimum so a wall in the AC's back cannot
+  clip. Remaining
+  open points: `dash_inv` (msg `0x66` `0x8285cf48`),
   `side_moving` (msg `0x67` `0x8285cf68`), distance-attenuated rumble shakes (`0x82bf9de0`,
   `0x82bf9ee8` using `ACCAM_RAMBLE_PARAM_ST`), zoom-blur source width (taken as 1280) and filter
   fade at `+0x54` (taken as 1), which base-transform factor carries the waist offset, the writer

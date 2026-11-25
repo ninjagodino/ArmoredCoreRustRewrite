@@ -23,7 +23,7 @@ use acvd_render::app::Orbit;
 use bevy::prelude::*;
 
 use crate::blur::ZoomBlur;
-use crate::collision::{Collision, Layer, RAY_HALF};
+use crate::collision::{Collision, Layer, RayFilter, RAY_HALF};
 use crate::hud::Status;
 use crate::pose::{Driven, Fade, Motion};
 
@@ -56,6 +56,16 @@ const NO_ACTION_SIDE_FRAMES: f32 = 120.0;
 const ACTION_DIST_MIN: f32 = 0.001;
 /// The zoom-blur filter draws only above this alpha (360 0x82c98368: `if (9 < alpha)`).
 const BLUR_MIN_ALPHA: u8 = 9;
+/// Follow-camera clip (`0x82bfaef0` -> `0x82bfa378` / `0x82c4d680`): the eye stops this far
+/// short of the wall it hit, so the near plane never sees through the surface.
+const CAM_CLIP_MARGIN: f32 = 0.3;
+/// The clipped eye never comes closer to the base point than this (the 360 clamps its min
+/// distance to 4 m at `0x8371e034`; the rewrite lets it come closer so a wall in the AC's back
+/// cannot clip, but keeps it off the base point).
+const CAM_CLIP_MIN: f32 = 0.5;
+/// Per-60-Hz-frame fraction the eye closes on the unobstructed distance after a wall clears
+/// (`0x82bfa740` blends at `0x8371e03c` = 0.2); pulling in to a wall is immediate.
+const CAM_CLIP_RECOVER: f32 = 0.2;
 /// Normalized Boost Charge hold threshold that auto-fires `HighBoostState` (360 `0x8237c1b8`,
 /// float `0x8200d3f0`).
 const QB_AUTO_FIRE: f32 = 0.9999;
@@ -444,6 +454,9 @@ struct FollowCam {
     blur_accum: f32,
     /// Shown eye and look-at, and last frame's targets; `None` until the first frame snaps.
     shown: Option<Shown>,
+    /// Eye distance from the base point kept by the wall clip (`CamFx` `0x82bfaef0` ->
+    /// `0x82bfa740`, distance state at `+0x2a0..+0x2b8`): 0 until the first clipped frame.
+    clip_dist: f32,
 }
 
 /// The game's linear float interpolator (disc 0x1136038): a new target restarts from the current
@@ -781,6 +794,7 @@ impl FollowCam {
             blur: 0.0,
             blur_accum: 0.0,
             shown: None,
+            clip_dist: 0.0,
         }
     }
 
@@ -1122,6 +1136,46 @@ impl FollowCam {
         };
         self.shown = Some(shown);
         (shown.eye, shown.look_at)
+    }
+
+    /// Keeps the eye out of map geometry (360 `CamFx` `0x82bfaef0`: a camera-filter ray
+    /// `0x82bfa378` -> `0x82c4d680` (filter `0x00000008`) from the AC base point to the eye, a
+    /// short sphere probe `0x82bf9a28`, then the distance blend `0x82bfa740`). `pivot` is the
+    /// waist, `eye` / `look_at` the placed points. The eye is pulled to the first wall hit minus
+    /// [`CAM_CLIP_MARGIN`] at once, and slides back out after the wall clears. Both points are
+    /// moved by the same correction so the view direction does not change.
+    fn clip(
+        &mut self,
+        pivot: Vec3,
+        eye: Vec3,
+        look_at: Vec3,
+        collision: &Collision,
+        dt: f32,
+    ) -> (Vec3, Vec3) {
+        let delta = eye - pivot;
+        let want = delta.length();
+        if want <= 1e-4 {
+            return (eye, look_at);
+        }
+        let dir = delta / want;
+        let hit = collision
+            .raycast(pivot, eye, RayFilter::Camera)
+            .map(|(t, _, _)| (t * want - CAM_CLIP_MARGIN).max(CAM_CLIP_MIN));
+        let target = hit.unwrap_or(want);
+        let dist = if self.clip_dist <= 0.0 || target < self.clip_dist {
+            target
+        } else {
+            let step = 1.0 - (1.0 - CAM_CLIP_RECOVER).powf(dt * TICK_RATE);
+            self.clip_dist + (target - self.clip_dist) * step
+        };
+        self.clip_dist = dist;
+        let eye = pivot + dir * dist;
+        // Keep the clipped eye as the follow state, so releasing a wall eases back out instead
+        // of snapping to last frame's unobstructed point.
+        if let Some(s) = self.shown.as_mut() {
+            s.eye = eye;
+        }
+        (eye, look_at + (eye - (pivot + dir * want)))
     }
 }
 
@@ -3178,6 +3232,9 @@ pub fn pilot(
         let (eye, look_at) = p
             .cam
             .follow(eye, look_at, cam_rot, airborne, time.delta_secs());
+        let (eye, look_at) =
+            p.cam
+                .clip(root + waist, eye, look_at, collision, time.delta_secs());
         let yaw_follow = p.cam.look_at_rate[0].value.clamp(0.01, 1.0);
         p.cam.hud_yaw_lead *= (1.0 - yaw_follow).powf(time.delta_secs() * TICK_RATE);
         o.focus = look_at;
@@ -4109,6 +4166,72 @@ mod tests {
     }
 
     #[test]
+    fn camera_clip_stops_at_wall_ignores_camera_material_and_eases_out() {
+        use crate::collision::{GroundSurface, Hit, Layer, Plane};
+        let wall = |z: f32, blocks_camera: bool| {
+            let tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| Hit {
+                a: Vec3::from(a),
+                b: Vec3::from(b),
+                c: Vec3::from(c),
+                layer: Layer::Ground,
+                surface: GroundSurface::Concrete,
+                wall_kickable: false,
+                blocks_fcs_los: true,
+                blocks_ai_los: true,
+                blocks_bullet: true,
+                blocks_camera,
+                prop_id: 0,
+                only_when_broken: false,
+            };
+            vec![
+                tri([-50.0, 0.0, z], [50.0, 0.0, z], [-50.0, 50.0, z]),
+                tri([50.0, 0.0, z], [50.0, 50.0, z], [-50.0, 50.0, z]),
+            ]
+        };
+        let pivot = Vec3::new(0.0, 4.0, 0.0);
+        let eye = Vec3::new(0.0, 4.0, -20.0);
+        let look = Vec3::new(0.0, 4.0, -1020.0);
+        let dt = 1.0 / 60.0;
+
+        // A `camera`-material wall (`0x08`) is excluded by the 360 filter; the solid wall behind
+        // it stops the eye 0.3 m short. (Camera wall at -4 is nearer and must be ignored.)
+        let mut hits = wall(-4.0, false);
+        hits.extend(wall(-8.0, true));
+        let col = Collision::with_hits(
+            vec![Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            hits,
+        );
+        let mut cam = FollowCam::of(10);
+        let (clipped, look_out) = cam.clip(pivot, eye, look, &col, dt);
+        let dist = (clipped - pivot).length();
+        assert!(
+            (dist - 7.7).abs() < 1e-3,
+            "solid wall at 8 m must stop the eye at 7.7 m, got {dist}"
+        );
+        let before = (look - eye).normalize();
+        let after = (look_out - clipped).normalize();
+        assert!((after - before).length() < 1e-5, "view direction changed");
+
+        // The wall clears: the eye eases back out instead of snapping to the full 20 m.
+        let clear = Collision::default();
+        let (out, _) = cam.clip(pivot, eye, look, &clear, dt);
+        let out_dist = (out - pivot).length();
+        assert!(
+            out_dist > dist && out_dist < 20.0,
+            "released eye must ease out, got {out_dist}"
+        );
+
+        // A lone camera-material wall never clips the eye.
+        let mut cam2 = FollowCam::of(10);
+        let camera_only = Collision::with_hits(Vec::new(), wall(-4.0, false));
+        let (free, _) = cam2.clip(pivot, eye, look, &camera_only, dt);
+        assert!((free - eye).length() < 1e-4, "camera material must not clip");
+    }
+
+    #[test]
     fn qb_shortage_and_high_boost_tae_ids() {
         assert_eq!(high_boost_tae_id(false, false, false), 0x0C1D);
         assert_eq!(high_boost_tae_id(false, false, true), 0x0C1E);
@@ -4166,6 +4289,7 @@ mod tests {
                         blocks_fcs_los: true,
                         blocks_ai_los: true,
                         blocks_bullet: true,
+                        blocks_camera: true,
                         surface: GroundSurface::Concrete,
                         prop_id,
                         only_when_broken: false,
@@ -4179,6 +4303,7 @@ mod tests {
                         blocks_fcs_los: true,
                         blocks_ai_los: true,
                         blocks_bullet: true,
+                        blocks_camera: true,
                         surface: GroundSurface::Concrete,
                         prop_id,
                         only_when_broken: false,

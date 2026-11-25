@@ -46,6 +46,10 @@ pub enum RayFilter {
     /// Bullet / missile terrain raycast (`0x828eea28` `0x00100004`): solid terrain and water,
     /// excluding wire (`0x04`) and invisible `camera`/`enehit`/`plyerhit`/`ackickrhit`.
     Bullet,
+    /// Follow-camera clip (`0x82c4d680` `0x00000008`; see `FollowCam::clip`): the HMD material
+    /// table's `camera` bit (`0x08`) is the only exclusion, so solid terrain and every other
+    /// hit-model surface can stop the eye. Synthetic planes can too.
+    Camera,
     /// Any `Layer::Ground` triangle.
     #[allow(dead_code)]
     Ground,
@@ -140,6 +144,9 @@ pub struct Hit {
     pub blocks_ai_los: bool,
     /// Blocks projectiles and missiles (`0x828eea28` `0x00100004`).
     pub blocks_bullet: bool,
+    /// Blocks the follow camera (`0x82c4d680` `0x00000008`): true unless the HMD material is the
+    /// `camera` bit (`0x08`).
+    pub blocks_camera: bool,
     /// `0` for static terrain / indestructible props; `part_index + 1` for destructible
     /// `KIND_OBJECT` props that ship `{model}_b.flv`.
     pub prop_id: u32,
@@ -162,6 +169,7 @@ impl Hit {
             blocks_fcs_los: true,
             blocks_ai_los: true,
             blocks_bullet: true,
+            blocks_camera: true,
             prop_id: 0,
             only_when_broken: false,
         }
@@ -183,6 +191,7 @@ impl Hit {
             RayFilter::FcsLos => self.blocks_fcs_los,
             RayFilter::AiLos => self.blocks_ai_los,
             RayFilter::Bullet => self.blocks_bullet,
+            RayFilter::Camera => self.blocks_camera,
             RayFilter::Ground => self.layer == Layer::Ground,
         }
     }
@@ -618,7 +627,7 @@ impl Collision {
         // Test synthetic planes (`--plane` / `--water`).
         for p in &self.planes {
             let plane_ok = match filter {
-                RayFilter::Bullet => true,
+                RayFilter::Bullet | RayFilter::Camera => true,
                 RayFilter::FcsLos | RayFilter::AiLos | RayFilter::Ground => {
                     p.layer == Layer::Ground
                 }
@@ -737,7 +746,7 @@ impl Collision {
 
         for p in &self.planes {
             let plane_ok = match filter {
-                RayFilter::Bullet => true,
+                RayFilter::Bullet | RayFilter::Camera => true,
                 RayFilter::FcsLos | RayFilter::AiLos | RayFilter::Ground => {
                     p.layer == Layer::Ground
                 }
@@ -1101,6 +1110,7 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los && !obj_look_penetrate,
                 blocks_bullet: (mask & 0x7c) == 0,
+                blocks_camera: (mask & 0x08) == 0,
                 prop_id,
                 only_when_broken,
             });
@@ -1207,6 +1217,7 @@ mod tests {
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los,
                 blocks_bullet: (mask & 0x7c) == 0,
+                blocks_camera: (mask & 0x08) == 0,
                 prop_id: 0,
                 only_when_broken: false,
             }
@@ -1283,6 +1294,7 @@ mod tests {
                 blocks_fcs_los,
                 blocks_ai_los: blocks_fcs_los,
                 blocks_bullet: (mask & 0x7c) == 0,
+                blocks_camera: (mask & 0x08) == 0,
                 prop_id: 0,
                 only_when_broken: false,
             };
