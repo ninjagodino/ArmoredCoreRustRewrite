@@ -133,6 +133,9 @@ in order:
       lookup as fallback), and gib materials reuse `map::mtd_alpha_mode` so
       `Map_Diffuse_Alpha`/`AlphaMask` scrap no longer renders as solid quads
       (`debris::tests::gib_textures_resolve_inside_the_model_pack`).
+      Remaining gib look: chunks still use the generic `StandardMaterial` (diffuse + bump only)
+      and sit outside any `MapPart`, so `env::relight` does not apply the map's fog/light set to
+      them.
     - **`o0006` `signboardGrow` `movie` texture is a runtime render target, not a missing asset**:
       the FLVER material (`model/obj/o0006/o0006.flv` mat 4, `signboardGrow.mtd` ->
       `Phong_ColDifEmi.spx`) names texture path `movie` for both `g_DiffuseTexture` and
