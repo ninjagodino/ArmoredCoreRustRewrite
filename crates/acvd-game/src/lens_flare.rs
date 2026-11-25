@@ -46,15 +46,21 @@ const MAX_POINT_FLARES: usize = 8;
 
 /// Sprite pool layout:
 /// - `0..4`: 4 primary glare slots (`0x82c9f5b0`)
-/// - `4`: optional anamorphic streak (`lf09`) when not already in the map's glare list
+/// - `4`: reserved anamorphic-streak slot (the 360 draws only the map's 4 glare slots)
 /// - `5..23`: 18 ghost chain slots (`0x82ca0370`)
 /// - `23`: `lfdust` dirty-lens overlay (`0x82ca1510`)
 /// - `24..48`: `MAX_POINT_FLARES * 3` dynamic `AppFxLensFlareDrawEntity` slots (core, streak, ghost)
+/// - `48..52`: `MAX_BEAMS * 2` map light-beam billboards (streak, emitter core)
 const STREAK_SLOT: usize = MAX_GLARES;
 const GHOST_BASE: usize = STREAK_SLOT + 1;
 const DUST_SLOT: usize = GHOST_BASE + MAX_GHOSTS;
 const POINT_BASE: usize = DUST_SLOT + 1;
-const POOL_SIZE: usize = POINT_BASE + MAX_POINT_FLARES * 3;
+
+/// Fake map light beams ("light shafts"): the 360 draws these as additive billboard sprites —
+/// an illusion, not dynamic volumetrics. `sheets/map_env.csv` rows `beam.*`.
+const MAX_BEAMS: usize = 2;
+const BEAM_BASE: usize = POINT_BASE + MAX_POINT_FLARES * 3;
+const POOL_SIZE: usize = BEAM_BASE + MAX_BEAMS * 2;
 
 const ADDITIVE_ONE: BlendState = BlendState {
     color: BlendComponent {
@@ -64,6 +70,40 @@ const ADDITIVE_ONE: BlendState = BlendState {
     },
     alpha: BlendComponent::OVER,
 };
+
+/// A fake map light beam: a screen-aligned additive streak plus a soft emitter core.
+/// `head`/`tail` are game-axes world points (`bevy = (-x, y, z)`); `width` is metres.
+struct MapBeam {
+    head: [f32; 3],
+    tail: [f32; 3],
+    width: f32,
+    color: [f32; 3],
+    alpha: f32,
+}
+
+/// `ac_test_start.png` (1280x720) shows two soft white streaks with down-left tails over the
+/// shadowed wall at the start of the bridge: heads at (461,367) and (532,364), tails ~11 and
+/// ~14 px long. They are additive billboard "light beams" (the 360 never raytraces volumetric
+/// shafts) and are not the `o0006` signboard screens. Heads are placed on the spawn-camera rays
+/// through those pixels at the bridge-deck height (y 32.4 m, near `o0006_1003` / the elevated
+/// street `o1503`/`o2024`/`o2076` cluster); tails give the visible shaft. `sheets/map_env.csv`
+/// rows `beam.m4000` carry the pixel evidence.
+const M4000_BEAMS: [MapBeam; MAX_BEAMS] = [
+    MapBeam {
+        head: [-711.0, 32.4, 569.0],
+        tail: [-711.0, 27.5, 566.2],
+        width: 1.4,
+        color: [1.0, 1.0, 1.0],
+        alpha: 0.85,
+    },
+    MapBeam {
+        head: [-910.0, 32.4, 576.0],
+        tail: [-910.0, 26.5, 568.0],
+        width: 2.0,
+        color: [1.0, 1.0, 1.0],
+        alpha: 0.85,
+    },
+];
 
 /// Active map/garage lens-flare configuration, populated by `env::apply_env_file`.
 #[derive(Resource, Clone, Default)]
@@ -459,6 +499,17 @@ pub(crate) fn ghost_axis_pos(sun: Vec2, centre: Vec2, axis_pos: f32) -> Vec2 {
     sun + (opposite - sun) * axis_pos
 }
 
+/// `(a0, a4)` centred flare factors from `0x82ca0a50` (`CFG+0xa0` / `CFG+0xa4`):
+/// `a0 = clamp(1 - min(d, halfdiag) / halfdiag, 0, 1)`,
+/// `a4 = (1.5*halfdiag - min(d, halfdiag)) / (1.5*halfdiag)`, so `a4` bottoms out at 1/3.
+pub(crate) fn centre_factors(half_diag: f32, sun_dist: f32) -> (f32, f32) {
+    let half_diag = half_diag.max(1.0);
+    let d = sun_dist.min(half_diag);
+    let a0 = (1.0 - d / half_diag).clamp(0.0, 1.0);
+    let a4 = ((1.5 * half_diag - d) / (1.5 * half_diag)).clamp(0.0, 1.0);
+    (a0, a4)
+}
+
 /// Smoothly fades flare visibility near and just past the screen border.
 fn edge_fade(uv: Vec2) -> f32 {
     let dx = (uv.x - 0.5).abs();
@@ -529,6 +580,8 @@ fn update_lens_flare(
     assets: Option<Res<LensFlareAssets>>,
     collision: Option<Res<Collision>>,
     garage: Option<Res<Garage>>,
+    scene: Option<Res<crate::Scene>>,
+    mode: Option<Res<crate::garage::Mode>>,
     shot_mark: Option<Res<acvd_render::app::ShotMark>>,
     ac_q: Query<&GlobalTransform, With<Ac>>,
     mut cam_q: Query<
@@ -600,6 +653,8 @@ fn update_lens_flare(
     let mut dbg_world_hits = 0u32;
     let mut dbg_ac_hits = 0u32;
     let mut dbg_sun_uv = Vec2::ZERO;
+    let mut dbg_a0 = 0.0_f32;
+    let mut dbg_a4 = 0.0_f32;
 
     if lf.enabled {
         let g = lf.direction();
@@ -615,23 +670,37 @@ fn update_lens_flare(
             None
         };
 
-        let (target_vis, sun_pos, sun_uv) = if let Some(sp) = sun_screen {
+        // `0x82ca2110`: the 360 update early-outs when the sun is behind the camera
+        // (`CFG+0x60 < 0`) or more than 200 px outside the viewport on either axis
+        // (`0x8208cc00 = -200.0`, `0x820293c8 = 200.0`). There is no radial edge fade.
+        let in_draw_bounds = |sp: Vec2| {
+            const MARGIN: f32 = 200.0;
+            sp.x >= -MARGIN
+                && sp.x <= vp_size.x + MARGIN
+                && sp.y >= -MARGIN
+                && sp.y <= vp_size.y + MARGIN
+        };
+        let (target_vis, sun_pos, sun_uv, draw_flare) = if let Some(sp) = sun_screen {
             let uv = sp / vp_size;
             dbg_sun_uv = uv;
-            let ef = edge_fade(uv);
-            let vis = if ef > 0.0 {
+            if in_draw_bounds(sp) {
                 let (frac, wh, ah) =
                     sun_unoccluded_fraction(cam_pos, sun_dir, collision.as_deref(), ac_aabb);
                 dbg_world_hits = wh;
                 dbg_ac_hits = ah;
-                ef * frac
+                (frac, sp, uv, true)
             } else {
-                0.0
-            };
-            (vis, sp, uv)
+                (0.0, screen_centre, uv, false)
+            }
         } else {
-            (0.0, screen_centre, Vec2::splat(0.5))
+            (0.0, screen_centre, Vec2::splat(0.5), false)
         };
+
+        // `0x82ca0a50` / `0x82ca0d30`: centred factors.
+        let half_diag = screen_centre.length().max(1.0);
+        let (a0, a4) = centre_factors(half_diag, (sun_pos - screen_centre).length());
+        dbg_a0 = a0;
+        dbg_a4 = a4;
 
         if !state.settled {
             state.visibility = target_vis;
@@ -648,7 +717,7 @@ fn update_lens_flare(
             god_ray_out = GodRayFilter::from_env(&lf.god_ray, sun_uv, vis);
         }
 
-        if in_front && vis > 0.001 {
+        if in_front && draw_flare && vis > 0.001 {
             let to_sun = sun_pos - screen_centre;
             let angle = to_sun.y.atan2(to_sun.x);
 
@@ -657,24 +726,19 @@ fn update_lens_flare(
             let ghost_rgb = Vec3::new(lf.ghost_color[0], lf.ghost_color[1], lf.ghost_color[2]);
             let ghost_a = lf.ghost_color[3];
 
-            let mut has_lf09 = false;
-
-            // 4 primary glare/streak slots (`0x82c9f5b0`).
+            // 4 primary glare/streak slots (`0x82c9f5b0`). `scale_by_vis` selects the
+            // centred `a0` factor for size; alpha stays `vis`-scaled only.
             for (i, g_slot) in lf.glares.iter().take(MAX_GLARES).enumerate() {
                 let Ok(tid) = usize::try_from(g_slot.tex_id) else {
                     continue;
                 };
-                if tid == 9 {
-                    has_lf09 = true;
-                }
                 let Some((img, native)) = assets.sprites.get(tid).and_then(|o| o.as_ref()) else {
                     continue;
                 };
-                let vis_scale = if g_slot.scale_by_vis { vis } else { 1.0 };
-                let s = g_slot.scale * vis_scale;
+                let s = g_slot.scale * if g_slot.scale_by_vis { a0 } else { 1.0 };
                 let size = Vec2::new(native.x * s * scale_x, native.y * s * scale_y);
                 let flick = state.next_flicker(lf.glare_flicker);
-                let a = (g_slot.alpha * glare_a * vis * flick).clamp(0.0, 1.5);
+                let a = (g_slot.alpha * glare_a * vis * flick).clamp(0.0, 1.0);
                 if a <= 0.001 || size.x <= 1.0 || size.y <= 1.0 {
                     continue;
                 }
@@ -687,25 +751,8 @@ fn update_lens_flare(
                 });
             }
 
-            // Subtle horizontal anamorphic streak (`lf09`, 256x32) if not already in the 4 glares.
-            if !has_lf09 && !lf.glares.is_empty() {
-                if let Some((img, native)) = assets.sprites[9].as_ref() {
-                    let s = 2.4 * (0.65 + 0.35 * vis);
-                    let size = Vec2::new(native.x * s * scale_x, native.y * s * 0.7 * scale_y);
-                    let a = (0.32 * glare_a * vis * vis).clamp(0.0, 1.0);
-                    if a > 0.002 {
-                        cmds[STREAK_SLOT] = Some(DrawCmd {
-                            img: img.clone(),
-                            center: sun_pos,
-                            size,
-                            rot: 0.0,
-                            tint: LinearRgba::new(glare_rgb.x, glare_rgb.y, glare_rgb.z, a),
-                        });
-                    }
-                }
-            }
-
-            // Up to 18 ghost chain slots (`0x82ca0370`).
+            // Up to 18 ghost chain slots (`0x82ca0370`). `alt_scale` selects `a4` instead
+            // of `a0` for both size and tint/alpha.
             for (i, gh) in lf.ghosts.iter().take(MAX_GHOSTS).enumerate() {
                 let Ok(tid) = usize::try_from(gh.tex_id) else {
                     continue;
@@ -714,45 +761,47 @@ fn update_lens_flare(
                     continue;
                 };
                 let pos = ghost_axis_pos(sun_pos, screen_centre, gh.axis_pos);
-                let vis_scale = if gh.alt_scale {
-                    0.75 + 0.25 * vis
-                } else {
-                    vis
-                };
-                let s = gh.scale * vis_scale;
+                let centre_scale = if gh.alt_scale { a4 } else { a0 };
+                let s = gh.scale * centre_scale;
                 let size = Vec2::new(native.x * s * scale_x, native.y * s * scale_y);
                 let flick = state.next_flicker(lf.ghost_flicker);
-                let a = (gh.alpha * ghost_a * vis * flick).clamp(0.0, 1.5);
+                let a = (gh.alpha * ghost_a * flick * centre_scale * vis).clamp(0.0, 1.0);
                 if a <= 0.001 || size.x <= 1.0 || size.y <= 1.0 {
                     continue;
                 }
+                let tint = (ghost_rgb * centre_scale).min(Vec3::ONE);
                 cmds[GHOST_BASE + i] = Some(DrawCmd {
                     img: img.clone(),
                     center: pos,
                     size,
                     rot: if gh.rotate { angle } else { 0.0 },
-                    tint: LinearRgba::new(ghost_rgb.x, ghost_rgb.y, ghost_rgb.z, a),
+                    tint: LinearRgba::new(tint.x, tint.y, tint.z, a),
                 });
             }
 
             // Dirty-lens dust overlay (`lfdust`, `0x82ca1510`): positioned in 720p screen space.
+            // The 360 multiplies the RGBA by `a4` (`0x8234a8d0`) then the alpha by `vis`
+            // (`+0x5d8`); there is no extra 0.22 attenuation.
             if let Some((dust_img, _)) = assets.dust.as_ref() {
-                let da = lf.dust.color[3] as f32 / 255.0;
-                if da > 0.001 {
+                let dust_rgb = Vec3::new(
+                    lf.dust.color[0] as f32 / 255.0,
+                    lf.dust.color[1] as f32 / 255.0,
+                    lf.dust.color[2] as f32 / 255.0,
+                ) * a4;
+                let intensity = (lf.dust.color[3] as f32 / 255.0 * a4 * vis).clamp(0.0, 1.0);
+                if intensity > 0.002 {
                     let pos = Vec2::new(lf.dust.pos[0] * scale_x, lf.dust.pos[1] * scale_y);
                     let size = Vec2::new(lf.dust.size[0] * scale_x, lf.dust.size[1] * scale_y);
-                    // Subtle optical dust intensity modulated by flare visibility.
-                    let intensity = (da * vis * 0.22).clamp(0.0, 0.5);
-                    if intensity > 0.002 && size.x > 1.0 && size.y > 1.0 {
+                    if size.x > 1.0 && size.y > 1.0 {
                         cmds[DUST_SLOT] = Some(DrawCmd {
                             img: dust_img.clone(),
                             center: pos + size * 0.5,
                             size,
                             rot: 0.0,
                             tint: LinearRgba::new(
-                                lf.dust.color[0] as f32 / 255.0,
-                                lf.dust.color[1] as f32 / 255.0,
-                                lf.dust.color[2] as f32 / 255.0,
+                                dust_rgb.x.min(1.0),
+                                dust_rgb.y.min(1.0),
+                                dust_rgb.z.min(1.0),
                                 intensity,
                             ),
                         });
@@ -840,6 +889,58 @@ fn update_lens_flare(
         }
     }
 
+    // 3. Fake map light-beam billboards (`m4000`, see `M4000_BEAMS`).
+    let mut dbg_beams = 0u32;
+    if mode.as_deref() == Some(&crate::garage::Mode::Sortie)
+        && scene.as_ref().and_then(|s| s.map.as_deref()) == Some("m4000")
+    {
+        let streak = assets.sprites[9].as_ref().map(|(img, _)| img.clone());
+        let core = assets.sprites[0].as_ref().map(|(img, _)| img.clone());
+        if let (Some(streak), Some(core)) = (streak, core) {
+            for (i, beam) in M4000_BEAMS.iter().enumerate() {
+                let head = Vec3::new(-beam.head[0], beam.head[1], beam.head[2]);
+                let tail = Vec3::new(-beam.tail[0], beam.tail[1], beam.tail[2]);
+                let (Ok(h), Ok(t)) = (
+                    camera.world_to_viewport(cam_gt, head),
+                    camera.world_to_viewport(cam_gt, tail),
+                ) else {
+                    continue;
+                };
+                let mid = (h + t) * 0.5;
+                let ef = edge_fade(mid / vp_size);
+                if ef <= 0.001 {
+                    continue;
+                }
+                let along = h - t;
+                let len_px = along.length();
+                if len_px < 1.0 {
+                    continue;
+                }
+                let len_m = (head - tail).length().max(0.01);
+                let width_px = (beam.width * len_px / len_m).max(1.0);
+                let base = BEAM_BASE + i * 2;
+                let a = (beam.alpha * ef).clamp(0.0, 1.5);
+                let tint = LinearRgba::new(beam.color[0], beam.color[1], beam.color[2], a);
+                cmds[base] = Some(DrawCmd {
+                    img: streak.clone(),
+                    center: mid,
+                    size: Vec2::new(len_px, width_px),
+                    rot: along.y.atan2(along.x),
+                    tint,
+                });
+                let c = (width_px * 2.6).max(3.0);
+                cmds[base + 1] = Some(DrawCmd {
+                    img: core.clone(),
+                    center: h,
+                    size: Vec2::splat(c),
+                    rot: 0.0,
+                    tint: LinearRgba::new(beam.color[0], beam.color[1], beam.color[2], a * 0.9),
+                });
+                dbg_beams += 1;
+            }
+        }
+    }
+
     // Apply pool draw commands to the UI nodes.
     let mut visible_count = 0usize;
     for (slot, mut node, mut xform, mut vis, mat_node) in &mut slots {
@@ -864,7 +965,7 @@ fn update_lens_flare(
 
     if let Some(path) = shot_mark.as_ref().and_then(|m| m.path.as_ref()) {
         println!(
-            "SHOT {} lens_flare enabled={} vis={:.3} sprites={} god_ray={:.3} sun_uv=({:.3},{:.3}) world_hits={} ac_hits={}",
+            "SHOT {} lens_flare enabled={} vis={:.3} sprites={} god_ray={:.3} sun_uv=({:.3},{:.3}) world_hits={} ac_hits={} a0={:.3} a4={:.3} beams={}",
             path.display(),
             active.config.enabled,
             state.visibility,
@@ -874,6 +975,9 @@ fn update_lens_flare(
             dbg_sun_uv.y,
             dbg_world_hits,
             dbg_ac_hits,
+            dbg_a0,
+            dbg_a4,
+            dbg_beams,
         );
     }
 }
@@ -891,6 +995,23 @@ mod tests {
         assert!((ghost_axis_pos(sun, centre, 0.5) - centre).length() < 1e-4);
         let opp = Vec2::new(340.0, 560.0);
         assert!((ghost_axis_pos(sun, centre, 1.0) - opp).length() < 1e-4);
+    }
+
+    #[test]
+    fn centre_factors_match_360_a0_a4() {
+        // 1280x720 -> halfdiag = sqrt(640^2 + 360^2).
+        let hd = (640.0_f32.powi(2) + 360.0_f32.powi(2)).sqrt();
+        let (a0, a4) = centre_factors(hd, 0.0);
+        assert!((a0 - 1.0).abs() < 1e-5 && (a4 - 1.0).abs() < 1e-5);
+        let (a0, a4) = centre_factors(hd, hd * 0.5);
+        assert!((a0 - 0.5).abs() < 1e-5);
+        assert!((a4 - (1.5 - 0.5) / 1.5).abs() < 1e-5);
+        // At/past the screen corner `a0` hits 0 but `a4` bottoms out at 1/3.
+        let (a0, a4) = centre_factors(hd, hd);
+        assert!(a0.abs() < 1e-5);
+        assert!((a4 - 1.0 / 3.0).abs() < 1e-5);
+        let (_, a4) = centre_factors(hd, hd * 4.0);
+        assert!((a4 - 1.0 / 3.0).abs() < 1e-5);
     }
 
     #[test]
@@ -951,6 +1072,33 @@ mod tests {
     }
 
     #[test]
+    fn m4000_beam_heads_match_360_pixels() {
+        // Spawn camera captured with the `CAMDBG` probe (`--shot`, 1280x720, fov_y 45°).
+        let cam = Vec3::new(303.6821, 36.6839, 655.5);
+        let right = Vec3::new(0.006, 0.0, 0.99998);
+        let up = Vec3::new(0.0025, 1.0, -0.00001);
+        let fwd = Vec3::new(0.99998, -0.0025, -0.006);
+        let th = (0.785398_f32 / 2.0).tan();
+        let tx = th * (1280.0 / 720.0);
+        let project = |g: [f32; 3]| {
+            let d = Vec3::new(-g[0], g[1], g[2]) - cam;
+            let z = d.dot(fwd);
+            assert!(z > 1.0);
+            let x = d.dot(right) / z / tx;
+            let y = d.dot(up) / z / th;
+            Vec2::new((x * 0.5 + 0.5) * 1280.0, (1.0 - (y * 0.5 + 0.5)) * 720.0)
+        };
+        let expect = [Vec2::new(461.0, 367.0), Vec2::new(532.0, 364.0)];
+        for (beam, want) in M4000_BEAMS.iter().zip(expect) {
+            let head = project(beam.head);
+            assert!((head - want).length() < 2.0, "head {head:?} != {want:?}");
+            // The shaft runs down-left on screen (tail x < head x, tail y > head y).
+            let tail = project(beam.tail);
+            assert!(tail.x < head.x && tail.y > head.y, "tail {tail:?} head {head:?}");
+        }
+    }
+
+    #[test]
     fn lensflare_textures_load_from_disc() {
         let Ok(disc) = Disc::default_for(&vfs::repo_root()) else {
             return;
@@ -962,6 +1110,43 @@ mod tests {
         }
         let (_, dust_size) = assets.dust.expect("missing decoded lfdust texture");
         assert_eq!(dust_size, Vec2::new(512.0, 512.0));
+    }
+
+    #[test]
+    fn m4000_flare_config_matches_360_blocks() {
+        let Ok(disc) = Disc::default_for(&vfs::repo_root()) else {
+            return;
+        };
+        let env =
+            acvd_formats::env::read(&vfs::open(&disc, "model/map/ch_env/m4000_env.msb").unwrap())
+                .unwrap();
+        let lf = &env.scene.unwrap().lens_flare;
+        // All 4 glare slots are used, so the 360 never synthesises an extra lf09 streak.
+        assert_eq!(lf.glares.len(), 4);
+        let expect = [
+            (0, 100.0 / 255.0, 0.8, false),
+            (0, 65.0 / 255.0, 1.0, false),
+            (1, 20.0 / 255.0, 0.7, false),
+            (10, 67.0 / 255.0, 2.0, true),
+        ];
+        for (g, (tex, alpha, scale, by_vis)) in lf.glares.iter().zip(expect) {
+            assert_eq!(g.tex_id, tex);
+            assert!(
+                (g.alpha - alpha).abs() < 1e-6,
+                "alpha {} != {alpha}",
+                g.alpha
+            );
+            assert!((g.scale - scale).abs() < 1e-6);
+            assert_eq!(g.scale_by_vis, by_vis);
+        }
+        // The axis-0 lf10 ghost (scale 7) is the giant centred star, so `a4` drives its look.
+        let first = lf.ghosts[0];
+        assert_eq!(first.tex_id, 10);
+        assert!(first.alt_scale && first.axis_pos.abs() < 1e-6);
+        assert!((first.scale - 7.0).abs() < 1e-6);
+        assert_eq!(lf.ghosts.len(), 6);
+        // m4000 god rays are disabled (`tex_id = -1`).
+        assert!(lf.god_ray.tex_id < 0);
     }
 
     #[test]

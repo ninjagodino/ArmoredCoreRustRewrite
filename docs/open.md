@@ -22,6 +22,11 @@ Rough priority order; reorder freely.
 "AC test scene"). Gameplay should match the 360 build; menus may stay partial. Tasks toward it,
 in order:
 
+- **Sun / lens-flare look**: sprite maths now matches the 360 (see Done "360 lens-flare parity"),
+  and the visible sun is flare-only (an `ACVD_NO_FLARE` bypass leaves a plain blue sky), so any
+  remaining gap vs the 360 is tone map / bloom / exposure. Re-shoot m4000 against saved 360 crops
+  (the user's originals were not kept) before changing `env`'s tonemap values.
+
 - **Map look**: lighting / fog / sky / tone map / per-draw light-set ids, area bounds (POINT kinds 100-102), destructible map props (`_b.flv` / `_b_h.hmd`), and water return (`POINT` kind 50 + `env::Scene.water_height`) are in (see below). The `o0006` `signboardGrow` screens' `movie` texture is a runtime render target, not an asset (see below).
   - Done: `acvd-formats::env` reads `ch_env/*_env.msb` (MSB chain at version 0x00989A6C,
     EVENT_PARAM_ST only); `sheets/map_env.csv` has every field, the shader constants built from
