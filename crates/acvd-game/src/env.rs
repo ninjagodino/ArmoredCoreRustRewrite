@@ -141,9 +141,14 @@ pub type SkyMaterial = ExtendedMaterial<StandardMaterial, SkyLit>;
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct SkyLit {
     /// `x > 0.5`: force far-plane depth (`0.0`, reverse Z); `y > 0.5`: preserve texture alpha for
-    /// cloud/additive blending; `z`: linear HDR scale (default `1.0`).
+    /// cloud/additive blending; `z`: linear HDR scale (default `1.0`); `w > 0.5`: additive
+    /// (`AlphaMode::Add`) so the shader premultiplies RGB by texture alpha to match Bevy's
+    /// premultiplied-add pipeline (`pbr_functions::premultiply_alpha`).
     #[uniform(100)]
     sky_flags: Vec4,
+    /// `g_DiffuseMapColor` (linear RGB) for unlit/additive map materials; `(1,1,1)` for sky domes.
+    #[uniform(103)]
+    sky_gain: Vec4,
     #[texture(101)]
     #[sampler(102)]
     sky_tex: Handle<Image>,
@@ -240,6 +245,22 @@ pub(crate) fn bevy_bloom(b: env::Bloom) -> Option<Bloom> {
     })
 }
 
+/// `material/mtd.bnd` `g_DiffuseMapColor` linear gain for the map's additive MTDs (the value the
+/// 360 pixel shader multiplies into the sampled diffuse). `Map_Diffuse_Add` is `(4, 4, 1)` -- the
+/// warm overbright that makes m4000's floodlights, signs and grates bloom past the 1.8 bright-pass
+/// (`bloom_threshold` 0.9 * 2) instead of clipping to flat discs. `Ene_Diffuse_Add` (light shafts)
+/// is `1.8`, `Map_NoLight_Add` `(3.5, 5, 5)`, `Map_NoLightNoFog_Add` `(0.16, 0.16, 0.22)`. MTDs not
+/// listed here are opaque/blended, not additive, so their diffuse gain is not used by this path.
+fn mtd_add_gain(mtd_low: &str) -> Vec3 {
+    match mtd_low {
+        "map_diffuse_add" => Vec3::new(4.0, 4.0, 1.0),
+        "map_nolight_add" => Vec3::new(3.5, 5.0, 5.0),
+        "ene_diffuse_add" => Vec3::splat(1.8),
+        "map_nolightnofog_add" => Vec3::new(0.16, 0.16, 0.22),
+        _ => Vec3::ONE,
+    }
+}
+
 /// True for FLVER materials backed by `Flver_Water*` (`Water.spx`, `WaterRiver`, `WaterWave`),
 /// excluding `Water_Mask` (which uses `Flver_ColDif`).
 pub(crate) fn is_water_mtd(mtd: &str) -> bool {
@@ -325,7 +346,11 @@ pub(crate) fn make_sky_material(
     far_plane: bool,
     use_tex_alpha: bool,
     hdr_scale: f32,
+    gain: Vec3,
 ) -> SkyMaterial {
+    // Additive planes (`Map_NoLightNoFog_Add` / `*_Add`) share Bevy's premultiplied-add blend
+    // state, so the shader must premultiply RGB by the texture alpha (`env_sky.wgsl`).
+    let additive = matches!(alpha_mode, AlphaMode::Add);
     SkyMaterial {
         base: StandardMaterial {
             base_color_texture: Some(sky_tex.clone()),
@@ -339,15 +364,19 @@ pub(crate) fn make_sky_material(
                 if far_plane { 1.0 } else { 0.0 },
                 if use_tex_alpha { 1.0 } else { 0.0 },
                 hdr_scale,
-                0.0,
+                if additive { 1.0 } else { 0.0 },
             ),
+            sky_gain: gain.extend(0.0),
             sky_tex,
         },
     }
 }
 
 pub(crate) fn white_srgb_pixel(images: &mut Assets<Image>) -> Handle<Image> {
-    images.add(solid_pixel([255, 255, 255, 255], TextureFormat::Rgba8UnormSrgb))
+    images.add(solid_pixel(
+        [255, 255, 255, 255],
+        TextureFormat::Rgba8UnormSrgb,
+    ))
 }
 
 fn water_params(set: &LightSet, has_bump: bool, has_refl: bool, clear: [u8; 3]) -> WaterParams {
@@ -570,7 +599,8 @@ struct EnvDisc(Disc);
 struct MapEnv {
     env: Env,
     parts_by_name: HashMap<String, msb::Part>,
-    made: HashMap<(AssetId<StandardMaterial>, u32, Option<AssetId<Image>>, u32), Handle<EnvMaterial>>,
+    made:
+        HashMap<(AssetId<StandardMaterial>, u32, Option<AssetId<Image>>, u32), Handle<EnvMaterial>>,
     unlit: HashMap<(AssetId<StandardMaterial>, bool), Handle<SkyMaterial>>,
     waters: HashMap<(Option<AssetId<Image>>, u32), Handle<WaterMaterial>>,
     skies: HashMap<String, Option<Handle<SkyMaterial>>>,
@@ -640,11 +670,7 @@ pub(crate) fn apply_env_file(
             ..default()
         });
     }
-    let tm = env
-        .scene
-        .as_ref()
-        .map(|s| s.tonemap)
-        .unwrap_or_default();
+    let tm = env.scene.as_ref().map(|s| s.tonemap).unwrap_or_default();
     commands.insert_resource(crate::blur::ActiveToneMap(tonemap_vec(tm)));
 
     let bloom = env
@@ -696,7 +722,10 @@ pub(crate) fn load_map_env(
         .and_then(|d| msb::parts(&d))
         .map(|parts| parts.into_iter().map(|p| (p.name.clone(), p)).collect())
         .unwrap_or_default();
-    let white_srgb = images.add(solid_pixel([255, 255, 255, 255], TextureFormat::Rgba8UnormSrgb));
+    let white_srgb = images.add(solid_pixel(
+        [255, 255, 255, 255],
+        TextureFormat::Rgba8UnormSrgb,
+    ));
     let flat_normal = images.add(solid_pixel([128, 128, 255, 255], TextureFormat::Rgba8Unorm));
     let refl_tex = images.add(make_reflection_target(
         WATER_REFL_DEFAULT_W,
@@ -748,7 +777,14 @@ fn load(
     let Some(map) = scene.map.as_deref() else {
         return;
     };
-    load_map_env(&mut commands, &disc.0, map, &mut lights, &cameras, &mut images);
+    load_map_env(
+        &mut commands,
+        &disc.0,
+        map,
+        &mut lights,
+        &cameras,
+        &mut images,
+    );
 }
 
 /// Moves every newly spawned map-part mesh onto `SkyMaterial` (`Map_Sky`), `WaterMaterial`
@@ -804,6 +840,7 @@ fn relight(
                         true,
                         false,
                         1.0,
+                        Vec3::ONE,
                     )))
                 })
                 .clone();
@@ -862,11 +899,7 @@ fn relight(
                     env.water_y, WATER_REFL_DEFAULT_W, WATER_REFL_DEFAULT_H
                 );
             }
-            let clear = env
-                .env
-                .scene
-                .as_ref()
-                .map_or([37, 50, 49], |s| s.clear);
+            let clear = env.env.scene.as_ref().map_or([37, 50, 49], |s| s.clear);
             let bump_id = base.normal_map_texture.as_ref().map(Handle::id);
             let refl = env.refl_tex.clone();
             let handle = env
@@ -913,6 +946,11 @@ fn relight(
         let is_add = matches!(base.alpha_mode, AlphaMode::Add);
         let is_nolight = mtd_low.contains("nolight");
         if is_add || is_nolight {
+            let gain = if is_add {
+                mtd_add_gain(&mtd_low)
+            } else {
+                Vec3::ONE
+            };
             let handle = env
                 .unlit
                 .entry((material.0.id(), is_add))
@@ -927,6 +965,7 @@ fn relight(
                         false,
                         is_add || matches!(base.alpha_mode, AlphaMode::Blend),
                         1.0,
+                        gain,
                     ))
                 })
                 .clone();
@@ -1088,8 +1127,10 @@ mod tests {
 
         // Oblique clip plane keeps points above water_y and clips points below it.
         let plane = oblique_water_clip_plane(&refl, water_y);
-        let above_view = refl.rotation.inverse() * (Vec3::new(400.0, 12.0, 650.0) - refl.translation);
-        let below_view = refl.rotation.inverse() * (Vec3::new(400.0, -8.9, 650.0) - refl.translation);
+        let above_view =
+            refl.rotation.inverse() * (Vec3::new(400.0, 12.0, 650.0) - refl.translation);
+        let below_view =
+            refl.rotation.inverse() * (Vec3::new(400.0, -8.9, 650.0) - refl.translation);
         assert!(plane.truncate().dot(above_view) + plane.w > 0.0);
         assert!(plane.truncate().dot(below_view) + plane.w < 0.0);
     }
@@ -1114,9 +1155,20 @@ mod tests {
             map::mtd_alpha_mode("Map_Diffuse_AlphaMask"),
             (AlphaMode::Mask(0.5), 1)
         );
+        assert_eq!(map::mtd_alpha_mode("Map_Diffuse_Add"), (AlphaMode::Add, 3));
+    }
+
+    #[test]
+    fn mtd_add_gain_uses_360_diffuse_map_color() {
+        // `material/mtd.bnd` `g_DiffuseMapColor` (float3, little-endian in the shipped MTD).
+        assert_eq!(mtd_add_gain("map_diffuse_add"), Vec3::new(4.0, 4.0, 1.0));
+        assert_eq!(mtd_add_gain("map_nolight_add"), Vec3::new(3.5, 5.0, 5.0));
+        assert_eq!(mtd_add_gain("ene_diffuse_add"), Vec3::splat(1.8));
         assert_eq!(
-            map::mtd_alpha_mode("Map_Diffuse_Add"),
-            (AlphaMode::Add, 3)
+            mtd_add_gain("map_nolightnofog_add"),
+            Vec3::new(0.16, 0.16, 0.22)
         );
+        // Opaque/blended MTDs never reach the additive branch; the fallback is neutral.
+        assert_eq!(mtd_add_gain("map_diffuse"), Vec3::ONE);
     }
 }

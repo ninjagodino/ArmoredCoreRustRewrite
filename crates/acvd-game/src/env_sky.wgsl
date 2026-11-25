@@ -10,6 +10,8 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> sky_flags: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var sky_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var sky_sampler: sampler;
+/// `g_DiffuseMapColor` linear RGB (1,1,1) for sky domes; per-MTD overbright for additive map planes.
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var<uniform> sky_gain: vec4<f32>;
 
 struct SkyOut {
     @location(0) color: vec4<f32>,
@@ -27,14 +29,28 @@ fn fragment(in: VertexOutput) -> SkyOut {
     // Sample sky_tex directly so dome vertex alpha does not zero out tex.a near the horizon.
     let s = textureSample(sky_tex, sky_sampler, in.uv);
     let scale = max(sky_flags.z, 0.001);
+    let gain = sky_gain.rgb;
     var out: SkyOut;
+    var rgb: vec3<f32>;
     if sky_flags.y > 0.5 {
         // Alpha-blended cloud dome (`Map_SkyMulti`) or additive sky (`Map_NoLightNoFog_Add`).
         let raw = srgb_encode(s.rgb);
-        out.color = vec4(raw * raw * scale, s.a);
+        rgb = raw * raw * scale * gain;
     } else {
         let raw = srgb_encode(s.rgb) * s.a;
-        out.color = vec4(raw * raw * scale, 1.0);
+        rgb = raw * raw * scale * gain;
+    }
+    if sky_flags.w > 0.5 {
+        // Additive (`*_Add`, e.g. `s_light` shafts): Bevy's `AlphaMode::Add` uses the
+        // premultiplied-add blend state (`src_factor = One`), so premultiply RGB by the
+        // texture alpha and zero alpha. Without this the soft shaft alpha is ignored and
+        // the plane draws as hard-edged colour slabs.
+        out.color = vec4(rgb * s.a, 0.0);
+    } else if sky_flags.y > 0.5 {
+        // Cloud dome uses straight alpha with `AlphaMode::Blend`.
+        out.color = vec4(rgb, s.a);
+    } else {
+        out.color = vec4(rgb, 1.0);
     }
     // Reverse Z: 0.0 is the far plane; otherwise keep normal rasterized depth.
     out.depth = select(in.position.z, 0.0, sky_flags.x > 0.5);
