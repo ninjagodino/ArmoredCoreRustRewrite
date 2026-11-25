@@ -407,6 +407,14 @@
   behind everything, centred under the camera at the env sky scale when `MODEL_PARAM_ST +0x14 +1`
   bit 7 is set (`0x829911f0`); light-set id from that same sub-record `+0` (part `+0x4c +0`
   override). Open leftovers under Map look.
+- **No map light beams (VMX128 trace, 2026-11-25)**: the two "beams" in `ac_test_start.png` are
+  HUD gauge end-caps (bit-identical across the three `ac_test_*` frames, each pair joined by a
+  dotted bar), and no map has beam data — `m4000` carries no `1300`/`1310` POINT records and no
+  shaft mesh, every `*_env.msb` has 0 spot lights, and the spot-light entity built at `0x82be7d08`
+  (ctor `0x82c03640`, vtable `0x820f59a8`) has no draw path. `lens_flare::M4000_BEAMS` and the
+  `beam.m4000.*` rows were deleted. Map objects do spawn FFX from their TAE (`tae/obj/*`,
+  `KIND_FFX`): each of m4000's six `o0006` signs spawns `ffx 197` on dummies 200/201 (tracked
+  Open as map-object FFX spawning).
 - Map piece LOD (`sheets/map_lod.csv`, `acvd-game::map`). m4000's piece binder has 57 full
   FLVERs and 39 `{model}_l1.flv` (54 of 72 kind-0 parts; no `_l2`; face flags 0). The model
   LOD metric is `max(distance - radius, 0.1) / (2 * radius)` (`0x82d13e70`, radius at model

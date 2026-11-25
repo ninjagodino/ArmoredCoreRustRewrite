@@ -45,56 +45,16 @@ const MAX_POINT_FLARES: usize = 8;
 /// - `5..23`: 18 ghost chain slots (`0x82ca0370`)
 /// - `23`: `lfdust` dirty-lens overlay (`0x82ca1510`)
 /// - `24..48`: `MAX_POINT_FLARES * 3` dynamic `AppFxLensFlareDrawEntity` slots (core, streak, ghost)
-/// - `48..52`: `MAX_BEAMS * 2` map light-beam billboards (streak, emitter core)
 const STREAK_SLOT: usize = MAX_GLARES;
 const GHOST_BASE: usize = STREAK_SLOT + 1;
 const DUST_SLOT: usize = GHOST_BASE + MAX_GHOSTS;
 const POINT_BASE: usize = DUST_SLOT + 1;
-
-/// Fake map light beams ("light shafts"): the 360 draws these as additive billboard sprites —
-/// an illusion, not dynamic volumetrics. `sheets/map_env.csv` rows `beam.*`.
-const MAX_BEAMS: usize = 2;
-const BEAM_BASE: usize = POINT_BASE + MAX_POINT_FLARES * 3;
-const POOL_SIZE: usize = BEAM_BASE + MAX_BEAMS * 2;
+const POOL_SIZE: usize = POINT_BASE + MAX_POINT_FLARES * 3;
 
 /// Distance of the flare quads from the camera (metres). They sit in front of the near plane and
 /// in front of all scene geometry, so the standard `AlphaMode::Add` depth test passes without
 /// depth writes while the transparent phase still draws them after the scene.
 const FLARE_DIST: f32 = 0.5;
-
-/// A fake map light beam: a screen-aligned additive streak plus a soft emitter core.
-/// `head`/`tail` are game-axes world points (`bevy = (-x, y, z)`); `width` is metres.
-struct MapBeam {
-    head: [f32; 3],
-    tail: [f32; 3],
-    width: f32,
-    color: [f32; 3],
-    alpha: f32,
-}
-
-/// `ac_test_start.png` (1280x720) shows two soft white streaks with down-left tails over the
-/// shadowed wall at the start of the bridge: heads at (461,367) and (532,364), tails ~11 and
-/// ~14 px long. They are additive billboard "light beams" (the 360 never raytraces volumetric
-/// shafts) and are not the `o0006` signboard screens. Heads are placed on the spawn-camera rays
-/// through those pixels at the bridge-deck height (y 32.4 m, near `o0006_1003` / the elevated
-/// street `o1503`/`o2024`/`o2076` cluster); tails give the visible shaft. `sheets/map_env.csv`
-/// rows `beam.m4000` carry the pixel evidence.
-const M4000_BEAMS: [MapBeam; MAX_BEAMS] = [
-    MapBeam {
-        head: [-711.0, 32.4, 569.0],
-        tail: [-711.0, 27.2, 567.6],
-        width: 1.4,
-        color: [1.0, 1.0, 1.0],
-        alpha: 0.75,
-    },
-    MapBeam {
-        head: [-910.0, 32.4, 576.0],
-        tail: [-910.0, 26.5, 568.0],
-        width: 2.0,
-        color: [1.0, 1.0, 1.0],
-        alpha: 0.75,
-    },
-];
 
 /// Active map/garage lens-flare configuration, populated by `env::apply_env_file`.
 #[derive(Resource, Clone, Default)]
@@ -567,8 +527,6 @@ fn update_lens_flare(
     assets: Option<Res<LensFlareAssets>>,
     collision: Option<Res<Collision>>,
     garage: Option<Res<Garage>>,
-    scene: Option<Res<crate::Scene>>,
-    mode: Option<Res<crate::garage::Mode>>,
     shot_mark: Option<Res<acvd_render::app::ShotMark>>,
     ac_q: Query<&GlobalTransform, (With<Ac>, Without<FlareSlot>)>,
     mut cam_q: Query<
@@ -884,60 +842,6 @@ fn update_lens_flare(
         }
     }
 
-    // 3. Fake map light-beam billboards (`m4000`, see `M4000_BEAMS`).
-    let mut dbg_beams = 0u32;
-    if mode.as_deref() == Some(&crate::garage::Mode::Sortie)
-        && scene.as_ref().and_then(|s| s.map.as_deref()) == Some("m4000")
-    {
-        let streak = assets.sprites[10].as_ref().map(|(img, _)| img.clone());
-        let core = assets.sprites[0].as_ref().map(|(img, _)| img.clone());
-        if let (Some(streak), Some(core)) = (streak, core) {
-            for (i, beam) in M4000_BEAMS.iter().enumerate() {
-                let head = Vec3::new(-beam.head[0], beam.head[1], beam.head[2]);
-                let tail = Vec3::new(-beam.tail[0], beam.tail[1], beam.tail[2]);
-                let (Ok(h), Ok(t)) = (
-                    camera.world_to_viewport(cam_gt, head),
-                    camera.world_to_viewport(cam_gt, tail),
-                ) else {
-                    continue;
-                };
-                let mid = (h + t) * 0.5;
-                let ef = edge_fade(mid / vp_size);
-                if ef <= 0.001 {
-                    continue;
-                }
-                let along = h - t;
-                let len_px = along.length();
-                if len_px < 1.0 {
-                    continue;
-                }
-                let len_m = (head - tail).length().max(0.01);
-                let width_px = (beam.width * len_px / len_m).max(1.0);
-                let base = BEAM_BASE + i * 2;
-                let a = (beam.alpha * ef).clamp(0.0, 1.5);
-                // `lf10` is a soft white disc; stretched along the shaft it reads as the 360's
-                // soft near-white beam, with the `lf00` core providing the bright emitter end.
-                let streak_tint = LinearRgba::new(beam.color[0], beam.color[1], beam.color[2], a);
-                cmds[base] = Some(DrawCmd {
-                    img: streak.clone(),
-                    center: mid,
-                    size: Vec2::new(len_px * 1.15, width_px * 2.2),
-                    rot: along.y.atan2(along.x),
-                    tint: streak_tint,
-                });
-                let c = (width_px * 2.4).max(3.0);
-                cmds[base + 1] = Some(DrawCmd {
-                    img: core.clone(),
-                    center: h,
-                    size: Vec2::splat(c),
-                    rot: 0.0,
-                    tint: LinearRgba::new(beam.color[0], beam.color[1], beam.color[2], a * 0.6),
-                });
-                dbg_beams += 1;
-            }
-        }
-    }
-
     // Apply pool draw commands to the camera-facing HDR quads.
     let mut visible_count = 0usize;
     let cam_rot = cam_gt.rotation();
@@ -973,7 +877,7 @@ fn update_lens_flare(
 
     if let Some(path) = shot_mark.as_ref().and_then(|m| m.path.as_ref()) {
         println!(
-            "SHOT {} lens_flare enabled={} vis={:.3} sprites={} god_ray={:.3} sun_uv=({:.3},{:.3}) world_hits={} ac_hits={} a0={:.3} a4={:.3} beams={}",
+            "SHOT {} lens_flare enabled={} vis={:.3} sprites={} god_ray={:.3} sun_uv=({:.3},{:.3}) world_hits={} ac_hits={} a0={:.3} a4={:.3}",
             path.display(),
             active.config.enabled,
             state.visibility,
@@ -985,7 +889,6 @@ fn update_lens_flare(
             dbg_ac_hits,
             dbg_a0,
             dbg_a4,
-            dbg_beams,
         );
     }
 }
@@ -1077,33 +980,6 @@ mod tests {
         assert!(e1 < e0 && e1 > 0.0);
         q.tick(0.3);
         assert!(q.active.is_empty());
-    }
-
-    #[test]
-    fn m4000_beam_heads_match_360_pixels() {
-        // Spawn camera captured with the `CAMDBG` probe (`--shot`, 1280x720, fov_y 45°).
-        let cam = Vec3::new(303.6821, 36.6839, 655.5);
-        let right = Vec3::new(0.006, 0.0, 0.99998);
-        let up = Vec3::new(0.0025, 1.0, -0.00001);
-        let fwd = Vec3::new(0.99998, -0.0025, -0.006);
-        let th = (0.785398_f32 / 2.0).tan();
-        let tx = th * (1280.0 / 720.0);
-        let project = |g: [f32; 3]| {
-            let d = Vec3::new(-g[0], g[1], g[2]) - cam;
-            let z = d.dot(fwd);
-            assert!(z > 1.0);
-            let x = d.dot(right) / z / tx;
-            let y = d.dot(up) / z / th;
-            Vec2::new((x * 0.5 + 0.5) * 1280.0, (1.0 - (y * 0.5 + 0.5)) * 720.0)
-        };
-        let expect = [Vec2::new(461.0, 367.0), Vec2::new(532.0, 364.0)];
-        for (beam, want) in M4000_BEAMS.iter().zip(expect) {
-            let head = project(beam.head);
-            assert!((head - want).length() < 2.0, "head {head:?} != {want:?}");
-            // The shaft runs down-left on screen (tail x < head x, tail y > head y).
-            let tail = project(beam.tail);
-            assert!(tail.x < head.x && tail.y > head.y, "tail {tail:?} head {head:?}");
-        }
     }
 
     #[test]

@@ -124,14 +124,45 @@ in order:
       `env::relight` routes `_Add`/`NoLight` to unlit `SkyMaterial`, `_Grow`/`_Glow` to
       `emissive_boost = 32.0` with `cull_mode: None`, and marks `Blend`/`Add` decals
       `NotShadowCaster` (removing the opaque black quad background on crater decals). The two
-      soft white diagonal dashes beside the first bridge in `ac_test_start.png` are fake additive
-      light-beam billboards (an illusion, not dynamic volumetrics; user correction), drawn by
-      `lens_flare::M4000_BEAMS` (`sheets/map_env.csv` `beam.m4000.*`); nearby `o2135` street-lamp
+      soft white diagonal dashes beside the first bridge in `ac_test_start.png` were initially
+      read as world light beams, but they are **HUD gauge end-caps** (bit-identical at
+      (460,365)/(530,365) and (189,364)/(273,364) in `ac_test_start`/`_move`/`_arena`, each pair
+      joined by a dotted horizontal bar), so the pixel-derived `lens_flare::M4000_BEAMS` billboards
+      and the `beam.m4000.*` sheet rows were **deleted** — nothing world-space sat on those pixels.
+      Nearby `o2135` street-lamp
       heads (`Map_Diffuse _Grow` / `Simple_Grow` LODs) and `m0510` traffic strips share the
       `_Grow` emission path.
       `Flver_ColDifEmi.fpo` squares the emission texture; the display-referred boost is calibrated
       against the 360 shot because the lamp MTD keeps `g_EmissionCoef 0.3`, `signboardGrow.mtd`
       keeps `1.0`, and Bevy's bloom weights a bright pixel by screen area.
+    - **Map beams / light shafts — no authored data (done, 2026-11-25)**: `m4000` has **no beam
+      geometry and no light record**. Every `POINT_PARAM_ST` in `m4000.msb` / `_map.msb` /
+      `_actest.msb` / `_aitest.msb` / `_env.msb` is kinds `50/100/101/102/200/850/1000/3000` — no
+      `1300` and no `1310` spot lights; MODEL kinds are `0`/`1` (geometry), `2` (enemies, light
+      set 20), `4` (AC); the only EVENT is the kind-101 tone-map block. All 1437 placed meshes
+      (`private/tmp/m4000_all.txt`) carry only ground-glow `Map_Diffuse_Add` (`m0100_03`) and
+      `m100_signboard_01` screens. Disc-wide `envlights --scan` finds point lights only in
+      `m3430`/`m3750` (10 each) and **no spot lights in any map**; `--shafts-scan` finds nolight
+      cards only in `m3230`/`m3231` (`o9331`) and `m3750` (`o4024`). The VMX128 trace of the
+      spot-light path (`py tools\x360dis\x360dis.py --func 0x82be7d08 --refs`, which decodes
+      Ghidra's "bad instruction data"): it reads a POINT `shape 3` record, stores pos at object
+      `+0x20` and dir/FOV at `+0x30` in a 0x1c0-byte entity (ctor `0x82c03640`, vtable
+      `0x820f59a8`); the vtable methods (`0x82c03930`, `0x82c039a0`, `0x82c031b8`, `0x82c03278`,
+      `0x8269bcb0`) are light lifecycle only, **no beam draw**. `AppFxLensFlareDrawEntity`
+      (`0x820ff920`, class meta `0x83ade720`, vtable `0x820ff994`, registrar `0x82c7b2b0`) is a
+      reflection registration. Conclusion: m4000 and every map have **0 beams**; the last two
+      in-tree fake billboards were removed. **Never re-derive placements from screenshots** (HUD
+      end-caps at (460,365)/(530,365)/(189,364)/(273,364) in the three `ac_test_*` frames prove
+      the trap; one view cannot recover depth).
+    - **Map-object TAE FFX — found, not yet spawned (open)**: map objects ship
+      `tae/obj/<oXXXX>/own000100.tae` (176 files); 141 of them carry `KIND_FFX` (0) events that
+      spawn an FFX id on a FLVER dummy. `m4000` places six `o0006` signboards, and each runs
+      `own000100.tae` → `ffx 197` on dummies `200`/`201` (8 warm-white `(1.0,0.78,0.70)` billboard
+      actions, size 3 m, texture id 226), i.e. 12 sign glows in the arena. The rewrite dispatches
+      AC TAE FFX only (`pose.rs:372`), so map-object glows are absent. Dump any TAE with
+      `cargo run --release -p acvd-formats --example taedump -- tae/obj/o0006/own000100.tae`
+      (all 176 dumped to `private/tmp/obj_tae_dump.txt`); the FFX 197 draw node still needs a
+      `ffxtree --params 197` → renderer mapping before spawning it.
     - **Per-model map texture pack (`map.rs` `texture_pack` / `Textures::load_tex`)**: object
       models (`KIND_OBJECT`, e.g. the road fence `o2076`) resolved every texture name through the
       disc-wide `best_texture_ref`, so `net`/`barbed_wire`/`o2036` came from unrelated packs
@@ -186,7 +217,9 @@ in order:
     are floor-tangent, `push_out` also skips static contacts at or below `feet + STEP_UP` (1.0 m,
     not game data) and the grounded ray probes `travel x tan(55)` above the feet, so kerbs are
     stepped over and 45-55 degree ramps are climbed; steeper than 55 degrees still acts as a wall
-    (see Done "AC wall collision"). The 360's own step-up/step-down height and its exact
+    (see Done "AC wall collision"). Airborne movement uses the same upward probe and lands on
+    ground that rises through the feet, so a glide boost or a plain airborne boost into an incline
+    lands instead of clipping; the 360's own step-up/step-down height and its exact
     walkable-slope limit are still unknown (45 degrees is only its wall-jump floor/wall split).
   - Walk speed: the 360 AC TEST AC walks at 0.12 m per tick at entity `+0x130`
     (`private/xenia/wall_walk3.jsonl`), the runtime's default design 5001 at 0.249; check
