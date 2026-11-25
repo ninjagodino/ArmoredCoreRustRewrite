@@ -866,6 +866,10 @@ const SIGHT: [u8; 3] = [0x00, 0xa5, 0xff];
 
 /// Lock-sight ring art: the filled quarters, arcs and the gauge tracks. Their authored colors are
 /// faint white (alpha `0x0a..0x40`), so [`readouts`] replaces both the color and the alpha.
+///
+/// `object*` is ring-art too (`rocksight_out_rotationInv` ticks), but the same names are the bars of
+/// `FE_font_base` / `Weapon_font_base` / `SHWeapon_font_base`; those keep the dark plate tint of
+/// their enclosing `000000ff` Dialog (`BG_ap`, `BG_en`, `Back_*`, [`plate_dialog`]).
 fn sight_art(name: &str) -> bool {
     name.starts_with("LockSight_Parts")
         || name.starts_with("Locksight_bar")
@@ -874,6 +878,15 @@ fn sight_art(name: &str) -> bool {
         || name.starts_with("rocksight_insight")
         || name.starts_with("piece")
         || name.starts_with("object")
+}
+
+/// Dialogs that tint the white readout plate bars black. Their `object*` bars are not ring art, or
+/// the plate's top row is painted opaque and covers the digit tops.
+fn plate_dialog(name: &str) -> bool {
+    matches!(
+        name,
+        "BG_ap" | "BG_en" | "Back_LWeapon" | "Back_RWeapon" | "Back_SWeapon"
+    )
 }
 
 /// Digit plates and the extra shoulder-weapon track; hidden with their readout.
@@ -1019,7 +1032,7 @@ pub fn readouts(
     >,
     mut plates: Query<(&MenuObject, &mut Visibility), (Without<MenuSprite>, Without<MenuGauge>)>,
     mut booster: Query<&mut Visibility, (With<BoosterPlate>, Without<MenuObject>)>,
-    parents: Query<&ChildOf>,
+    parents: Query<(&ChildOf, Option<&MenuObject>)>,
     sight_roots: Query<(), With<LockSightTrack>>,
     booster_roots: Query<(), With<BoosterPlate>>,
 ) {
@@ -1031,8 +1044,11 @@ pub fn readouts(
     // accents, so it is a barrier for the sight tint.
     let in_sight = |e: Entity| {
         let mut cur = e;
-        while let Ok(child) = parents.get(cur) {
+        while let Ok((child, object)) = parents.get(cur) {
             cur = child.0;
+            if object.is_some_and(|o| plate_dialog(&o.0)) {
+                return false;
+            }
             if booster_roots.contains(cur) {
                 return false;
             }
@@ -2385,6 +2401,37 @@ mod tests {
         assert!(readout("AP10000") == Some((Readout::Ap, 10000)));
         assert!(readout("ENDot0") == Some((Readout::Energy, 0)));
         assert!(readout("BG_ap").is_none() && readout("APfont").is_none());
+    }
+
+    /// The readout plates are `FE_font_base` / `Weapon_font_base` / `SHWeapon_font_base` bars named
+    /// `object*`; their enclosing `000000ff` Dialog (`BG_ap`, `BG_en`, `Back_*`) tints them into the
+    /// dark plate, so [`readouts`] must not repaint them with the sight color.
+    #[test]
+    fn readout_plate_bars_keep_their_dialog_tint() {
+        // Same name as the `rocksight_out_rotationInv` ticks, which are ring art.
+        assert!(sight_art("object1") && sight_art("object2"));
+        for name in [
+            "BG_ap",
+            "BG_en",
+            "Back_LWeapon",
+            "Back_RWeapon",
+            "Back_SWeapon",
+        ] {
+            assert!(plate_dialog(name), "{name}");
+        }
+        for name in ["rocksight_insight", "BG_black", "ACV_FE_LockSightCenter"] {
+            assert!(!plate_dialog(name), "{name}");
+        }
+        for name in [
+            "AP_ENBar_base1",
+            "WeaponBar_base1",
+            "piece1",
+            "rocksight_insight",
+            "LockSight_Parts1",
+            "Locksight_bar1",
+        ] {
+            assert!(sight_art(name), "{name}");
+        }
     }
 
     /// Full energy reads 100.00 on EN1 EN2 EN3 . EN4 EN5.
