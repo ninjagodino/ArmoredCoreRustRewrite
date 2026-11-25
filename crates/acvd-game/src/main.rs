@@ -67,6 +67,7 @@ mod boost;
 mod collision;
 mod control;
 mod damage;
+mod debris;
 mod decal;
 mod env;
 mod fcs;
@@ -74,10 +75,11 @@ mod frontend;
 mod garage;
 mod garage_assemble;
 mod hanger;
+mod hints;
 mod hud;
+mod input;
 mod lens_flare;
 mod map;
-mod debris;
 mod movie;
 mod paint;
 mod pause;
@@ -273,6 +275,7 @@ fn main() {
         None::<String>,
     );
     let mut start_pause: Option<pause::PauseScreen> = None;
+    let mut start_input = input::InputDevice::KeyboardMouse;
     let mut start_options_tab = settings::OptionsTab::Graphics;
     let mut shadow_dist_override: Option<settings::ShadowDistance> = None;
     let mut hanger_r_override: Option<i16> = None;
@@ -326,7 +329,8 @@ fn main() {
                 if let Some(raw) = args.next() {
                     boot_stage = if raw.eq_ignore_ascii_case("movie") {
                         frontend::BootStage::Movie
-                    } else if raw.eq_ignore_ascii_case("done") || raw.eq_ignore_ascii_case("garage") {
+                    } else if raw.eq_ignore_ascii_case("done") || raw.eq_ignore_ascii_case("garage")
+                    {
                         frontend::BootStage::Done
                     } else {
                         frontend::BootStage::Title
@@ -411,6 +415,18 @@ fn main() {
             "--sfx" => preview = args.next().and_then(|s| s.parse::<i32>().ok()),
             "--burst" => burst = args.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1),
             "--no-hud" => no_hud = true,
+            "--input" => {
+                if let Some(raw) = args.next() {
+                    start_input = if raw.eq_ignore_ascii_case("gamepad")
+                        || raw.eq_ignore_ascii_case("pad")
+                        || raw.eq_ignore_ascii_case("controller")
+                    {
+                        input::InputDevice::Gamepad
+                    } else {
+                        input::InputDevice::KeyboardMouse
+                    };
+                }
+            }
             "--hanger-r" => {
                 hanger_r_override = args.next().and_then(|s| s.parse::<i16>().ok());
             }
@@ -506,7 +522,11 @@ fn main() {
         eye,
         look: cam_look.unwrap_or(eye + Vec3::X * 100.0),
     });
-    let piloting = !start_garage && !boot_enabled && clip.is_none() && frame.is_none() && cam_override.is_none();
+    let piloting = !start_garage
+        && !boot_enabled
+        && clip.is_none()
+        && frame.is_none()
+        && cam_override.is_none();
     // Piloting starts behind the AC, the browser in front of it.
     let start_aim = StartAim { yaw, pitch };
     let yaw = yaw.unwrap_or(if piloting { 0.25 } else { 2.6 });
@@ -561,7 +581,10 @@ fn main() {
                 for pref in [6007u32, 6008, 6004, 6003] {
                     if let Some(pos) = designs.iter().position(|r| r.id == pref) {
                         let s = garage::AcSpecs::calculate(&designs[pos].data);
-                        if !s.overweight && !s.en_shortage && !garage::has_weapon_arms(&designs[pos].data) {
+                        if !s.overweight
+                            && !s.en_shortage
+                            && !garage::has_weapon_arms(&designs[pos].data)
+                        {
                             return pos;
                         }
                     }
@@ -633,7 +656,12 @@ fn main() {
         }),
         ..default()
     }))
-    .add_plugins((blur::BlurPlugin, paint::PaintPlugin, acvd_render::menu::MenuPlugin, frontend::FrontendPlugin))
+    .add_plugins((
+        blur::BlurPlugin,
+        paint::PaintPlugin,
+        acvd_render::menu::MenuPlugin,
+        frontend::FrontendPlugin,
+    ))
     .add_plugins(sfx::SfxPlugin { disc: disc.clone() })
     .add_plugins(sound::SoundPlugin {
         disc: disc.clone(),
@@ -669,11 +697,11 @@ fn main() {
         auto_start: boot_auto,
     })
     .insert_resource(pause_state)
-        .init_resource::<AcTexturePacks>()
-        .init_resource::<garage_assemble::AssembleUiAssets>()
-        .init_resource::<garage::PaintPickerAssets>()
-        .init_resource::<paint::CustomCamoLibrary>()
-        .insert_resource(decal::DecalState::new(cli_decal, cli_emblem))
+    .init_resource::<AcTexturePacks>()
+    .init_resource::<garage_assemble::AssembleUiAssets>()
+    .init_resource::<garage::PaintPickerAssets>()
+    .init_resource::<paint::CustomCamoLibrary>()
+    .insert_resource(decal::DecalState::new(cli_decal, cli_emblem))
     .insert_resource(decal::DecalMeshCache::default())
     .insert_resource(Garage {
         disc,
@@ -716,7 +744,11 @@ fn main() {
         keys: if hold_delay > 0.0 { held } else { Vec::new() },
     })
     .insert_resource(ShowHud(!no_hud))
-    .add_systems(Startup, (setup, weapons::setup).run_if(not(frontend_active)))
+    .insert_resource(input::ActiveInput(start_input))
+    .add_systems(
+        Startup,
+        (setup, weapons::setup).run_if(not(frontend_active)),
+    )
     .add_systems(
         PreUpdate,
         (setup, weapons::setup, mark_world_spawned)
@@ -726,6 +758,7 @@ fn main() {
     .add_systems(
         Update,
         (
+            input::track_device,
             sortie_garage_hotkey,
             pause::handle_input,
             process_mode_switch,
@@ -1631,7 +1664,11 @@ fn show(
         (Vec3::ZERO, std::f32::consts::PI, Some(0.0))
     } else {
         let y = collision.ground_below(start.position + Vec3::Y * RAY_HALF);
-        (start.position.with_y(y.unwrap_or(start.position.y)), start.yaw, y)
+        (
+            start.position.with_y(y.unwrap_or(start.position.y)),
+            start.yaw,
+            y,
+        )
     };
     let ac = commands
         .spawn((
@@ -1709,7 +1746,8 @@ fn show(
                 .and_then(|&(_, b)| b)
             {
                 if let Some(&arm_entity) = joints.get(arm_bone) {
-                    arms_dummy60 = Some((loaded_i, part.index, part.placement, arm_bone, arm_entity));
+                    arms_dummy60 =
+                        Some((loaded_i, part.index, part.placement, arm_bone, arm_entity));
                 }
             }
         }
@@ -1746,10 +1784,7 @@ fn show(
                                 arm_bone,
                             ),
                         ) {
-                            let stowed_parent = mounted
-                                .0
-                                .map(|p| joint_entities[p])
-                                .unwrap_or(ac);
+                            let stowed_parent = mounted.0.map(|p| joint_entities[p]).unwrap_or(ac);
                             ow_arm_attach = Some(weapons::OwArmAttach {
                                 root_60: root_60_entity,
                                 stowed_parent,
@@ -1826,8 +1861,9 @@ fn show(
                 rack_pose[hand as usize] = weapon_hanger_pose;
             }
             let on_prong = if on_bay {
-                rack_bones[hand as usize].as_ref().and_then(
-                    |(rack_i, rack_joints, front, back)| {
+                rack_bones[hand as usize]
+                    .as_ref()
+                    .and_then(|(rack_i, rack_joints, front, back)| {
                         let base = rig.local_against(loaded_i, root_bone, *rack_i, *front)?;
                         // Attach the bay weapon onto the prong joint (`*_hg_f` / `*_hg_b`) with
                         // the FLVER dummy 87/88/85/86 local translation (`[±0.0012, -0.5188, -0.8182]`
@@ -1838,8 +1874,7 @@ fn show(
                         let parent = *rack_joints.get(*front)?;
                         let alt_parent = back.and_then(|b| rack_joints.get(b).copied());
                         Some((parent, alt_parent, local))
-                    },
-                )
+                    })
             } else {
                 None
             };
@@ -2038,11 +2073,7 @@ fn show(
         None => commands.remove_resource::<pose::Motion>(),
     }
 
-    let mut status = format!(
-        "{} - {} models",
-        design_name,
-        built.placements.len()
-    );
+    let mut status = format!("{} - {} models", design_name, built.placements.len());
     if missing > 0 {
         status.push_str(&format!(", {missing} textures missing"));
     }

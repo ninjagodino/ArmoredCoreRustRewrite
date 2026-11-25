@@ -90,11 +90,7 @@ enum WallJumpPhase {
     },
     /// Phase 1 (`0x82841190`): launch acceleration (`trijump_accel_frames`), calling
     /// `AcMove_wallJump` (`0x82824560`) and playing `wall_jump` rows 232/234/236/238.
-    Accel {
-        timer: f32,
-        dir: Vec3,
-        clip_dir: u8,
-    },
+    Accel { timer: f32, dir: Vec3, clip_dir: u8 },
     /// Phase 2 (`0x82843b88`): post-launch follow-through (`trijump_after_frames`), allowing
     /// turns at `trijump_turn_rate` (`0x8281fcd0`) until timer expiry or touchdown.
     After { timer: f32, clip_dir: u8 },
@@ -275,7 +271,6 @@ pub struct Pilot {
     pub velocity: Vec3,
     pub yaw: f32,
     pub boost: bool,
-    pub glide: bool,
     pub glide: bool,
     /// Remaining height of the Glide Boost start ascent (m); set to `glide_lift_height` at
     /// activation and spent at `glide_rise_tick` per tick.
@@ -1317,8 +1312,10 @@ impl Pilot {
         let entry_speed_tick = Vec2::new(self.velocity.x, self.velocity.z).length();
         // `0x828ad510`: dash duration = `blade_homing_time_speed_coef * entry_speed * 0.01 + blade_dash_max_frames / 60`
         // (with a responsive homing window when FCS-locked onto a target outside instant-swing range).
-        let speed_bonus_ticks =
-            NEW_AC_BEHAVIOR.blade_homing_time_speed_coef * (entry_speed_tick * TICK_TO_KMH) * 0.01 * TICK_RATE;
+        let speed_bonus_ticks = NEW_AC_BEHAVIOR.blade_homing_time_speed_coef
+            * (entry_speed_tick * TICK_TO_KMH)
+            * 0.01
+            * TICK_RATE;
         let max_dash_ticks = if launch.target.is_some() {
             (NEW_AC_BEHAVIOR.blade_dash_max_frames + speed_bonus_ticks).clamp(18.0, 45.0)
         } else {
@@ -1352,8 +1349,8 @@ impl Pilot {
         } else {
             Quat::from_rotation_y(self.yaw) * FORWARD
         };
-        let frames = (acvd_data::generated::tuning::NEW_AC_BEHAVIOR.ow_attack_dash_frames as f32)
-            .max(1.0);
+        let frames =
+            (acvd_data::generated::tuning::NEW_AC_BEHAVIOR.ow_attack_dash_frames as f32).max(1.0);
         self.ow_dash_ticks = frames;
         self.ow_dash_dir = dir;
         self.qb = None;
@@ -1370,7 +1367,6 @@ impl Pilot {
             velocity: Vec3::ZERO,
             yaw: 0.0,
             boost: false,
-            glide: false,
             glide: false,
             glide_lift_left: 0.0,
             glide_lifting: false,
@@ -2053,7 +2049,8 @@ fn step_kick(p: &mut Pilot, horizontal: Vec2) -> Option<(Vec2, bool)> {
         // (`+0x1c0 = 0` in `0x828435b4`), decaying gently if above `kick_max_tick`.
         let cur = horizontal.length();
         if cur > c.kick_max_tick {
-            horizontal.normalize_or(dir2) * (cur * (1.0 - c.over_max_decel_tick)).max(c.kick_max_tick)
+            horizontal.normalize_or(dir2)
+                * (cur * (1.0 - c.over_max_decel_tick)).max(c.kick_max_tick)
         } else {
             dir2 * cur.max(c.kick_max_tick * 0.85)
         }
@@ -2107,9 +2104,7 @@ fn step_blade(
 
     let forward = Quat::from_rotation_y(p.yaw) * FORWARD;
     let forward_h = Vec2::new(forward.x, forward.z).normalize_or(Vec2::NEG_Y);
-    let dist_to_target = b
-        .target_pos
-        .map(|t| (t - position).with_y(0.0).length());
+    let dist_to_target = b.target_pos.map(|t| (t - position).with_y(0.0).length());
 
     let (next_h, skip_gravity) = match b.phase {
         BladePhase::Charge => {
@@ -2126,9 +2121,7 @@ fn step_blade(
             if b.timer >= charge_ticks {
                 b.timer = 0.0;
                 let instant_dist = NEW_AC_BEHAVIOR.blade_instant_swing_dist;
-                if b.max_dash_ticks > 0.0
-                    && dist_to_target.is_some_and(|d| d > instant_dist)
-                {
+                if b.max_dash_ticks > 0.0 && dist_to_target.is_some_and(|d| d > instant_dist) {
                     b.phase = BladePhase::Dash;
                 } else {
                     b.phase = BladePhase::Swing;
@@ -2165,7 +2158,8 @@ fn step_blade(
                         (p.velocity.y + c.quick_boost_v_acc_tick).min(c.blade_rise_max_tick);
                     hover = true;
                 } else if dy < -1.0 && p.airborne {
-                    p.velocity.y = (p.velocity.y - c.quick_boost_v_acc_tick).max(-c.blade_rise_max_tick);
+                    p.velocity.y =
+                        (p.velocity.y - c.quick_boost_v_acc_tick).max(-c.blade_rise_max_tick);
                     hover = true;
                 } else if p.airborne {
                     p.velocity.y *= 0.85;
@@ -2347,7 +2341,6 @@ fn step_core_ref(
 
 fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collision: &Collision) {
     let c = p.ctrl;
-    let c = p.ctrl;
     // Glide Boost begins with a fixed ascent (`0x8281dd28` clamps the rise to block+0x0 above
     // the activation height, `object+0x2b4`): 5.0 m at ~6 m/s, so the AC lifts off even on flat
     // ground. The lift itself runs in the vertical block below; it stays on the ground clip
@@ -2385,7 +2378,12 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
     let speed = horizontal.length();
     let moving = wish != Vec2::ZERO;
     // A glide starts on the ground (`pilot`) but carries on over a drop.
-    p.glide &= p.boost && moving && p.qb.is_none() && p.wj.is_none() && p.kick.is_none() && p.blade.is_none();
+    p.glide &= p.boost
+        && moving
+        && p.qb.is_none()
+        && p.wj.is_none()
+        && p.kick.is_none()
+        && p.blade.is_none();
     let brake = if speed >= c.brake_switch_tick {
         c.hispeed_brake_tick
     } else {
@@ -2485,7 +2483,8 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
         }
         if qb.hop && qb.scale > 0.0 {
             p.airborne = true;
-            p.velocity.y = (p.velocity.y + c.quick_boost_v_acc_tick * qb.scale).min(c.qb_hop_max_tick);
+            p.velocity.y =
+                (p.velocity.y + c.quick_boost_v_acc_tick * qb.scale).min(c.qb_hop_max_tick);
             qb_hopped = true;
         }
     } else if let Some(wj) = wj_thrust {
@@ -2550,7 +2549,12 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
         } else if !p.airborne {
             approach(horizontal, Vec2::ZERO, brake)
         } else if p.boost && moving {
-            integrate(horizontal, wish * c.boost_acc_tick, c.boost_max_tick, c.over_max_decel_tick)
+            integrate(
+                horizontal,
+                wish * c.boost_acc_tick,
+                c.boost_max_tick,
+                c.over_max_decel_tick,
+            )
         } else {
             horizontal *= (1.0 - drag).clamp(0.0, 1.0);
             horizontal
@@ -2569,7 +2573,13 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
     } else {
         horizontal *= (1.0 - drag).clamp(0.0, 1.0);
     }
-    if p.jump_queued && !p.airborne && p.qb.is_none() && p.wj.is_none() && p.kick.is_none() && p.blade.is_none() {
+    if p.jump_queued
+        && !p.airborne
+        && p.qb.is_none()
+        && p.wj.is_none()
+        && p.kick.is_none()
+        && p.blade.is_none()
+    {
         (p.airborne, p.takeoff, p.boost, p.glide) = (true, c.jump_frames, true, false);
         // `0x8283d4b8`: entering Jump (state 3) sets `action_ctrl +0x114` to
         // `NewAcBehavior +0x4ae` (10 ticks), preventing immediate wall kick off the ground.
@@ -2640,19 +2650,30 @@ fn step_resolve_world(p: &mut Pilot, position: &mut Vec3, collision: &Collision)
     }
     // Snap puts y on the triangle, so a grounded ray has to start above it. The lift is this
     // tick's travel (slopes) or 5 cm when still — a hit farther down than that is a drop.
-    // Airborne, the ray starts at last tick's height so a fast fall cannot step past a floor.
+    // Airborne, the ray starts at last tick's height so a fast fall cannot step past a floor;
+    // a walkable slope rising into the flight path is also above the feet, so the probe has to
+    // clear `travel x tan(55)` there too or a glide boost clips through an incline.
     let lift = if p.airborne {
         (before_y - position.y).max(0.0)
     } else {
         horizontal.length().max(0.05)
     };
+    let probe_up = if p.airborne {
+        lift.max(horizontal.length() * crate::collision::WALKABLE_SLOPE_TAN)
+    } else {
+        (lift * crate::collision::WALKABLE_SLOPE_TAN).max(crate::collision::STEP_UP)
+    };
     let ground = collision.ground_below_with_surface(Vec3::new(
         position.x,
-        position.y + lift,
+        position.y + probe_up,
         position.z,
     ));
     if p.airborne {
-        if let Some((g, surf)) = ground.filter(|&(g, _)| position.y <= g && p.velocity.y <= 0.0) {
+        // Ground that rose through the feet is a hit even while still rising (a glide boost
+        // does not rise after its start ascent, but the slope can).
+        if let Some((g, surf)) = ground
+            .filter(|&(g, _)| position.y <= g && (p.velocity.y <= 0.0 || position.y < g - 1e-3))
+        {
             let impact_kmh = p.velocity.y.abs() * TICK_TO_KMH;
             p.landing_impact_kmh = p.landing_impact_kmh.max(impact_kmh);
             p.ground_surface = surf;
@@ -2662,7 +2683,14 @@ fn step_resolve_world(p: &mut Pilot, position: &mut Vec3, collision: &Collision)
     } else if p.glide_lifting {
         // Glide Boost start ascent (`glide_lift_height`): the ground snap must not undo the lift
         // while the movement state is still the ground glide; the vertical block marks the AC
-        // airborne once the fixed 5.0 m are spent.
+        // airborne once the fixed 5.0 m are spent. Rising terrain still stops it, or the ascent
+        // carries the AC through the slope.
+        if let Some((g, surf)) = ground.filter(|&(g, _)| g > position.y + 1e-3) {
+            (position.y, p.velocity.y, p.airborne, p.landed) = (g, 0.0, false, true);
+            p.ground_surface = surf;
+            p.glide_lifting = false;
+            p.glide_lift_left = 0.0;
+        }
     } else {
         match ground.filter(|&(g, _)| g >= position.y - lift) {
             Some((g, surf)) => {
@@ -2685,8 +2713,8 @@ fn step_resolve_world(p: &mut Pilot, position: &mut Vec3, collision: &Collision)
             position.y - RAY_HALF,
             Layer::Water,
         ) {
-            let sank = position.y <= wy
-                && (before_y >= wy || wy - position.y <= WATER_RETURN_DEPTH);
+            let sank =
+                position.y <= wy && (before_y >= wy || wy - position.y <= WATER_RETURN_DEPTH);
             if sank {
                 position.y = wy;
                 p.velocity.y = 0.0;
@@ -2715,21 +2743,39 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
             (false, true, _, BladePhase::Charge | BladePhase::Dash, true) => "blade_air_charge_r",
             (false, true, _, BladePhase::Charge | BladePhase::Dash, false) => "blade_air_charge_l",
             (false, true, _, BladePhase::Swing | BladePhase::Recovery, true) => "blade_air_swing_r",
-            (false, true, _, BladePhase::Swing | BladePhase::Recovery, false) => "blade_air_swing_l",
+            (false, true, _, BladePhase::Swing | BladePhase::Recovery, false) => {
+                "blade_air_swing_l"
+            }
             (false, false, _, BladePhase::Charge | BladePhase::Dash, true) => "blade_charge_r",
             (false, false, _, BladePhase::Charge | BladePhase::Dash, false) => "blade_charge_l",
             (false, false, _, BladePhase::Swing | BladePhase::Recovery, true) => "blade_swing_r",
             (false, false, _, BladePhase::Swing | BladePhase::Recovery, false) => "blade_swing_l",
-            (true, true, true, BladePhase::Swing | BladePhase::Recovery, true) => "phys_blade_down_r",
-            (true, true, true, BladePhase::Swing | BladePhase::Recovery, false) => "phys_blade_down_l",
-            (true, true, _, BladePhase::Charge | BladePhase::Dash, true) => "phys_blade_air_charge_r",
-            (true, true, _, BladePhase::Charge | BladePhase::Dash, false) => "phys_blade_air_charge_l",
-            (true, true, _, BladePhase::Swing | BladePhase::Recovery, true) => "phys_blade_air_swing_r",
-            (true, true, _, BladePhase::Swing | BladePhase::Recovery, false) => "phys_blade_air_swing_l",
+            (true, true, true, BladePhase::Swing | BladePhase::Recovery, true) => {
+                "phys_blade_down_r"
+            }
+            (true, true, true, BladePhase::Swing | BladePhase::Recovery, false) => {
+                "phys_blade_down_l"
+            }
+            (true, true, _, BladePhase::Charge | BladePhase::Dash, true) => {
+                "phys_blade_air_charge_r"
+            }
+            (true, true, _, BladePhase::Charge | BladePhase::Dash, false) => {
+                "phys_blade_air_charge_l"
+            }
+            (true, true, _, BladePhase::Swing | BladePhase::Recovery, true) => {
+                "phys_blade_air_swing_r"
+            }
+            (true, true, _, BladePhase::Swing | BladePhase::Recovery, false) => {
+                "phys_blade_air_swing_l"
+            }
             (true, false, _, BladePhase::Charge | BladePhase::Dash, true) => "phys_blade_charge_r",
             (true, false, _, BladePhase::Charge | BladePhase::Dash, false) => "phys_blade_charge_l",
-            (true, false, _, BladePhase::Swing | BladePhase::Recovery, true) => "phys_blade_swing_r",
-            (true, false, _, BladePhase::Swing | BladePhase::Recovery, false) => "phys_blade_swing_l",
+            (true, false, _, BladePhase::Swing | BladePhase::Recovery, true) => {
+                "phys_blade_swing_r"
+            }
+            (true, false, _, BladePhase::Swing | BladePhase::Recovery, false) => {
+                "phys_blade_swing_l"
+            }
         };
         return (clip, None);
     }
@@ -2756,11 +2802,7 @@ fn state(p: &Pilot, input: &Input, motion: &Motion) -> (&'static str, Option<u8>
             ("quick_boost_charge", None)
         };
     }
-    if current.0 == "quick_boost"
-        && p.clip_ok
-        && !motion.finished()
-        && !p.glide
-        && p.takeoff <= 0.0
+    if current.0 == "quick_boost" && p.clip_ok && !motion.finished() && !p.glide && p.takeoff <= 0.0
     {
         return current;
     }
@@ -2863,13 +2905,13 @@ pub fn ow_locomotion_row(name: &str, dir: Option<u8>) -> Option<u32> {
             const WALK: [u32; 8] = [194, 198, 202, 208, 204, 206, 200, 196];
             WALK.get(dir.unwrap_or(0) as usize).copied()
         }
-        "turn_left" => Some(248),  // anim 226
-        "turn_right" => Some(249), // anim 227
-        "dash" | "glide" => Some(268),     // anim 228: OW展開時 地上ブースト
+        "turn_left" => Some(248),              // anim 226
+        "turn_right" => Some(249),             // anim 227
+        "dash" | "glide" => Some(268),         // anim 228: OW展開時 地上ブースト
         "air_move" | "glide_air" => Some(269), // anim 229: OW展開時 空中ブースト
-        "jump" => Some(258), // anim 232
-        "rise" => Some(259), // anim 233
-        "fall" => Some(260), // anim 234
+        "jump" => Some(258),                   // anim 232
+        "rise" => Some(259),                   // anim 233
+        "fall" => Some(260),                   // anim 234
         "quick_boost" => match dir.unwrap_or(0) {
             0 | 1 | 7 => Some(254), // anim 245 front QB
             2 => Some(257),         // anim 248 right QB
@@ -2957,7 +2999,7 @@ pub fn pilot(
     mut window: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
     mut cursor: Query<&mut bevy::window::CursorOptions, With<bevy::window::PrimaryWindow>>,
     mouse: Res<bevy::input::mouse::AccumulatedMouseMotion>,
-    mut mouselook: Local<bool>,
+    active_input: Res<crate::input::ActiveInput>,
 ) {
     let collision = &mut *world.collision;
     let props = &mut world.props;
@@ -2967,18 +3009,15 @@ pub fn pilot(
     if keys.just_pressed(KeyCode::KeyP) {
         piloting.0 = !piloting.0;
     }
-    // M toggles mouselook: the grabbed mouse turns the AC (like Q/E) and pitches the camera.
-    if keys.just_pressed(KeyCode::KeyM) {
-        *mouselook = !*mouselook;
-    }
-    if !piloting.0 {
-        *mouselook = false;
-    }
+    // Mouselook follows the last-used device: mouse+keyboard grabs and hides the cursor and lets
+    // the mouse turn the AC; controller input releases it. `input::track_device` switches modes
+    // automatically, so `M` is no longer a toggle.
+    let mouselook = piloting.0 && !active_input.is_gamepad();
     if let Ok(mut c) = cursor.single_mut() {
-        let (grab, visible) = if *mouselook {
+        let (grab, visible) = if mouselook {
             (bevy::window::CursorGrabMode::Locked, false)
         } else {
-            (bevy::window::CursorGrabMode::None, true)
+            (bevy::window::CursorGrabMode::None, false)
         };
         if c.grab_mode != grab {
             c.grab_mode = grab;
@@ -3063,10 +3102,10 @@ pub fn pilot(
     };
     input.turn *= zoom_turn_scale;
     input.look *= zoom_turn_scale;
-    if !*mouselook {
+    if !mouselook {
         p.cam.yaw_off = 0.0;
     }
-    if *mouselook {
+    if mouselook {
         // AC6-style: the mouse moves the camera freely; the AC turns toward it at its turn rate.
         p.cam.yaw_off = (p.cam.yaw_off - mouse.delta.x * MOUSE_YAW * zoom_turn_scale)
             .clamp(-std::f32::consts::PI, std::f32::consts::PI);
@@ -3103,7 +3142,7 @@ pub fn pilot(
             }
             false
         };
-        if *mouselook {
+        if mouselook {
             let per_tick = (p.ctrl.turn_rate / TICK_RATE).max(1e-4);
             input.turn = (p.cam.yaw_off / per_tick).clamp(-1.0, 1.0);
             let yaw_before = p.yaw;
@@ -3128,7 +3167,7 @@ pub fn pilot(
     }
     // Keep mouselook `input.turn` consistent on render frames where the 60 Hz accumulator did not
     // tick (e.g. >60 FPS monitors), so `state()` doesn't flap between `turn_*` and `idle`.
-    if *mouselook {
+    if mouselook {
         let per_tick = (p.ctrl.turn_rate / TICK_RATE).max(1e-4);
         input.turn = if p.cam.yaw_off.abs() > 0.03 {
             (p.cam.yaw_off / per_tick).clamp(-1.0, 1.0)
@@ -3282,7 +3321,7 @@ pub fn pilot(
         p.cam.yaw_off,
         p.cam.pitch,
         body.stick.x,
-        if *mouselook { 0.0 } else { input.turn },
+        if mouselook { 0.0 } else { input.turn },
         fcs.and_then(|f| f.locked.as_ref()).map(|l| l.world_pos),
     );
     motion.core_ctrl.enabled = core_allowed;
@@ -3303,7 +3342,7 @@ pub fn pilot(
         p.cam.blur_step(velocity, time.delta_secs());
         // Mouselook turning is auto-generated and jittery near zero: ignore small values so the
         // side shift only flips for a real turn (the blend itself smooths the move).
-        let cam_turn = if *mouselook && input.turn.abs() < 0.25 {
+        let cam_turn = if mouselook && input.turn.abs() < 0.25 {
             0.0
         } else {
             input.turn
@@ -3328,7 +3367,7 @@ pub fn pilot(
         );
         let cam_rot = transform.rotation * Quat::from_rotation_y(p.cam.yaw_off);
         let total_yaw = p.yaw + p.cam.yaw_off;
-        if *mouselook {
+        if mouselook {
             let delta = total_yaw - p.cam.cam_yaw;
             p.cam.swing(root + waist, delta);
             p.cam.hud_yaw_lead = (p.cam.hud_yaw_lead + delta).clamp(-0.22, 0.22);
@@ -3339,9 +3378,9 @@ pub fn pilot(
         let (eye, look_at) = p
             .cam
             .follow(eye, look_at, cam_rot, airborne, time.delta_secs());
-        let (eye, look_at) =
-            p.cam
-                .clip(root + waist, eye, look_at, collision, time.delta_secs());
+        let (eye, look_at) = p
+            .cam
+            .clip(root + waist, eye, look_at, collision, time.delta_secs());
         let yaw_follow = p.cam.look_at_rate[0].value.clamp(0.01, 1.0);
         p.cam.hud_yaw_lead *= (1.0 - yaw_follow).powf(time.delta_secs() * TICK_RATE);
         o.focus = look_at;
@@ -3490,7 +3529,10 @@ mod tests {
             burst_ticks += 1;
             assert!(burst_ticks < 30);
         }
-        assert!(hopped, "grounded High Boost should add a small vertical hop");
+        assert!(
+            hopped,
+            "grounded High Boost should add a small vertical hop"
+        );
         assert!(
             (tap_peak - expected_tap_max).abs() < 1e-3,
             "tap peak {tap_peak} vs expected {expected_tap_max}"
@@ -3498,7 +3540,10 @@ mod tests {
         assert!(!p.boost, "High Boost must not force boost mode on");
         // Immediately re-fireable once HighBoostState ends (well under 20 ticks).
         assert!(burst_ticks <= 16, "burst took {burst_ticks} ticks");
-        assert!(start_quick_boost(&mut p), "re-fire unlocked right after burst");
+        assert!(
+            start_quick_boost(&mut p),
+            "re-fire unlocked right after burst"
+        );
         p.qb = None;
         for _ in 0..300 {
             step(&mut p, &tap_release, &mut pos, &ground);
@@ -3526,7 +3571,10 @@ mod tests {
             step(&mut p2, &hold, &mut pos2, &Collision::default());
         }
         step(&mut p2, &tap_release, &mut pos2, &Collision::default());
-        assert!(p2.second_stage_qb, "sweet-spot release must trigger Second-Stage QB");
+        assert!(
+            p2.second_stage_qb,
+            "sweet-spot release must trigger Second-Stage QB"
+        );
         let mut sweet_peak = 0.0f32;
         while p2.in_quick_boost() {
             step(&mut p2, &tap_release, &mut pos2, &Collision::default());
@@ -3561,7 +3609,10 @@ mod tests {
         assert!((away - Vec3::X).length() < 1e-5, "{away}");
         // Oblique into wall (-0.3, +0.95): -cos(45°) <= dot <= 0 -> rotated wall normal.
         let oblique = wall_jump_dir(Vec2::new(-0.3, 0.95), facing, wall_n, vert_rad, glance_rad);
-        assert!(oblique.y.abs() < 1e-5 && oblique.x > 0.0 && oblique.z < 0.0, "{oblique}");
+        assert!(
+            oblique.y.abs() < 1e-5 && oblique.x > 0.0 && oblique.z < 0.0,
+            "{oblique}"
+        );
         assert!(
             (oblique.dot(wall_n) - glance_rad.cos()).abs() < 1e-4,
             "expected cos(85°) = {}, got {}",
@@ -3623,7 +3674,10 @@ mod tests {
         };
         step(&mut p, &away, &mut pos, &world);
         assert!(matches!(p.wj, Some(WallJumpPhase::Prep { .. })));
-        assert_eq!(camera_action("wall_jump_prep", true, true, ReadyCamera::Off), 43);
+        assert_eq!(
+            camera_action("wall_jump_prep", true, true, ReadyCamera::Off),
+            43
+        );
         assert_eq!(camera_action("wall_jump", true, true, ReadyCamera::Off), 43);
 
         let mut peak_h = 0.0f32;
@@ -3672,7 +3726,10 @@ mod tests {
             "vertical wall kick v peak {vert_v} vs {}",
             ctrl.trijump_v_speed_tick
         );
-        assert!(vert_h < 1e-4, "vertical wall kick should add no horizontal speed, got {vert_h}");
+        assert!(
+            vert_h < 1e-4,
+            "vertical wall kick should add no horizontal speed, got {vert_h}"
+        );
     }
 
     #[test]
@@ -3779,7 +3836,10 @@ mod tests {
         p.scan_mode = true;
         let before_scan = p.en;
         let scan_net_tick = ctrl.en_output_tick - ctrl.scan_passive_en_drain_tick;
-        assert!(scan_net_tick > net_tick, "Scan Mode recharges EN faster than Combat Mode");
+        assert!(
+            scan_net_tick > net_tick,
+            "Scan Mode recharges EN faster than Combat Mode"
+        );
         step_en(&mut p);
         assert!((p.en - (before_scan + scan_net_tick)).abs() < 1e-3);
         p.scan_mode = false;
@@ -3857,9 +3917,15 @@ mod tests {
         // 0x8281e408: thrust adds below max; at/above max the speed is held and only steered.
         let max = 0.463;
         let below = glide_thrust(Vec2::new(0.0, 0.40), Vec2::new(0.0, 0.01), max);
-        assert!((below.length() - 0.41).abs() < 1e-4, "below max adds the thrust");
+        assert!(
+            (below.length() - 0.41).abs() < 1e-4,
+            "below max adds the thrust"
+        );
         let at_cap = glide_thrust(Vec2::new(0.0, max), Vec2::new(0.01, 0.0), max);
-        assert!((at_cap.length() - max).abs() < 1e-4, "at max the speed stays capped");
+        assert!(
+            (at_cap.length() - max).abs() < 1e-4,
+            "at max the speed stays capped"
+        );
         assert!(at_cap.x > 0.0, "at max a perpendicular thrust steers");
         let above = glide_thrust(Vec2::new(0.0, 0.60), Vec2::new(0.01, 0.0), max);
         assert!(
@@ -3945,7 +4011,10 @@ mod tests {
         // Start with just enough EN for 2 ticks of glide (net drain per tick = glide - net_rec).
         let net_rec = ctrl.en_output_tick - ctrl.passive_en_drain_tick;
         let net_drain = ctrl.glide_en_tick - net_rec;
-        assert!(net_drain > 0.0, "glide drains faster than generator surplus");
+        assert!(
+            net_drain > 0.0,
+            "glide drains faster than generator surplus"
+        );
         p.en = ctrl.glide_en_tick * 1.5;
 
         let input = Input {
@@ -4043,9 +4112,15 @@ mod tests {
                 break;
             }
         }
-        assert!(entered_kick, "holding High Boost into Phase 2 must launch KickState");
+        assert!(
+            entered_kick,
+            "holding High Boost into Phase 2 must launch KickState"
+        );
         assert_eq!(p.kicks_started, 1);
-        assert!(p.en < en_start - ctrl.qb_en_drain, "kick must drain qb_en_drain");
+        assert!(
+            p.en < en_start - ctrl.qb_en_drain,
+            "kick must drain qb_en_drain"
+        );
         let kick_speed = p.horiz_speed_kmh();
         assert!(
             kick_speed >= ctrl.kick_max_speed * 0.9,
@@ -4128,10 +4203,22 @@ mod tests {
                 None => break,
             }
         }
-        assert!(saw_dash, "locked target 25 m away must trigger BladePhase::Dash");
-        assert!(saw_swing, "blade dash must transition into BladePhase::Swing");
-        assert!(saw_recovery, "blade swing must transition into BladePhase::Recovery");
-        assert!(!p.in_blade(), "blade attack must finish cleanly after recovery");
+        assert!(
+            saw_dash,
+            "locked target 25 m away must trigger BladePhase::Dash"
+        );
+        assert!(
+            saw_swing,
+            "blade dash must transition into BladePhase::Swing"
+        );
+        assert!(
+            saw_recovery,
+            "blade swing must transition into BladePhase::Recovery"
+        );
+        assert!(
+            !p.in_blade(),
+            "blade attack must finish cleanly after recovery"
+        );
         assert!(
             pos.z < -8.0,
             "homing blade dash should close significant distance toward target (z={})",
@@ -4152,8 +4239,16 @@ mod tests {
             0.0,
             Some(Vec3::new(0.0, 5.0, -100.0)),
         );
-        assert!(yaw0.abs() < 1e-4, "straight-ahead yaw={}", yaw0.to_degrees());
-        assert!(pitch0.abs() < 1e-4, "straight-ahead pitch={}", pitch0.to_degrees());
+        assert!(
+            yaw0.abs() < 1e-4,
+            "straight-ahead yaw={}",
+            yaw0.to_degrees()
+        );
+        assert!(
+            pitch0.abs() < 1e-4,
+            "straight-ahead pitch={}",
+            pitch0.to_degrees()
+        );
 
         // Locked target 100 m forward (-Z) and 100 m left (-X) at AC torso height (+5 Y) -> +45 deg yaw, 0 pitch.
         let (yaw, pitch) = core_aim_angles(
@@ -4165,14 +4260,19 @@ mod tests {
             0.0,
             Some(Vec3::new(-100.0, 5.0, -100.0)),
         );
-        assert!((yaw.to_degrees() - 45.0).abs() < 0.1, "yaw={}", yaw.to_degrees());
+        assert!(
+            (yaw.to_degrees() - 45.0).abs() < 0.1,
+            "yaw={}",
+            yaw.to_degrees()
+        );
         assert!(pitch.abs() < 0.01);
 
         // Locked target ahead-right (+X, -Z) and above (+Y) -> -45 deg yaw, positive pitch,
         // and the resulting aim ray points directly at the target even when the AC is rotated.
         let body_yaw = 0.7_f32;
         let target = Vec3::new(60.0, 45.0, -80.0);
-        let (ryaw, rpitch) = core_aim_angles(body_yaw, Vec3::ZERO, 0.0, 0.0, 0.0, 0.0, Some(target));
+        let (ryaw, rpitch) =
+            core_aim_angles(body_yaw, Vec3::ZERO, 0.0, 0.0, 0.0, 0.0, Some(target));
         let aim_dir =
             Quat::from_rotation_y(body_yaw + ryaw) * Quat::from_rotation_x(rpitch) * FORWARD;
         let expected = (target - Vec3::Y * 5.0).normalize();
@@ -4226,9 +4326,17 @@ mod tests {
         // WATER_RETURN_DEPTH of it (here 3 m), never returns: this is the `--plane --water 2`
         // case where the AC glides 2 m under the test surface.
         let mut above = Vec3::new(-45.0, 5.0, 12.0);
-        assert!(!check_water_return(&mut p, &mut above, &wr, fallback, &ground));
+        assert!(!check_water_return(
+            &mut p, &mut above, &wr, fallback, &ground
+        ));
         let mut wading = Vec3::new(-45.0, 1.0, 12.0);
-        assert!(!check_water_return(&mut p, &mut wading, &wr, fallback, &ground));
+        assert!(!check_water_return(
+            &mut p,
+            &mut wading,
+            &wr,
+            fallback,
+            &ground
+        ));
 
         // Sunk past the torso (feet more than WATER_RETURN_DEPTH under 3.0): teleports to the
         // nearest return point (-50, 15, 10).
@@ -4290,7 +4398,11 @@ mod tests {
                 pos.y
             );
         }
-        assert!((pos.y - 10.0).abs() < 1e-2, "expected hover at 10 m, got {}", pos.y);
+        assert!(
+            (pos.y - 10.0).abs() < 1e-2,
+            "expected hover at 10 m, got {}",
+            pos.y
+        );
 
         // A tick that dipped under the surface while moving is pulled back up.
         let mut p = Pilot::new(ctrl, 0);
@@ -4314,7 +4426,11 @@ mod tests {
         for _ in 0..30 {
             step(&mut p, &Input::default(), &mut pos, &collision);
         }
-        assert!(pos.y < 10.0, "boosters off should drop below the surface, got {}", pos.y);
+        assert!(
+            pos.y < 10.0,
+            "boosters off should drop below the surface, got {}",
+            pos.y
+        );
     }
 
     #[test]
@@ -4346,7 +4462,10 @@ mod tests {
         for _ in 0..5 {
             peak_impact = peak_impact.max(cam.shake(0.015).length());
         }
-        assert!(peak_impact > 0.0, "impact shake must produce non-zero offset");
+        assert!(
+            peak_impact > 0.0,
+            "impact shake must produce non-zero offset"
+        );
         for _ in 0..10 {
             cam.shake(0.02);
         }
@@ -4381,7 +4500,10 @@ mod tests {
     #[test]
     fn ready_position_zoom_camera_transitions_and_stows() {
         // Action mapping (`0x8285db68` + `0x8285d548`): Deploying -> 40, Zoomed -> 49, not overridden by boost.
-        assert_eq!(camera_action("idle", true, false, ReadyCamera::Deploying), 40);
+        assert_eq!(
+            camera_action("idle", true, false, ReadyCamera::Deploying),
+            40
+        );
         assert_eq!(
             camera_action(
                 "dash",
@@ -4452,7 +4574,10 @@ mod tests {
 
         // One 60 Hz frame (1/60 s) has not reached a 30 Hz step yet.
         cam.blur_step(vel, 1.0 / 60.0);
-        assert_eq!(cam.blur, 0.0, "blur must not step after a single 1/60 s frame");
+        assert_eq!(
+            cam.blur, 0.0,
+            "blur must not step after a single 1/60 s frame"
+        );
 
         // Second 60 Hz frame completes 1/30 s -> exactly one 0x82bfa9f0 ease step.
         cam.blur_step(vel, 1.0 / 60.0);
@@ -4546,7 +4671,10 @@ mod tests {
         let mut cam2 = FollowCam::of(10);
         let camera_only = Collision::with_hits(Vec::new(), wall(-4.0, false));
         let (free, _) = cam2.clip(pivot, eye, look, &camera_only, dt);
-        assert!((free - eye).length() < 1e-4, "camera material must not clip");
+        assert!(
+            (free - eye).length() < 1e-4,
+            "camera material must not clip"
+        );
     }
 
     #[test]
@@ -4558,9 +4686,12 @@ mod tests {
         assert_eq!(high_boost_tae_id(true, true, false), 0x0C21);
         assert_eq!(high_boost_tae_id(true, true, true), 0x0C22);
 
-        let design = &find(acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN, 5001)
-            .expect("design 5001")
-            .data;
+        let design = &find(
+            acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN,
+            5001,
+        )
+        .expect("design 5001")
+        .data;
         let mut p = Pilot::new(AcCtrlParam::calculate(design), 10);
         // Drain EN below qb_en_drain -> QB attempt fails and increments qb_shortages.
         p.en = (p.ctrl.qb_en_drain * 0.5).max(0.0);
@@ -4587,9 +4718,12 @@ mod tests {
         use crate::collision::{GroundSurface, Hit, Layer, Plane};
         use crate::map::DestructibleProp;
 
-        let design = &find(acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN, 5001)
-            .expect("design 5001")
-            .data;
+        let design = &find(
+            acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN,
+            5001,
+        )
+        .expect("design 5001")
+        .data;
         let ctrl = AcCtrlParam::calculate(design);
         let prop_wall = |z: f32, prop_id: u32| {
             Collision::with_hits(
@@ -4661,8 +4795,15 @@ mod tests {
                 id == prop_a.prop_id && prop_a.apply_collision_damage(raw)
             });
         }
-        assert!(prop_a.broken, "walking into 耐久A ground prop must shatter it");
-        assert!(pos.z < -6.5, "AC must crash straight through broken 耐久A prop, got z={}", pos.z);
+        assert!(
+            prop_a.broken,
+            "walking into 耐久A ground prop must shatter it"
+        );
+        assert!(
+            pos.z < -6.5,
+            "AC must crash straight through broken 耐久A prop, got z={}",
+            pos.z
+        );
 
         // 2. 耐久B (AP=500, collision_defensibility=0 -> mult=1.0): boosting into it shatters it
         //    and the AC crashes through.
@@ -4677,7 +4818,11 @@ mod tests {
             });
         }
         assert!(prop_b.broken, "boosting into 耐久B prop must shatter it");
-        assert!(pos.z < -6.5, "AC must crash through broken 耐久B prop, got z={}", pos.z);
+        assert!(
+            pos.z < -6.5,
+            "AC must crash through broken 耐久B prop, got z={}",
+            pos.z
+        );
 
         // 3. 耐久C / indestructible (collision_defensibility=100 -> mult=0.0): resists AC body
         //    collision and blocks the AC at the wall.
@@ -4691,7 +4836,201 @@ mod tests {
                 id == prop_c.prop_id && prop_c.apply_collision_damage(raw)
             });
         }
-        assert!(!prop_c.broken, "collision_defensibility=100 prop must not break on body contact");
-        assert!(pos.z > -5.0, "intact collision-immune prop must block the AC, got z={}", pos.z);
+        assert!(
+            !prop_c.broken,
+            "collision_defensibility=100 prop must not break on body contact"
+        );
+        assert!(
+            pos.z > -5.0,
+            "intact collision-immune prop must block the AC, got z={}",
+            pos.z
+        );
+    }
+
+    /// Boosting up a kerb or ramp. `quad` builds two triangles.
+    fn ramp_collision(deg: f32, kerb: f32) -> Collision {
+        use crate::collision::Hit;
+        let quad = |x0: f32, x1: f32, z0: f32, z1: f32, y0: f32, y1: f32| {
+            let a = Vec3::new(x0, y0, z0);
+            let b = Vec3::new(x1, y0, z0);
+            let c = Vec3::new(x1, y1, z1);
+            let d = Vec3::new(x0, y1, z1);
+            vec![Hit::solid(a, b, c), Hit::solid(a, c, d)]
+        };
+        let mut hits = quad(-50.0, 50.0, 0.0, 30.0, 0.0, 0.0);
+        if kerb > 0.0 {
+            hits.push(Hit::solid(
+                Vec3::new(-50.0, 0.0, 0.0),
+                Vec3::new(50.0, 0.0, 0.0),
+                Vec3::new(50.0, kerb, 0.0),
+            ));
+            hits.push(Hit::solid(
+                Vec3::new(-50.0, 0.0, 0.0),
+                Vec3::new(50.0, kerb, 0.0),
+                Vec3::new(-50.0, kerb, 0.0),
+            ));
+            hits.extend(quad(-50.0, 50.0, -60.0, 0.0, kerb, kerb));
+        } else {
+            let h = 10.0 * deg.to_radians().tan();
+            hits.extend(quad(-50.0, 50.0, -10.0, 0.0, h, 0.0));
+            hits.extend(quad(-50.0, 50.0, -60.0, -10.0, h, h));
+        }
+        Collision::with_hits(Vec::new(), hits)
+    }
+
+    fn boost_forward(ctrl: AcCtrlParam) -> (Pilot, Vec3) {
+        let mut p = Pilot::new(ctrl, 0);
+        p.boost = true;
+        p.en = ctrl.en_capacity;
+        (p, Vec3::new(0.0, 0.0, 10.0))
+    }
+
+    fn test_ctrl() -> AcCtrlParam {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001")
+    }
+
+    /// The body spheres are floor-tangent, so even a 15 cm kerb used to push the AC back and
+    /// stop a boost dead at the foot of every ramp. It now steps up and keeps its speed.
+    #[test]
+    fn boost_steps_over_kerbs() {
+        for kerb in [0.15f32, 0.5] {
+            let collision = ramp_collision(0.0, kerb);
+            let (mut p, mut pos) = boost_forward(test_ctrl());
+            let input = Input {
+                stick: Vec2::Y,
+                ..Input::default()
+            };
+            for _ in 0..120 {
+                step(&mut p, &input, &mut pos, &collision);
+            }
+            assert!(pos.z < -5.0, "kerb {kerb}: boost stopped at z={}", pos.z);
+            assert!(
+                (pos.y - kerb).abs() < 1e-3,
+                "kerb {kerb}: AC should stand on the kerb, y={}",
+                pos.y
+            );
+            assert!(!p.airborne);
+        }
+    }
+
+    /// 45-55 degree city ramps were the ones that clipped or stopped the AC: with only this
+    /// tick's travel the ground ray started under the next triangle, and at/over 45 degrees the
+    /// old floor/wall split could push or miss the ramp. Both now climb without leaving the
+    /// ground.
+    #[test]
+    fn boost_climbs_steep_ramps_without_clipping() {
+        for deg in [45.0f32, 52.0] {
+            let ctrl = test_ctrl();
+            let collision = ramp_collision(deg, 0.0);
+            let (mut p, mut pos) = boost_forward(ctrl);
+            let input = Input {
+                stick: Vec2::Y,
+                ..Input::default()
+            };
+            let tan = deg.to_radians().tan();
+            let h = 10.0 * tan;
+            let mut worst = f32::INFINITY;
+            for _ in 0..80 {
+                step(&mut p, &input, &mut pos, &collision);
+                assert!(!p.airborne, "{deg} deg: AC left the ground at {pos:?}");
+                if (-10.0..0.0).contains(&pos.z) {
+                    worst = worst.min(pos.y - (-pos.z) * tan);
+                }
+            }
+            assert!(
+                worst > -0.05,
+                "{deg} deg: clip through the floor by {}",
+                -worst
+            );
+            assert!(
+                pos.z < -12.0 && (pos.y - h).abs() < 1e-2,
+                "{deg} deg: AC should be on the top platform, got {pos:?}"
+            );
+        }
+    }
+
+    /// Glide Boost opens with a 5 m vertical ascent. On an incline the ramp surface rises
+    /// faster than that, so the lift (and the held-height glide after it) used to pass through
+    /// the slope. It must land on the ramp instead.
+    #[test]
+    fn glide_boost_lands_on_rising_ground() {
+        let ctrl = test_ctrl();
+        let collision = ramp_collision(45.0, 0.0);
+        let (mut p, mut pos) = boost_forward(ctrl);
+        p.glide = true;
+        let input = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
+        let mut worst = f32::INFINITY;
+        for _ in 0..90 {
+            step(&mut p, &input, &mut pos, &collision);
+            if (-10.0..0.0).contains(&pos.z) {
+                worst = worst.min(pos.y - (-pos.z));
+            }
+        }
+        assert!(
+            worst > -0.05,
+            "glide boost: clip through the ramp by {}",
+            -worst
+        );
+        assert!(
+            pos.z < -12.0 && (pos.y - 10.0).abs() < 0.1,
+            "glide boost: AC should end on the top platform, got {pos:?}"
+        );
+    }
+
+    /// Plain airborne boost (no glide) is held level by the boost gravity, so a ramp can also
+    /// rise through it; the same upward probe must land it.
+    #[test]
+    fn airborne_boost_lands_on_rising_ground() {
+        let ctrl = test_ctrl();
+        let collision = ramp_collision(45.0, 0.0);
+        let mut p = Pilot::new(ctrl, 0);
+        p.boost = true;
+        p.airborne = true;
+        p.en = ctrl.en_capacity;
+        p.velocity = Vec3::new(0.0, 0.0, -0.6);
+        let mut pos = Vec3::new(0.0, 2.0, 2.0);
+        let input = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
+        let mut worst = f32::INFINITY;
+        for _ in 0..90 {
+            step(&mut p, &input, &mut pos, &collision);
+            if (-10.0..0.0).contains(&pos.z) {
+                worst = worst.min(pos.y - (-pos.z));
+            }
+        }
+        assert!(worst > -0.05, "airborne boost: clip by {}", -worst);
+        assert!(
+            pos.z < -12.0 && (pos.y - 10.0).abs() < 0.1,
+            "airborne boost: AC should end on the top platform, got {pos:?}"
+        );
+    }
+
+    /// Steeper than the 55 degree walkable limit is still a wall and stops the AC.
+    #[test]
+    fn steep_ramp_still_blocks() {
+        let collision = ramp_collision(60.0, 0.0);
+        let (mut p, mut pos) = boost_forward(test_ctrl());
+        let input = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
+        for _ in 0..80 {
+            step(&mut p, &input, &mut pos, &collision);
+        }
+        assert!(
+            pos.z > 0.0,
+            "a 60 degree ramp must stay a wall, got {pos:?}"
+        );
     }
 }

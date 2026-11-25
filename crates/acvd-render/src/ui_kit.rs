@@ -11,15 +11,15 @@
 use std::sync::Arc;
 
 use acvd_formats::vfs::Disc;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bevy::asset::{Assets, Handle};
 use bevy::color::Color;
 use bevy::image::Image;
 use bevy::math::{Rect, Rot2, Vec2};
 use bevy::prelude::*;
 use bevy::ui::{
-    px, AlignItems, BackgroundGradient, ColorStop, FlexDirection, Gradient, JustifyContent,
-    LinearGradient, PositionType, UiRect, UiSystems, UiTransform, Val, Val2,
+    px, AlignItems, BackgroundGradient, ColorStop, FlexDirection, FlexWrap, Gradient,
+    JustifyContent, LinearGradient, PositionType, UiRect, UiSystems, UiTransform, Val, Val2,
 };
 
 use crate::menu::{self, Layout, MenuSprite};
@@ -200,6 +200,69 @@ pub enum ArrowDir {
     Right,
     Up,
     Down,
+}
+
+/// A controller button glyph from the retail 360 key-guide font (`fontdef.xml` ID 10
+/// `s1_xbox/s1_xbox.ccm`, sheet `font/s1_xbox/s1_xbox_t.bnd|#0`).
+///
+/// The sheet is a 256x128 BC3 atlas in three rows: D-pad up/down/left/right + B/A/Y/X at
+/// `v=1..25`, RB/RT/LB/LT + R3/L3 at `v=26..50`, and scroll pills / HOLD at `v=51..75`.
+/// Codepoints are the ASCII advances `a..y` the font maps those cells to; the retail
+/// `AITestKeyGuide` DRB uses `font=10` with `Static("o")` for a shoulder prompt, confirming the
+/// font is the key-guide icon font (see `sheets/keyguide.csv`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadGlyph {
+    DPadUp,
+    DPadDown,
+    DPadLeft,
+    DPadRight,
+    A,
+    B,
+    X,
+    Y,
+    Rb,
+    Rt,
+    Lb,
+    Lt,
+    R3,
+    L3,
+    ScrollRight,
+    ScrollLeft,
+    Hold,
+    ArrowUp,
+}
+
+impl PadGlyph {
+    /// `s1_xbox` codepoint of this glyph (the glyph atlas cell `a..y`).
+    pub const fn glyph(self) -> char {
+        match self {
+            PadGlyph::DPadUp => 'a',
+            PadGlyph::DPadDown => 'b',
+            PadGlyph::DPadLeft => 'c',
+            PadGlyph::DPadRight => 'd',
+            PadGlyph::B => 'e',
+            PadGlyph::A => 'f',
+            PadGlyph::Y => 'g',
+            PadGlyph::X => 'h',
+            PadGlyph::Rb => 'i',
+            PadGlyph::Rt => 'j',
+            PadGlyph::Lb => 'k',
+            PadGlyph::Lt => 'l',
+            PadGlyph::R3 => 'm',
+            PadGlyph::L3 => 'n',
+            PadGlyph::ScrollRight => 'o',
+            PadGlyph::ScrollLeft => 'p',
+            PadGlyph::Hold => 's',
+            PadGlyph::ArrowUp => 't',
+        }
+    }
+}
+
+/// One run of controller icons plus a label for [`AcvdUiKit::spawn_hints`].
+#[derive(Debug, Clone, Copy)]
+pub struct HintPart<'a> {
+    pub icons: &'a [PadGlyph],
+    pub label: &'a str,
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +666,14 @@ fn animate_ui_tweens(
             UiRepeat::Loop => ((active % cycle) / cycle, false),
             UiRepeat::PingPong => {
                 let m = active % (cycle * 2.0);
-                (if m <= cycle { m / cycle } else { 2.0 - m / cycle }, false)
+                (
+                    if m <= cycle {
+                        m / cycle
+                    } else {
+                        2.0 - m / cycle
+                    },
+                    false,
+                )
             }
         };
         let pose = tween.from.lerp(tween.to, tween.ease.apply(progress));
@@ -623,7 +693,11 @@ fn animate_ui_tweens(
             }
         }
 
-        if tween.touches_alpha() && tween.last_alpha.is_none_or(|a| (a - pose.alpha).abs() > 1e-4) {
+        if tween.touches_alpha()
+            && tween
+                .last_alpha
+                .is_none_or(|a| (a - pose.alpha).abs() > 1e-4)
+        {
             if let Some(bases) = &tween.bases {
                 for (entity, base) in bases {
                     if let Some(color) = base.bg {
@@ -699,6 +773,8 @@ pub struct AcvdUiKit {
     pub font_header: Option<Arc<Font>>,
     pub font_body: Option<Arc<Font>>,
     pub font_small: Option<Arc<Font>>,
+    /// Retail controller key-guide icon font (`fontdef.xml` ID 10, `s1_xbox`).
+    pub font_icons: Option<Arc<Font>>,
 
     /// `base_window_L` outer corner reticle (`Parts_01`, `uv=[35,4,48,19]`).
     pub reticle_corner: Option<SpriteSlice>,
@@ -738,26 +814,51 @@ impl AcvdUiKit {
     /// + `font/fontdef.xml`).
     pub fn load(disc: &Disc, images: &mut Assets<Image>) -> Result<Self> {
         let layout = menu::load(disc, KIT_DRB_PATH, images)?;
-        Ok(Self::from_layout(&layout))
+        let mut kit = Self::from_layout(&layout);
+        kit.load_icons(disc, images);
+        Ok(kit)
+    }
+
+    /// Loads the retail controller key-guide glyph font (`fontdef.xml` ID 10 `s1_xbox`) used by
+    /// device-aware button hints. Failure leaves [`Self::font_icons`] empty so callers keep the
+    /// keyboard hint line.
+    pub fn load_icons(&mut self, disc: &Disc, images: &mut Assets<Image>) {
+        let loaded = (|| -> Result<Arc<Font>> {
+            let defs =
+                acvd_formats::fontdef::read(&disc.asset("font/fontdef.xml")?, disc.platform())?;
+            let (folder, file) = defs
+                .file(10)
+                .context("fontdef.xml has no controller glyph font ID 10")?;
+            Ok(Arc::new(text::load_file(disc, folder, file, images)?))
+        })();
+        match loaded {
+            Ok(font) => self.font_icons = Some(font),
+            Err(e) => warn!("controller key-guide font: {e:#}"),
+        }
     }
 
     /// Extracts the kit's fonts and chrome sprites from an already-loaded `assemble.drb.dcx` [`Layout`]
     /// with zero extra disc reads or GPU texture allocations.
     pub fn from_layout(layout: &Layout) -> Self {
-        let font_body = layout.fonts.get(&17).cloned().or_else(|| layout.fonts.values().next().cloned());
+        let font_body = layout
+            .fonts
+            .get(&17)
+            .cloned()
+            .or_else(|| layout.fonts.values().next().cloned());
         let font_header = layout.fonts.get(&18).cloned().or_else(|| font_body.clone());
         let font_small = layout.fonts.get(&21).cloned().or_else(|| font_body.clone());
 
         let parts_01 = find_tex(layout, "Parts_01");
         let locksight = find_tex(layout, "ACV_FE_Locksight_02");
         let frame = find_tex(layout, "ACV_frame");
-        let menu_parts = find_tex(layout, "ACV_MENU_parts1")
-            .or_else(|| find_tex(layout, "ACV_MENU_parts01"));
+        let menu_parts =
+            find_tex(layout, "ACV_MENU_parts1").or_else(|| find_tex(layout, "ACV_MENU_parts01"));
 
         Self {
             font_header,
             font_body,
             font_small,
+            font_icons: None,
             reticle_corner: slice(parts_01.clone(), 35.0, 4.0, 48.0, 19.0),
             reticle_side: slice(parts_01.clone(), 1.0, 22.0, 13.0, 39.0),
             corner_bracket: slice(locksight, 326.0, 398.0, 331.0, 403.0),
@@ -850,6 +951,98 @@ impl AcvdUiKit {
                 ChildOf(parent),
             ))
             .id()
+    }
+
+    /// Spawns one run of retail controller key-guide glyphs ([`PadGlyph`]) inside `parent`.
+    /// Returns `None` when the kit has no icon font loaded.
+    pub fn spawn_icon_text(
+        &self,
+        commands: &mut Commands,
+        parent: Entity,
+        text_str: &str,
+        scale: f32,
+        color: Color,
+    ) -> Option<Entity> {
+        let f = self.font_icons.as_ref()?;
+        let (quads, size) = text::layout(&f.ccm, &f.sheet_size, text_str, scale);
+        let boxed = commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Relative,
+                    width: px(size.x.ceil().max(1.0)),
+                    height: px(size.y.ceil().max(1.0)),
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                },
+                ChildOf(parent),
+            ))
+            .id();
+        text::spawn_glyphs(commands, f, &quads, Vec2::ZERO, boxed, color);
+        Some(boxed)
+    }
+
+    /// Spawns a device-aware controller hint line: each [`HintPart`] draws its retail button
+    /// glyphs (font ID 10) followed by a small-font label. Returns `None` when the icon font is
+    /// unavailable so the caller can fall back to the keyboard hint line.
+    pub fn spawn_hints(
+        &self,
+        commands: &mut Commands,
+        parent: Entity,
+        parts: &[HintPart],
+        scale: f32,
+        color: Color,
+    ) -> Option<Entity> {
+        if self.font_icons.is_none() || parts.is_empty() {
+            return None;
+        }
+        let row = commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Relative,
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    align_items: AlignItems::Center,
+                    column_gap: px((14.0 * scale).round()),
+                    row_gap: px((4.0 * scale).round()),
+                    ..Default::default()
+                },
+                ChildOf(parent),
+            ))
+            .id();
+        for part in parts {
+            let item = commands
+                .spawn((
+                    Node {
+                        position_type: PositionType::Relative,
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: px((3.0 * scale).round()),
+                        ..Default::default()
+                    },
+                    ChildOf(row),
+                ))
+                .id();
+            for icon in part.icons {
+                self.spawn_icon_text(
+                    commands,
+                    item,
+                    &icon.glyph().to_string(),
+                    scale * 0.58,
+                    Color::WHITE,
+                );
+            }
+            if !part.label.is_empty() {
+                self.spawn_text(
+                    commands,
+                    item,
+                    FontRole::Small,
+                    part.label,
+                    scale * 0.90,
+                    color,
+                );
+            }
+        }
+        Some(row)
     }
 
     /// Spawns a scalable ACVD container panel with retail shading, hairlines, and corner chrome.
@@ -1085,10 +1278,24 @@ impl AcvdUiKit {
             ChildOf(left),
         ));
 
-        self.spawn_text(commands, left, FontRole::Header, title, scale, palette::TEXT_PRIMARY);
+        self.spawn_text(
+            commands,
+            left,
+            FontRole::Header,
+            title,
+            scale,
+            palette::TEXT_PRIMARY,
+        );
 
         if let Some(tag) = right_tag {
-            self.spawn_text(commands, plate, FontRole::Small, tag, scale, palette::TEXT_MUTED);
+            self.spawn_text(
+                commands,
+                plate,
+                FontRole::Small,
+                tag,
+                scale,
+                palette::TEXT_MUTED,
+            );
         }
 
         self.spawn_trace(commands, wrap, TraceStyle::Simple, scale);
@@ -1317,7 +1524,9 @@ impl AcvdUiKit {
         if state == ButtonState::Selected {
             if let Some(arrow) = &self.focus_arrow {
                 let h = (14.0 * scale).round().max(8.0);
-                let w = (h * (arrow.size().x / arrow.size().y.max(1.0))).round().max(6.0);
+                let w = (h * (arrow.size().x / arrow.size().y.max(1.0)))
+                    .round()
+                    .max(6.0);
                 arrow.spawn(
                     commands,
                     left,
@@ -1380,7 +1589,11 @@ impl AcvdUiKit {
         even_row: bool,
         scale: f32,
     ) -> Entity {
-        let bg = if even_row { palette::BG_ROW } else { palette::BG_BAR };
+        let bg = if even_row {
+            palette::BG_ROW
+        } else {
+            palette::BG_BAR
+        };
         let row = commands
             .spawn((
                 Node {
@@ -1397,7 +1610,14 @@ impl AcvdUiKit {
             ))
             .id();
 
-        self.spawn_text(commands, row, FontRole::Body, label, scale, palette::TEXT_PRIMARY);
+        self.spawn_text(
+            commands,
+            row,
+            FontRole::Body,
+            label,
+            scale,
+            palette::TEXT_PRIMARY,
+        );
 
         let right = commands
             .spawn((
@@ -1411,7 +1631,14 @@ impl AcvdUiKit {
             ))
             .id();
 
-        self.spawn_text(commands, right, FontRole::Body, value, scale, palette::TEXT_PRIMARY);
+        self.spawn_text(
+            commands,
+            right,
+            FontRole::Body,
+            value,
+            scale,
+            palette::TEXT_PRIMARY,
+        );
 
         if let Some(d) = delta {
             let color = match d.cmp.cmp(&0) {
@@ -1419,7 +1646,14 @@ impl AcvdUiKit {
                 std::cmp::Ordering::Less => palette::TEXT_BAD,
                 std::cmp::Ordering::Equal => palette::TEXT_PRIMARY,
             };
-            self.spawn_text(commands, right, FontRole::Body, ">", scale, palette::TEXT_MUTED);
+            self.spawn_text(
+                commands,
+                right,
+                FontRole::Body,
+                ">",
+                scale,
+                palette::TEXT_MUTED,
+            );
             self.spawn_text(commands, right, FontRole::Body, d.text, scale, color);
         }
 
@@ -1470,7 +1704,11 @@ impl AcvdUiKit {
             FontRole::Body,
             label,
             scale,
-            if alert { palette::TEXT_ALERT } else { palette::TEXT_PRIMARY },
+            if alert {
+                palette::TEXT_ALERT
+            } else {
+                palette::TEXT_PRIMARY
+            },
         );
 
         let track_h = (10.0 * scale).round().max(6.0);
@@ -1487,7 +1725,11 @@ impl AcvdUiKit {
                     ..Default::default()
                 },
                 BackgroundColor(palette::BG_BAR),
-                BorderColor::all(if alert { palette::TEXT_ALERT } else { palette::BORDER_SUBTLE }),
+                BorderColor::all(if alert {
+                    palette::TEXT_ALERT
+                } else {
+                    palette::BORDER_SUBTLE
+                }),
                 ChildOf(row),
             ))
             .id();
@@ -1867,8 +2109,16 @@ impl AcvdUiKit {
                     column_gap: px((5.0 * scale).round()),
                     ..Default::default()
                 },
-                BackgroundColor(if active { palette::ACCENT_TEAL_FILL_TOP } else { palette::BG_BAR }),
-                BorderColor::all(if active { accent } else { palette::BORDER_SUBTLE }),
+                BackgroundColor(if active {
+                    palette::ACCENT_TEAL_FILL_TOP
+                } else {
+                    palette::BG_BAR
+                }),
+                BorderColor::all(if active {
+                    accent
+                } else {
+                    palette::BORDER_SUBTLE
+                }),
                 ChildOf(parent),
             ))
             .id();
@@ -1890,7 +2140,11 @@ impl AcvdUiKit {
             FontRole::Small,
             label,
             scale,
-            if active { palette::TEXT_BRIGHT } else { palette::TEXT_MUTED },
+            if active {
+                palette::TEXT_BRIGHT
+            } else {
+                palette::TEXT_MUTED
+            },
         );
 
         badge
@@ -2005,8 +2259,14 @@ mod tests {
             .expect("child tint")
             .0
             .alpha();
-        assert!((a - 1.0).abs() < 0.01, "finished frame should be opaque, got {a}");
-        assert!(app.world().get::<UiTween>(root).is_none(), "one-shot tween removed");
+        assert!(
+            (a - 1.0).abs() < 0.01,
+            "finished frame should be opaque, got {a}"
+        );
+        assert!(
+            app.world().get::<UiTween>(root).is_none(),
+            "one-shot tween removed"
+        );
 
         // `Move_Right` starts at -48 px and settles at 0, giving the retail cursor/row travel.
         let mut app = App::new();
@@ -2017,7 +2277,11 @@ mod tests {
             .spawn((UiTween::clip(UiClip::MoveRight, 0), UiTransform::IDENTITY))
             .id();
         app.update();
-        let x0 = match app.world().get::<UiTransform>(moving).map(|t| t.translation.x) {
+        let x0 = match app
+            .world()
+            .get::<UiTransform>(moving)
+            .map(|t| t.translation.x)
+        {
             Some(Val::Px(x)) => x,
             other => panic!("initial translation: {other:?}"),
         };
@@ -2027,7 +2291,11 @@ mod tests {
             .expect("tween exists")
             .elapsed = UiClip::MoveRight.frames() as f32 / UiTween::FPS;
         app.update();
-        let x1 = match app.world().get::<UiTransform>(moving).map(|t| t.translation.x) {
+        let x1 = match app
+            .world()
+            .get::<UiTransform>(moving)
+            .map(|t| t.translation.x)
+        {
             Some(Val::Px(x)) => x,
             other => panic!("final translation: {other:?}"),
         };
@@ -2115,11 +2383,20 @@ mod tests {
         assert!(kit.font_header.is_some(), "header CCM font (ID 18) missing");
         assert!(kit.font_body.is_some(), "body CCM font (ID 17) missing");
         assert!(kit.font_small.is_some(), "small CCM font (ID 21) missing");
-        assert!(kit.reticle_corner.is_some(), "Parts_01 corner reticle missing");
+        assert!(
+            kit.reticle_corner.is_some(),
+            "Parts_01 corner reticle missing"
+        );
         assert!(kit.reticle_side.is_some(), "Parts_01 side reticle missing");
-        assert!(kit.corner_bracket.is_some(), "ACV_FE_Locksight_02 corner bracket missing");
+        assert!(
+            kit.corner_bracket.is_some(),
+            "ACV_FE_Locksight_02 corner bracket missing"
+        );
         assert!(kit.trace_step.is_some(), "ACV_frame stepped trace missing");
-        assert!(kit.focus_arrow.is_some(), "ACV_MENU_parts1 focus arrow missing");
+        assert!(
+            kit.focus_arrow.is_some(),
+            "ACV_MENU_parts1 focus arrow missing"
+        );
         assert!(kit.arrow_horiz.is_some(), "Parts_01 horiz arrow missing");
         assert!(kit.arrow_vert.is_some(), "Parts_01 vert arrow missing");
 
@@ -2134,7 +2411,10 @@ mod tests {
         // bearings don't produce broken kerning.
         let small_caps = kit.resolve_font(FontRole::Small, "PARTS VIEW").unwrap();
         let small_lower = kit
-            .resolve_font(FontRole::Small, "Click anywhere on the AC to stamp your image.")
+            .resolve_font(
+                FontRole::Small,
+                "Click anywhere on the AC to stamp your image.",
+            )
             .unwrap();
         assert!(Arc::ptr_eq(small_caps, kit.font_small.as_ref().unwrap()));
         assert!(Arc::ptr_eq(small_lower, kit.font_body.as_ref().unwrap()));

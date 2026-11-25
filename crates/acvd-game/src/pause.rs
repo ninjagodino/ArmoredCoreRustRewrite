@@ -7,9 +7,7 @@
 //! - **RETURN TO GARAGE**: shown when in the AC TEST arena (`Scene::is_test_arena()`),
 //!   transitioning cleanly back to the 3D Garage with the current AC.
 
-use acvd_render::ui_kit::{
-    palette, AcvdUiKit, ButtonState, FontRole, PanelStyle, TraceStyle,
-};
+use acvd_render::ui_kit::{palette, AcvdUiKit, ButtonState, FontRole, PanelStyle, TraceStyle};
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::AccumulatedMouseScroll;
@@ -21,6 +19,7 @@ use bevy::window::CursorGrabMode;
 
 use crate::garage::{Mode, ModeSwitch, CUE_CANCEL, CUE_CATEGORY, CUE_MOVE, CUE_OK};
 use crate::garage_assemble::AssembleUiAssets;
+use crate::input::InputDevice;
 use crate::settings::{
     self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab, ShadowDistance,
 };
@@ -56,6 +55,14 @@ impl PauseItem {
             Self::Resume => "ESC",
             Self::Options => "SETTINGS",
             Self::ReturnToGarage => "AC TEST",
+        }
+    }
+
+    /// The right-hand key tag for the last-used device.
+    pub fn tag_for(self, device: InputDevice) -> &'static str {
+        match self {
+            Self::Resume if crate::hints::use_icons(device) => "START",
+            _ => self.tag(),
         }
     }
 }
@@ -332,9 +339,7 @@ pub fn handle_input(
     let gp_ok = gamepads
         .iter()
         .any(|g| g.just_pressed(GamepadButton::South));
-    let gp_cancel = gamepads
-        .iter()
-        .any(|g| g.just_pressed(GamepadButton::East));
+    let gp_cancel = gamepads.iter().any(|g| g.just_pressed(GamepadButton::East));
     let gp_tab = gamepads.iter().any(|g| {
         g.just_pressed(GamepadButton::LeftTrigger) || g.just_pressed(GamepadButton::RightTrigger)
     });
@@ -505,7 +510,8 @@ pub fn handle_input(
                             (options.settings.hud_color[comp] as i16 + delta).clamp(0, 255) as u8;
                         options.settings.save();
                         let hc = options.settings.hud_color;
-                        garage_state.paint_hsv = crate::paint::rgb_to_hsv([hc[0], hc[1], hc[2], 255]);
+                        garage_state.paint_hsv =
+                            crate::paint::rgb_to_hsv([hc[0], hc[1], hc[2], 255]);
                         garage_state.paint_hsv_synced_channel = Some(usize::MAX - 1);
                         sound::cue(
                             &mut commands,
@@ -581,7 +587,13 @@ pub fn handle_input(
                 PauseAction::SelectOptionRow(OptionRow::ShadowDistance)
                 | PauseAction::StepShadowDistance(_) => {
                     state.cursor = OptionRow::ShadowDistance.cursor_index();
-                    step_shadow_distance(&mut commands, &mut options, &mut audio, &mut state, delta);
+                    step_shadow_distance(
+                        &mut commands,
+                        &mut options,
+                        &mut audio,
+                        &mut state,
+                        delta,
+                    );
                     return;
                 }
                 PauseAction::SelectOptionRow(OptionRow::Volume(channel))
@@ -670,8 +682,7 @@ pub fn handle_input(
     let left = keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyA) || gp_left;
     let right =
         keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::KeyD) || gp_right;
-    let confirm =
-        keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) || gp_ok;
+    let confirm = keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) || gp_ok;
 
     let count = match state.screen {
         PauseScreen::Main => items.len(),
@@ -883,7 +894,12 @@ fn activate_main_item(
     match item {
         PauseItem::Resume => {
             state.close();
-            sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_CANCEL);
+            sound::cue(
+                commands,
+                &mut audio.cues,
+                &mut audio.audio_assets,
+                CUE_CANCEL,
+            );
         }
         PauseItem::Options => {
             state.screen = PauseScreen::Options;
@@ -913,6 +929,7 @@ pub fn sync_ui(
     mut picker_assets: ResMut<crate::garage::PaintPickerAssets>,
     mut images: ResMut<Assets<Image>>,
     mut state: ResMut<PauseState>,
+    active_input: Res<crate::input::ActiveInput>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     existing: Query<Entity, With<PauseUi>>,
 ) {
@@ -958,6 +975,7 @@ pub fn sync_ui(
 
     let base_scale = (win_size.x / 1280.0).min(win_size.y / 720.0);
     let scale = (base_scale * settings.ui_scale).clamp(0.35, 2.2);
+    let device = active_input.device();
     let in_test_arena = scene.is_test_arena();
     let mode_tag = if in_test_arena {
         "AC TEST ARENA"
@@ -1072,7 +1090,7 @@ pub fn sync_ui(
                     &mut commands,
                     list,
                     item.label(),
-                    Some(item.tag()),
+                    Some(item.tag_for(device)),
                     btn_state,
                     scale,
                 );
@@ -1097,14 +1115,21 @@ pub fn sync_ui(
                 },
                 scale,
             );
-            kit.spawn_text(
-                &mut commands,
-                footer,
-                FontRole::Small,
-                "W/S MOVE   ENTER SELECT   ESC RESUME",
-                scale,
-                palette::TEXT_MUTED,
-            );
+            let hints = crate::hints::parts(crate::hints::PAUSE_MAIN);
+            let shown = crate::hints::use_icons(device)
+                && kit
+                    .spawn_hints(&mut commands, footer, &hints, scale, palette::TEXT_MUTED)
+                    .is_some();
+            if !shown {
+                kit.spawn_text(
+                    &mut commands,
+                    footer,
+                    FontRole::Small,
+                    "W/S MOVE   ENTER SELECT   ESC RESUME",
+                    scale,
+                    palette::TEXT_MUTED,
+                );
+            }
         }
         PauseScreen::Options => {
             // Top tab strip: GRAPHICS | SOUND
@@ -1204,9 +1229,11 @@ pub fn sync_ui(
                     commands
                         .entity(ui_slider.row)
                         .insert((Button, PauseAction::SelectOptionRow(OptionRow::UiScale)));
-                    commands.entity(ui_slider.track).insert(
-                        crate::garage::SliderTrack(crate::garage::SliderTrackTarget::UiScale),
-                    );
+                    commands
+                        .entity(ui_slider.track)
+                        .insert(crate::garage::SliderTrack(
+                            crate::garage::SliderTrackTarget::UiScale,
+                        ));
                     commands
                         .entity(ui_slider.dec_btn)
                         .insert((Button, PauseAction::StepUiScale(-1)));
@@ -1230,9 +1257,11 @@ pub fn sync_ui(
                     commands
                         .entity(sway_slider.row)
                         .insert((Button, PauseAction::SelectOptionRow(OptionRow::HudSway)));
-                    commands.entity(sway_slider.track).insert(
-                        crate::garage::SliderTrack(crate::garage::SliderTrackTarget::HudSway),
-                    );
+                    commands
+                        .entity(sway_slider.track)
+                        .insert(crate::garage::SliderTrack(
+                            crate::garage::SliderTrackTarget::HudSway,
+                        ));
                     commands
                         .entity(sway_slider.dec_btn)
                         .insert((Button, PauseAction::StepHudSway(-1)));
@@ -1259,11 +1288,11 @@ pub fn sync_ui(
                             Button,
                             PauseAction::SelectOptionRow(OptionRow::DisplayParam(param)),
                         ));
-                        commands.entity(slider.track).insert(
-                            crate::garage::SliderTrack(
+                        commands
+                            .entity(slider.track)
+                            .insert(crate::garage::SliderTrack(
                                 crate::garage::SliderTrackTarget::DisplayParam(param),
-                            ),
-                        );
+                            ));
                         commands
                             .entity(slider.dec_btn)
                             .insert((Button, PauseAction::StepDisplayParam(param, -1)));
@@ -1289,9 +1318,11 @@ pub fn sync_ui(
                         Button,
                         PauseAction::SelectOptionRow(OptionRow::ShadowDistance),
                     ));
-                    commands.entity(sd_slider.track).insert(
-                        crate::garage::SliderTrack(crate::garage::SliderTrackTarget::ShadowDistance),
-                    );
+                    commands
+                        .entity(sd_slider.track)
+                        .insert(crate::garage::SliderTrack(
+                            crate::garage::SliderTrackTarget::ShadowDistance,
+                        ));
                     commands
                         .entity(sd_slider.dec_btn)
                         .insert((Button, PauseAction::StepShadowDistance(-1)));
@@ -1302,8 +1333,7 @@ pub fn sync_ui(
                     // Combat HUD Color HSV / RGB picker
                     if garage_state.paint_hsv_synced_channel != Some(usize::MAX - 1) {
                         let c = settings.hud_color;
-                        garage_state.paint_hsv =
-                            crate::paint::rgb_to_hsv([c[0], c[1], c[2], 255]);
+                        garage_state.paint_hsv = crate::paint::rgb_to_hsv([c[0], c[1], c[2], 255]);
                         garage_state.paint_hsv_synced_channel = Some(usize::MAX - 1);
                     }
                     picker_assets.ensure_loaded(garage_state.paint_hsv[0], &mut images);
@@ -1359,11 +1389,11 @@ pub fn sync_ui(
                             Button,
                             PauseAction::SelectOptionRow(OptionRow::Volume(channel)),
                         ));
-                        commands.entity(slider.track).insert(
-                            crate::garage::SliderTrack(crate::garage::SliderTrackTarget::Volume(
-                                channel,
-                            )),
-                        );
+                        commands
+                            .entity(slider.track)
+                            .insert(crate::garage::SliderTrack(
+                                crate::garage::SliderTrackTarget::Volume(channel),
+                            ));
                         commands
                             .entity(slider.dec_btn)
                             .insert((Button, PauseAction::StepVolume(channel, -1)));
@@ -1388,7 +1418,11 @@ pub fn sync_ui(
                 &mut commands,
                 list,
                 "BACK",
-                Some("ESC"),
+                Some(if crate::hints::use_icons(device) {
+                    "B"
+                } else {
+                    "ESC"
+                }),
                 back_state,
                 scale,
             );
@@ -1403,7 +1437,10 @@ pub fn sync_ui(
                     PanelStyle::Bar,
                     Node {
                         width: Val::Percent(100.0),
-                        padding: UiRect::axes(px((10.0 * scale).round()), px((4.0 * scale).round())),
+                        padding: UiRect::axes(
+                            px((10.0 * scale).round()),
+                            px((4.0 * scale).round()),
+                        ),
                         flex_direction: FlexDirection::Row,
                         align_items: AlignItems::Center,
                         justify_content: JustifyContent::Center,
@@ -1430,14 +1467,21 @@ pub fn sync_ui(
                 },
                 scale,
             );
-            kit.spawn_text(
-                &mut commands,
-                footer,
-                FontRole::Small,
-                "W/S MOVE   A/D ADJUST   TAB SWITCH TAB   ESC BACK",
-                scale,
-                palette::TEXT_MUTED,
-            );
+            let hints = crate::hints::parts(crate::hints::PAUSE_OPTIONS);
+            let shown = crate::hints::use_icons(device)
+                && kit
+                    .spawn_hints(&mut commands, footer, &hints, scale, palette::TEXT_MUTED)
+                    .is_some();
+            if !shown {
+                kit.spawn_text(
+                    &mut commands,
+                    footer,
+                    FontRole::Small,
+                    "W/S MOVE   A/D ADJUST   TAB SWITCH TAB   ESC BACK",
+                    scale,
+                    palette::TEXT_MUTED,
+                );
+            }
         }
     }
 }

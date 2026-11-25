@@ -48,6 +48,7 @@ use crate::garage::{
     part_name, parts_for_slot, AcSpecs, AssembleSlot, GarageScreen, GarageState, GarageUi, Mode,
     UiAction, UiRow,
 };
+use crate::input::InputDevice;
 use crate::paint;
 use crate::pose;
 
@@ -91,7 +92,9 @@ pub const PREVIEW_PITCH_LIMIT: f32 = 1.25;
 /// Converts a window-space cursor coordinate into the virtual `1280×720` DRB canvas space,
 /// using the exact same letterbox transform as [`spawn_assemble_ui`].
 fn window_to_virtual(window_size: Vec2, cursor: Vec2) -> Vec2 {
-    let scale = (window_size.x / SCREEN_W).min(window_size.y / SCREEN_H).max(0.5);
+    let scale = (window_size.x / SCREEN_W)
+        .min(window_size.y / SCREEN_H)
+        .max(0.5);
     let origin = Vec2::new(
         ((window_size.x - SCREEN_W * scale) * 0.5).round(),
         ((window_size.y - SCREEN_H * scale) * 0.5).round(),
@@ -129,7 +132,11 @@ pub fn cursor_in_ac_preview_panel(window_size: Vec2, cursor: Vec2) -> bool {
 /// Default hero orbit yaw (radians) for the right-side `ASSEMBLY VIEW` preview AC per slot.
 pub fn ac_preview_default_yaw(slot: AssembleSlot) -> f32 {
     match slot {
-        AssembleSlot::Head | AssembleSlot::Core | AssembleSlot::Fcs | AssembleSlot::Generator | AssembleSlot::Recon => 0.28,
+        AssembleSlot::Head
+        | AssembleSlot::Core
+        | AssembleSlot::Fcs
+        | AssembleSlot::Generator
+        | AssembleSlot::Recon => 0.28,
         AssembleSlot::Arms | AssembleSlot::Legs => 0.36,
         AssembleSlot::ArmUnitR | AssembleSlot::HangerR => 0.46,
         AssembleSlot::ArmUnitL | AssembleSlot::HangerL => -0.50,
@@ -335,6 +342,7 @@ impl AssembleUiAssets {
         match menu::load(disc, ASSEMBLE_DRB, images) {
             Ok(layout) => {
                 self.kit = AcvdUiKit::from_layout(&layout);
+                self.kit.load_icons(disc, images);
                 self.layout = Some(layout);
             }
             Err(e) => warn!("assemble UI: failed to load {ASSEMBLE_DRB}: {e:#}"),
@@ -398,8 +406,8 @@ impl AssembleUiAssets {
                 // Fallback to empty icon if a special/variant model_id lacks a dedicated thumbnail.
                 let zstem = format!("{prefix}0000");
                 let zpack = format!("image/partsthumbnail/{dir}/{zstem}.tpf.dcx");
-                let found = acvd_data::textures_named(&zstem)
-                    .find(|r| r.pack.eq_ignore_ascii_case(&zpack));
+                let found =
+                    acvd_data::textures_named(&zstem).find(|r| r.pack.eq_ignore_ascii_case(&zpack));
                 found
             })?;
         let mut img = self.packs.texture(disc, tref).ok()?;
@@ -657,107 +665,387 @@ pub fn part_stat_rows(slot: AssembleSlot, cur_id: u16, sel_id: u16, detail: bool
     match c {
         0 => {
             // HEAD
-            top.push(stat_i32("AP", pf(cur_id, c, "ap"), pf(sel_id, c, "ap"), true));
-            top.push(stat_i32("KE Defense", pf(cur_id, c, "ke_def"), pf(sel_id, c, "ke_def"), true));
-            top.push(stat_i32("CE Defense", pf(cur_id, c, "ce_def"), pf(sel_id, c, "ce_def"), true));
-            top.push(stat_i32("TE Defense", pf(cur_id, c, "te_def"), pf(sel_id, c, "te_def"), true));
+            top.push(stat_i32(
+                "AP",
+                pf(cur_id, c, "ap"),
+                pf(sel_id, c, "ap"),
+                true,
+            ));
+            top.push(stat_i32(
+                "KE Defense",
+                pf(cur_id, c, "ke_def"),
+                pf(sel_id, c, "ke_def"),
+                true,
+            ));
+            top.push(stat_i32(
+                "CE Defense",
+                pf(cur_id, c, "ce_def"),
+                pf(sel_id, c, "ce_def"),
+                true,
+            ));
+            top.push(stat_i32(
+                "TE Defense",
+                pf(cur_id, c, "te_def"),
+                pf(sel_id, c, "te_def"),
+                true,
+            ));
             if detail {
-                top.push(stat_i32("Stability", pf(cur_id, c, "balance"), pf(sel_id, c, "balance"), true));
-                top.push(stat_i32("Camera Perf.", pf(cur_id, c, "camera_ability"), pf(sel_id, c, "camera_ability"), true));
-                top.push(stat_i32("Scan Perf.", pf(cur_id, c, "scan_performance"), pf(sel_id, c, "scan_performance"), true));
+                top.push(stat_i32(
+                    "Stability",
+                    pf(cur_id, c, "balance"),
+                    pf(sel_id, c, "balance"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Camera Perf.",
+                    pf(cur_id, c, "camera_ability"),
+                    pf(sel_id, c, "camera_ability"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Scan Perf.",
+                    pf(cur_id, c, "scan_performance"),
+                    pf(sel_id, c, "scan_performance"),
+                    true,
+                ));
             }
         }
         1 => {
             // CORE
-            top.push(stat_i32("AP", pf(cur_id, c, "ap"), pf(sel_id, c, "ap"), true));
-            top.push(stat_i32("KE Defense", pf(cur_id, c, "ke_def"), pf(sel_id, c, "ke_def"), true));
-            top.push(stat_i32("CE Defense", pf(cur_id, c, "ce_def"), pf(sel_id, c, "ce_def"), true));
-            top.push(stat_i32("TE Defense", pf(cur_id, c, "te_def"), pf(sel_id, c, "te_def"), true));
+            top.push(stat_i32(
+                "AP",
+                pf(cur_id, c, "ap"),
+                pf(sel_id, c, "ap"),
+                true,
+            ));
+            top.push(stat_i32(
+                "KE Defense",
+                pf(cur_id, c, "ke_def"),
+                pf(sel_id, c, "ke_def"),
+                true,
+            ));
+            top.push(stat_i32(
+                "CE Defense",
+                pf(cur_id, c, "ce_def"),
+                pf(sel_id, c, "ce_def"),
+                true,
+            ));
+            top.push(stat_i32(
+                "TE Defense",
+                pf(cur_id, c, "te_def"),
+                pf(sel_id, c, "te_def"),
+                true,
+            ));
             if detail {
-                top.push(stat_i32("EN Conductivity", pf(cur_id, c, "en_conductivity"), pf(sel_id, c, "en_conductivity"), true));
-                top.push(stat_i32("Recon Storage", pf(cur_id, c, "recon_capacity"), pf(sel_id, c, "recon_capacity"), true));
-                top.push(stat_i32("Booster Output", pf(cur_id, c, "vs_hi_en"), pf(sel_id, c, "vs_hi_en"), true));
+                top.push(stat_i32(
+                    "EN Conductivity",
+                    pf(cur_id, c, "en_conductivity"),
+                    pf(sel_id, c, "en_conductivity"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Recon Storage",
+                    pf(cur_id, c, "recon_capacity"),
+                    pf(sel_id, c, "recon_capacity"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Booster Output",
+                    pf(cur_id, c, "vs_hi_en"),
+                    pf(sel_id, c, "vs_hi_en"),
+                    true,
+                ));
             }
         }
         2 => {
             // ARMS (matches user's reference screenshot!)
-            top.push(stat_i32("AP", pf(cur_id, c, "ap"), pf(sel_id, c, "ap"), true));
-            top.push(stat_i32("KE Defense", pf(cur_id, c, "ke_def"), pf(sel_id, c, "ke_def"), true));
-            top.push(stat_i32("CE Defense", pf(cur_id, c, "ce_def"), pf(sel_id, c, "ce_def"), true));
-            top.push(stat_i32("TE Defense", pf(cur_id, c, "te_def"), pf(sel_id, c, "te_def"), true));
+            top.push(stat_i32(
+                "AP",
+                pf(cur_id, c, "ap"),
+                pf(sel_id, c, "ap"),
+                true,
+            ));
+            top.push(stat_i32(
+                "KE Defense",
+                pf(cur_id, c, "ke_def"),
+                pf(sel_id, c, "ke_def"),
+                true,
+            ));
+            top.push(stat_i32(
+                "CE Defense",
+                pf(cur_id, c, "ce_def"),
+                pf(sel_id, c, "ce_def"),
+                true,
+            ));
+            top.push(stat_i32(
+                "TE Defense",
+                pf(cur_id, c, "te_def"),
+                pf(sel_id, c, "te_def"),
+                true,
+            ));
             if detail {
-                top.push(stat_i32("Firing Stability", pf(cur_id, c, "shoot_stability"), pf(sel_id, c, "shoot_stability"), true));
-                top.push(stat_i32("Shoulder Mounts", pf(cur_id, c, "shoulder_mount_count"), pf(sel_id, c, "shoulder_mount_count"), true));
+                top.push(stat_i32(
+                    "Firing Stability",
+                    pf(cur_id, c, "shoot_stability"),
+                    pf(sel_id, c, "shoot_stability"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Shoulder Mounts",
+                    pf(cur_id, c, "shoulder_mount_count"),
+                    pf(sel_id, c, "shoulder_mount_count"),
+                    true,
+                ));
             }
         }
         3 => {
             // LEGS
-            top.push(stat_i32("AP", pf(cur_id, c, "ap"), pf(sel_id, c, "ap"), true));
-            top.push(stat_i32("KE Defense", pf(cur_id, c, "ke_def"), pf(sel_id, c, "ke_def"), true));
-            top.push(stat_i32("CE Defense", pf(cur_id, c, "ce_def"), pf(sel_id, c, "ce_def"), true));
-            top.push(stat_i32("TE Defense", pf(cur_id, c, "te_def"), pf(sel_id, c, "te_def"), true));
+            top.push(stat_i32(
+                "AP",
+                pf(cur_id, c, "ap"),
+                pf(sel_id, c, "ap"),
+                true,
+            ));
+            top.push(stat_i32(
+                "KE Defense",
+                pf(cur_id, c, "ke_def"),
+                pf(sel_id, c, "ke_def"),
+                true,
+            ));
+            top.push(stat_i32(
+                "CE Defense",
+                pf(cur_id, c, "ce_def"),
+                pf(sel_id, c, "ce_def"),
+                true,
+            ));
+            top.push(stat_i32(
+                "TE Defense",
+                pf(cur_id, c, "te_def"),
+                pf(sel_id, c, "te_def"),
+                true,
+            ));
             if detail {
-                top.push(stat_i32("Load Capacity", pf(cur_id, c, "payload"), pf(sel_id, c, "payload"), true));
-                top.push(stat_i32("Movement Perf.", pf(cur_id, c, "move_ability"), pf(sel_id, c, "move_ability"), true));
-                top.push(stat_i32("Jump Perf.", pf(cur_id, c, "jump_ability"), pf(sel_id, c, "jump_ability"), true));
-                top.push(stat_i32("Turning Perf.", pf(cur_id, c, "turn_ability"), pf(sel_id, c, "turn_ability"), true));
+                top.push(stat_i32(
+                    "Load Capacity",
+                    pf(cur_id, c, "payload"),
+                    pf(sel_id, c, "payload"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Movement Perf.",
+                    pf(cur_id, c, "move_ability"),
+                    pf(sel_id, c, "move_ability"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Jump Perf.",
+                    pf(cur_id, c, "jump_ability"),
+                    pf(sel_id, c, "jump_ability"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Turning Perf.",
+                    pf(cur_id, c, "turn_ability"),
+                    pf(sel_id, c, "turn_ability"),
+                    true,
+                ));
             }
         }
         4 => {
             // FCS
-            top.push(stat_i32("Lock-On Range", pf(cur_id, c, "lock_range"), pf(sel_id, c, "lock_range"), true));
-            top.push(stat_i32("Lock Compute", pf(cur_id, c, "lock_calc_speed"), pf(sel_id, c, "lock_calc_speed"), true));
-            top.push(stat_i32("Missile Lock", pf(cur_id, c, "missile_lock_calc_speed"), pf(sel_id, c, "missile_lock_calc_speed"), true));
-            top.push(stat_i32("Max Locks", pf(cur_id, c, "missile_lock_max"), pf(sel_id, c, "missile_lock_max"), true));
+            top.push(stat_i32(
+                "Lock-On Range",
+                pf(cur_id, c, "lock_range"),
+                pf(sel_id, c, "lock_range"),
+                true,
+            ));
+            top.push(stat_i32(
+                "Lock Compute",
+                pf(cur_id, c, "lock_calc_speed"),
+                pf(sel_id, c, "lock_calc_speed"),
+                true,
+            ));
+            top.push(stat_i32(
+                "Missile Lock",
+                pf(cur_id, c, "missile_lock_calc_speed"),
+                pf(sel_id, c, "missile_lock_calc_speed"),
+                true,
+            ));
+            top.push(stat_i32(
+                "Max Locks",
+                pf(cur_id, c, "missile_lock_max"),
+                pf(sel_id, c, "missile_lock_max"),
+                true,
+            ));
             if detail {
-                top.push(stat_i32("Sight Width", pf(cur_id, c, "lock_sight_x"), pf(sel_id, c, "lock_sight_x"), true));
-                top.push(stat_i32("Sight Height", pf(cur_id, c, "lock_sight_y"), pf(sel_id, c, "lock_sight_y"), true));
+                top.push(stat_i32(
+                    "Sight Width",
+                    pf(cur_id, c, "lock_sight_x"),
+                    pf(sel_id, c, "lock_sight_x"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Sight Height",
+                    pf(cur_id, c, "lock_sight_y"),
+                    pf(sel_id, c, "lock_sight_y"),
+                    true,
+                ));
             }
         }
         5 => {
             // GENERATOR
-            top.push(stat_i32("EN Capacity", pf(cur_id, c, "en_capacity"), pf(sel_id, c, "en_capacity"), true));
-            top.push(stat_i32("EN Output", pf(cur_id, c, "en_output"), pf(sel_id, c, "en_output"), true));
-            top.push(stat_i32("OW EN Output", pf(cur_id, c, "ow_en_output"), pf(sel_id, c, "ow_en_output"), true));
+            top.push(stat_i32(
+                "EN Capacity",
+                pf(cur_id, c, "en_capacity"),
+                pf(sel_id, c, "en_capacity"),
+                true,
+            ));
+            top.push(stat_i32(
+                "EN Output",
+                pf(cur_id, c, "en_output"),
+                pf(sel_id, c, "en_output"),
+                true,
+            ));
+            top.push(stat_i32(
+                "OW EN Output",
+                pf(cur_id, c, "ow_en_output"),
+                pf(sel_id, c, "ow_en_output"),
+                true,
+            ));
         }
         6 => {
             // BOOSTER
-            top.push(stat_i32("Boost Output", pf(cur_id, c, "power"), pf(sel_id, c, "power"), true));
-            top.push(stat_i32("HB Output", pf(cur_id, c, "hi_output"), pf(sel_id, c, "hi_output"), true));
-            top.push(stat_i32("HB EN Drain", pf(cur_id, c, "hi_en"), pf(sel_id, c, "hi_en"), false));
-            top.push(stat_f32("Burn Eff.", pf(cur_id, c, "std_burn_eff"), pf(sel_id, c, "std_burn_eff"), true));
+            top.push(stat_i32(
+                "Boost Output",
+                pf(cur_id, c, "power"),
+                pf(sel_id, c, "power"),
+                true,
+            ));
+            top.push(stat_i32(
+                "HB Output",
+                pf(cur_id, c, "hi_output"),
+                pf(sel_id, c, "hi_output"),
+                true,
+            ));
+            top.push(stat_i32(
+                "HB EN Drain",
+                pf(cur_id, c, "hi_en"),
+                pf(sel_id, c, "hi_en"),
+                false,
+            ));
+            top.push(stat_f32(
+                "Burn Eff.",
+                pf(cur_id, c, "std_burn_eff"),
+                pf(sel_id, c, "std_burn_eff"),
+                true,
+            ));
             if detail {
-                top.push(stat_f32("HB Burn Eff.", pf(cur_id, c, "hi_burn_eff"), pf(sel_id, c, "hi_burn_eff"), true));
-                top.push(stat_i32("Charge Frames", pf(cur_id, c, "qb_charge_max_frames"), pf(sel_id, c, "qb_charge_max_frames"), false));
+                top.push(stat_f32(
+                    "HB Burn Eff.",
+                    pf(cur_id, c, "hi_burn_eff"),
+                    pf(sel_id, c, "hi_burn_eff"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Charge Frames",
+                    pf(cur_id, c, "qb_charge_max_frames"),
+                    pf(sel_id, c, "qb_charge_max_frames"),
+                    false,
+                ));
             }
         }
         10 | 11 | 12 => {
             // ARM UNITS / BAY UNITS / OVERED WEAPONS / SHOULDER UNITS
-            top.push(stat_i32("Attack Power", pf(cur_id, c, "damage_power"), pf(sel_id, c, "damage_power"), true));
-            top.push(stat_i32("Impact Force", pf(cur_id, c, "damage_recoil"), pf(sel_id, c, "damage_recoil"), true));
-            top.push(stat_i32("Reload Time", pf(cur_id, c, "reload_time"), pf(sel_id, c, "reload_time"), false));
-            top.push(stat_i32("Ammo", pf(cur_id, c, "magazine"), pf(sel_id, c, "magazine"), true));
+            top.push(stat_i32(
+                "Attack Power",
+                pf(cur_id, c, "damage_power"),
+                pf(sel_id, c, "damage_power"),
+                true,
+            ));
+            top.push(stat_i32(
+                "Impact Force",
+                pf(cur_id, c, "damage_recoil"),
+                pf(sel_id, c, "damage_recoil"),
+                true,
+            ));
+            top.push(stat_i32(
+                "Reload Time",
+                pf(cur_id, c, "reload_time"),
+                pf(sel_id, c, "reload_time"),
+                false,
+            ));
+            top.push(stat_i32(
+                "Ammo",
+                pf(cur_id, c, "magazine"),
+                pf(sel_id, c, "magazine"),
+                true,
+            ));
             if detail {
-                top.push(stat_i32("Opt. Range", pf(cur_id, c, "no_decay_range"), pf(sel_id, c, "no_decay_range"), true));
-                top.push(stat_i32("Atten. Range", pf(cur_id, c, "damp_range"), pf(sel_id, c, "damp_range"), true));
-                top.push(stat_i32("Muzzle Vel.", pf(cur_id, c, "init_speed"), pf(sel_id, c, "init_speed"), true));
-                top.push(stat_i32("Firing EN", pf(cur_id, c, "en_drain"), pf(sel_id, c, "en_drain"), false));
+                top.push(stat_i32(
+                    "Opt. Range",
+                    pf(cur_id, c, "no_decay_range"),
+                    pf(sel_id, c, "no_decay_range"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Atten. Range",
+                    pf(cur_id, c, "damp_range"),
+                    pf(sel_id, c, "damp_range"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Muzzle Vel.",
+                    pf(cur_id, c, "init_speed"),
+                    pf(sel_id, c, "init_speed"),
+                    true,
+                ));
+                top.push(stat_i32(
+                    "Firing EN",
+                    pf(cur_id, c, "en_drain"),
+                    pf(sel_id, c, "en_drain"),
+                    false,
+                ));
                 if c == 10 {
-                    top.push(stat_i32("Charge Time", pf(cur_id, c, "charge_time"), pf(sel_id, c, "charge_time"), false));
+                    top.push(stat_i32(
+                        "Charge Time",
+                        pf(cur_id, c, "charge_time"),
+                        pf(sel_id, c, "charge_time"),
+                        false,
+                    ));
                 }
-                top.push(stat_i32("Burst Count", pf(cur_id, c, "burst_count"), pf(sel_id, c, "burst_count"), true));
+                top.push(stat_i32(
+                    "Burst Count",
+                    pf(cur_id, c, "burst_count"),
+                    pf(sel_id, c, "burst_count"),
+                    true,
+                ));
             }
         }
         13 => {
             // RECON
-            top.push(stat_i32("Recon Type", pf(cur_id, c, "recon_subcategory"), pf(sel_id, c, "recon_subcategory"), true));
+            top.push(stat_i32(
+                "Recon Type",
+                pf(cur_id, c, "recon_subcategory"),
+                pf(sel_id, c, "recon_subcategory"),
+                true,
+            ));
         }
         _ => {}
     }
 
     // Weight & Energy Consumption always sit at the bottom (`@Param0` / `@Param1` in `@PartsNormal` and `@PartsDetail`).
-    top.push(stat_i32("Weight", pf(cur_id, c, "weight"), pf(sel_id, c, "weight"), false));
-    top.push(stat_i32("Energy Consumption", pf(cur_id, c, "en_consumption"), pf(sel_id, c, "en_consumption"), false));
+    top.push(stat_i32(
+        "Weight",
+        pf(cur_id, c, "weight"),
+        pf(sel_id, c, "weight"),
+        false,
+    ));
+    top.push(stat_i32(
+        "Energy Consumption",
+        pf(cur_id, c, "en_consumption"),
+        pf(sel_id, c, "en_consumption"),
+        false,
+    ));
     top
 }
 
@@ -768,19 +1056,54 @@ pub fn ac_spec_detail_rows(cur: &AcSpecs, preview: &AcSpecs) -> Vec<StatRow> {
         stat_i32("KE Defense", cur.ke_def as f64, preview.ke_def as f64, true),
         stat_i32("CE Defense", cur.ce_def as f64, preview.ce_def as f64, true),
         stat_i32("TE Defense", cur.te_def as f64, preview.te_def as f64, true),
-        stat_i32("Total Weight", cur.total_weight as f64, preview.total_weight as f64, false),
-        stat_i32("Load Capacity", cur.leg_payload as f64, preview.leg_payload as f64, true),
-        stat_i32("EN Output", cur.en_output as f64, preview.en_output as f64, true),
-        stat_i32("EN Recovery", cur.en_recovery as f64, preview.en_recovery as f64, true),
-        stat_i32("Boost Speed", cur.boost_speed as f64, preview.boost_speed as f64, true),
-        stat_i32("HB Speed", cur.hb_speed as f64, preview.hb_speed as f64, true),
-        stat_i32("Glide Speed", cur.glide_speed as f64, preview.glide_speed as f64, true),
+        stat_i32(
+            "Total Weight",
+            cur.total_weight as f64,
+            preview.total_weight as f64,
+            false,
+        ),
+        stat_i32(
+            "Load Capacity",
+            cur.leg_payload as f64,
+            preview.leg_payload as f64,
+            true,
+        ),
+        stat_i32(
+            "EN Output",
+            cur.en_output as f64,
+            preview.en_output as f64,
+            true,
+        ),
+        stat_i32(
+            "EN Recovery",
+            cur.en_recovery as f64,
+            preview.en_recovery as f64,
+            true,
+        ),
+        stat_i32(
+            "Boost Speed",
+            cur.boost_speed as f64,
+            preview.boost_speed as f64,
+            true,
+        ),
+        stat_i32(
+            "HB Speed",
+            cur.hb_speed as f64,
+            preview.hb_speed as f64,
+            true,
+        ),
+        stat_i32(
+            "Glide Speed",
+            cur.glide_speed as f64,
+            preview.glide_speed as f64,
+            true,
+        ),
     ]
 }
 
 fn cmp_color(cmp: i8) -> Color {
     match cmp {
-        1 => Color::srgb(0.32, 0.78, 1.0),  // ACVD color index 1003 (blue = better)
+        1 => Color::srgb(0.32, 0.78, 1.0), // ACVD color index 1003 (blue = better)
         -1 => Color::srgb(1.0, 0.30, 0.28), // ACVD color index 1004 (red = worse)
         _ => Color::srgb(0.92, 0.94, 0.96), // ACVD color index 1000 (neutral)
     }
@@ -797,10 +1120,13 @@ pub fn spawn_assemble_ui(
     slot: AssembleSlot,
     window_size: Vec2,
     images: &mut Assets<Image>,
+    device: InputDevice,
 ) -> bool {
     assets.ensure_loaded(&garage.disc, images);
 
-    let scale = (window_size.x / SCREEN_W).min(window_size.y / SCREEN_H).max(0.5);
+    let scale = (window_size.x / SCREEN_W)
+        .min(window_size.y / SCREEN_H)
+        .max(0.5);
     let origin = Vec2::new(
         ((window_size.x - SCREEN_W * scale) * 0.5).round(),
         ((window_size.y - SCREEN_H * scale) * 0.5).round(),
@@ -850,9 +1176,17 @@ pub fn spawn_assemble_ui(
     // 1. Real `@ModelBackImage` DRB dialog (authentic left/right corner-reticle frames +
     //    9-slice translucent `汎用ベース1` panels spanning `[173,220,686,567]` and `[705,109,1213,567]`).
     if let Some(layout) = assets.layout.as_ref() {
-        if let Some(idx) = layout.drb.dialogs.iter().position(|d| d.name == "@ModelBackImage") {
+        if let Some(idx) = layout
+            .drb
+            .dialogs
+            .iter()
+            .position(|d| d.name == "@ModelBackImage")
+        {
             let dlg = menu::spawn(commands, layout, idx, Vec2::ZERO, scale);
-            commands.entity(dlg).remove::<MenuRoot>().insert(ChildOf(screen_root));
+            commands
+                .entity(dlg)
+                .remove::<MenuRoot>()
+                .insert(ChildOf(screen_root));
         }
     }
 
@@ -884,7 +1218,12 @@ pub fn spawn_assemble_ui(
         // We spawn it as a child of `screen_root`, then immediately patch its runtime `MenuText`
         // values and dynamic gauges via `AssembleDrbSync` (or a one-shot marker)!
         if let Some(layout) = assets.layout.as_ref() {
-            if let Some(idx) = layout.drb.dialogs.iter().position(|d| d.name == "@PartsNormal") {
+            if let Some(idx) = layout
+                .drb
+                .dialogs
+                .iter()
+                .position(|d| d.name == "@PartsNormal")
+            {
                 let dlg = menu::spawn(commands, layout, idx, Vec2::ZERO, scale);
                 commands.entity(dlg).remove::<MenuRoot>().insert((
                     ChildOf(screen_root),
@@ -934,7 +1273,12 @@ pub fn spawn_assemble_ui(
     } else {
         // Detail View (`@PartsDetail` + `@SpecDetail` from `lang/en/menu/assemble.drb.dcx`).
         if let Some(layout) = assets.layout.as_ref() {
-            if let Some(idx) = layout.drb.dialogs.iter().position(|d| d.name == "@PartsDetail") {
+            if let Some(idx) = layout
+                .drb
+                .dialogs
+                .iter()
+                .position(|d| d.name == "@PartsDetail")
+            {
                 let dlg = menu::spawn(commands, layout, idx, Vec2::ZERO, scale);
                 commands.entity(dlg).remove::<MenuRoot>().insert((
                     ChildOf(screen_root),
@@ -945,7 +1289,12 @@ pub fn spawn_assemble_ui(
                     },
                 ));
             }
-            if let Some(idx) = layout.drb.dialogs.iter().position(|d| d.name == "@SpecDetail") {
+            if let Some(idx) = layout
+                .drb
+                .dialogs
+                .iter()
+                .position(|d| d.name == "@SpecDetail")
+            {
                 let dlg = menu::spawn(commands, layout, idx, Vec2::ZERO, scale);
                 commands.entity(dlg).remove::<MenuRoot>().insert((
                     ChildOf(screen_root),
@@ -1043,7 +1392,13 @@ pub fn spawn_assemble_ui(
         commands,
         detail_wrap,
         if state.assemble_detail_view {
-            "[Tab] Normal View"
+            if crate::hints::use_icons(device) {
+                "[X] Normal View"
+            } else {
+                "[Tab] Normal View"
+            }
+        } else if crate::hints::use_icons(device) {
+            "[X] Detail Specs"
         } else {
             "[Tab] Detail Specs"
         },
@@ -1068,10 +1423,18 @@ pub fn spawn_assemble_ui(
             ChildOf(top_actions),
         ))
         .id();
-    let back_btn =
-        assets
-            .kit
-            .spawn_button(commands, back_wrap, "[Esc] Back", None, ButtonState::Normal, scale);
+    let back_btn = assets.kit.spawn_button(
+        commands,
+        back_wrap,
+        if crate::hints::use_icons(device) {
+            "[B] Back"
+        } else {
+            "[Esc] Back"
+        },
+        None,
+        ButtonState::Normal,
+        scale,
+    );
     commands.entity(back_btn).insert((Button, UiAction::Back));
 
     assets
@@ -1368,9 +1731,14 @@ pub fn spawn_assemble_ui(
                     ChildOf(item),
                 ))
                 .id();
-            assets
-                .kit
-                .spawn_text(commands, eq_box, FontRole::Small, "E", scale * 0.85, palette::ACCENT_TEAL);
+            assets.kit.spawn_text(
+                commands,
+                eq_box,
+                FontRole::Small,
+                "E",
+                scale * 0.85,
+                palette::ACCENT_TEAL,
+            );
         }
 
         // Damage-type pip in bottom-right corner for weapons.
@@ -1468,20 +1836,32 @@ pub fn spawn_assemble_ui(
         scale,
         palette::TEXT_ALERT,
     );
-    assets.kit.spawn_text(
-        commands,
-        footer_left,
-        FontRole::Small,
-        "W/S: Part   A/D: Slot   Q/E: Filter   Tab: Specs   Enter: Equip   Right-Drag: Orbit",
-        scale,
-        palette::TEXT_PRIMARY,
-    );
+    let hints = crate::hints::parts(crate::hints::ASSEMBLE);
+    let shown = crate::hints::use_icons(device)
+        && assets
+            .kit
+            .spawn_hints(commands, footer_left, &hints, scale, palette::TEXT_PRIMARY)
+            .is_some();
+    if !shown {
+        assets.kit.spawn_text(
+            commands,
+            footer_left,
+            FontRole::Small,
+            "W/S: Part   A/D: Slot   Q/E: Filter   Tab: Specs   Enter: Equip   Right-Drag: Orbit",
+            scale,
+            palette::TEXT_PRIMARY,
+        );
+    }
     assets.kit.spawn_badge(
         commands,
         footer,
         &format!(
             "{} / {}",
-            if parts.is_empty() { 0 } else { state.cursor + 1 },
+            if parts.is_empty() {
+                0
+            } else {
+                state.cursor + 1
+            },
             parts.len()
         ),
         palette::SQUARE_MARK,
@@ -1758,8 +2138,16 @@ pub fn populate_drb_dialogs(
         // `@Param2..@Param5` = stats[0..n-2] (top 4 category stats)
         // `@Param0`, `@Param1` = stats[n-2], stats[n-1] (Weight, Energy Consumption)
         let n = data.stats.len();
-        let top_stats = if n >= 2 { &data.stats[..n - 2] } else { &[][..] };
-        let bottom_stats = if n >= 2 { &data.stats[n - 2..] } else { &data.stats[..] };
+        let top_stats = if n >= 2 {
+            &data.stats[..n - 2]
+        } else {
+            &[][..]
+        };
+        let bottom_stats = if n >= 2 {
+            &data.stats[n - 2..]
+        } else {
+            &data.stats[..]
+        };
 
         for child in top_children.iter() {
             let Ok(obj) = names_q.get(child) else {
@@ -1893,8 +2281,16 @@ pub fn populate_drb_dialogs(
             continue;
         };
         let n = data.stats.len();
-        let top_stats = if n >= 2 { &data.stats[..n - 2] } else { &[][..] };
-        let bottom_stats = if n >= 2 { &data.stats[n - 2..] } else { &data.stats[..] };
+        let top_stats = if n >= 2 {
+            &data.stats[..n - 2]
+        } else {
+            &[][..]
+        };
+        let bottom_stats = if n >= 2 {
+            &data.stats[n - 2..]
+        } else {
+            &data.stats[..]
+        };
         for child in top_children.iter() {
             let Ok(obj) = names_q.get(child) else {
                 continue;
@@ -1944,7 +2340,13 @@ pub fn populate_drb_dialogs(
             };
             if let Some(num) = obj.0.strip_prefix("@Param") {
                 if let Ok(idx) = num.parse::<usize>() {
-                    fill_param_dialog(child, data.stats.get(idx), &children_q, &names_q, &mut texts_q);
+                    fill_param_dialog(
+                        child,
+                        data.stats.get(idx),
+                        &children_q,
+                        &names_q,
+                        &mut texts_q,
+                    );
                 }
             }
         }
@@ -2120,8 +2522,8 @@ pub fn sync_part_preview(
 
     // If not already cached (and not the very first preview frame or empty slot), debounce
     // disc FLVER loading by 90 ms so rapid W/S scrolling stays 60 FPS.
-    let is_cached = sel_id == 0
-        || (slot != AssembleSlot::Arms && assets.preview_cache.contains_key(&want));
+    let is_cached =
+        sel_id == 0 || (slot != AssembleSlot::Arms && assets.preview_cache.contains_key(&want));
     if !is_cached && assets.preview_loaded.is_some() {
         match assets.preview_pending {
             Some((k, ref mut rem)) if k == want => {
@@ -2181,11 +2583,9 @@ pub fn sync_part_preview(
                 continue;
             }
             let places = assemble::root_places(p, &built.placements, &known);
-            if let Ok((meshes, rig)) =
-                flvers.rigged_model(&garage.disc, p.model.path, &|root| {
-                    assemble::place_of(&places, root)
-                })
-            {
+            if let Ok((meshes, rig)) = flvers.rigged_model(&garage.disc, p.model.path, &|root| {
+                assemble::place_of(&places, root)
+            }) {
                 known[index] = Some(assemble::Stored {
                     places,
                     frames: rig.frames.clone(),
@@ -2258,8 +2658,9 @@ pub fn sync_part_preview(
                 .position(|b| b.name.eq_ignore_ascii_case("l_kata"))
                 .and_then(|i| binds.get(i))
                 .map(|m| m.inverse());
-            let left_emblem_tex: Option<Handle<Image>> =
-                l_kata_rest.zip(decals.active_emblem_asset()).and_then(|(rest, emblem_asset)| {
+            let left_emblem_tex: Option<Handle<Image>> = l_kata_rest
+                .zip(decals.active_emblem_asset())
+                .and_then(|(rest, emblem_asset)| {
                     let mut left_cache = decal::DecalMeshCache::default();
                     for lm in &arm_part.meshes {
                         let cx = 0.5 * (lm.min[0] + lm.max[0]);
@@ -2277,11 +2678,8 @@ pub fn sync_part_preview(
                         }
                     }
                     let left_refs: Vec<&decal::CachedPartMesh> = left_cache.meshes.iter().collect();
-                    let proj = decal::build_shoulder_emblem_projector(
-                        sel_id as i16,
-                        rest,
-                        &left_refs,
-                    )?;
+                    let proj =
+                        decal::build_shoulder_emblem_projector(sel_id as i16, rest, &left_refs)?;
                     let pixels = decal::bake_slot_pixels(
                         DecalSlot::LeftArm,
                         512,
@@ -2540,7 +2938,8 @@ pub fn rotate_part_preview(
             assets.preview_pitch = pitch;
         }
     } else if !assets.preview_manual {
-        assets.preview_yaw = (assets.preview_yaw + time.delta_secs() * 0.55) % std::f32::consts::TAU;
+        assets.preview_yaw =
+            (assets.preview_yaw + time.delta_secs() * 0.55) % std::f32::consts::TAU;
     }
 
     if over_panel && scroll.delta.y.abs() > 0.0 {
@@ -2591,7 +2990,8 @@ pub fn sync_ac_preview(
     studio_q: Query<Entity, With<AcPreviewStudio>>,
     pivot_q: Query<Entity, With<AcPreviewPivot>>,
 ) {
-    let in_assemble = *mode == Mode::Garage && matches!(state.screen, GarageScreen::AssembleParts { .. });
+    let in_assemble =
+        *mode == Mode::Garage && matches!(state.screen, GarageScreen::AssembleParts { .. });
     // Blurred bokeh garage + crisp `+` reticle grid backdrop (active in both Normal and Detail Specs).
     backdrop.0 = if in_assemble {
         Vec4::new(1.0, 0.48, 0.36, 92.0)
@@ -2762,11 +3162,9 @@ pub fn sync_ac_preview(
     let mut known = vec![None; built.placements.len()];
     for (index, p) in built.placements.iter().enumerate() {
         let places = assemble::root_places(p, &built.placements, &known);
-        if let Ok((meshes, rig)) =
-            flvers.rigged_model(&garage.disc, p.model.path, &|root| {
-                assemble::place_of(&places, root)
-            })
-        {
+        if let Ok((meshes, rig)) = flvers.rigged_model(&garage.disc, p.model.path, &|root| {
+            assemble::place_of(&places, root)
+        }) {
             known[index] = Some(assemble::Stored {
                 places,
                 frames: rig.frames.clone(),
@@ -2922,10 +3320,10 @@ pub fn rotate_ac_preview(
         return;
     }
 
-    let cursor_win = windows
-        .single()
-        .ok()
-        .and_then(|w| w.cursor_position().map(|c| (Vec2::new(w.width(), w.height()), c)));
+    let cursor_win = windows.single().ok().and_then(|w| {
+        w.cursor_position()
+            .map(|c| (Vec2::new(w.width(), w.height()), c))
+    });
     let over_ac = cursor_win
         .map(|(ws, c)| cursor_in_ac_preview_panel(ws, c))
         .unwrap_or(false);
@@ -2946,7 +3344,8 @@ pub fn rotate_ac_preview(
     if assets.ac_preview_dragging && motion.delta.length_squared() > 0.0 {
         assets.ac_preview_yaw =
             (assets.ac_preview_yaw + motion.delta.x * 0.008).rem_euclid(std::f32::consts::TAU);
-        assets.ac_preview_pitch = (assets.ac_preview_pitch + motion.delta.y * 0.006).clamp(-0.65, 0.85);
+        assets.ac_preview_pitch =
+            (assets.ac_preview_pitch + motion.delta.y * 0.006).clamp(-0.65, 0.85);
     }
 
     let mut right_stick = Vec2::ZERO;
@@ -2957,8 +3356,8 @@ pub fn rotate_ac_preview(
         assets.ac_preview_manual = true;
         assets.ac_preview_yaw = (assets.ac_preview_yaw + right_stick.x * 2.0 * time.delta_secs())
             .rem_euclid(std::f32::consts::TAU);
-        assets.ac_preview_pitch = (assets.ac_preview_pitch - right_stick.y * 1.3 * time.delta_secs())
-            .clamp(-0.65, 0.85);
+        assets.ac_preview_pitch =
+            (assets.ac_preview_pitch - right_stick.y * 1.3 * time.delta_secs()).clamp(-0.65, 0.85);
     }
 
     if !assets.ac_preview_manual {
@@ -3073,12 +3472,12 @@ mod tests {
 
     #[test]
     fn part_thumbnails_subcategories_and_descriptions_resolve_from_disc() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
         let disc = Disc::open(&vfs::default_disc(&root)).expect("open 360 disc");
-        let drb = acvd_formats::drb::read(
-            &disc.asset(ASSEMBLE_DRB).expect("assemble.drb"),
-        )
-        .expect("parse assemble.drb");
+        let drb = acvd_formats::drb::read(&disc.asset(ASSEMBLE_DRB).expect("assemble.drb"))
+            .expect("parse assemble.drb");
         for dlg in &drb.dialogs {
             if dlg.name == "@PartsItem" || dlg.name == "@PartsCategoryItem" {
                 assert_eq!(dlg.size, [84, 54]);
@@ -3104,13 +3503,19 @@ mod tests {
 
         // Arms subcategories (KE / CE / TE / WEAPON ARMS).
         let arm_subs = subcategories_for_slot(AssembleSlot::Arms, Some(&sub_fmg));
-        assert!(arm_subs.len() >= 4, "arms should have 4 subcategories: {arm_subs:?}");
+        assert!(
+            arm_subs.len() >= 4,
+            "arms should have 4 subcategories: {arm_subs:?}"
+        );
         assert_eq!(subcategory_name(Some(&sub_fmg), 2, 1), "KE-RESISTANT TYPE");
         assert_eq!(subcategory_name(Some(&sub_fmg), 2, 4), "WEAPON ARMS");
 
         // Arm Unit weapon types & KE/CE/TE damage filtering.
         let wep_subs = subcategories_for_slot(AssembleSlot::ArmUnitR, Some(&sub_fmg));
-        assert!(wep_subs.len() >= 20, "arm units should have 20+ weapon types");
+        assert!(
+            wep_subs.len() >= 20,
+            "arm units should have 20+ weapon types"
+        );
         let ke_weps = filtered_parts_for_slot(AssembleSlot::ArmUnitR, None, Some(0));
         let ce_weps = filtered_parts_for_slot(AssembleSlot::ArmUnitR, None, Some(6));
         let te_weps = filtered_parts_for_slot(AssembleSlot::ArmUnitR, None, Some(1));
@@ -3118,7 +3523,10 @@ mod tests {
 
         // Real part description resolves from partsexplain_en.fmg.
         let desc = part_description(Some(&exp_fmg), 2, 110);
-        assert!(!desc.is_empty(), "arms part 110 should have an English description");
+        assert!(
+            !desc.is_empty(),
+            "arms part 110 should have an English description"
+        );
 
         // Every category has valid thumbnail packs on disc.
         let mut packs = Packs::default();
@@ -3153,7 +3561,9 @@ mod tests {
 
     #[test]
     fn posed_arm_preview_bounds_are_upright_and_finite() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
         let disc = Disc::open(&vfs::default_disc(&root)).expect("open 360 disc");
         let design = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
             .iter()
@@ -3171,7 +3581,9 @@ mod tests {
             }
             let places = assemble::root_places(p, &built.placements, &known);
             let (meshes, rig) = flvers
-                .rigged_model(&disc, p.model.path, &|root| assemble::place_of(&places, root))
+                .rigged_model(&disc, p.model.path, &|root| {
+                    assemble::place_of(&places, root)
+                })
                 .expect("rigged model");
             known[index] = Some(assemble::Stored {
                 places,
