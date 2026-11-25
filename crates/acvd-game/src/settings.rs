@@ -264,7 +264,8 @@ pub struct GameSettings {
     pub ui_scale: f32,
     /// Crosshair / lock-sight HUD sway intensity in `0.0..=1.0` (0–100%, default 100%).
     pub hud_sway: f32,
-    /// Combat HUD (lock-sight ring, digits, gauges) RGB color (default `#00FFA5`).
+    /// Combat HUD (lock-sight ring, digits, gauges) RGB color (default `#00A5FF`, the retail
+    /// lock-sight cyan).
     pub hud_color: [u8; 3],
     /// Display gamma multiplier in `0.50..=1.50` (50–150%, default 100%).
     pub gamma: f32,
@@ -290,7 +291,7 @@ impl Default for GameSettings {
             fullscreen: false,
             ui_scale: 1.0,
             hud_sway: 1.0,
-            hud_color: [0x00, 0xff, 0xa5],
+            hud_color: [0x00, 0xa5, 0xff],
             gamma: 1.0,
             brightness: 1.0,
             contrast: 1.0,

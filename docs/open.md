@@ -331,8 +331,11 @@ in order:
   byte 1 / low half (0x0204000f ...; base ctor 0x824da1d8 passes them to 0x824d9450 / 0x824d95f0).
   HUD: the lock-sight show scale
   (StaticDrawParam +0x448 = 0.53, not applied), the weapon-gauge fill formula inside `0x829d0580`,
+  the `BOOSTER` label (`ACV_FE_LockSightCenter` `Boost` anchor `[-41,113,41,130]` nesting
+  `FE_booster` dialog 123 / localized dialog 261, not spawned), and
   hanger panels (shoulder panels, live EN, `Gauge_APEffect` damage lag/blink, and `ErrorLog_Stagger`
-  are now wired; Xenia probes `private/xenia/en_drain{,2}.jsonl` confirmed HUD status EN
+  are now wired; ring/arc art is tinted with the sight color since 2026-11-25; Xenia probes
+  `private/xenia/en_drain{,2}.jsonl` confirmed HUD status EN
   `+0x10`/`+0x14` = `58630/58630`). **Param enums**:
   TDF reader.
 - **Effects leftovers** (FFX player done, see Done): every slot meaning in

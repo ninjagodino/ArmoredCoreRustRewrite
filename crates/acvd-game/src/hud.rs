@@ -14,10 +14,12 @@
 //! with the energy fraction, `Gauge_LWeapon`/`Gauge_RWeapon` with rounds left / magazine, all
 //! times a show scale that rises over `gauge_show_time` after the lock sight appears. Below its
 //! red zone (`ap_red_zone`, `en_red_zone`, `ammo_red_zone`) a gauge and its digits fade to the
-//! low colour over `gauge_color_time` (`0x82599090`). The arcs of `ACV_LockSight_base` and the
-//! gauge tracks are drawn in the lock-sight digit color. Not drawn: `Top_outline` (a faint frame
-//! around the whole screen), the filled quarters under the ring, and `Locksight_bar` (a solid
-//! band across the crosshair). Player coloring and gauge shading are not applied yet.
+//! low colour over `gauge_color_time` (`0x82599090`). The faint white ring art (the rotating
+//! `rocksight_out_rotation*` band, `rocksight_insight`, `piece*` and the gauge tracks) is painted
+//! with the sight color at full strength, matching the retail cyan ring. Not drawn: `Top_outline`
+//! (a faint frame around the whole screen), the filled quarters (`LockSight_Parts`) and
+//! `Locksight_bar` (a solid band across the crosshair). Player coloring and gauge shading are not
+//! applied yet.
 //!
 //! Side panels: the `Weapon` dialog at the `LeftArm`/`RightArm` anchors of `ACV_FE_Normal`
 //! (`0x82598b30` via `0x82597f38`) shows rounds left in `CurAmmo` (`%d` up to 9999), or `Empty`
@@ -88,8 +90,8 @@ impl ApEffectState {
         }
         self.cur_ap = cur_ap;
         // `0x825b36e8`: `NewAcBehavior +0x57c` (`ap_lag_decay_frames` = 120) * 1/60 = 2.0 s.
-        let decay_secs = (acvd_data::tuning("NewAcBehavior", 379).unwrap_or(120.0) as f32 / 60.0)
-            .max(0.05);
+        let decay_secs =
+            (acvd_data::tuning("NewAcBehavior", 379).unwrap_or(120.0) as f32 / 60.0).max(0.05);
         if self.lag_ap > cur_ap {
             // `0x8258c7d8`: `rate = (peak_ap - cur_ap) / decay_secs`.
             let rate = ((self.peak_ap - cur_ap) / decay_secs).max(0.0);
@@ -127,7 +129,8 @@ impl ApEffectState {
             1.0
         };
         let damaged = self.lag_ap > cur_ap + 0.5;
-        self.damage_blend = (self.damage_blend + if damaged { step } else { -step }).clamp(0.0, 1.0);
+        self.damage_blend =
+            (self.damage_blend + if damaged { step } else { -step }).clamp(0.0, 1.0);
     }
 
     /// Trailing fill fraction `lag_ap / ap_max` (`0x829d0c0c`).
@@ -754,18 +757,21 @@ fn gauge(name: &str) -> Option<Readout> {
     })
 }
 
-/// The lock-sight digit color (`AP1` in `ACV_FE_LockSightCenter`, 0x00ffa5ff). The ring art is
-/// authored white; the coloring option repaints it (the reference sight is the selected swatch).
-/// That option is not wired, so the ring uses this color instead of sitting on screen as a white veil.
-const SIGHT: [u8; 3] = [0x00, 0xff, 0xa5];
+/// The lock-sight accent color (`AP1` in `ACV_FE_LockSightCenter` is authored `0x00ffa5ff`, the
+/// scan HUD accents are `0x00a5ffff`). The ring art is authored white at a low alpha; the engine
+/// paints it with the sight color, so the rewrite uses the retail cyan instead of a white veil.
+const SIGHT: [u8; 3] = [0x00, 0xa5, 0xff];
 
-/// White ring art: the filled quarters and arcs of `ACV_LockSight_base`, and the gauge tracks
-/// under the `AlphaAnimSprite`s. `SHWeaponBar_base` is handled with the shoulder readout.
+/// Lock-sight ring art: the filled quarters, arcs and the gauge tracks. Their authored colors are
+/// faint white (alpha `0x0a..0x40`), so [`readouts`] replaces both the color and the alpha.
 fn sight_art(name: &str) -> bool {
     name.starts_with("LockSight_Parts")
         || name.starts_with("Locksight_bar")
         || name.starts_with("AP_ENBar_base")
         || name.starts_with("WeaponBar_base")
+        || name.starts_with("rocksight_insight")
+        || name.starts_with("piece")
+        || name.starts_with("object")
 }
 
 /// Digit plates and the extra shoulder-weapon track; hidden with their readout.
@@ -784,8 +790,14 @@ fn gun(arms: Option<&Armament>, which: Readout) -> Option<Gun> {
         Readout::RightArm => 0,
         _ => return None,
     };
-    arms.map(|a| if a.weapon_arm { a.hands[0] } else { a.hands[hand] })
-        .filter(|g| g.kind != Kind::Skip)
+    arms.map(|a| {
+        if a.weapon_arm {
+            a.hands[0]
+        } else {
+            a.hands[hand]
+        }
+    })
+    .filter(|g| g.kind != Kind::Skip)
 }
 
 /// Shown value (digits), fill and whether it is below its red zone; None hides the readout.
@@ -802,11 +814,7 @@ fn reading(
         }),
         Readout::Energy => status.map(|s| {
             let f = s.energy_fraction();
-            (
-                (f * 10000.0) as u32,
-                f,
-                s.en_max > 0.0 && f < tuning(323),
-            )
+            ((f * 10000.0) as u32, f, s.en_max > 0.0 && f < tuning(323))
         }),
         Readout::LeftArm | Readout::RightArm => gun(arms, which).map(|g| {
             if g.kind == Kind::Blade && g.magazine == 0 {
@@ -881,6 +889,7 @@ pub fn tick(
 pub fn readouts(
     mut commands: Commands,
     hud: Option<Res<Sortie>>,
+    settings: Option<Res<crate::settings::GameSettings>>,
     status: Query<&Status>,
     arms: Query<&Armament>,
     scan_q: Query<&ScanState>,
@@ -891,6 +900,7 @@ pub fn readouts(
             &mut MenuSprite,
             &mut Visibility,
             Option<&Authored>,
+            &ChildOf,
         ),
         Without<MenuGauge>,
     >,
@@ -905,8 +915,23 @@ pub fn readouts(
         Without<MenuSprite>,
     >,
     mut plates: Query<(&MenuObject, &mut Visibility), (Without<MenuSprite>, Without<MenuGauge>)>,
+    parents: Query<&ChildOf>,
+    sight_roots: Query<(), With<LockSightTrack>>,
 ) {
     let Some(hud) = hud else { return };
+    let hud_rgb = settings.as_ref().map(|s| s.hud_color).unwrap_or(SIGHT);
+    // Only the lock-sight dialogs get the sight color: `ACV_FE_Normal` and other HUD dialogs also
+    // use generic `piece*` / `object*` names, which keep their authored colors.
+    let in_sight = |e: Entity| {
+        let mut cur = e;
+        while let Ok(child) = parents.get(cur) {
+            cur = child.0;
+            if sight_roots.contains(cur) {
+                return true;
+            }
+        }
+        false
+    };
     let (status, arms) = (status.single().ok(), arms.single().ok());
     let in_scan = scan_q.single().is_ok_and(|s| s.active);
     let arms_for_hud = (!in_scan).then_some(arms).flatten();
@@ -921,7 +946,7 @@ pub fn readouts(
             Visibility::Hidden
         });
     }
-    for (e, object, mut sprite, mut visibility, authored) in &mut digits {
+    for (e, object, mut sprite, mut visibility, authored, _) in &mut digits {
         if let Some(which) = chrome(&object.0) {
             visibility.set_if_neq(if reading(which, status, arms_for_hud).is_some() {
                 Visibility::Inherited
@@ -930,34 +955,49 @@ pub fn readouts(
             });
             continue;
         }
-        if sight_art(&object.0) && authored.is_none() {
-            let a = (sprite.color.to_srgba().alpha * 255.0).round() as u8;
-            // Filled quarters (alpha 10) edge as a disc. `Locksight_bar` is a solid slab across
-            // the crosshair; tinted, it is the green block behind the digits.
-            let filled = (object.0.starts_with("LockSight_Parts") && a <= 12)
-                || object.0.starts_with("Locksight_bar");
-            if filled {
-                visibility.set_if_neq(Visibility::Hidden);
+        if sight_art(&object.0) && in_sight(e) {
+            if authored.is_none() {
                 commands.entity(e).insert(Authored {
                     rect: sprite.rect,
                     color: sprite.color,
                 });
+            }
+            // The engine never draws the filled quarters/slab of `ACV_LockSight_base`; they only
+            // edge as discs or a green block behind the digits.
+            if object.0.starts_with("LockSight_Parts") || object.0.starts_with("Locksight_bar") {
+                visibility.set_if_neq(Visibility::Hidden);
                 continue;
             }
-            sprite.color = Color::srgba_u8(SIGHT[0], SIGHT[1], SIGHT[2], a);
-            commands.entity(e).insert(Authored {
-                rect: sprite.rect,
-                color: sprite.color,
-            });
+            // Ring art is authored as a faint white veil (alpha `0x20..0x40`); the engine paints
+            // it with the sight color at full strength.
+            let tinted = Color::srgba(
+                hud_rgb[0] as f32 / 255.0,
+                hud_rgb[1] as f32 / 255.0,
+                hud_rgb[2] as f32 / 255.0,
+                1.0,
+            );
+            if sprite.color != tinted {
+                sprite.color = tinted;
+            }
             continue;
         }
         let Some((which, place)) = readout(&object.0) else {
             continue;
         };
-        let (rect, color) = authored.map_or((sprite.rect, sprite.color), |a| (a.rect, a.color));
+        let (rect, authored_color) =
+            authored.map_or((sprite.rect, sprite.color), |a| (a.rect, a.color));
         if authored.is_none() {
-            commands.entity(e).insert(Authored { rect, color });
+            commands.entity(e).insert(Authored {
+                rect,
+                color: authored_color,
+            });
         }
+        let color = Color::srgba(
+            hud_rgb[0] as f32 / 255.0,
+            hud_rgb[1] as f32 / 255.0,
+            hud_rgb[2] as f32 / 255.0,
+            authored_color.to_srgba().alpha,
+        );
         let value = reading(which, status, arms_for_hud);
         visibility.set_if_neq(if value.is_some() {
             Visibility::Inherited
@@ -996,13 +1036,19 @@ pub fn readouts(
         let Some(which) = gauge(&object.0) else {
             continue;
         };
-        let color = authored.map_or(g.color, |a| a.color);
+        let authored_color = authored.map_or(g.color, |a| a.color);
         if authored.is_none() {
             commands.entity(e).insert(Authored {
                 rect: g.rect,
-                color,
+                color: authored_color,
             });
         }
+        let color = Color::srgba(
+            hud_rgb[0] as f32 / 255.0,
+            hud_rgb[1] as f32 / 255.0,
+            hud_rgb[2] as f32 / 255.0,
+            authored_color.to_srgba().alpha,
+        );
         let value = reading(which, status, arms_for_hud);
         if object.0 == "Gauge_APEffect" {
             // `0x829d0c6c..0x829d0d24`: trailing damage bar fills to `lag_ap / ap_max * show`
@@ -1096,12 +1142,7 @@ pub fn area_warning_hud(
 
     let pulse = ((time.elapsed_secs() * 8.0).sin() * 0.5 + 0.5).clamp(0.25, 1.0);
     let (show, msg, fg, bg) = match zone {
-        AreaZone::Inside => (
-            false,
-            "",
-            Color::WHITE,
-            Color::srgba(0.0, 0.0, 0.0, 0.0),
-        ),
+        AreaZone::Inside => (false, "", Color::WHITE, Color::srgba(0.0, 0.0, 0.0, 0.0)),
         AreaZone::Caution => (
             true,
             "LIMIT OF AREA",
@@ -1200,8 +1241,14 @@ pub fn ow_hud(
                     if let Ok((obj, mut v)) = sub_vis.get_mut(child) {
                         if matches!(
                             obj.0.as_str(),
-                            "Hit" | "Ineffective" | "Danger" | "Booster"
-                                | "Status_Hit" | "Status_Ineffective" | "Status_Danger" | "Status_Booster"
+                            "Hit"
+                                | "Ineffective"
+                                | "Danger"
+                                | "Booster"
+                                | "Status_Hit"
+                                | "Status_Ineffective"
+                                | "Status_Danger"
+                                | "Status_Booster"
                         ) {
                             v.set_if_neq(Visibility::Hidden);
                         }
@@ -1225,7 +1272,10 @@ pub fn ow_hud(
                     }
                     if let Ok((obj, mut t)) = texts.get_mut(child) {
                         let name = obj.0.to_lowercase();
-                        if name.contains("limit") || t.text.contains('%') || t.text.contains("000.00") {
+                        if name.contains("limit")
+                            || t.text.contains('%')
+                            || t.text.contains("000.00")
+                        {
                             if t.text != limit_pct {
                                 t.text = limit_pct.clone();
                             }
@@ -1292,7 +1342,10 @@ pub fn scan_hud(
     hud: Option<ResMut<Sortie>>,
     garage: Option<Res<crate::Garage>>,
     mut images: ResMut<Assets<Image>>,
-    cameras: Query<(&Camera, &GlobalTransform), (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
+    cameras: Query<
+        (&Camera, &GlobalTransform),
+        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+    >,
     scan_q: Query<&ScanState>,
     mut combat_sight: Query<
         &mut Visibility,
@@ -1610,7 +1663,10 @@ pub fn scan_hud(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn recon_hud(
     hud: Option<Res<Sortie>>,
-    cameras: Query<(&Camera, &GlobalTransform), (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
+    cameras: Query<
+        (&Camera, &GlobalTransform),
+        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+    >,
     scan_q: Query<&ScanState>,
     recons: Query<(&ReconUnit, &Transform)>,
     mut ammo_q: Query<
@@ -1821,7 +1877,10 @@ pub fn recon_hud(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn lock_cursor(
     hud: Option<Res<Sortie>>,
-    cameras: Query<(&Camera, &GlobalTransform), (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
+    cameras: Query<
+        (&Camera, &GlobalTransform),
+        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+    >,
     fcs_q: Query<&Fcs>,
     mut wings: Query<
         (Entity, &LockCursorWing, &mut Node, &mut Visibility),
@@ -2026,6 +2085,7 @@ pub fn lock_cursor(
 #[allow(clippy::type_complexity)]
 pub fn track_lock_sight(
     hud: Option<Res<Sortie>>,
+    settings: Option<Res<crate::settings::GameSettings>>,
     mark: Option<Res<ShotMark>>,
     cameras: Query<
         (&Camera, &Transform),
@@ -2043,18 +2103,25 @@ pub fn track_lock_sight(
     let origin = pilot.sight_origin(ac_tf.translation);
     let aim_dir = pilot.sight_direction();
     let (yaw, pitch) = pilot.aim_angles();
-    let roll = pilot.camera_roll();
+    let sway = settings
+        .as_ref()
+        .map(|s| s.hud_sway.clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    let center = hud.size * 0.5;
+    let roll = pilot.camera_roll() * sway;
     let ring_rot = sight_ring_rotation(yaw, pitch);
     let normal_dist = tuning(51).max(1.0);
     let ow_dist = tuning(53).max(1.0);
     let normal_vp = cam
         .world_to_viewport(&cam_gt, sight_world_pos(origin, aim_dir, normal_dist))
-        .ok();
+        .ok()
+        .map(|vp| center + (vp - center) * sway);
     let ow_vp = if (ow_dist - normal_dist).abs() < 1e-3 {
         normal_vp
     } else {
         cam.world_to_viewport(&cam_gt, sight_world_pos(origin, aim_dir, ow_dist))
             .ok()
+            .map(|vp| center + (vp - center) * sway)
     };
 
     for (track, mut node, mut ui_tf) in &mut roots {
@@ -2130,7 +2197,10 @@ mod tests {
         assert!((tuning(298) - 0.3).abs() < 1e-6 && (tuning(322) - 0.3).abs() < 1e-6);
         assert!((tuning(300) - 5.0).abs() < 1e-6 && (tuning(301) - 0.02).abs() < 1e-6);
         assert_eq!(low_color().to_srgba().to_u8_array(), [255, 0, 0, 255]);
-        assert_eq!(ap_damage_color().to_srgba().to_u8_array(), [255, 80, 0, 255]);
+        assert_eq!(
+            ap_damage_color().to_srgba().to_u8_array(),
+            [255, 80, 0, 255]
+        );
     }
 
     #[test]
@@ -2147,10 +2217,7 @@ mod tests {
 
         let vp = Vec2::new(700.0, 380.0);
         assert_eq!(sight_root_origin(vp, Vec2::ZERO), vp);
-        assert_eq!(
-            sight_root_origin(vp, SCREEN * 0.5),
-            Vec2::new(60.0, 20.0)
-        );
+        assert_eq!(sight_root_origin(vp, SCREEN * 0.5), Vec2::new(60.0, 20.0));
     }
 
     #[test]
@@ -2181,11 +2248,9 @@ mod tests {
             .objects
             .iter()
             .find_map(|o| match o.shape {
-                acvd_formats::drb::Shape::Dialog { dialog: Some(idx), .. }
-                    if o.name == "EnemyPic" =>
-                {
-                    Some(idx as usize)
-                }
+                acvd_formats::drb::Shape::Dialog {
+                    dialog: Some(idx), ..
+                } if o.name == "EnemyPic" => Some(idx as usize),
                 _ => None,
             })
             .expect("EnemyPic dialog in ACV_Scan_Cur_EnemyParamInfo");
@@ -2256,7 +2321,11 @@ mod tests {
         // Heavy hit (-6000 AP = 20% > 2% threshold): double gauge activates and blinks at 5 Hz.
         fx.step(24000.0, 30000.0, 0.1);
         assert!(fx.lag_ap < 30000.0 && fx.lag_ap > 24000.0);
-        assert!(fx.effect_alpha > 0.5, "at t=0.1 s, sin(0.5*pi)=1 -> alpha=1.0, got {}", fx.effect_alpha);
+        assert!(
+            fx.effect_alpha > 0.5,
+            "at t=0.1 s, sin(0.5*pi)=1 -> alpha=1.0, got {}",
+            fx.effect_alpha
+        );
         assert!(fx.damage_blend > 0.0);
 
         // After 2.5 s total decay (> 120 ticks = 2.0 s), lag catches up to cur_ap and blink turns off.
