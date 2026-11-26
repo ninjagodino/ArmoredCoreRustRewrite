@@ -112,7 +112,27 @@ impl Plugin for SfxPlugin {
 }
 
 #[derive(Resource)]
-struct Dir(Disc);
+pub(crate) struct Dir(pub(crate) Disc);
+
+/// A live action-43 distortion quad (`FXParticleAppearance_Distortion`, `0x835b7330` /
+/// `0x835b9580`). The [`crate::haze`] pass projects it to screen and samples `s1206_n` like the
+/// 360 `Sfx_DistortionType1` shader.
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct HazeFx {
+    /// World-space quad size in metres (slots 3/4).
+    pub width: f32,
+    pub height: f32,
+    /// In-plane rotation, radians (slot 13 integrated over the node's life).
+    pub angle: f32,
+    /// Scene UV offset strength (slot 7, shader `c7.x`).
+    pub strength: f32,
+    /// Edge falloff exponent (slot 6, shader `c6.y`).
+    pub power: f32,
+    /// Normal-map UV phase (slots 9/10, shader `c9.x` / `c10.x`).
+    pub normal_scale: Vec2,
+    /// Output tint/alpha (slot 16, shader `c20`).
+    pub color: Vec4,
+}
 
 /// A playing effect. Effects end on their own when every node's life is over; [`Sfx::stop`]
 /// ends the nodes that never would. The entity despawns when its effect ends.
@@ -776,13 +796,19 @@ enum Look {
         radius: Curve,
     },
     /// Action 43 heat haze: a camera-facing quad that refracts the scene through `texture`
-    /// (the normal map). Width and height are metres.
+    /// (the normal map). Width and height are metres. Slots 6..13 are the shader's
+    /// `DL_FREG_006..013` constants (`sheets/ffx_actions.csv` row 43); slot 16 is `c20`.
     Haze {
         #[allow(dead_code)]
         texture: i32,
         width: Curve,
         height: Curve,
         spin: Curve,
+        curve6: Curve,
+        curve7: Curve,
+        curve9: Curve,
+        curve10: Curve,
+        color: ColorCurve,
     },
     /// Action 107 (`0x6b`): `FXParticleAppearance_RadialBlur` (360 `0x83197ba0` -> `0x831971b0`
     /// -> `0x835b3658`, `FXParticleAppearance_RadialBlur.cpp`). Post-process radial blur ring,
@@ -830,13 +856,20 @@ fn look(id: i32, l: &ParamList) -> Option<Look> {
             color: color_curve(p(0)),
             radius: float_curve(p(2)),
         },
-        // f0000300 node 1: 1.2 m, normal map 1206, 1.35 m out the nozzle. Refraction strength
-        // is not a traced slot.
+        // f0000300 node 1: 1.2 m, normal map 1206, 1.35 m out the nozzle. The 360
+        // `Sfx_DistortionType1.fpo` constant table maps slots 6/7/9/10/20 straight to
+        // `DL_FREG_006/007/009/010/020`; `0x835b7330` reads slots 0..21 in order and
+        // `0x835b9580` builds the billboard from slots 3/4/13.
         43 => Look::Haze {
             texture: int(l, 14),
             width: float_curve(p(3)),
             height: float_curve(p(4)),
             spin: float_curve(p(13)),
+            curve6: float_curve(p(6)),
+            curve7: float_curve(p(7)),
+            curve9: float_curve(p(9)),
+            curve10: float_curve(p(10)),
+            color: color_curve(p(16)),
         },
         // f0000134 child node: s1847 cloud texture, 0.06 m wide, sample every tick, 1 s trail
         // life, 16 segments, white alpha 0.235. The camera-facing strip trails the parent
@@ -1319,7 +1352,11 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
 
 /// Live-particle cap; -1 has none (f0000131's glide jet, one s1011 every 1/12 s for 1 s).
 fn cluster_max(v: i32) -> usize {
-    if v < 0 { usize::MAX } else { v.max(1) as usize }
+    if v < 0 {
+        usize::MAX
+    } else {
+        v.max(1) as usize
+    }
 }
 
 /// Cluster motion action 55: [0] gravity keys, [1] drag keys, [2] gravity range.
@@ -1484,6 +1521,8 @@ struct NodeRt {
     batch: Option<Visual>,
     /// Action-40 ribbon history: `(age, world position)` samples, oldest first.
     ribbon: Vec<(f32, Vec3)>,
+    /// Action-43 in-plane spin, integrated from slot 13 (radians).
+    haze_angle: f32,
 }
 
 /// Per-frame context while stepping an effect.
@@ -1498,6 +1537,8 @@ struct Cx<'a, 'w, 's> {
     owner: Entity,
     /// Transforms and lights to write to existing visuals once the step is done.
     moves: Vec<(Entity, Transform, Option<PointLight>)>,
+    /// Action-43 quads to write to their persistent marker entities.
+    haze: Vec<(Entity, HazeFx)>,
 }
 
 impl Cx<'_, '_, '_> {
@@ -1602,7 +1643,10 @@ fn look_span(def: &NodeDef) -> f32 {
     };
     match look {
         Look::Model {
-            scale, color, frames, ..
+            scale,
+            color,
+            frames,
+            ..
         } => curve_end(&scale[0])
             .max(curve_end(&scale[1]))
             .max(curve_end(&scale[2]))
@@ -1622,10 +1666,23 @@ fn look_span(def: &NodeDef) -> f32 {
             .max(curve_end(spin)),
         Look::Light { color, radius } => color_end(color).max(curve_end(radius)),
         Look::Haze {
-            width, height, spin, ..
+            width,
+            height,
+            spin,
+            curve6,
+            curve7,
+            curve9,
+            curve10,
+            color,
+            ..
         } => curve_end(width)
             .max(curve_end(height))
-            .max(curve_end(spin)),
+            .max(curve_end(spin))
+            .max(curve_end(curve6))
+            .max(curve_end(curve7))
+            .max(curve_end(curve9))
+            .max(curve_end(curve10))
+            .max(color_end(color)),
         Look::RadialBlur => 0.0,
         Look::Ribbon { .. } => 0.0,
     }
@@ -1669,19 +1726,13 @@ impl NodeRt {
             particles: Vec::new(),
             batch: None,
             ribbon: Vec::new(),
+            haze_angle: 0.0,
         }
     }
 
     /// Advances the node by `dt` under its parent's world transform; false once it and all its
     /// children and particles are done (`0x83190798` node lifecycle state machine).
-    fn step(
-        &mut self,
-        parent: Affine3A,
-        dt: f32,
-        stop: bool,
-        rng: &mut Rng,
-        cx: &mut Cx,
-    ) -> bool {
+    fn step(&mut self, parent: Affine3A, dt: f32, stop: bool, rng: &mut Rng, cx: &mut Cx) -> bool {
         let def = self.def.clone();
         // A spawned copy is posed in the spawner's world at birth and then left there.
         let parent = self.anchor.unwrap_or(parent);
@@ -1689,6 +1740,9 @@ impl NodeRt {
         let t = self.age - def.delay;
         if t < 0.0 {
             return !stop;
+        }
+        if let Some(Look::Haze { spin, .. }) = &def.look {
+            self.haze_angle = (self.haze_angle + spin.at(t) * dt).rem_euclid(std::f32::consts::TAU);
         }
         // Negative life runs until stopped (`0x83190d60`, `0x83190a14`, `0x83190c50`).
         // Finite life ends at `t >= life`, or early on `stop` if the node's stop flag is set.
@@ -1764,7 +1818,11 @@ impl NodeRt {
         // expires and lets its existing particles fade out. Spawned copies (`anchor.is_some()`)
         // are independent world instances and only stop on effect-level `stop`.
         self.children.retain_mut(|c| {
-            let child_stop = if c.anchor.is_some() { stop } else { stop || !own };
+            let child_stop = if c.anchor.is_some() {
+                stop
+            } else {
+                stop || !own
+            };
             let live = c.step(world, dt, child_stop, rng, cx);
             if !live {
                 c.clear(cx);
@@ -1898,9 +1956,10 @@ impl NodeRt {
                     // cell (right for a 0–1 billboard quad) samples an empty corner and the
                     // flame mesh disappears. Slide the cell instead.
                     let (o, s) = frames.rect(t, 0.0);
-                    let slide = cx.lib.model(*model, cx.meshes, cx.images).is_some_and(|parts| {
-                        parts.iter().all(|p| uvs_in_cell(&p.uvs, s))
-                    });
+                    let slide = cx
+                        .lib
+                        .model(*model, cx.meshes, cx.images)
+                        .is_some_and(|parts| parts.iter().all(|p| uvs_in_cell(&p.uvs, s)));
                     let material = v.material.clone();
                     if let Some(mut m) = cx.materials.get_mut(&material) {
                         m.base_color = srgba(color.at(t));
@@ -1938,9 +1997,49 @@ impl NodeRt {
                     }
                 }
             }
-            Look::Haze { .. } | Look::RadialBlur => {
-                // Action 43 (heat haze) and action 107 (FXParticleAppearance_RadialBlur,
-                // 0x835b3658) are screen/post-process effects, not world-space cards.
+            Look::Haze {
+                width,
+                height,
+                curve6,
+                curve7,
+                curve9,
+                curve10,
+                color,
+                ..
+            } => {
+                // Action 43 is a screen-space refraction drawn by `crate::haze`: the marker
+                // entity only carries the world position and the shader constants.
+                let h = HazeFx {
+                    width: width.at(t) * k,
+                    height: height.at(t) * k,
+                    angle: self.haze_angle,
+                    strength: curve7.at(t),
+                    power: curve6.at(t),
+                    normal_scale: Vec2::new(curve9.at(t), curve10.at(t)),
+                    color: color.at(t),
+                };
+                if h.width <= 0.0 || h.height <= 0.0 {
+                    return;
+                }
+                let e = match &self.visual {
+                    Some(v) => v.entities[0],
+                    None => {
+                        let e = cx.spawn((h,), Transform::from_translation(pos));
+                        self.visual = Some(Visual {
+                            entities: vec![e],
+                            material: Handle::default(),
+                            shared_material: true,
+                            mesh: None,
+                        });
+                        e
+                    }
+                };
+                cx.haze.push((e, h));
+                cx.moves.push((e, Transform::from_translation(pos), None));
+            }
+            Look::RadialBlur => {
+                // Action 107 (FXParticleAppearance_RadialBlur, 0x835b3658) is a post-process
+                // ring, not a world-space card.
                 if let Some(v) = self.visual.take() {
                     cx.despawn(v);
                 }
@@ -1973,7 +2072,11 @@ impl NodeRt {
                 // Keep the live head even between interval samples so the strip reaches the
                 // nozzle instead of lagging one sample behind.
                 let mut pts: Vec<(f32, Vec3)> = self.ribbon.clone();
-                if emit && pts.last().is_none_or(|(_, p)| p.distance_squared(anchor) > 1e-6) {
+                if emit
+                    && pts
+                        .last()
+                        .is_none_or(|(_, p)| p.distance_squared(anchor) > 1e-6)
+                {
                     pts.push((t, anchor));
                 }
                 if pts.len() < 2 {
@@ -2090,8 +2193,8 @@ impl NodeRt {
                 let (s, cs) = phi.sin_cos();
                 let r = radius.at(t).max(0.0);
                 let polar = c.emitter.angle.to_radians();
-                let dir = Vec3::new(cs * polar.sin(), polar.cos(), s * polar.sin())
-                    .normalize_or(Vec3::X);
+                let dir =
+                    Vec3::new(cs * polar.sin(), polar.cos(), s * polar.sin()).normalize_or(Vec3::X);
                 (Vec3::new(cs * r, 0.0, s * r), dir)
             }
             EmitterShape::Sphere { radius } => {
@@ -2204,11 +2307,7 @@ impl NodeRt {
                 )
             };
             let q = center - origin;
-            b.quad(
-                [q - r - u, q + r - u, q + r + u, q - r + u],
-                rect,
-                color,
-            );
+            b.quad([q - r - u, q + r - u, q + r + u, q - r + u], rect, color);
         }
         if self.batch.is_none() {
             let (texture, blend) = match (&c.look.shape, &model) {
@@ -2275,13 +2374,7 @@ impl Batch {
         self.index.extend([i, i + 1, i + 2, i, i + 2, i + 3]);
     }
 
-    fn model(
-        &mut self,
-        part: &Part,
-        m: Affine3A,
-        (o, _): (Vec2, Vec2),
-        color: [f32; 4],
-    ) {
+    fn model(&mut self, part: &Part, m: Affine3A, (o, _): (Vec2, Vec2), color: [f32; 4]) {
         let i = self.pos.len() as u32;
         self.pos.extend(
             part.positions
@@ -2349,6 +2442,7 @@ fn simulate(
             &mut Transform,
             &mut GlobalTransform,
             Option<&mut PointLight>,
+            Option<&mut HazeFx>,
         ),
         (With<SfxVisual>, Without<Sfx>),
     >,
@@ -2391,6 +2485,7 @@ fn simulate(
             camera_rot,
             owner: entity,
             moves: Vec::new(),
+            haze: Vec::new(),
         };
         let world = at.affine();
         let Run { nodes, rng } = run;
@@ -2402,12 +2497,17 @@ fn simulate(
             live
         });
         for (e, tf, light) in std::mem::take(&mut cx.moves) {
-            if let Ok((mut t, mut g, l)) = visuals.get_mut(e) {
+            if let Ok((mut t, mut g, l, _)) = visuals.get_mut(e) {
                 *t = tf;
                 *g = GlobalTransform::from(tf);
                 if let (Some(mut l), Some(light)) = (l, light) {
                     *l = light;
                 }
+            }
+        }
+        for (e, haze) in std::mem::take(&mut cx.haze) {
+            if let Ok((_, _, _, Some(mut h))) = visuals.get_mut(e) {
+                *h = haze;
             }
         }
         if nodes.is_empty() {
@@ -2545,7 +2645,12 @@ fn sfx_probe(sfx: &Sfx) -> String {
     }
     format!(
         "nodes={} spawners={} spawned={} particles={} drawn={} stop={}",
-        t.nodes, t.spawners, t.spawned, t.particles, t.drawn, u8::from(sfx.stopping)
+        t.nodes,
+        t.spawners,
+        t.spawned,
+        t.particles,
+        t.drawn,
+        u8::from(sfx.stopping)
     )
 }
 
@@ -3049,7 +3154,13 @@ fn ground_and_water_sfx(
     } else {
         0
     };
-    sync_loop_sfx(&mut commands, &mut state.slide_fx, want_slide, pos, &mut loop_fx);
+    sync_loop_sfx(
+        &mut commands,
+        &mut state.slide_fx,
+        want_slide,
+        pos,
+        &mut loop_fx,
+    );
 
     // 4. Wall-kick / surface kick-off dust (`groundsfxparam` row 7, `116`, `0x828358a0..0x82835918`:
     //    only fires on wall-jump or grounded surface kick contact, not mid-air boost-charge kick).
@@ -3091,9 +3202,7 @@ fn ground_and_water_sfx(
 
         // Only emit continuous near-water spray over open water (not through a solid concrete
         // bridge or road surface that sits above `wy`).
-        let ground_above_water = collision
-            .ground_below(pos)
-            .is_some_and(|gy| gy > wy + 0.1);
+        let ground_above_water = collision.ground_below(pos).is_some_and(|gy| gy > wy + 0.1);
         let clearance = pos.y - wy;
         let want_spray = if !ground_above_water
             && (-2.0..=WATER_SPRAY_CLEARANCE).contains(&clearance)
@@ -3112,7 +3221,13 @@ fn ground_and_water_sfx(
         );
     } else {
         state.submerged = false;
-        sync_loop_sfx(&mut commands, &mut state.water_spray_fx, 0, pos, &mut loop_fx);
+        sync_loop_sfx(
+            &mut commands,
+            &mut state.water_spray_fx,
+            0,
+            pos,
+            &mut loop_fx,
+        );
     }
 }
 
@@ -3169,10 +3284,20 @@ mod tests {
 
     #[test]
     fn qb_sfx_id_matches_360_dispatcher_and_tae_bursts() {
-        let row = &find(PARAM_MAPSFXPARAM_BIN, 0).expect("mapsfxparam row 0").data;
-        assert_eq!(qb_sfx_id(QB_SHORTAGE_SCALE, row), 304, "scale < 1.0 -> ac_qb_shortage");
+        let row = &find(PARAM_MAPSFXPARAM_BIN, 0)
+            .expect("mapsfxparam row 0")
+            .data;
+        assert_eq!(
+            qb_sfx_id(QB_SHORTAGE_SCALE, row),
+            304,
+            "scale < 1.0 -> ac_qb_shortage"
+        );
         assert_eq!(qb_sfx_id(1.0, row), 303, "scale == 1.0 -> ac_qb_normal");
-        assert_eq!(qb_sfx_id(QB_LARGE_SCALE, row), 305, "scale > 1.0 -> ac_qb_large");
+        assert_eq!(
+            qb_sfx_id(QB_LARGE_SCALE, row),
+            305,
+            "scale > 1.0 -> ac_qb_large"
+        );
 
         // HighBoostState TAE 0xC1D..0xC22 (private/xenia/fx_polish2.jsonl).
         assert!(qb_tae_ffx(0x0C1D).is_empty());
@@ -3185,9 +3310,18 @@ mod tests {
 
     #[test]
     fn ground_and_water_sfx_rows_resolve_from_disc_params() {
-        assert_eq!(ground_sfx_id(GROUND_ROW_WALK, GroundSurface::Concrete), 1404);
-        assert_eq!(ground_sfx_id(GROUND_ROW_LAND, GroundSurface::Concrete), 1405);
-        assert_eq!(ground_sfx_id(GROUND_ROW_SLIDE, GroundSurface::Concrete), 1406);
+        assert_eq!(
+            ground_sfx_id(GROUND_ROW_WALK, GroundSurface::Concrete),
+            1404
+        );
+        assert_eq!(
+            ground_sfx_id(GROUND_ROW_LAND, GroundSurface::Concrete),
+            1405
+        );
+        assert_eq!(
+            ground_sfx_id(GROUND_ROW_SLIDE, GroundSurface::Concrete),
+            1406
+        );
         assert_eq!(ground_sfx_id(GROUND_ROW_WALK, GroundSurface::Sand), 1407);
         assert_eq!(ground_sfx_id(GROUND_ROW_LAND, GroundSurface::Sand), 1408);
         assert_eq!(ground_sfx_id(GROUND_ROW_SLIDE, GroundSurface::Sand), 1409);
@@ -3195,7 +3329,9 @@ mod tests {
         // Default falls back to concrete on rows 1-3 where `default == 0`.
         assert_eq!(ground_sfx_id(GROUND_ROW_WALK, GroundSurface::Default), 1404);
 
-        let env = &find(PARAM_ENVSFXPARAM_BIN, 0).expect("envsfxparam row 0").data;
+        let env = &find(PARAM_ENVSFXPARAM_BIN, 0)
+            .expect("envsfxparam row 0")
+            .data;
         assert_eq!(env.water_splash_sfx_id, 1419);
         assert_eq!(env.water_fly_out_sfx_id, 1419);
         assert_eq!(env.water_spray_sfx_id, 1420);
@@ -3209,18 +3345,46 @@ mod tests {
         let img_a = images.add(Image::default());
         let img_b = images.add(Image::default());
 
-        let h1 = cached_material(&mut cache, Some(img_a.clone()), Blend::Add, Vec4::ONE, &mut materials);
-        let h2 = cached_material(&mut cache, Some(img_a.clone()), Blend::Add, Vec4::ONE, &mut materials);
-        assert_eq!(h1.id(), h2.id(), "identical (texture, blend, color) must share one material");
+        let h1 = cached_material(
+            &mut cache,
+            Some(img_a.clone()),
+            Blend::Add,
+            Vec4::ONE,
+            &mut materials,
+        );
+        let h2 = cached_material(
+            &mut cache,
+            Some(img_a.clone()),
+            Blend::Add,
+            Vec4::ONE,
+            &mut materials,
+        );
+        assert_eq!(
+            h1.id(),
+            h2.id(),
+            "identical (texture, blend, color) must share one material"
+        );
         assert_eq!(materials.len(), 1);
 
         // Different blend mode -> distinct material.
-        let h3 = cached_material(&mut cache, Some(img_a.clone()), Blend::Alpha, Vec4::ONE, &mut materials);
+        let h3 = cached_material(
+            &mut cache,
+            Some(img_a.clone()),
+            Blend::Alpha,
+            Vec4::ONE,
+            &mut materials,
+        );
         assert_ne!(h1.id(), h3.id());
         assert_eq!(materials.len(), 2);
 
         // Different texture -> distinct material.
-        let h4 = cached_material(&mut cache, Some(img_b), Blend::Add, Vec4::ONE, &mut materials);
+        let h4 = cached_material(
+            &mut cache,
+            Some(img_b),
+            Blend::Add,
+            Vec4::ONE,
+            &mut materials,
+        );
         assert_ne!(h1.id(), h4.id());
         assert_eq!(materials.len(), 3);
     }
@@ -3325,9 +3489,7 @@ mod tests {
                 haze: world
                     .resource_mut::<Assets<bevy::prelude::Mesh>>()
                     .add(bevy::prelude::Rectangle::new(1.0, 1.0)),
-                dot: world
-                    .resource_mut::<Assets<Image>>()
-                    .add(Image::default()),
+                dot: world.resource_mut::<Assets<Image>>().add(Image::default()),
                 seed: 0x2545_f491,
             };
             let mut rng = super::Rng(0x1234_5679);
@@ -3339,7 +3501,9 @@ mod tests {
             let steps = (secs * 60.0).round() as u32;
             let dt = 1.0 / 60.0;
             for _ in 0..steps {
-                let mut meshes = world.remove_resource::<Assets<bevy::prelude::Mesh>>().unwrap();
+                let mut meshes = world
+                    .remove_resource::<Assets<bevy::prelude::Mesh>>()
+                    .unwrap();
                 let mut materials = world.remove_resource::<Assets<StandardMaterial>>().unwrap();
                 let mut images = world.remove_resource::<Assets<Image>>().unwrap();
                 let mut commands = world.commands();
@@ -3353,6 +3517,7 @@ mod tests {
                     camera_rot: bevy::prelude::Quat::IDENTITY,
                     owner,
                     moves: Vec::new(),
+                    haze: Vec::new(),
                 };
                 nodes.retain_mut(|n| {
                     let live = n.step(bevy::math::Affine3A::IDENTITY, dt, false, &mut rng, &mut cx);
@@ -3376,7 +3541,10 @@ mod tests {
         // 1. f0000098 (idle exhaust puff): parent 2101 life=1.0s stops child 2023 smoke;
         //    emits during [0.083s..1.0s] and finishes completely by 2.5s.
         let (alive_mid, parts_mid) = run_for(98, 0.5);
-        assert!(alive_mid > 0 && parts_mid > 0, "f0000098 should emit smoke at 0.5s");
+        assert!(
+            alive_mid > 0 && parts_mid > 0,
+            "f0000098 should emit smoke at 0.5s"
+        );
         let (alive_end, parts_end) = run_for(98, 2.5);
         assert_eq!(
             (alive_end, parts_end),
@@ -3387,7 +3555,10 @@ mod tests {
         // 2. f0001404 (walk step dust): parent 2101 life=0.0833s stops child 2023 dust;
         //    finishes completely by 2.0s instead of leaking forever.
         let (walk_mid, walk_parts) = run_for(1404, 0.2);
-        assert!(walk_mid > 0 && walk_parts > 0, "f0001404 should have active dust at 0.2s");
+        assert!(
+            walk_mid > 0 && walk_parts > 0,
+            "f0001404 should have active dust at 0.2s"
+        );
         let (walk_end, walk_parts_end) = run_for(1404, 2.0);
         assert_eq!(
             (walk_end, walk_parts_end),
@@ -3417,7 +3588,9 @@ mod tests {
         //    and no action-71 smoke cluster is still alive.
         let roots_300 = load(300);
         assert!(
-            roots_300.iter().any(|n| matches!(&n.kind, super::Kind::Cluster(c) if (c.emit_for - 0.5).abs() < 0.01)),
+            roots_300.iter().any(
+                |n| matches!(&n.kind, super::Kind::Cluster(c) if (c.emit_for - 0.5).abs() < 0.01)
+            ),
             "f0000300 should contain Node(2034) smoke cluster with emit_for=0.5s"
         );
         let (b_alive, _) = run_for(300, 2.5);
@@ -3447,9 +3620,7 @@ mod tests {
             .flat_map(|s| &s.actions)
             .flat_map(|a| super::nodes(&a.params))
             .collect();
-        fn find_ribbon<'a>(
-            ns: &'a [std::sync::Arc<super::NodeDef>],
-        ) -> Option<&'a super::Look> {
+        fn find_ribbon<'a>(ns: &'a [std::sync::Arc<super::NodeDef>]) -> Option<&'a super::Look> {
             for n in ns {
                 if let Some(l @ super::Look::Ribbon { .. }) = &n.look {
                     return Some(l);
@@ -3479,7 +3650,10 @@ mod tests {
         assert!((interval - 1.0 / 60.0).abs() < 1e-5, "one tick sample");
         assert!((life - 1.0).abs() < 1e-5, "1 s trail life");
         assert_eq!(*segments, 16);
-        assert!((*fade - 0.5).abs() < 1e-5, "0.5 s segment alpha fade (slot 15)");
+        assert!(
+            (*fade - 0.5).abs() < 1e-5,
+            "0.5 s segment alpha fade (slot 15)"
+        );
         let c = color.at(0.0);
         assert!(
             (c.x - 1.0).abs() < 1e-3 && (c.w - 0.235).abs() < 1e-3,

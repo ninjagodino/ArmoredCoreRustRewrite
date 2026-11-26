@@ -72,9 +72,11 @@ mod decal;
 mod env;
 mod fcs;
 mod frontend;
+mod fullscreen_extra;
 mod garage;
 mod garage_assemble;
 mod hanger;
+mod haze;
 mod hints;
 mod hud;
 mod input;
@@ -673,6 +675,7 @@ fn main() {
     }))
     .add_plugins((
         blur::BlurPlugin,
+        haze::HazePlugin,
         paint::PaintPlugin,
         acvd_render::menu::MenuPlugin,
         frontend::FrontendPlugin,

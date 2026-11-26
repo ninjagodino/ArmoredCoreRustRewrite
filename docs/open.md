@@ -548,16 +548,16 @@ in order:
   - Whether particles follow the emitter: 108 models follow, 71/82 stay in the world.
   - Point-sprite size unit (action 82).
   - Light intensity (only colour and radius are stored).
-  - Not drawn: distortion (43), radial blur, tracer/line actions, actions 2118/3000.
+  - Not drawn: radial blur, tracer/line actions, actions 2118/3000.
 
   Gameplay gaps:
   - Booster routing, QB shortage/large (`304`/`305`) + `HighBoostState` TAE (`0xC1D..0xC22`),
     ground/landing/slide/wall-kick dust (`groundsfxparam.bin`), water splashes & near-water
     spray (`envsfxparam.bin`), shell cartridges (`cartridge_sfx_id`), real 360 muzzle scale
     (`1.0` + `action 107` radial blur), Circle/Sphere emitters (`30`/`31`), and particle
-    material sharing are done (see Done). Still open: heat-haze distortion (action 43) draws
-    as a refractive quad; the 360 shot's blown-out white core is the additive stack plus the
-    engine bloom, which Bevy's tonemap does not match.
+    material sharing are done (see Done). Action 43 heat haze now draws as the 360's screen-space
+    distortion (`acvd-game::haze`); the 360 shot's blown-out white core is the additive stack plus
+    the engine bloom, which Bevy's tonemap does not match.
   - Hits always use `default2`: bullet/missile wall-hit SFX do not yet map HMD surface material
     to `bullethitsfxparam.bin` columns (`hit_sfx_type` mapping is still assumed).
 - **Sheet values from the PS3 balance data**: the generated data (`acvd-data`) now comes from the
