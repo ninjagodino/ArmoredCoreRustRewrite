@@ -298,6 +298,12 @@ pub struct Pilot {
     /// `AcMove +0x2b4` and `+0x318` by `0x8281f8c0`); the 5.0 m lift caps at this plus
     /// `glide_lift_height` (`0x8281dd28`).
     glide_activation_y: f32,
+    /// True while a High Boost was started from an active Glide Boost (the glide quick boost).
+    /// The 360 keeps the glide top-level action (`0x82092318`, update `0x8283f240`) alive while
+    /// `HighBoostState` replaces only the movement substate, so a tapped Hi-Boost during a glide
+    /// is a quick boost that keeps (and then resumes) the glide. A *held* Hi-Boost still becomes
+    /// the Boost Charge Kick (`QbPhase::Phase2` -> `0x8283fdb0`).
+    pub glide_qb: bool,
     pub airborne: bool,
     /// True while Scan Mode is active (`AC + 0xdb0 != 0`, `0x828b41a0`). Switches passive EN
     /// drain to `scan_passive_en_drain_tick` (`0x8286a558` / `0x828bef18`) and locks out firing.
@@ -1261,6 +1267,7 @@ impl Pilot {
         let dir = Vec3::new(dir.x, 0.0, dir.z).normalize_or(FORWARD);
         self.qb = None;
         self.glide = false;
+        self.glide_qb = false;
         self.kicks_started += 1;
         // Carry at least kick_max_tick forward so a standalone kick or low-speed entry immediately
         // reaches charging speed, while preserving higher High Boost / Glide Boost entry speed.
@@ -1393,6 +1400,7 @@ impl Pilot {
             glide_phase: GlidePhase::Ground,
             glide_phase_time: 0.0,
             glide_activation_y: 0.0,
+            glide_qb: false,
             airborne: false,
             scan_mode: false,
             ow_active: false,
@@ -1634,7 +1642,11 @@ pub fn high_boost_tae_id(release: bool, second_stage: bool, airborne: bool) -> u
 /// Drains `qb_en_drain` (`BST__HI_EN * 0.7`, Lua param 57) via `0x828b2648` -> `0x82830910` and
 /// blocks launch when EN is insufficient (Xenia probe `private/xenia/en_drain2.jsonl`), recording
 /// an EN-shortage QB attempt so `sfx` can fire `ac_qb_shortage` (`304`, `0x82891ce8`).
-fn start_quick_boost(p: &mut Pilot) -> bool {
+///
+/// `from_glide` marks the glide quick boost: the 360 glide top-level action stays active while
+/// `HighBoostState` runs, so the glide survives the burst and resumes when it ends (see
+/// `Pilot::glide_qb`). A normal High Boost still clears the glide.
+fn start_quick_boost(p: &mut Pilot, from_glide: bool) -> bool {
     if p.qb.is_some() || p.kick.is_some() || p.blade.is_some() || p.qb_cooldown >= 1.0 {
         return false;
     }
@@ -1644,7 +1656,12 @@ fn start_quick_boost(p: &mut Pilot) -> bool {
         return false;
     }
     p.qb_cooldown = p.ctrl.qb_reload_ticks;
-    p.glide = false;
+    if from_glide && p.glide {
+        p.glide_qb = true;
+    } else {
+        p.glide = false;
+        p.glide_qb = false;
+    }
     p.qb_charge_starts += 1;
     p.qb_airborne = p.airborne;
     p.last_qb_tae = high_boost_tae_id(false, false, p.airborne);
@@ -1674,7 +1691,9 @@ fn fire_quick_boost(p: &mut Pilot, stick: Vec2, hold_ratio: f32) {
     let forward = Quat::from_rotation_y(p.yaw + p.cam.yaw_off) * FORWARD;
     let world = forward.cross(Vec3::Y) * stick.x + forward * stick.y;
     let eighth = direction(body_stick(stick, p.cam.yaw_off));
-    p.glide = false;
+    if !p.glide_qb {
+        p.glide = false;
+    }
     p.quick_dir = world;
     p.quick_boosts += 1;
     p.second_stage_qb = w2 >= 1.0;
@@ -1779,8 +1798,15 @@ fn step_qb(p: &mut Pilot, input: &Input, moving: bool) -> Option<QbThrust> {
             if input.qb_held && p.start_kick() {
                 return None;
             }
-            // Glide Boost cancels an active Phase 2 burst.
-            if input.glide && p.boost && moving && !p.airborne && p.en >= p.ctrl.glide_en_tick {
+            // Glide Boost cancels an active Phase 2 burst. A glide quick boost already has its
+            // glide running, so it must not cancel the burst it started.
+            if !p.glide_qb
+                && input.glide
+                && p.boost
+                && moving
+                && !p.airborne
+                && p.en >= p.ctrl.glide_en_tick
+            {
                 p.qb = None;
                 p.glide = true;
                 return None;
@@ -2420,10 +2446,15 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
     let mut horizontal = Vec2::new(p.velocity.x, p.velocity.z);
     let speed = horizontal.length();
     let moving = wish != Vec2::ZERO;
-    // A glide starts on the ground (`pilot`) but carries on over a drop.
+    // A glide starts on the ground (`pilot`) but carries on over a drop. A glide quick boost
+    // keeps the glide alive while `HighBoostState` runs, so the phase timer and start ascent
+    // survive the burst and the glide resumes when it ends.
+    if p.qb.is_none() || !p.glide {
+        p.glide_qb = false;
+    }
     p.glide &= p.boost
         && moving
-        && p.qb.is_none()
+        && (p.qb.is_none() || p.glide_qb)
         && p.wj.is_none()
         && p.kick.is_none()
         && p.blade.is_none();
@@ -2438,8 +2469,10 @@ fn step_move_integrate(p: &mut Pilot, input: &Input, position: &mut Vec3, collis
         c.air_drag_tick
     };
 
-    // Glide Boost -> Boost Charge Kick (`0x82840ee0` -> `0x8283fdb0`), or direct Kick key.
-    if (p.glide && input.qb_held) || input.kick {
+    // Boost Charge Kick (`0x82840ee0` -> `0x8283fdb0`) is the *held* Hi-Boost path (manual
+    // 20301/20401 "□ + HOLD"). A tapped Hi-Boost during a glide is the glide quick boost and
+    // keeps the glide; holding it through `QbPhase::Phase2` starts the kick in `step_qb`.
+    if input.kick {
         p.start_kick();
     }
 
@@ -3186,8 +3219,11 @@ pub fn pilot(
     }
     // Re-fire is gated by `HighBoostState` ending (`0x8200d378` slot `+0x50` = `0x8241a6b8`) and
     // `action_ctrl +0x110` (`qb_reload_ticks`, `0x8283ed98`), not the animation clip length.
-    if input.quick_boost && !p.glide {
-        start_quick_boost(&mut p);
+    // A Hi-Boost tap during a glide is the glide quick boost (the glide top-level action keeps the
+    // glide alive); holding it through Phase 2 is the Boost Charge Kick.
+    let from_glide = p.glide;
+    if input.quick_boost {
+        start_quick_boost(&mut p, from_glide);
     }
     p.prev_position = transform.translation;
     let yaw = p.yaw;
@@ -3579,8 +3615,8 @@ mod tests {
         );
         let mut p = Pilot::new(ctrl, 0);
         let mut pos = Vec3::ZERO;
-        assert!(start_quick_boost(&mut p));
-        assert!(!start_quick_boost(&mut p), "blocked while active");
+        assert!(start_quick_boost(&mut p, false));
+        assert!(!start_quick_boost(&mut p, false), "blocked while active");
         let tap_release = Input {
             stick: Vec2::Y,
             qb_held: false,
@@ -3612,7 +3648,7 @@ mod tests {
         // Immediately re-fireable once HighBoostState ends (well under 20 ticks).
         assert!(burst_ticks <= 16, "burst took {burst_ticks} ticks");
         assert!(
-            start_quick_boost(&mut p),
+            start_quick_boost(&mut p, false),
             "re-fire unlocked right after burst"
         );
         p.qb = None;
@@ -3631,7 +3667,7 @@ mod tests {
         p2.boost = true;
         p2.airborne = true;
         let mut pos2 = Vec3::new(0.0, 500.0, 0.0);
-        assert!(start_quick_boost(&mut p2));
+        assert!(start_quick_boost(&mut p2, false));
         let sweet_ticks = ctrl.qb_sweet_frames.round() as u32;
         let hold = Input {
             stick: Vec2::Y,
@@ -3893,7 +3929,7 @@ mod tests {
 
         let mut p = Pilot::new(ctrl, 0);
         assert_eq!(p.en, p.en_max);
-        assert!(start_quick_boost(&mut p));
+        assert!(start_quick_boost(&mut p, false));
         assert!((p.en - (p.en_max - ctrl.qb_en_drain)).abs() < 1e-2);
 
         // Immediate recharge with no delay, same on ground and in air.
@@ -3920,7 +3956,7 @@ mod tests {
         p.qb_cooldown = 0.0;
         p.en = ctrl.qb_en_drain - 10.0;
         let low_en = p.en;
-        assert!(!start_quick_boost(&mut p));
+        assert!(!start_quick_boost(&mut p, false));
         assert_eq!(p.en, low_en);
     }
 
@@ -4036,6 +4072,85 @@ mod tests {
             "the phase switch happens before the 5.0 m are spent, got {}",
             pos.y
         );
+    }
+
+    #[test]
+    fn glide_quick_boost_keeps_the_glide() {
+        // A tapped Hi-Boost during a glide is the glide quick boost: the 360 glide top-level
+        // action (vtable 0x82092318, update 0x8283f240) stays active while HighBoostState runs,
+        // so the glide does not exit and resumes after the burst. Holding the button through
+        // Phase 2 is the separate Boost Charge Kick path.
+        let ctrl = acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        let ground = Collision::with_hits(
+            vec![crate::collision::Plane {
+                y: 0.0,
+                layer: Layer::Ground,
+            }],
+            Vec::new(),
+        );
+        let mut p = Pilot::new(ctrl, 0);
+        p.boost = true;
+        p.glide = true;
+        p.en = p.en_max;
+        p.velocity = Vec3::NEG_Z * ctrl.glide_max_tick;
+        let mut pos = Vec3::ZERO;
+        let input = Input {
+            stick: Vec2::Y,
+            ..Input::default()
+        };
+        for _ in 0..10 {
+            step(&mut p, &input, &mut pos, &ground);
+        }
+        assert!(p.glide);
+
+        assert!(start_quick_boost(&mut p, true));
+        assert!(p.glide, "the tap must not clear the glide");
+        assert!(p.glide_qb);
+
+        // Two held ticks then a release: the tap fires High Boost.
+        let held = Input {
+            stick: Vec2::Y,
+            qb_held: true,
+            ..Input::default()
+        };
+        step(&mut p, &held, &mut pos, &ground);
+        step(&mut p, &held, &mut pos, &ground);
+        step(&mut p, &input, &mut pos, &ground);
+        assert!(p.qb.is_some(), "the tap fires High Boost Phase 1");
+        assert!(p.glide);
+        assert!(p.glide_qb);
+
+        let mut saw_glide_qb = false;
+        for _ in 0..300 {
+            saw_glide_qb |= p.glide_qb;
+            step(&mut p, &input, &mut pos, &ground);
+            assert!(p.glide, "the glide survives the whole burst");
+        }
+        assert!(
+            saw_glide_qb,
+            "the glide quick boost flag held through the burst"
+        );
+        assert!(p.qb.is_none(), "the burst ends");
+        assert!(
+            !p.glide_qb,
+            "the glide quick boost flag clears when the burst ends"
+        );
+        assert!(p.glide, "the glide resumes after the glide quick boost");
+
+        // A normal High Boost still exits the glide.
+        p.qb = None;
+        p.qb_cooldown = 0.0;
+        p.en = p.en_max;
+        p.glide = true;
+        p.glide_qb = false;
+        assert!(start_quick_boost(&mut p, false));
+        assert!(!p.glide, "a normal High Boost clears the glide");
+        assert!(!p.glide_qb);
     }
 
     #[test]
@@ -4224,7 +4339,7 @@ mod tests {
         let mut p = Pilot::new(ctrl, 0);
         let mut pos = Vec3::ZERO;
         let en_start = p.en;
-        assert!(start_quick_boost(&mut p));
+        assert!(start_quick_boost(&mut p, false));
         let hold_v = Input {
             stick: Vec2::Y,
             qb_held: true,
@@ -4849,13 +4964,13 @@ mod tests {
         let mut p = Pilot::new(AcCtrlParam::calculate(design), 10);
         // Drain EN below qb_en_drain -> QB attempt fails and increments qb_shortages.
         p.en = (p.ctrl.qb_en_drain * 0.5).max(0.0);
-        assert!(!start_quick_boost(&mut p));
+        assert!(!start_quick_boost(&mut p, false));
         assert_eq!(p.qb_shortages, 1);
         assert_eq!(p.qb_charge_starts, 0);
 
         // Refill EN -> QB charge starts and records 0xC1D (grounded).
         p.en = p.en_max;
-        assert!(start_quick_boost(&mut p));
+        assert!(start_quick_boost(&mut p, false));
         assert_eq!(p.qb_charge_starts, 1);
         assert_eq!(p.last_qb_tae, 0x0C1D);
 

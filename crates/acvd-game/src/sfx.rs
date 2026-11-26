@@ -2571,12 +2571,13 @@ fn probe_shot(
         .map(|c| c.rotation() * Vec3::NEG_Z)
         .unwrap_or(Vec3::Z);
     eprintln!(
-        "SHOT {} pos=({:.2},{:.2},{:.2}) glide={} boost={} air={} stick=({:.3},{:.3}) speed={:.3} vel=({:.2},{:.2},{:.2}) cam=({:.2},{:.2},{:.2})",
+        "SHOT {} pos=({:.2},{:.2},{:.2}) glide={} glide_qb={} boost={} air={} stick=({:.3},{:.3}) speed={:.3} vel=({:.2},{:.2},{:.2}) cam=({:.2},{:.2},{:.2})",
         path.display(),
         at.translation.x,
         at.translation.y,
         at.translation.z,
         u8::from(pilot.glide),
+        u8::from(pilot.glide_qb),
         u8::from(pilot.boost),
         u8::from(pilot.airborne),
         pilot.command.x,

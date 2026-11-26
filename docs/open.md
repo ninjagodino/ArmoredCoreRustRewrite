@@ -306,7 +306,15 @@ in order:
     acceleration from the thrust block `+0x2cc` (recomputed per tick here), while `+0x1e8` is
     copied from `+0x2dc`, the lift accumulator that `0x8281db00` advances and `0x8281dd28` stops
     at activation + 5.0 m (`glide_cap.jsonl` reads 0.00226 at the state-5 entry, then 0 at the
-    ceiling); after the ascent the air glide holds a flat height. Done: the action-40 ribbon
+    ceiling); after the ascent the air glide holds a flat height. Done: the glide quick boost —
+    a tapped Hi-Boost during a glide keeps the glide (the 360 glide top-level action vtable
+    `0x82092318`, update `0x8283f240`, stays alive while `HighBoostState` replaces the movement
+    substate; its `+0x1c` slot `0x8283f360` and `+0x24` slot `0x8283fcb8` start the glide
+    sub-actions, and `FUN_82844c78` re-creates the `0x82092318` state). Holding Hi-Boost through
+    `QbPhase::Phase2` remains the Boost Charge Kick (`0x8283fdb0`); the old immediate
+    `qb_held` -> `start_kick` on the first glide tick was the bug that exited the glide on a tap.
+    `Pilot::glide_qb` keeps `glide`/the phase timer/lift through the burst so the glide resumes;
+    SHOT telemetry reports `glide_qb`. Done: the action-40 ribbon
     trails (f0000134, 3 starts from `0x828a8088`, dummies 153/155/156/213/218/223 in TAE anims
     63-70) render in `sfx.rs`. Left: the exact state-4 vertical rate (the runtime shares
     `glide_rise_tick` across both phases; the probe's state-4 leg is ~0.074 m/tick vs 0.1007 in
