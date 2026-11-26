@@ -296,11 +296,11 @@ pub struct GameSettings {
     /// COM / operator voice pack: `0` = OFF, `1..=5` = the on-disc `acv2_voice_com_00..04`
     /// packs (Type 1..5). Retail save key `VoiceNo` (`0x82002418`); `sheets/voice.csv`.
     #[serde(default = "default_com_voice")]
+    pub com_voice: u8,
     /// Name of a user-made pack in `custom_voices.json` (rewrite-only); when set it overrides
     /// `com_voice` and supplies the callout lines instead of the on-disc FEV packs.
     #[serde(default)]
     pub com_voice_custom: Option<String>,
-    pub com_voice: u8,
 }
 
 impl Default for GameSettings {
@@ -318,8 +318,8 @@ impl Default for GameSettings {
             music_volume: 1.0,
             sfx_volume: 1.0,
             ui_volume: 1.0,
-            com_voice_custom: None,
             com_voice: default_com_voice(),
+            com_voice_custom: None,
         }
     }
 }
@@ -344,6 +344,7 @@ impl GameSettings {
         self.music_volume = self.music_volume.clamp(0.0, 1.0);
         self.sfx_volume = self.sfx_volume.clamp(0.0, 1.0);
         self.ui_volume = self.ui_volume.clamp(0.0, 1.0);
+        self.com_voice = self.com_voice.min(COM_VOICE_MAX);
         if self
             .com_voice_custom
             .as_deref()
@@ -351,7 +352,6 @@ impl GameSettings {
         {
             self.com_voice_custom = None;
         }
-        self.com_voice = self.com_voice.min(COM_VOICE_MAX);
     }
 
     pub fn save(&self) {

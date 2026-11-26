@@ -277,8 +277,8 @@ fn main() {
     );
     let mut start_pause: Option<pause::PauseScreen> = None;
     let mut start_input = input::InputDevice::KeyboardMouse;
-    let mut open_com_voice_editor = false;
     let mut start_options_tab = settings::OptionsTab::Graphics;
+    let mut open_com_voice_editor = false;
     let mut shadow_dist_override: Option<settings::ShadowDistance> = None;
     let mut hanger_r_override: Option<i16> = None;
     let mut hanger_l_override: Option<i16> = None;
@@ -475,13 +475,13 @@ fn main() {
                         garage_screen = s;
                     }
                 }
+            }
             // Deterministic screenshot/debug entry into Options > Sound > CUSTOM COM VOICE.
             "--com-voice-editor" => {
                 start_garage = true;
                 garage_screen = garage::GarageScreen::Options;
                 start_options_tab = settings::OptionsTab::Sound;
                 open_com_voice_editor = true;
-            }
             }
             "--decal" => {
                 cli_decal = args.next().map(PathBuf::from);
@@ -633,12 +633,12 @@ fn main() {
     );
     garage_state.paint_tab = garage_paint_tab;
     garage_state.paint_picker_mode = garage_paint_picker_mode;
+    garage_state.options_tab = start_options_tab;
     if open_com_voice_editor {
         garage_state.com_voice_editor = Some(garage::ComVoiceEditor::new(
             voice::VoiceLibrary::load().next_name(),
         ));
     }
-    garage_state.options_tab = start_options_tab;
     if shot.is_none() {
         garage_state.view_anim.pending = start_view_action;
     }

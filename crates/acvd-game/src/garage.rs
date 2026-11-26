@@ -20,9 +20,9 @@
 //!   and `acv2_bgm_menu_bgm_menu.fev` `grg` BGM.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
-use std::f32::consts::PI;
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
 use acvd_data::generated::assembly::AC_PARTS;
@@ -45,8 +45,8 @@ use acvd_render::Packs;
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
 use bevy::camera::Exposure;
 use bevy::ecs::system::SystemParam;
-use bevy::input::keyboard::KeyboardInput;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -64,8 +64,8 @@ use crate::settings::{
     self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab, ShadowDistance,
 };
 use crate::sfx::{EffectPoint, Sfx};
-use crate::voice::{CustomVoicePack, VoiceLibrary, EDITOR_EVENTS, MAX_PACK_NAME};
 use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
+use crate::voice::{CustomVoicePack, VoiceLibrary, EDITOR_EVENTS, MAX_PACK_NAME};
 use crate::weapons::{
     Armament, ClipJoint, Hand, Hardpoint, Kind, Shift, ShoulderHardpoint, WeaponAnims,
 };
@@ -193,6 +193,7 @@ pub enum UiAction {
     DisplayParamStep(DisplayParam, i8),
     ShadowDistanceStep(i8),
     VolumeStep(AudioChannel, i8),
+    ComVoiceStep(i8),
     ComVoiceAdd,
     ComVoiceNameFocus,
     ComVoicePickLine(usize),
@@ -200,7 +201,6 @@ pub enum UiAction {
     ComVoiceSave,
     ComVoiceCancel,
     ComVoiceExitDiscard,
-    ComVoiceStep(i8),
     ViewAction(GarageViewAction),
     ToggleViewUi,
     QuitToDesktop,
@@ -1271,6 +1271,7 @@ pub fn acsis_camera_pose(
         fov_deg,
     }
 }
+
 /// Modal editor for a user-made COM voice pack (`custom_voices.json`): a name plus one audio
 /// file per `EDITOR_EVENTS` callout. Opened from Options > Sound > ADD CUSTOM COM VOICE.
 pub struct ComVoiceEditor {
@@ -1380,7 +1381,6 @@ impl ComVoiceEditor {
     }
 }
 
-
 /// Persistent Garage controller state.
 #[derive(Resource)]
 pub struct GarageState {
@@ -1436,9 +1436,9 @@ pub struct GarageState {
     /// True when the "Save paint changes before exit?" modal prompt is open.
     pub paint_exit_prompt: bool,
     /// Selected choice in the paint exit prompt (`true` = YES / Save, `false` = NO / Discard).
+    pub paint_exit_prompt_choice: bool,
     /// Open custom COM voice pack editor modal (Options > Sound > ADD CUSTOM COM VOICE).
     pub com_voice_editor: Option<ComVoiceEditor>,
-    pub paint_exit_prompt_choice: bool,
     /// Sortie launcher indices.
     pub sortie_map_idx: usize,
     pub sortie_target_idx: usize,
@@ -1534,8 +1534,8 @@ impl GarageState {
             paint_history: PaintUndoHistory::default(),
             wheel_consumed: false,
             paint_exit_prompt: false,
-            com_voice_editor: None,
             paint_exit_prompt_choice: true,
+            com_voice_editor: None,
             sortie_map_idx,
             sortie_target_idx,
             parts_fmg,
@@ -2275,9 +2275,9 @@ pub struct OptionsCtx<'w, 's> {
     audio_buses: Query<'w, 's, &'static AudioBus>,
     windows: Query<'w, 's, &'static mut Window, With<bevy::window::PrimaryWindow>>,
     app_exit: MessageWriter<'w, AppExit>,
+    custom_camos: ResMut<'w, paint::CustomCamoLibrary>,
     voice_lib: ResMut<'w, VoiceLibrary>,
     key_events: MessageReader<'w, 's, KeyboardInput>,
-    custom_camos: ResMut<'w, paint::CustomCamoLibrary>,
 }
 
 /// Handles keyboard, gamepad, and mouse-button interaction in the 3D Garage.
@@ -3043,6 +3043,7 @@ pub fn handle_input(
                     delta,
                 );
                 return;
+            }
             UiAction::ComVoiceAdd => {
                 if state.screen == GarageScreen::Options
                     && state.options_tab == OptionsTab::Sound
@@ -3124,7 +3125,6 @@ pub fn handle_input(
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
                 state.ui_dirty = true;
                 return;
-            }
             }
             UiAction::QuitToDesktop => {
                 options.app_exit.write(AppExit::Success);
@@ -3237,6 +3237,7 @@ pub fn handle_input(
         }
         return;
     }
+
     // Custom COM voice editor modal: collects typed text, keyboard navigation, and the
     // paint-style "SAVE BEFORE EXIT?" prompt before the regular garage input runs.
     if state.com_voice_editor.is_some() {
@@ -3273,7 +3274,6 @@ pub fn handle_input(
         state.wheel_consumed = true;
         return;
     }
-
 
     // Mouse clicks on list rows.
     for (interaction, UiRow(idx)) in &row_buttons {
@@ -4194,6 +4194,7 @@ fn step_com_voice_setting(
     );
     state.ui_dirty = true;
 }
+
 /// Plays the selected pack's preview line (custom packs: their `PREVIEW` file, else the first
 /// set line; built-in packs: the FEV `PREVIEW` event).
 fn preview_com_voice(
@@ -4548,7 +4549,6 @@ fn handle_com_voice_editor_input(
         request_close_com_voice_editor(commands, state, cues, audio_assets);
     }
 }
-
 
 fn clamp_scroll_win(scroll: &mut usize, cursor: usize, count: usize, window: usize) {
     if count <= window {
@@ -5105,10 +5105,10 @@ fn trigger_confirm(
             (OptionsTab::Graphics, 7) => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
             }
+            (OptionsTab::Graphics, 8) => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
             }
             (OptionsTab::Graphics, 9) => {
-            (OptionsTab::Graphics, 8) => {
                 options.app_exit.write(AppExit::Success);
             }
             (OptionsTab::Sound, 0) => {
@@ -6001,8 +6001,8 @@ pub fn sync_ui(
     mut decals: ResMut<DecalState>,
     mut custom_camos: ResMut<paint::CustomCamoLibrary>,
     mut assemble_assets: ResMut<crate::garage_assemble::AssembleUiAssets>,
-    voice_lib: Res<VoiceLibrary>,
     mut picker_assets: ResMut<PaintPickerAssets>,
+    voice_lib: Res<VoiceLibrary>,
     mut images: ResMut<Assets<Image>>,
     shift: Option<Res<Shift>>,
     arms_q: Query<&Armament>,
@@ -6184,8 +6184,8 @@ pub fn sync_ui(
             &kit,
             &settings,
             &state,
-            &voice_lib,
             &picker_assets,
+            &voice_lib,
             state.cursor,
             scale,
             device,
@@ -7492,8 +7492,8 @@ fn spawn_garage_options_menu(
     kit: &AcvdUiKit,
     settings: &GameSettings,
     state: &GarageState,
-    voice_lib: &VoiceLibrary,
     picker_assets: &PaintPickerAssets,
+    voice_lib: &VoiceLibrary,
     cursor: usize,
     scale: f32,
     device: InputDevice,
@@ -7883,6 +7883,7 @@ fn spawn_garage_options_menu(
         active_desc,
         scale * 0.86,
         palette::TEXT_BRIGHT,
+    );
 
     // Custom COM voice pack editor modal layered over the Options screen.
     if let Some(editor) = &state.com_voice_editor {
@@ -8179,7 +8180,6 @@ fn spawn_com_voice_exit_prompt(
         "ENTER CONFIRM   -   LEFT/RIGHT SELECT   -   ESC CANCEL",
         scale * 0.78,
         palette::TEXT_MUTED,
-    );
     );
 }
 
@@ -11425,6 +11425,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+
     #[test]
     fn com_voice_editor_rows_and_lines() {
         let mut editor = ComVoiceEditor::new("CUSTOM 1".to_string());
@@ -11440,7 +11441,6 @@ mod tests {
         assert!(editor.dirty);
         assert!(!editor.clear_line(offset));
     }
-
 
     #[test]
     fn all_13_retail_workshops_have_models_and_lighting() {
