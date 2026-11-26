@@ -8,14 +8,24 @@
 //!   `0x829d8340` / `0x829dd5b8`): datum sits `fcs_datum_back` (`20.0 m`, `Assemble.bin +0x328`)
 //!   behind the AC along the aim direction. A target within `first_lock_range` of the AC with
 //!   datum-local `z > 0` lies inside the inner cone when
-//!   `(x / (z * tan(sight_x)))^2 + (y / (z * tan(sight_y)))^2 <= 1.0`. An outer hysteresis cone
-//!   adds `2.0°` (`DAT_820b005c` in `0x829d8758`) to keep an existing lock from flickering at the
-//!   edge. Terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20` → `0x829c5e30`, filter
-//!   `0x80100006` + `0x829c5c00` `AcObjectParam.camera_collidable`) is raycast against the map
-//!   collision BVH (`Collision::has_los(..., RayFilter::FcsLos)`).
-//! - **Secondary lock-on timer** (`0x82857688` → `0x829debe8` → `0x829de560`): per hand,
-//!   `lock_time = weapon.missile_lock_time * AcCtrlParam::lock_effective_rate / 60.0` seconds.
-//!   Once `elapsed >= lock_time`, secondary lock is complete.
+//!   `(x / (z * tan(sight_x)))^2 + (y / (z * tan(sight_y)))^2 <= 1.0`. Every candidate is
+//!   accepted in the outer (`sight + 2.0 deg`, `DAT_820b005c` in `0x829d8758`) cone
+//!   (`0x829d8d58` only checks flag bit 0 from `0x829d8850`); the inner cone sets flag bit 1
+//!   on the candidate record and is what the HUD/missile paths prefer. Terrain line-of-sight
+//!   occlusion (`LockCheckRay` `0x829c5f20` → `0x829c5e30`, filter `0x80100006` +
+//!   `0x829c5c00` `AcObjectParam.camera_collidable`) is raycast against the map collision BVH
+//!   (`Collision::has_los(..., RayFilter::FcsLos)`).
+//! - **Target selection**: accepted candidates carry their 3D distance to the AC (`0x8287c560`
+//!   computes `sqrt(dx^2 + dy^2 + dz^2)` for every candidate record before the tracker update),
+//!   and `rank_candidates` orders nearest first. `0x82876b40` only re-feeds the candidate list
+//!   when the slot target state is not 2 (`FUN_82877320`); in state 2 the tracker keeps its
+//!   current target and only maintains range/loss callbacks, so the lock is sticky while the
+//!   target stays an accepted candidate.
+//! - **Secondary lock-on timer** (normal-mode weapon lock class `0x82850ef0` → `0x82850778`;
+//!   progress `0x82850578` = `elapsed / lock_time` clamped to 1): per hand,
+//!   `lock_time = weapon.lock_time_ticks * AcCtrlParam::lock_effective_rate / 60.0` seconds
+//!   (`0x82857688` first float). Once `elapsed >= lock_time`, secondary lock is complete.
+//!   The timer is cleared when the target becomes invalid (`0x82850bd0` resets `[0x20/0x24/0x28]`).
 //! - **Lead-point prediction** (`0x8287b070` → `0x829c2ee8` → `0x829c2808`):
 //!   - Secondary lock complete: aims at `target_pos + target_vel * t_flight`, solving time-of-flight
 //!     from `muzzle` at `gun.init_speed`.
@@ -68,8 +78,12 @@ impl FcsSpec {
             lock_effective_rate: ctrl.lock_effective_rate.max(0.05),
             missile_lock_effective_rate: ctrl.missile_lock_effective_rate.max(0.05),
             missile_lock_max: ctrl.missile_lock_max.round().clamp(1.0, 6.0) as u8,
-            sight_x_rad: ctrl.lock_sight_x_rad.clamp(0.02, std::f32::consts::FRAC_PI_2 - 0.01),
-            sight_y_rad: ctrl.lock_sight_y_rad.clamp(0.02, std::f32::consts::FRAC_PI_2 - 0.01),
+            sight_x_rad: ctrl
+                .lock_sight_x_rad
+                .clamp(0.02, std::f32::consts::FRAC_PI_2 - 0.01),
+            sight_y_rad: ctrl
+                .lock_sight_y_rad
+                .clamp(0.02, std::f32::consts::FRAC_PI_2 - 0.01),
             datum_back: ctrl.fcs_datum_back.max(0.0),
         }
     }
@@ -92,11 +106,11 @@ pub struct LockedTarget {
     pub ap: f32,
     #[allow(dead_code)]
     pub ap_max: f32,
-    /// Elapsed secondary lock time in seconds for `[right, left]` hand weapons (`0x829debe8`).
+    /// Elapsed secondary lock time in seconds for `[right, left]` hand weapons (`0x82850778`).
     pub elapsed: [f32; 2],
     /// Required secondary lock time in seconds for `[right, left]` hand weapons (`0x82857688`).
     pub lock_time: [f32; 2],
-    /// True once `elapsed[hand] >= lock_time[hand]` (`0x829de560`).
+    /// True once `elapsed[hand] >= lock_time[hand]` (`0x82850578` progress reaches 1).
     pub secondary: [bool; 2],
 }
 
@@ -107,6 +121,7 @@ impl LockedTarget {
     }
 
     /// Lock progress in `0.0..=1.0` for `hand_idx` (`0` right, `1` left).
+    #[allow(dead_code)]
     pub fn progress(&self, hand_idx: usize) -> f32 {
         let t = self.lock_time[hand_idx];
         if t <= 0.0 {
@@ -123,13 +138,13 @@ pub struct LockCandidate {
     pub entity: Entity,
     /// World-space center of the target's primary hit sphere.
     pub world_pos: Vec3,
-    /// Aim score: lower is closer to the sight center (same scale as `fcs::update`'s `best`).
-    pub score: f32,
+    /// 3D distance from the AC in metres (`0x8287c560` candidate record `+0xc`); lower is nearer.
+    pub distance: f32,
 }
 
-/// Sorts candidates by aim score (center-most first), keeping one entry per entity.
+/// Sorts candidates by 3D distance (nearest first), keeping one entry per entity.
 pub fn rank_candidates(mut candidates: Vec<LockCandidate>) -> Vec<LockCandidate> {
-    candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
+    candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
     let mut ranked: Vec<LockCandidate> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         if ranked.iter().all(|r| r.entity != candidate.entity) {
@@ -139,13 +154,27 @@ pub fn rank_candidates(mut candidates: Vec<LockCandidate>) -> Vec<LockCandidate>
     ranked
 }
 
+/// Picks the lock target. The current target stays selected while it is still an accepted
+/// candidate (`0x82876b40` state-2 branch keeps the tracker target); otherwise the nearest
+/// accepted candidate wins (`0x8287c560` distance ranking).
+pub fn select_target(current: Option<Entity>, candidates: &[LockCandidate]) -> Option<Entity> {
+    if current.is_some_and(|e| candidates.iter().any(|c| c.entity == e)) {
+        return current;
+    }
+    candidates
+        .iter()
+        .min_by(|a, b| a.distance.total_cmp(&b.distance))
+        .map(|c| c.entity)
+}
+
 /// Per-AC FCS runtime state (`AcFcs` component on the piloted AC).
 #[derive(Component, Clone, Debug)]
 pub struct Fcs {
     pub spec: FcsSpec,
     pub locked: Option<LockedTarget>,
-    /// Every enemy the FCS can acquire this frame (inner cone + LOS, plus the lingering current
-    /// target in the outer cone), sorted center-most first. Drives the per-enemy lock boxes.
+    /// Every enemy the FCS can acquire this frame (outer cone + LOS, including the lingering
+    /// current target), sorted nearest first (`0x8287c560` distance ranking). Drives the
+    /// per-enemy lock boxes.
     pub candidates: Vec<LockCandidate>,
     /// Accumulated multi-target missile lock slots (`0x82858638`, up to 6).
     pub missile_locks: Vec<Entity>,
@@ -182,6 +211,7 @@ impl Fcs {
 
     /// Unique missile-locked targets with their latest world center and lock count (`1..=6`),
     /// preserving first-locked order.
+    #[allow(dead_code)]
     pub fn missile_targets(&self) -> Vec<(Entity, Vec3, u8)> {
         let mut out: Vec<(Entity, Vec3, u8)> = Vec::new();
         for &entity in &self.missile_locks {
@@ -230,7 +260,7 @@ impl Fcs {
 }
 
 /// Computes secondary lock-on duration in seconds (`0x82857688`):
-/// `weapon.missile_lock_time * AcCtrlParam::lock_effective_rate / 60.0`.
+/// `weapon.lock_time_ticks * AcCtrlParam::lock_effective_rate / 60.0`.
 pub fn secondary_lock_time(lock_time_ticks: f32, lock_effective_rate: f32) -> f32 {
     if lock_time_ticks <= 0.0 {
         return 0.0;
@@ -294,12 +324,14 @@ pub fn step_missile_locks(
     }
 }
 
-/// Tests whether `target_pos` is within `range` metres of `ac_pos` and inside the elliptical
-/// lock-sight cone (`0x829d8d58` → `0x829d8850` → `0x829d8340` / `0x829dd5b8`).
+/// Normalized position of `target_pos` inside the elliptical lock sight
+/// (`0x829d8d58` → `0x829d8850` → `0x829d8340` / `0x829dd5b8`).
 ///
-/// Returns `Some(ell)` where `ell = (x / max_x)^2 + (y / max_y)^2` in `0.0..=1.0` (0 = dead
-/// center of sight, 1 = on the ellipse boundary), or `None` if outside range or cone.
-pub fn in_lock_cone(
+/// Returns `Some(ell)` where `ell = (x / max_x)^2 + (y / max_y)^2` (0 = dead center of sight,
+/// 1 = on the ellipse boundary), or `None` when the target is out of `range`, behind the sight
+/// datum, or outside the ellipse's axis-aligned box. `ell > 1` is a target between the inner
+/// sight and the outer margin, exactly how `0x829d8850` reports flags `1` vs `3`.
+pub fn lock_sight_ellipse(
     ac_pos: Vec3,
     aim_dir: Vec3,
     target_pos: Vec3,
@@ -317,7 +349,11 @@ pub fn in_lock_cone(
         return None;
     }
     // Build orthonormal basis around `forward` (up = world +Y, fallback +Z near poles).
-    let up_hint = if forward.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let up_hint = if forward.y.abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
     let right = forward.cross(up_hint).normalize();
     let up = right.cross(forward);
 
@@ -339,8 +375,31 @@ pub fn in_lock_cone(
     }
     let nx = x / max_x;
     let ny = y / max_y;
-    let ell = nx * nx + ny * ny;
-    (ell <= 1.0).then_some(ell)
+    Some(nx * nx + ny * ny)
+}
+
+/// Tests whether `target_pos` is inside the inner lock sight (`ell <= 1.0`). `0x829d8850`
+/// requires the outer (+2 deg) cone for every candidate; the inner cone only sets flag bit 1
+/// in the candidate record at `0x829d8d58`.
+pub fn in_lock_cone(
+    ac_pos: Vec3,
+    aim_dir: Vec3,
+    target_pos: Vec3,
+    range: f32,
+    half_x_rad: f32,
+    half_y_rad: f32,
+    datum_back: f32,
+) -> Option<f32> {
+    lock_sight_ellipse(
+        ac_pos,
+        aim_dir,
+        target_pos,
+        range,
+        half_x_rad,
+        half_y_rad,
+        datum_back,
+    )
+    .filter(|ell| *ell <= 1.0)
 }
 
 /// Linear lead-point prediction (`0x829c2ee8` → `0x829c2808`):
@@ -406,7 +465,9 @@ pub fn update(
     let Ok((pilot, arms, ac_tf, mut fcs)) = acs.single_mut() else {
         return;
     };
-    if pilot.scan_mode || pilot.ow_lockout {
+    // Scan Mode only locks out firing; it does not clear the FCS lock
+    // (`AC + 0xdb0` has no reader in the 0x829d lock-cursor path).
+    if pilot.ow_lockout {
         fcs.locked = None;
         fcs.candidates.clear();
         fcs.missile_locks.clear();
@@ -418,14 +479,19 @@ pub fn update(
     let ac_pos = ac_tf.translation + Vec3::Y * AC_WAIST_Y;
     let aim_dir = pilot.aim_direction();
     let spec = fcs.spec;
-    let outer_x = (spec.sight_x_rad + OUTER_MARGIN_DEG.to_radians())
-        .min(std::f32::consts::FRAC_PI_2 - 0.01);
-    let outer_y = (spec.sight_y_rad + OUTER_MARGIN_DEG.to_radians())
-        .min(std::f32::consts::FRAC_PI_2 - 0.01);
-    let cur_entity = fcs.locked.as_ref().map(|l| l.entity);
+    let outer_x =
+        (spec.sight_x_rad + OUTER_MARGIN_DEG.to_radians()).min(std::f32::consts::FRAC_PI_2 - 0.01);
+    let outer_y =
+        (spec.sight_y_rad + OUTER_MARGIN_DEG.to_radians()).min(std::f32::consts::FRAC_PI_2 - 0.01);
 
-    // Track target velocities and collect all candidates in the inner/outer lock-sight cones.
-    let mut best: Option<(f32, Entity, String, String, Vec3, Vec3, f32, f32, f32)> = None;
+    let current = fcs.locked.as_ref().map(|l| l.entity);
+
+    // Track target velocities and collect every target in the outer (+2 deg) lock cone.
+    // `0x829d8850` returns bit 0 when the target is inside the outer cone and bit 1 when it is
+    // also inside the inner sight; `0x829d8d58` accepts on bit 0 alone, so the outer cone is
+    // both the acquisition and the keep-lock cone (the `+2 deg` margin is the hysteresis).
+    type TargetInfo = (Entity, String, String, Vec3, Vec3, f32, f32, f32);
+    let mut infos: Vec<TargetInfo> = Vec::new();
     let mut inner_candidates: Vec<(Entity, f32)> = Vec::new();
     let mut candidates: Vec<LockCandidate> = Vec::new();
     let mut valid_targets: HashMap<Entity, Vec3> = HashMap::new();
@@ -449,69 +515,46 @@ pub fn update(
             spec.sight_y_rad,
             spec.datum_back,
         );
-        let in_missile_locks = fcs.missile_locks.contains(&entity);
-        let score = if let Some(ell) = inner {
-            if !target_has_los(&collision, ac_pos, center) {
-                continue;
-            }
-            inner_candidates.push((entity, ell));
-            valid_targets.insert(entity, center);
-            // Slight bias toward keeping the current locked target to prevent edge flicker.
-            if Some(entity) == cur_entity {
-                ell * 0.85
-            } else {
-                ell
-            }
-        } else if Some(entity) == cur_entity || in_missile_locks {
-            // Outer +2 deg hysteresis cone (`0x829d8758` / `0x829d8850`).
-            match in_lock_cone(
-                ac_pos,
-                aim_dir,
-                center,
-                spec.first_lock_range,
-                outer_x,
-                outer_y,
-                spec.datum_back,
-            ) {
-                Some(ell) => {
-                    if !target_has_los(&collision, ac_pos, center) {
-                        continue;
-                    }
-                    valid_targets.insert(entity, center);
-                    if Some(entity) == cur_entity {
-                        1.0 + ell
-                    } else {
-                        continue;
-                    }
-                }
-                None => continue,
-            }
-        } else {
+        let outer = lock_sight_ellipse(
+            ac_pos,
+            aim_dir,
+            center,
+            spec.first_lock_range,
+            outer_x,
+            outer_y,
+            spec.datum_back,
+        )
+        .filter(|ell| *ell <= 1.0);
+        if outer.is_none() {
             continue;
-        };
+        }
+        if !target_has_los(&collision, ac_pos, center) {
+            continue;
+        }
+        valid_targets.insert(entity, center);
+        if let Some(ell) = inner {
+            inner_candidates.push((entity, ell));
+        }
+        let distance = (center - ac_pos).length();
         candidates.push(LockCandidate {
             entity,
             world_pos: center,
-            score,
+            distance,
         });
-
-        let dist = (center - ac_pos).length();
-        if best.as_ref().is_none_or(|b| score < b.0) {
-            best = Some((
-                score,
-                entity,
-                target.name.clone(),
-                target.model.clone(),
-                center,
-                vel,
-                dist,
-                health.ap,
-                health.ap_max,
-            ));
-        }
+        infos.push((
+            entity,
+            target.name.clone(),
+            target.model.clone(),
+            center,
+            vel,
+            distance,
+            health.ap,
+            health.ap_max,
+        ));
     }
 
     fcs.candidates = rank_candidates(candidates);
+    let selected = select_target(current, &fcs.candidates);
 
     // Multi-target missile lock accumulation (`0x82858638` + `0x82857688`):
     // supports shoulder missiles as well as missile weapon arms (`am7210`/`am7220`).
@@ -552,7 +595,9 @@ pub fn update(
     fcs.missile_locks = locks;
     fcs.missile_lock_timer = timer;
 
-    let Some((_, entity, name, model, world_pos, velocity, distance, ap, ap_max)) = best else {
+    let Some((entity, name, model, world_pos, velocity, distance, ap, ap_max)) =
+        selected.and_then(|e| infos.into_iter().find(|i| i.0 == e))
+    else {
         fcs.locked = None;
         return;
     };
@@ -621,7 +666,10 @@ mod tests {
             "lock_effective_rate = {}",
             spec.lock_effective_rate
         );
-        assert!((spec.datum_back - 20.0).abs() < 1e-4, "Assemble.bin +0x328 = 20 m");
+        assert!(
+            (spec.datum_back - 20.0).abs() < 1e-4,
+            "Assemble.bin +0x328 = 20 m"
+        );
         assert!(spec.sight_x_rad > 0.1 && spec.sight_y_rad > 0.1);
 
         // Verify exact Lua formula for FCS 111 + Head 111:
@@ -646,19 +694,63 @@ mod tests {
         let datum_back = 20.0;
 
         // Straight ahead at 100 m (z from datum = 120 m): dead center -> ell == 0.
-        let c = in_lock_cone(ac, aim, Vec3::new(0.0, 0.0, -100.0), 160.0, half, half, datum_back);
+        let c = in_lock_cone(
+            ac,
+            aim,
+            Vec3::new(0.0, 0.0, -100.0),
+            160.0,
+            half,
+            half,
+            datum_back,
+        );
         assert!(c.is_some_and(|e| e < 1e-5));
 
         // Out of range (170 m > 160 m): rejected.
-        assert!(in_lock_cone(ac, aim, Vec3::new(0.0, 0.0, -170.0), 160.0, half, half, datum_back).is_none());
+        assert!(in_lock_cone(
+            ac,
+            aim,
+            Vec3::new(0.0, 0.0, -170.0),
+            160.0,
+            half,
+            half,
+            datum_back
+        )
+        .is_none());
 
         // Behind AC (z from datum <= 0): rejected.
-        assert!(in_lock_cone(ac, aim, Vec3::new(0.0, 0.0, 25.0), 160.0, half, half, datum_back).is_none());
+        assert!(in_lock_cone(
+            ac,
+            aim,
+            Vec3::new(0.0, 0.0, 25.0),
+            160.0,
+            half,
+            half,
+            datum_back
+        )
+        .is_none());
 
         // At 100 m ahead, z_datum = 120 m, max_x = 120 * tan(14°) ≈ 29.92 m.
         let max_x = 120.0 * half.tan();
-        assert!(in_lock_cone(ac, aim, Vec3::new(max_x * 0.9, 0.0, -100.0), 160.0, half, half, datum_back).is_some());
-        assert!(in_lock_cone(ac, aim, Vec3::new(max_x * 1.05, 0.0, -100.0), 160.0, half, half, datum_back).is_none());
+        assert!(in_lock_cone(
+            ac,
+            aim,
+            Vec3::new(max_x * 0.9, 0.0, -100.0),
+            160.0,
+            half,
+            half,
+            datum_back
+        )
+        .is_some());
+        assert!(in_lock_cone(
+            ac,
+            aim,
+            Vec3::new(max_x * 1.05, 0.0, -100.0),
+            160.0,
+            half,
+            half,
+            datum_back
+        )
+        .is_none());
 
         // Diagonal corner (0.8, 0.8) has 0.64 + 0.64 = 1.28 > 1.0 -> outside ellipse even though inside box!
         assert!(
@@ -674,6 +766,44 @@ mod tests {
             .is_none(),
             "ellipse rejects box corner (0.8, 0.8)"
         );
+    }
+
+    #[test]
+    fn outer_margin_cone_accepts_what_inner_sight_rejects() {
+        // `0x829d8850` tests the outer cone first and `0x829d8d58` accepts on bit 0, so a target
+        // just outside the inner half-angle but inside `inner + 2 deg` is a valid lock
+        // candidate (`DAT_820b005c` = 2.0 deg in `0x829d8758`).
+        let ac = Vec3::ZERO;
+        let aim = Vec3::NEG_Z;
+        let half = 14.0_f32.to_radians();
+        let outer = half + OUTER_MARGIN_DEG.to_radians();
+        let datum_back = 20.0;
+        let z = 120.0;
+        let target = Vec3::new(z * 14.5_f32.to_radians().tan(), 0.0, -100.0);
+        assert!(
+            in_lock_cone(
+                ac,
+                aim,
+                target,
+                160.0,
+                half,
+                half,
+                datum_back
+            )
+            .is_none(),
+            "14.5 deg is outside the 14 deg inner sight"
+        );
+        let ell = lock_sight_ellipse(
+            ac,
+            aim,
+            target,
+            160.0,
+            outer,
+            outer,
+            datum_back,
+        )
+        .expect("14.5 deg is inside the 16 deg outer cone");
+        assert!(ell > 0.0 && ell <= 1.0);
     }
 
     #[test]
@@ -737,32 +867,52 @@ mod tests {
     }
 
     #[test]
-    fn lock_candidates_rank_by_score_and_dedup() {
+    fn lock_candidates_rank_by_distance_and_dedup() {
         let a = Entity::from_bits(1);
         let b = Entity::from_bits(2);
         let ranked = rank_candidates(vec![
             LockCandidate {
                 entity: b,
                 world_pos: Vec3::ZERO,
-                score: 0.6,
+                distance: 60.0,
             },
             LockCandidate {
                 entity: a,
                 world_pos: Vec3::X,
-                score: 0.2,
+                distance: 20.0,
             },
             LockCandidate {
                 entity: b,
                 world_pos: Vec3::Y,
-                score: 0.1,
+                distance: 10.0,
             },
         ]);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].entity, b);
-        assert_eq!(ranked[0].score, 0.1);
+        assert_eq!(ranked[0].distance, 10.0);
         assert_eq!(ranked[0].world_pos, Vec3::Y);
         assert_eq!(ranked[1].entity, a);
-        assert_eq!(ranked[1].score, 0.2);
+        assert_eq!(ranked[1].distance, 20.0);
+    }
+
+    #[test]
+    fn sticky_target_survives_reselection() {
+        // `0x82876b40` keeps the tracker target while it remains valid even when another
+        // accepted candidate is nearer; the nearest candidate only wins after the current
+        // target drops out of the accepted list.
+        let a = Entity::from_bits(1);
+        let b = Entity::from_bits(2);
+        let cand = |entity, distance| LockCandidate {
+            entity,
+            world_pos: Vec3::ZERO,
+            distance,
+        };
+        let list = vec![cand(b, 20.0), cand(a, 50.0)];
+        assert_eq!(select_target(Some(a), &list), Some(a));
+        assert_eq!(select_target(Some(b), &list), Some(b));
+        assert_eq!(select_target(Some(Entity::from_bits(3)), &list), Some(b));
+        assert_eq!(select_target(None, &list), Some(b));
+        assert_eq!(select_target(Some(a), &[]), None);
     }
 
     #[test]
@@ -797,7 +947,11 @@ mod tests {
             let m4000 = crate::collision::load_map(&disc, "m4000").expect("m4000 collision");
             let origin = Vec3::new(324.65, 33.5, 649.5);
             // Straight down through the floor (to y = -10) is occluded by m4000 ground.
-            assert!(!target_has_los(&m4000, origin, Vec3::new(324.65, -10.0, 649.5)));
+            assert!(!target_has_los(
+                &m4000,
+                origin,
+                Vec3::new(324.65, -10.0, 649.5)
+            ));
             // Short open-air sightline 5 m above start is clear.
             assert!(target_has_los(&m4000, origin, origin + Vec3::Y * 5.0));
         }
