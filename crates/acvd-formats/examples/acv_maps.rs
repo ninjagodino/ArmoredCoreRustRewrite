@@ -92,8 +92,8 @@ fn main() -> anyhow::Result<()> {
                 msb_paths.insert(member.clone());
                 let data = vfs::undcx(entry.contents(&binder)?.into_owned())?;
                 if member.to_ascii_lowercase().contains("/ch_env/") {
-                    // ACV `ch_env` files use the plain MSB magic; VD's `env::read` requires
-                    // `MAGIC_ENV`, so their event payloads are a separate (open) decode.
+                    // ACV `ch_env` files use the plain MSB magic; `env::read` accepts it but
+                    // their type-100/101 payloads are a separate (open) packed layout.
                     env_msbs.insert(member.clone());
                 }
                 if !msb::is_msb(&data) {
@@ -168,7 +168,7 @@ fn main() -> anyhow::Result<()> {
         envs.len(),
         navs.len()
     );
-    println!("ACV env MSBs use the plain MSB magic and carry EVENT kinds 100/101/102/103/400; VD's env::read requires MAGIC_ENV");
+    println!("ACV env MSBs use the plain MSB magic; env::read parses their EVENT table and BGM, not the packed type-100/101 payloads");
     println!(
         "MSB records: {models} models, {parts} parts, {points} points; part kinds {part_kinds:?}; point kinds {point_kinds:?}"
     );

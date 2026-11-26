@@ -1,5 +1,7 @@
 //! Map environment (`model/map/ch_env/{map}_env.msb`): the MSB section chain at version
-//! `msb::MAGIC_ENV`, with every record in `EVENT_PARAM_ST`. Field layouts and the shader
+//! `msb::MAGIC_ENV` (VD) or `msb::MAGIC` (ACV), with every record in `EVENT_PARAM_ST`.
+//! ACV's type-100/101 payloads are packed differently, so `read` exposes only its events and
+//! BGM; VD's light/scene decoding remains the full path. Field layouts and the shader
 //! constants built from them are in `sheets/map_env.csv`.
 //!
 //! Event record: `u32 name, i32 id, u32 type, u32 index, u32 data`, offsets relative to the
@@ -534,7 +536,14 @@ fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
 
 pub fn read(data: &[u8]) -> Result<Env> {
     let r = Be(data);
-    ensure!(r.u32(0)? == msb::MAGIC_ENV, "not an env MSB");
+    let magic = r.u32(0)?;
+    ensure!(
+        matches!(magic, msb::MAGIC_ENV | msb::MAGIC),
+        "not an env MSB"
+    );
+    // ACV's type-100/101 payloads are packed differently from VD's f32 blocks; only the
+    // event table and BGM record are layout-compatible, so leave lights/scene unparsed.
+    let acv = magic == msb::MAGIC;
     let mut env = Env {
         events: Vec::new(),
         lights: Vec::new(),
@@ -557,8 +566,8 @@ pub fn read(data: &[u8]) -> Result<Env> {
             data: off + r.u32(off + 0x10)? as usize,
         };
         match e.kind {
-            EVENT_LIGHT => env.lights.push(light(&r, e.name.clone(), e.data)?),
-            EVENT_SCENE if env.scene.is_none() => {
+            EVENT_LIGHT if !acv => env.lights.push(light(&r, e.name.clone(), e.data)?),
+            EVENT_SCENE if !acv && env.scene.is_none() => {
                 let sub = e.data + r.u32(e.data)? as usize;
                 let sub2_rel = r.u32(e.data + 8)? as usize;
                 let tonemap = if sub2_rel > 0 && e.data + sub2_rel + 0x14 <= data.len() {
@@ -759,6 +768,45 @@ mod tests {
             println!("  {} ({}x{}, fmt={:#x})", t.name, t.width, t.height, t.format);
         }
         for i in 0..=10 {
+    #[test]
+    fn acv_env_from_mission_binder() {
+        let Some(disc) = crate::vfs::test_disc_v() else {
+            return;
+        };
+        let binder = disc.asset("bind/mission/mission_1200.bnd").unwrap();
+        let b = crate::bnd3::read(&binder).unwrap();
+        let entry = b
+            .entries
+            .iter()
+            .find(|e| {
+                e.name
+                    .as_deref()
+                    .is_some_and(|n| n.ends_with("m0300_env.msb"))
+            })
+            .expect("m0300_env.msb");
+        let data = crate::vfs::undcx(entry.contents(&binder).unwrap().into_owned()).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(data[..4].try_into().unwrap()),
+            msb::MAGIC
+        );
+        let env = read(&data).unwrap();
+        assert_eq!(env.events.len(), 50);
+        assert_eq!(
+            env.events.iter().filter(|e| e.kind == EVENT_LIGHT).count(),
+            44
+        );
+        assert_eq!(
+            env.events.iter().filter(|e| e.kind == EVENT_SCENE).count(),
+            2
+        );
+        assert_eq!(env.events.iter().filter(|e| e.kind == EVENT_BGM).count(), 1);
+        let bgm = env.bgm.unwrap();
+        assert_eq!((bgm.id, bgm.param_a, bgm.param_b), (103, 1001, 0));
+        // VD's f32 light/scene blocks do not describe ACV's packed payloads.
+        assert!(env.lights.is_empty());
+        assert!(env.scene.is_none());
+    }
+
             let expected = format!("lf{i:02}");
             assert!(
                 names.iter().any(|n| n.eq_ignore_ascii_case(&expected)),

@@ -382,10 +382,12 @@ in order:
   VD's equivalent is vtable
   `0x8210c624` (secondary vfptr at `+0x62c`), ctor `0x82d0f750`; slot 14 `0x82d0f680` ->
   `0x82c2d4d0`, which appends the model name to `context+0xc`; VD source path `0x8210c5c0`,
-  ACV `0x820c6090` (`0x82d0eee0` was a thunk). ACV `ch_env/*_env.msb` use the **plain** `msb::MAGIC` (0x00989A6A), not VD's
-  `MAGIC_ENV` (0x00989A6C), so `env::read` rejects all 37 of them even though `msbdump` reads the
-  same EVENT header/kinds (100 light, 101 scene, 102 wind, 103 rain, 400 BGM); relax the magic
-  check and verify the type-100/101 payloads against ACV before using `env.rs`. Also open:
+  ACV `0x820c6090` (`0x82d0eee0` was a thunk). ACV `ch_env/*_env.msb` use the **plain**
+  `msb::MAGIC` (0x00989A6A), not VD's `MAGIC_ENV` (0x00989A6C). `env::read` now accepts both;
+  it parses ACV's EVENT table and BGM (`env::tests::acv_env_from_mission_binder`: m0300 has 50
+  events, BGM 103/1001), but ACV type-100/101 payloads are packed byte fields, not VD's f32
+  light/scene blocks, so `Env.lights`/`scene` stay empty for ACV; decoding those packed blocks
+  is open. Also open:
   HNAV/HTR, the `.mtd` binders, and the loaders for the `_m.mlb`-only folders
   m0650/m1000/m5000/m5001.
 - **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), the per-enemy target lock-on HUD cursor (one pooled 256×128 `sortie.drb` box per enemy in the FCS cone, up to 8; text/bars/pips only on the FCS-selected target, `MissileLock1..6`), and Scan Mode / Target Scan / Recon Units (`ACV_ScanModeLockSight`, `ACV_Scan_Cur_EnemyParamInfo`, `ACV_MapScan_ReconInfo*`) are now in (see Done). Retail lock-cursor appearance/rule confirmed from the build instead of a sortie capture: `sortie.drb` authors every element (`LockOnText` msg 2313, `MissileLock1..6`, `EnemyName`/`EnemyAP`, and the 32x32 `_Target` with `LockColor1st` `0x006680ff` / `LockColor2nd` `0xff4000ff`); `0x829d4a90` bakes those color defaults and `0x829d4b88` overrides them from the dialog's named colors. `0x829d4558` -> `0x829d30e0` draws each wing only when the candidate's `+0` lock flag or `i16 +2` missile-lock count is set and `+1` or `f32 +4` >= 1.0; `0x829d1a10` shows `MissileLock1..n` from `i16 +2`, `0x829d1ac0` fills `CursorLine` from `f32 +4`. The Xenia runs drew no cursor because the tanks sat outside the FCS sight cone (aim), not because of a missing code path; the `_Target` 1st/2nd selection is the authored two-sprite dialog read through that candidate state.
