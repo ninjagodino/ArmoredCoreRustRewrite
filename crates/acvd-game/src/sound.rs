@@ -38,13 +38,14 @@ const BOOST_ON: &str = "b00000000";
 /// `main_boost03_hicut` layer, automated by the authored speed envelopes. The old single-layer
 /// `b00000010` (`main_boost11`, -18 dB) is not it.
 const BOOST_SUSTAIN: &str = "b00000003";
-/// Horizontal speed (m/tick) where the FEV `speed` axis reaches 1.0. `0x8289a138` lerps `cur`
-/// 10% per 60 Hz tick toward the speed target, sends `cur * 216.0000153` (`0x8200D0A0`) as the
-/// parameter value, and the FEV parameter max is 150; the target is the horizontal speed over
-/// 450 km/h (probed: starter AC boost 117.9 km/h -> 0.262, high boost 251.3 -> 0.555).
-/// `velocity` is m/tick and 216 km/h is 1 m/tick (`AcCtrlParam::calculate`), so
-/// `x = v_kmh * 216 / (450 * 150) = v_tick * 216 * 216 / (450 * 150)`.
-const SPEED_AXIS_FULL_TICK: f32 = 450.0 * 150.0 / (216.0 * 216.0);
+/// Speed (m/tick) where the FEV `speed` axis reaches 1.0. The writer `0x82892f08`
+/// (LR `0x82892fa4`) sets `AcSfxCtrl+0x11c` to `|velocity| / 60` from the AC velocity
+/// provider (owner+0x738 slot 0x2c); the update `0x8289a138` lerps `cur` 10% per 60 Hz tick
+/// toward it and sends `cur * 216.0000153` (`0x8200D0A0`, km/h) on a 150-max FEV parameter.
+/// So the envelope axis is `cur * 216 / 150 = cur * 1.44` and full scale is 150 km/h =
+/// `150/216` m/tick. Probed boost target 0.26299 m/tick -> axis 0.3787, matching the retail
+/// capture's 0.377.
+const SPEED_AXIS_FULL_TICK: f32 = 150.0 / 216.0;
 /// `AcSfxCtrl` slot +0x40 plays both (`boost_on06` + `boost11`, and `quick_boost03`): high boost.
 const QUICK_BOOST: [&str; 2] = ["b00000007", "b00000008"];
 /// `AcSfxCtrl` slots +0x30 / +0x3c (`dash00` + `boost_on06`), taken as the glide start; not traced
@@ -1074,9 +1075,10 @@ fn motion(
 }
 
 /// Advances the boost sustain mix every frame. The 360 `AcSfxCtrl` update (`0x8289a138`)
-/// lerps its speed target toward `horizontal speed / 450 km/h` by 10% per 60 Hz tick and
-/// sends `target * 216` on the FEV `speed` parameter, whose max is 150, so the envelope axis
-/// is `v * 216 * 216 / (450 * 150)` (`SPEED_AXIS_FULL_TICK`). Each voice's gain is its base
+/// lerps its speed target by 10% per 60 Hz tick; the target is written by `0x82892f08`
+/// (`AcSfxCtrl+0x11c` = `|velocity| / 60`, m/tick) and the update sends `target * 216`
+/// (km/h) on the FEV `speed` parameter, whose max is 150, so the envelope axis is
+/// `target * 1.44` (`SPEED_AXIS_FULL_TICK`). Each voice's gain is its base
 /// gain times the authored envelopes sampled there, times the event's 3D distance gain: the
 /// FEV `b00000003` is a 3D event with a 0..50 m linear rolloff and the follow camera sits
 /// 16-21 m out (`sheets/camera_follow.csv`), so the sustain is 0.58-0.68 of its authored
@@ -1098,7 +1100,7 @@ fn update_sfx_mix(
         .unwrap_or(pilot_transform.translation);
     let distance = listener.distance(pilot_transform.translation);
     listener_distance.0 = distance;
-    let target = (pilot.velocity.with_y(0.0).length() / SPEED_AXIS_FULL_TICK).clamp(0.0, 1.0);
+    let target = (pilot.velocity.length() / SPEED_AXIS_FULL_TICK).clamp(0.0, 1.0);
     // `cur += 0.1 * (target - cur)` at 60 Hz in the 360, expressed for the frame delta.
     let alpha = 1.0 - 0.9f32.powf(60.0 * time.delta_secs());
     for (mut sink, mut mix) in &mut sinks {
@@ -1186,17 +1188,18 @@ mod tests {
         assert_eq!(mix_gain(&[], 0.7), 1.0);
     }
 
-    /// The FEV `speed` axis the 360 feeds `b00000003`: `0x8289a138` sends `cur * 216` on a    /// 150-wide parameter where `cur` is the horizontal speed over 450 km/h, so the axis is
-    /// `cur * 1.44`. Checked against the probed targets for the starter AC (`sheets` preset
-    /// 5010: boost 117.9 km/h -> cur 0.262, high boost 251.3 -> cur 0.555) and its computed
-    /// top speeds.
+    /// The FEV `speed` axis the 360 feeds `b00000003`: the writer `0x82892f08` (LR
+    /// `0x82892fa4`) sets `AcSfxCtrl+0x11c` to `|velocity| / 60` (m/tick) and `0x8289a138`
+    /// sends `cur * 216` (km/h) on a 150-max parameter, so the axis is `cur * 216 / 150`.
+    /// The boost probe (`private/xenia/speed_int.jsonl`, setter `0x82899028`) measured
+    /// 0.26299 m/tick -> 0.3787, the retail capture's 0.377.
     #[test]
     fn boost_speed_axis_matches_360_parameter() {
         let axis = |v_tick: f32| (v_tick / SPEED_AXIS_FULL_TICK).clamp(0.0, 1.0);
-        // Probed target * 1.44 (`0x8200D0A0` / FEV max 150).
-        assert!((axis(117.9 / 216.0) - 0.262 * 1.44).abs() < 2e-3);
-        assert!((axis(251.3 / 216.0) - 0.555 * 1.44).abs() < 6e-3);
-        // FMOD clamps the normalized parameter at 1.0.
+        assert!((axis(0.26299) - 0.3787).abs() < 1e-3);
+        assert!((axis(0.555) - 0.7992).abs() < 2e-3);
+        // Full scale is 150 km/h = 150/216 m/tick; FMOD clamps the normalized parameter.
+        assert!((axis(150.0 / 216.0) - 1.0).abs() < 1e-6);
         assert_eq!(axis(400.0 / 216.0), 1.0);
     }
 
@@ -1341,8 +1344,9 @@ mod tests {
 
     /// The `FMOD ParamEQ` of `b00000003` layer 0, mapped from its normalized FEV curves onto
     /// the 360 DSP parameter ranges (`0x8374de50`): center 20..22000 Hz, 0.2..5.0 octaves,
-    /// linear gain 0.05..3.0. At the retail-capture speed (`~118 km/h`, axis 0.377) the filter
-    /// is ~unity, which is why the captured RMS matched the dry mix; at full speed it is +2.4 dB.
+    /// linear gain 0.05..3.0. At the retail-capture speed (axis 0.377 = 0.263 m/tick,
+    /// 56.8 km/h) the filter is ~unity, which is why the captured RMS matched the dry mix;
+    /// at full speed it is +2.4 dB.
     #[test]
     fn boost_param_eq_uses_the_360_dsp_ranges() {
         let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);

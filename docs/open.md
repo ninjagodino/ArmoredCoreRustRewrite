@@ -522,19 +522,15 @@ in order:
   `lang/en/text/ai/aisys.fmg` and shows the line for the FSB clip length (`Cues::com_voice_seconds`).
 
 - **Booster sound mix follow-ups** (`acvd-game::sound`, `sheets/sound_cues.csv`): the sustain
-  `b00000003` follows the 360 `AcSfxCtrl` speed path (`0x8289a138`: target +0x11c lerped 10%
-  per 60 Hz tick into +0x120, FMOD `speed` = cur*216 on a 150-wide FEV parameter, envelope
-  axis cur*1.44; probed starter AC boost 117.9 km/h -> 0.262, high boost 251.3 -> 0.555, i.e.
-  cur = km/h / 450) and the authored 3D linear rolloff (mode `0x0408_0010`, 0..50 m at the
-  16-21 m follow camera -> 0.58-0.68, matching the 0.6 retail-capture ratio in archive).
-  The booster one-shots carry their own ranges and use the same gain at spawn: b00000000
-  0..100, b00000006 0..240, b00000008 0..200, while b00000007 is 2D (`0x0018_0008`) and stays
-  at unity. The layer-0 `FMOD ParamEQ` is applied on the same speed axis (center + octave
-  range + linear gain mapped onto the 360 DSP ranges `0x8374de50`, ~0 dB at the capture speed
-  and +2.4 dB at full speed). Remaining: weapon and world 3D cues are still non-positional
-  (they need per-emitter positions); the +0x11c writer
-  is still untraced (no scalar store tied to the player AcSfxCtrl at owner+0x734, VMX128
-  stores invisible to `acvd-index`), so 450 km/h is inferred from the
-  starter AC top speeds (0.6% low on high boost). Confirm with a second AC or the garage
-  speed stat, and probe whether +0x11c is nonzero while walking with boost OFF (the 360
-  starts b00000003 whenever cur*216 > 0.001; the rewrite gates it on boost/kick/blade dash).
+  `b00000003` follows the 360 `AcSfxCtrl` speed path and the authored 3D linear rolloff (mode
+  `0x0408_0010`, 0..50 m at the 16-21 m follow camera -> 0.58-0.68, matching the 0.6 retail
+  capture ratio in archive). The speed target is now traced: `0x82892f08` (LR `0x82892fa4`)
+  feeds `AcSfxCtrl+0x11c` = `|v| / 60` (m/tick) through the one-instruction setter
+  `0x82899028` (vtable `0x82098c88` slot +0x4), and `0x8289a138` sends `cur*216` km/h on the
+  150-max FEV `speed` parameter, so the envelope axis is `cur*1.44` (old 450 km/h inference
+  corrected; see Done "Booster speed-target writer"). Walking with boost OFF leaves +0x11c
+  at 0 and never calls the setter (`private/xenia/speed_int.jsonl`), so the boost gate is
+  correct. The layer-0 `FMOD ParamEQ` is applied on the same axis (center + octave range +
+  linear gain mapped onto the 360 DSP ranges `0x8374de50`, ~0 dB at the capture speed and
+  +2.4 dB at full speed). Remaining: weapon and world 3D cues are still non-positional (they
+  need per-emitter positions).
