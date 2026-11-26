@@ -529,10 +529,12 @@ in order:
   axis cur*1.44; probed starter AC boost 117.9 km/h -> 0.262, high boost 251.3 -> 0.555, i.e.
   cur = km/h / 450) and the authored 3D linear rolloff (mode `0x0408_0010`, 0..50 m at the
   16-21 m follow camera -> 0.58-0.68, matching the 0.6 retail-capture ratio in archive).
-  Remaining: the other 3D one-shots (b00000000 0..100, b00000006 0..240, b00000008 0..200)
-  still play without `falloff_gain`; the ParamEQ DSP envelopes on b00000003 are not applied;
-  the +0x11c writer is still untraced (no scalar store tied to the player AcSfxCtrl at
-  owner+0x734, VMX128 stores invisible to `acvd-index`), so 450 km/h is inferred from the
+  The booster one-shots carry their own ranges and use the same gain at spawn: b00000000
+  0..100, b00000006 0..240, b00000008 0..200, while b00000007 is 2D (`0x0018_0008`) and stays
+  at unity. Remaining: the ParamEQ DSP envelopes on b00000003 are not applied; weapon and
+  world 3D cues are still non-positional (they need per-emitter positions); the +0x11c writer
+  is still untraced (no scalar store tied to the player AcSfxCtrl at owner+0x734, VMX128
+  stores invisible to `acvd-index`), so 450 km/h is inferred from the
   starter AC top speeds (0.6% low on high boost). Confirm with a second AC or the garage
   speed stat, and probe whether +0x11c is nonzero while walking with boost OFF (the 360
   starts b00000003 whenever cur*216 > 0.001; the rewrite gates it on boost/kick/blade dash).

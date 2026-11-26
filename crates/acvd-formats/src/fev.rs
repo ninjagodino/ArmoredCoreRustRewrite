@@ -493,6 +493,9 @@ mod tests {
         assert!(!quick.is_3d());
         assert_eq!(quick.distance_gain(500.0), 1.0);
         assert!(project.event("b00000008").unwrap().is_3d());
+        // One-shot 3D ranges used by the boost start / glide / high boost cues.
+        assert!((project.event("b00000006").unwrap().max_distance - 240.0).abs() < 1e-3);
+        assert!((project.event("b00000008").unwrap().max_distance - 200.0).abs() < 1e-3);
         assert_eq!(speed.mix.len(), 2);
         assert_eq!(speed.mix[0].param, 0);
         assert_eq!(speed.mix[0].sounds.len(), 2);

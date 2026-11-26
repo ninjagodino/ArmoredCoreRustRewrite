@@ -66,6 +66,11 @@ struct SfxMix {
     distance: (f32, f32),
 }
 
+/// Listener (follow camera) to player AC distance in metres, the input the FEV 3D rolloff
+/// uses. `update_sfx_mix` refreshes it every frame; one-shots read it at spawn.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+struct ListenerDistance(f32);
+
 /// Piecewise-linear envelope sample, clamped to the first/last point.
 fn envelope_at(points: &[(f32, f32)], x: f32) -> f32 {
     let Some(&(first_x, first_y)) = points.first() else {
@@ -149,10 +154,30 @@ impl Cues {
         cue: &str,
         looping: bool,
     ) -> Vec<Entity> {
+        self.play_at(commands, assets, cue, looping, None)
+    }
+
+    /// One-shot (or looping) cue with the authored 3D rolloff sampled at `distance` metres.
+    /// Only pass a distance for events whose emitter is the player AC (booster cues); weapon
+    /// and world cues have their own emitter positions and stay non-positional for now.
+    fn play_at(
+        &mut self,
+        commands: &mut Commands,
+        assets: &mut Assets<AudioSource>,
+        cue: &str,
+        looping: bool,
+        distance: Option<f32>,
+    ) -> Vec<Entity> {
         let found: Option<(Vec<fev::Wave>, f32, AudioBus)> =
             self.projects.iter().find_map(|(p, bus)| {
-                p.event(cue)
-                    .map(|e| (p.waves(cue).into_iter().cloned().collect(), e.volume, *bus))
+                p.event(cue).map(|e| {
+                    let gain = distance.map_or(1.0, |d| e.distance_gain(d));
+                    (
+                        p.waves(cue).into_iter().cloned().collect(),
+                        e.volume * gain,
+                        *bus,
+                    )
+                })
             });
         let Some((waves, volume, bus)) = found else {
             if self.missing.insert(cue.to_string()) {
@@ -472,6 +497,7 @@ impl Plugin for SoundPlugin {
         };
         app.insert_resource(Cues::load(&self.disc))
             .insert_resource(bgm)
+            .init_resource::<ListenerDistance>()
             .add_systems(Startup, sync_initial_bus_volumes)
             .add_systems(
                 Update,
@@ -671,6 +697,7 @@ fn motion(
     mut cues: ResMut<Cues>,
     mut assets: ResMut<Assets<AudioSource>>,
     piloting: Res<Piloting>,
+    listener: Res<ListenerDistance>,
     pilots: Query<&Pilot>,
     anim: Option<Res<crate::pose::Motion>>,
     mut heard: Local<Heard>,
@@ -695,12 +722,18 @@ fn motion(
     }
     if pilot.quick_boosts != heard.quick_boosts || pilot.kicks_started != heard.kicks {
         for cue in QUICK_BOOST {
-            cues.play(&mut commands, &mut assets, cue, false);
+            cues.play_at(&mut commands, &mut assets, cue, false, Some(listener.0));
         }
     }
     let wall_jumped = pilot.wall_jumps != heard.wall_jumps;
     if pilot.glide && !heard.glide {
-        cues.play(&mut commands, &mut assets, GLIDE_ON, false);
+        cues.play_at(
+            &mut commands,
+            &mut assets,
+            GLIDE_ON,
+            false,
+            Some(listener.0),
+        );
     }
     (
         heard.glide,
@@ -717,7 +750,13 @@ fn motion(
     let moving =
         (pilot.boost || pilot.in_kick() || pilot.in_blade_dash()) && flat.length() > BOOST_MOVING;
     if moving && !heard.moving {
-        cues.play(&mut commands, &mut assets, BOOST_ON, false);
+        cues.play_at(
+            &mut commands,
+            &mut assets,
+            BOOST_ON,
+            false,
+            Some(listener.0),
+        );
     }
     if moving && heard.sustain.is_empty() {
         heard.sustain = cues.play_boost(&mut commands, &mut assets, BOOST_SUSTAIN);
@@ -791,6 +830,7 @@ fn update_sfx_mix(
     time: Res<Time>,
     pilots: Query<(&Pilot, &Transform)>,
     cameras: Query<&Transform, (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
+    mut listener_distance: ResMut<ListenerDistance>,
     mut sinks: Query<(&mut AudioSink, &mut SfxMix)>,
 ) {
     let Ok((pilot, pilot_transform)) = pilots.single() else {
@@ -802,6 +842,7 @@ fn update_sfx_mix(
         .map(|camera| camera.translation)
         .unwrap_or(pilot_transform.translation);
     let distance = listener.distance(pilot_transform.translation);
+    listener_distance.0 = distance;
     let target = (pilot.velocity.with_y(0.0).length() / SPEED_AXIS_FULL_TICK).clamp(0.0, 1.0);
     // `cur += 0.1 * (target - cur)` at 60 Hz in the 360, expressed for the frame delta.
     let alpha = 1.0 - 0.9f32.powf(60.0 * time.delta_secs());
@@ -904,6 +945,56 @@ mod tests {
         assert_eq!(falloff_gain(80.0, range), 0.0);
         // 2D voices (the quick-boost pair's `b00000007`) and events without a range are unity.
         assert_eq!(falloff_gain(500.0, (0.0, 0.0)), 1.0);
+    }
+
+    /// The booster one-shots carry their own authored 3D ranges: b00000000 0..100 m (boost
+    /// start), b00000006 0..240 (glide), b00000008 0..200 (high boost), while b00000007 is 2D.
+    /// `play_at` must fold `Event::distance_gain` into the spawn volume.
+    #[test]
+    fn boost_one_shots_apply_the_authored_3d_falloff() {
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        let Ok(disc) = Disc::open(&iso) else { return };
+        let mut app = App::new();
+        app.insert_resource(Cues::load(&disc));
+        app.insert_resource(Assets::<AudioSource>::default());
+        app.add_systems(
+            Update,
+            |mut commands: Commands,
+             mut cues: ResMut<Cues>,
+             mut assets: ResMut<Assets<AudioSource>>| {
+                for cue in [BOOST_ON, QUICK_BOOST[0], GLIDE_ON, QUICK_BOOST[1]] {
+                    cues.play_at(&mut commands, &mut assets, cue, false, Some(20.0));
+                }
+            },
+        );
+        app.update();
+        let world = app.world_mut();
+        let mut query = world.query::<&PlaybackSettings>();
+        let mut volumes: Vec<f32> = query
+            .iter(world)
+            .map(|settings| match settings.volume {
+                Volume::Linear(v) => v,
+                _ => panic!("unexpected volume curve"),
+            })
+            .collect();
+        volumes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Sorted: boost_on06 at 0.8, quick_boost03 at 0.9, dash00 + boost_on06 at 1-20/240,
+        // then the 2D high-boost partner's two layers at unity.
+        let expected = [
+            0.467735 * 0.8,
+            0.501187 * 0.9,
+            0.707946 * (1.0 - 20.0 / 240.0),
+            0.707946 * (1.0 - 20.0 / 240.0),
+            0.707946,
+            0.707946,
+        ];
+        assert_eq!(volumes.len(), expected.len(), "{volumes:?}");
+        for (volume, expected) in volumes.iter().zip(expected) {
+            assert!(
+                (volume - expected).abs() < 1e-4,
+                "{volume} != {expected} in {volumes:?}"
+            );
+        }
     }
 
     #[test]
