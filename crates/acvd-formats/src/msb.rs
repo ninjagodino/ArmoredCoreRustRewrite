@@ -11,9 +11,11 @@
 //!
 //! `POINT_PARAM_ST` record: `u32 name, u32 index, u32 kind, u32 kind index, u32 shape,
 //! f32x3 translation, f32x3 rotation (degrees)`. Kinds seen on m4000: 50 water return
-//! (水没復帰), 100 / 101 / 102 operation / warning / caution area (作戦 / 警告 / 注意領域),
-//! 200 start position (AC初期位置 index 0, vs UNAC用のUNAC初期位置 index 1), 1000 ambient sound,
-//! 3000 navigation debug point.
+//! (æ°´æ²¡å¾©å¸°), 100 / 101 / 102 operation / warning / caution area (ä½œæˆ¦ / è­¦å‘Š / æ³¨æ„é åŸŸ),
+//! 200 start position (ACåˆæœŸä½ç½® index 0, vs UNACç”¨ã®UNACåˆæœŸä½ç½® index 1), 1000 ambient sound,
+//! 3000 navigation debug point. An ambient sound point's `+0x44` relative pointer names an
+//! 8-byte `{ s8 category, u8 pad[3], u32 id }` record; category 5 is the `m%08d` event
+//! (`sheets/sound_cues.csv`).
 
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
@@ -34,6 +36,18 @@ pub const POINT_WARNING_AREA: u32 = 101;
 pub const POINT_CAUTION_AREA: u32 = 102;
 /// `POINT_PARAM_ST` kind of a start position.
 pub const POINT_START: u32 = 200;
+/// `POINT_PARAM_ST` kind of an ambient sound emitter (name is the Japanese "environment
+/// sound").
+pub const POINT_AMBIENT_SOUND: u32 = 1000;
+
+/// Sound event named by an ambient sound point's `+0x44` sub-record (`0x828087f8`:
+/// `lbz` category, `lwz` id). `category` indexes the `0x8371c688` format table; 5 is
+/// `m%08d` (`sheets/sound_cues.csv`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AmbientSound {
+    pub category: i8,
+    pub id: u32,
+}
 
 /// Decoded shape payload at `POINT_PARAM_ST +0x38` (`m4000_actest.msb`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -116,6 +130,8 @@ pub struct Point {
     pub shape_data: PointShape,
     pub translation: [f32; 3],
     pub rotation_deg: [f32; 3],
+    /// Sound event of a kind-1000 point (`POINT_AMBIENT_SOUND`).
+    pub ambient: Option<AmbientSound>,
 }
 
 pub fn is_msb(data: &[u8]) -> bool {
@@ -335,6 +351,23 @@ pub fn points(data: &[u8]) -> Result<Vec<Point>> {
                 "MSB point at {off:#x} name offset {name_rel:#x}"
             );
             let shape = r.u32(off + 0x10)?;
+            let kind = r.u32(off + 8)?;
+            let ambient_rel = if off + 0x48 <= data.len() {
+                r.u32(off + 0x44)? as usize
+            } else {
+                0
+            };
+            let ambient = if kind == POINT_AMBIENT_SOUND
+                && ambient_rel > 0
+                && off + ambient_rel + 8 <= data.len()
+            {
+                Some(AmbientSound {
+                    category: r.i8(off + ambient_rel)?,
+                    id: r.u32(off + ambient_rel + 4)?,
+                })
+            } else {
+                None
+            };
             let shape_rel = if off + 0x3C <= data.len() {
                 r.u32(off + 0x38)? as usize
             } else {
@@ -360,12 +393,13 @@ pub fn points(data: &[u8]) -> Result<Vec<Point>> {
                 name: r
                     .cstr_sjis(off + name_rel)
                     .with_context(|| format!("MSB point at {off:#x}"))?,
-                kind: r.u32(off + 8)?,
+                kind,
                 kind_index: r.u32(off + 0x0C)?,
                 shape,
                 shape_data,
                 translation: vec3(&r, off + 0x14)?,
                 rotation_deg: vec3(&r, off + 0x20)?,
+                ambient,
             })
         })
         .collect()
@@ -477,6 +511,40 @@ mod tests {
                 depth: 850.0,
                 height: 175.0
             }
+        );
+        let ambient: Vec<_> = actest_points
+            .iter()
+            .filter(|p| p.kind == POINT_AMBIENT_SOUND)
+            .collect();
+        assert_eq!(ambient.len(), 3);
+        assert_eq!(
+            ambient
+                .iter()
+                .filter(|p| p.ambient
+                    == Some(AmbientSound {
+                        category: 5,
+                        id: 2010
+                    }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            ambient
+                .iter()
+                .filter(|p| p.ambient
+                    == Some(AmbientSound {
+                        category: 5,
+                        id: 2002
+                    }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            ambient
+                .iter()
+                .filter(|p| p.shape_data == PointShape::Sphere { radius: 550.0 })
+                .count(),
+            2
         );
         let caution_area = actest_points
             .iter()

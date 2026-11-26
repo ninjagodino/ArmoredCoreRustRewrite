@@ -500,6 +500,79 @@ pub fn start(disc: &Disc, map: &str, layout: Option<&str>) -> Result<Option<Star
     Ok(None)
 }
 
+/// One ambient sound emitter from a placement MSB: `POINT_PARAM_ST` kind 1000.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MapAmbient {
+    /// `0x8371c688` category (5 = `m%08d`).
+    pub category: i8,
+    pub id: u32,
+    /// Bevy-space point (360 X mirrored).
+    pub position: Vec3,
+}
+
+/// Ambient sound emitters of the map's active placement MSB (`{map}_{layout}.msb`, else
+/// `{map}.msb`; the terrain `{map}_map.msb` has none). The 360 scene activation
+/// `0x82808bd0` calls `0x828087f8` for each loaded map resource, which reads the point's
+/// `+0x44` sub-record (`s8 category`, `u32 id`) and starts the event positionally
+/// (`sheets/sound_cues.csv`).
+pub fn ambient_points(disc: &Disc, map: &str, layout: Option<&str>) -> Result<Vec<MapAmbient>> {
+    let mut placement = None;
+    if let Some(l) = layout {
+        let path = format!("{}/{map}_{l}.msb", folder(map));
+        if disc.exists(&path) {
+            placement = Some(path);
+        }
+    }
+    if placement.is_none() {
+        let path = format!("{}/{map}.msb", folder(map));
+        if disc.exists(&path) {
+            placement = Some(path);
+        }
+    }
+    let Some(path) = placement else {
+        return Ok(Vec::new());
+    };
+    let points = msb::points(&vfs::open(disc, &path)?)?;
+    Ok(points
+        .iter()
+        .filter_map(|p| {
+            let sound = p.ambient?;
+            let [x, y, z] = p.translation;
+            Some(MapAmbient {
+                category: sound.category,
+                id: sound.id,
+                position: Vec3::new(-x, y, z),
+            })
+        })
+        .collect())
+}
+
+/// `MapSe` project id of a map, from the mission XML `<Map>`/`<MapSe>` blocks
+/// (`sheets/sound_cues.csv`). The 360 loads `sound/acv2_se_map%03d.fev` (`0x82b4a530`).
+pub fn sound_project(map: &str) -> Option<u32> {
+    Some(match map {
+        "m3100" | "m3101" | "m3103" | "m3104" | "m3106" | "m3107" | "m3110" | "m3120" | "m3121"
+        | "m3130" => 310,
+        "m3105" => 311,
+        "m3200" | "m3201" | "m3202" | "m3203" | "m3205" | "m3210" | "m3220" => 320,
+        "m3230" | "m3231" => 322,
+        "m3300" | "m3301" | "m3302" | "m3303" | "m3304" | "m3306" | "m3310" | "m3311" => 330,
+        "m3320" | "m3330" => 331,
+        "m3400" | "m3401" | "m3402" | "m3403" => 340,
+        "m3410" | "m3411" | "m3420" | "m3430" => 341,
+        "m3500" | "m3501" | "m3510" => 350,
+        "m3520" | "m3521" | "m3522" | "m3523" => 351,
+        "m3524" => 353,
+        "m3530" => 352,
+        "m3600" | "m3601" | "m3602" | "m3603" | "m3621" => 360,
+        "m3610" | "m3620" | "m3630" => 361,
+        "m3700" | "m3710" | "m3711" | "m3730" | "m3740" => 370,
+        "m3720" | "m3721" | "m3750" => 371,
+        "m4000" => 600,
+        _ => return None,
+    })
+}
+
 /// A map's drawn parts; children carry the meshes.
 #[derive(Component)]
 pub struct MapPart;
@@ -848,12 +921,11 @@ pub fn step_aircraft(
         let Some(fx) = fx else {
             continue;
         };
-        for fired in crate::pose::crossed_events(&fx.timeline, prev, anim.frame, frames, anim.looping)
+        for fired in
+            crate::pose::crossed_events(&fx.timeline, prev, anim.frame, frames, anim.looping)
         {
             let crate::pose::TaeFired::Ffx {
-                ffx_id,
-                dummy_id,
-                ..
+                ffx_id, dummy_id, ..
             } = fired
             else {
                 continue;
@@ -865,8 +937,8 @@ pub fn step_aircraft(
                 continue;
             };
             let position = Vec3::new(-sock.position[0], sock.position[1], sock.position[2]);
-            let forward = Vec3::new(-sock.forward[0], sock.forward[1], sock.forward[2])
-                .normalize_or(Vec3::Z);
+            let forward =
+                Vec3::new(-sock.forward[0], sock.forward[1], sock.forward[2]).normalize_or(Vec3::Z);
             commands.spawn((
                 sfx::Sfx::new(ffx_id),
                 Transform::from_translation(position)
@@ -1975,6 +2047,33 @@ mod tests {
     }
 
     #[test]
+    fn ambient_points_load_from_the_active_placement_msb() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let actest = ambient_points(&disc, "m4000", Some("actest")).unwrap();
+        assert_eq!(actest.len(), 3);
+        assert_eq!(
+            actest.iter().filter(|p| p.id == 2010).count(),
+            2,
+            "m4000_actest war ambience"
+        );
+        let honoo = actest.iter().find(|p| p.id == 2002).unwrap();
+        assert_eq!(honoo.category, 5);
+        assert!((honoo.position.x - 581.540_47).abs() < 1e-3);
+        assert!((honoo.position.y - 14.876).abs() < 1e-3);
+        assert!((honoo.position.z - 851.438_54).abs() < 1e-3);
+        let arena = ambient_points(&disc, "m3202", Some("arena")).unwrap();
+        assert_eq!(arena.len(), 15);
+        assert_eq!(sound_project("m4000"), Some(600));
+        assert_eq!(sound_project("m3524"), Some(353));
+        assert_eq!(sound_project("m9100"), None);
+    }
+
+    #[test]
     fn water_return_points_load_from_m4000_and_pick_nearest() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -2037,12 +2136,11 @@ mod tests {
         let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
             return;
         };
-        let (list, rig) = acvd_render::rigged_model(
-            &disc,
-            "model/obj/o9341/o9341_m.bnd.dcx|o9341.flv",
-            &|_| acvd_render::RootPlace::IDENTITY,
-        )
-        .unwrap();
+        let (list, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9341/o9341_m.bnd.dcx|o9341.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
         let route = root_mesh_route(&rig, &list).expect("o9341 is skinned to the root bone");
         assert!(rig.bones[route].name.eq_ignore_ascii_case("body"));
         let mut bank = EnemyAnimBank::load_object(&disc, "o9341", &rig);
@@ -2069,9 +2167,18 @@ mod tests {
         let bomber = tae::read(&vfs::open(&disc, "tae/obj/o9330/own000100.tae").unwrap()).unwrap();
         let flight = bomber.animation(210).expect("o9330 flight timeline");
         let effects: Vec<(i32, u8)> = flight.events.iter().filter_map(|e| e.as_ffx()).collect();
-        assert!(effects.contains(&(5709, 150)), "o9330 flight trail dummy 150");
-        assert!(effects.contains(&(5710, 170)), "o9330 flight trail dummy 170");
-        assert!(effects.contains(&(7510, 171)), "o9330 flight burst dummy 171");
+        assert!(
+            effects.contains(&(5709, 150)),
+            "o9330 flight trail dummy 150"
+        );
+        assert!(
+            effects.contains(&(5710, 170)),
+            "o9330 flight trail dummy 170"
+        );
+        assert!(
+            effects.contains(&(7510, 171)),
+            "o9330 flight burst dummy 171"
+        );
         let fired = crate::pose::crossed_events(&flight, 80.0, 100.0, 1800.0, true);
         assert!(
             fired.iter().any(|e| matches!(
@@ -2085,23 +2192,23 @@ mod tests {
             "crossing frame 93 fires 5710 on dummy 170"
         );
         let startup = bomber.animation(1000).expect("o9330 startup timeline");
-        assert!(startup.events.iter().filter_map(|e| e.as_ffx()).any(|(id, d)| id == 4083 && d == 160));
+        assert!(startup
+            .events
+            .iter()
+            .filter_map(|e| e.as_ffx())
+            .any(|(id, d)| id == 4083 && d == 160));
 
-        let (_, rig) = acvd_render::rigged_model(
-            &disc,
-            "model/obj/o9330/o9330_m.bnd.dcx|o9330.flv",
-            &|_| acvd_render::RootPlace::IDENTITY,
-        )
-        .unwrap();
+        let (_, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9330/o9330_m.bnd.dcx|o9330.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
         let socket = rig
             .effects
             .iter()
             .find(|e| e.id == 170)
             .expect("o9330 dummy 170");
-        assert_eq!(
-            rig.bones[socket.bone.expect("dummy bone")].name,
-            "bauntbox"
-        );
+        assert_eq!(rig.bones[socket.bone.expect("dummy bone")].name, "bauntbox");
 
         // The flying-wing bomber's clip timelines carry no FFX events.
         let wing = tae::read(&vfs::open(&disc, "tae/obj/o9341/own000100.tae").unwrap()).unwrap();

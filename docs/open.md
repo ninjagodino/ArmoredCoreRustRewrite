@@ -579,6 +579,12 @@ in order:
   `LogAI` state names; no sheet yet).
 
 
+- **Map ambient combat noise** done: placement-MSB `POINT_PARAM_ST` kind-1000 points now
+  start looping positional `m%08d` events from the mission `<MapSe>` project
+  (`acvd-game::sound::ambient_map`, `acvd-game::map::ambient_points`, `msb::Point::ambient`,
+  see Done). Remaining: m00002011 exists only in projects 109/330/331/353/361 and
+  m00004404 in none, so those authored points are silent; box-shape (kind 5) points play as
+  point emitters because the 360's box branch only changes the FMOD area attributes.
 - **COM / operator voice follow-ups** (`acvd-game::voice`, `garage`, `sheets/voice.csv`): the
   slider walks OFF, the on-disc Type 1..5 packs (`acv2_voice_com_00..04.fev`), then any user
   packs saved from Options > Sound > `+ ADD CUSTOM COM VOICE` (modal pack name + one

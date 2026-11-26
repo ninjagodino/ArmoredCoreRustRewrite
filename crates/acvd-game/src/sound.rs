@@ -87,6 +87,16 @@ struct SfxMix {
     eq: Option<EqVoice>,
 }
 
+/// A looping map ambient emitter (`POINT_PARAM_ST` kind 1000). `base` is the FEV event
+/// volume; [`update_ambient`] scales it by the live SFX bus volume and the event's 3D
+/// rolloff from the follow camera to `position`.
+#[derive(Component, Debug, Clone)]
+struct AmbientMix {
+    base: f32,
+    distance: (f32, f32),
+    position: Vec3,
+}
+
 /// The authored ParamEQ curves plus the live filter state the audio thread reads.
 #[derive(Debug, Clone)]
 struct EqVoice {
@@ -295,6 +305,8 @@ fn mix_gain(curves: &[Vec<(f32, f32)>], x: f32) -> f32 {
 pub struct Cues {
     disc: Disc,
     projects: Vec<(fev::Project, AudioBus)>,
+    /// FEV stems already loaded into `projects` (map projects arrive per sortie).
+    loaded_projects: HashSet<String>,
     /// Lazily loaded COM voice projects, keyed by pack index (`1..=5` → `acv2_voice_com_00..04`).
     voices: HashMap<u8, fev::Project>,
     banks: HashMap<String, fsb::Bank>,
@@ -312,6 +324,7 @@ pub struct Cues {
 impl Cues {
     fn load(disc: &Disc) -> Self {
         let mut projects = Vec::new();
+        let mut loaded_projects = HashSet::new();
         for (name, bus) in [
             ("acv2_se_weapon.fev", AudioBus::Sfx),
             ("acv2_se_bombs.fev", AudioBus::Sfx),
@@ -325,13 +338,17 @@ impl Cues {
                 .read(&format!("sound/{name}"))
                 .and_then(|b| fev::read(&b))
             {
-                Ok(project) => projects.push((project, bus)),
+                Ok(project) => {
+                    projects.push((project, bus));
+                    loaded_projects.insert(name.trim_end_matches(".fev").to_string());
+                }
                 Err(err) => eprintln!("sound: {err:#}"),
             }
         }
         Self {
             disc: disc.clone(),
             projects,
+            loaded_projects,
             voices: HashMap::new(),
             banks: HashMap::new(),
             decoded: HashMap::new(),
@@ -350,6 +367,35 @@ impl Cues {
 
     pub(crate) fn set_listener(&mut self, listener: Vec3) {
         self.listener = listener;
+    }
+
+    pub(crate) fn sfx_volume(&self) -> f32 {
+        self.sfx_volume
+    }
+
+    /// Loads `sound/{name}.fev` once. Map ambient projects are loaded on sortie, not at boot
+    /// (`0x82b4a530` loads `se_map%03d` from the scene's +0x1b0).
+    fn ensure_project(&mut self, name: &str, bus: AudioBus) -> bool {
+        if self.loaded_projects.contains(name) {
+            return true;
+        }
+        match self
+            .disc
+            .read(&format!("sound/{name}.fev"))
+            .and_then(|b| fev::read(&b))
+        {
+            Ok(project) => {
+                self.projects.push((project, bus));
+                self.loaded_projects.insert(name.to_string());
+                true
+            }
+            Err(err) => {
+                if self.missing.insert(name.to_string()) {
+                    eprintln!("sound: {err:#}");
+                }
+                false
+            }
+        }
     }
 
     fn play(
@@ -414,6 +460,65 @@ impl Cues {
     ) -> Vec<Entity> {
         let distance = self.listener.distance(position);
         self.play_at(commands, assets, cue, looping, Some(distance))
+    }
+
+    /// Starts one looping map ambient emitter. `0x828087f8` builds the cue from the point's
+    /// `+0x44` record and creates a positional event instance (`0x82b46e98` sphere/cylinder,
+    /// `0x82b46fb0` box) at the point translation; the event's authored FEV rolloff mixes it
+    /// against the listener every frame ([`update_ambient`]).
+    fn play_ambient(
+        &mut self,
+        commands: &mut Commands,
+        assets: &mut Assets<AudioSource>,
+        cue: &str,
+        position: Vec3,
+    ) -> Vec<Entity> {
+        let found = self.projects.iter().find_map(|(project, bus)| {
+            let event = project.event(cue)?;
+            Some((
+                project.waves(cue).into_iter().cloned().collect::<Vec<_>>(),
+                event.volume,
+                if event.is_3d() {
+                    (event.min_distance, event.max_distance)
+                } else {
+                    (0.0, 0.0)
+                },
+                *bus,
+            ))
+        });
+        let Some((waves, volume, distance, bus)) = found else {
+            if self.missing.insert(cue.to_string()) {
+                eprintln!("sound: no ambient cue {cue}");
+            }
+            return Vec::new();
+        };
+        let bus_vol = match bus {
+            AudioBus::Sfx => self.sfx_volume,
+            AudioBus::Ui => self.ui_volume,
+        };
+        let gain = falloff_gain(self.listener.distance(position), distance);
+        let settings = PlaybackSettings::LOOP.with_volume(Volume::Linear(bus_vol * volume * gain));
+        let mut spawned = Vec::new();
+        for wave in waves {
+            let Some(handle) = self.source(assets, &wave) else {
+                continue;
+            };
+            spawned.push(
+                commands
+                    .spawn((
+                        AudioPlayer(handle),
+                        settings,
+                        bus,
+                        AmbientMix {
+                            base: volume,
+                            distance,
+                            position,
+                        },
+                    ))
+                    .id(),
+            );
+        }
+        spawned
     }
 
     /// Plays the boost sustain with its authored speed mix: every sound of every layer
@@ -802,6 +907,7 @@ impl Plugin for SoundPlugin {
         app.insert_resource(Cues::load(&self.disc))
             .insert_resource(bgm)
             .init_resource::<ListenerDistance>()
+            .init_resource::<AmbientState>()
             .add_audio_source::<BoostVoice>()
             .add_systems(Startup, sync_initial_bus_volumes)
             .add_systems(
@@ -811,6 +917,8 @@ impl Plugin for SoundPlugin {
                     motion.after(crate::weapons::fire),
                     bgm_update,
                     update_sfx_mix,
+                    ambient_map,
+                    update_ambient,
                 ),
             );
     }
@@ -1217,6 +1325,107 @@ fn falloff_gain(distance: f32, (min_distance, max_distance): (f32, f32)) -> f32 
     ((max_distance - distance) / (max_distance - min_distance)).clamp(0.0, 1.0)
 }
 
+/// The active sortie's map ambient emitters, respawned when the map/layout changes or the
+/// player leaves sortie.
+#[derive(Resource, Default)]
+struct AmbientState {
+    key: Option<(String, Option<String>)>,
+    entities: Vec<Entity>,
+}
+
+/// `0x8371c688` cue-name table, used by the ambient point's category byte (`0x828087f8`).
+fn category_cue(category: i8, id: u32) -> Option<String> {
+    Some(match category {
+        1 => format!("c{id:08}"),
+        2 => format!("a{id:08}"),
+        3 => format!("b{id:08}"),
+        4 => format!("w{id:08}"),
+        5 => format!("m{id:08}"),
+        6 => format!("d{id:08}"),
+        7 => format!("menu_{id:04}"),
+        8 => format!("{id:08}"),
+        11 => format!("c{id:03}"),
+        12 => format!("r{id:03}"),
+        _ => return None,
+    })
+}
+
+/// Loads and starts the sortie map's `POINT_PARAM_ST` kind-1000 emitters. The 360 starts
+/// them from the scene activation (`0x82808bd0` -> `0x828087f8`) and keeps the event
+/// instances for the life of the map; the project is the mission XML `<MapSe>`
+/// (`sound/acv2_se_map%03d.fev`, loaded by `0x82b4a530`). Missing events (e.g. m3524's
+/// 4404) stay silent, as they would on the 360.
+fn ambient_map(
+    mut commands: Commands,
+    mut cues: ResMut<Cues>,
+    mut assets: ResMut<Assets<AudioSource>>,
+    scene: Res<crate::Scene>,
+    mode: Res<crate::garage::Mode>,
+    mut state: ResMut<AmbientState>,
+) {
+    let key = if *mode == crate::garage::Mode::Sortie {
+        scene
+            .map
+            .as_ref()
+            .map(|map| (map.clone(), scene.layout.clone()))
+    } else {
+        None
+    };
+    if key == state.key {
+        return;
+    }
+    stop(&mut commands, &mut state.entities);
+    state.key = key.clone();
+    let Some((map, layout)) = key else {
+        return;
+    };
+    let Some(project) = crate::map::sound_project(&map) else {
+        return;
+    };
+    let project_name = format!("acv2_se_map{project:03}");
+    if !cues.ensure_project(&project_name, AudioBus::Sfx) {
+        return;
+    }
+    let points = match crate::map::ambient_points(&cues.disc, &map, layout.as_deref()) {
+        Ok(points) => points,
+        Err(err) => {
+            eprintln!("sound: {map} ambient points: {err:#}");
+            return;
+        }
+    };
+    let mut emitters = 0;
+    for point in points {
+        let Some(cue) = category_cue(point.category, point.id) else {
+            continue;
+        };
+        let spawned = cues.play_ambient(&mut commands, &mut assets, &cue, point.position);
+        if !spawned.is_empty() {
+            state.entities.extend(spawned);
+            emitters += 1;
+        }
+    }
+    if emitters > 0 {
+        eprintln!("sound: {map} ambient: {emitters} emitters from {project_name}");
+    }
+}
+
+/// Keeps every ambient voice at its authored event volume times the live SFX bus volume and
+/// the FEV 3D rolloff from the follow camera to the emitter point (`0x82b46e98` positional
+/// event attributes).
+fn update_ambient(
+    cues: Res<Cues>,
+    cameras: Query<&Transform, (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
+    mut sinks: Query<(&mut AudioSink, &AmbientMix)>,
+) {
+    let Some(camera) = cameras.iter().next() else {
+        return;
+    };
+    for (mut sink, mix) in &mut sinks {
+        let gain = falloff_gain(camera.translation.distance(mix.position), mix.distance);
+        sink.set_volume(Volume::Linear(mix.base * cues.sfx_volume() * gain));
+    }
+}
+
 fn stop(commands: &mut Commands, entities: &mut Vec<Entity>) {
     for entity in entities.drain(..) {
         commands.entity(entity).try_despawn();
@@ -1585,5 +1794,35 @@ mod tests {
         let boosted_mean = sum / count as f32;
         // The +6 dB state takes effect within the 64-sample refresh.
         assert!((boosted_mean - 2.0 * 0.6366).abs() < 0.05, "{boosted_mean}");
+    }
+
+    #[test]
+    fn map_ambient_events_come_from_the_map_se_project() {
+        assert_eq!(category_cue(5, 2010).as_deref(), Some("m00002010"));
+        assert_eq!(category_cue(12, 7).as_deref(), Some("r007"));
+        assert_eq!(category_cue(0, 1), None);
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        let Ok(disc) = Disc::open(&iso) else {
+            return;
+        };
+        let mut cues = Cues::load(&disc);
+        assert!(cues.ensure_project("acv2_se_map600", AudioBus::Sfx));
+        let project = cues
+            .projects
+            .iter()
+            .find(|(p, _)| p.name == "acv2_se_map600")
+            .map(|(p, _)| p)
+            .expect("map600 project");
+        let war = project.event("m00002010").expect("m00002010 war00");
+        assert!(war.is_3d());
+        assert_eq!(war.min_distance, 0.0);
+        assert_eq!(war.max_distance, 550.0);
+        let waves = project.waves("m00002010");
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].bank, "se_map600");
+        assert!(
+            project.event("m00004404").is_none(),
+            "m3524 id is absent everywhere"
+        );
     }
 }
