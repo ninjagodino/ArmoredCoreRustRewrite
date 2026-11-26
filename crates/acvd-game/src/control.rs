@@ -2946,6 +2946,12 @@ pub fn check_water_return(
     let Some(wy) = water_return.water_height else {
         return false;
     };
+    // Kind-50 points are the only water-return destinations. Maps whose env has a sea-level
+    // water plane but no `POINT_WATER_RETURN` (m3750 Agria/M42: water_height 127, playable
+    // interior at y -1) never return; the old height-only check respawned the AC every frame.
+    if water_return.points.is_empty() {
+        return false;
+    }
     if pos.y + WATER_RETURN_DEPTH >= wy {
         return false;
     }
@@ -4352,6 +4358,34 @@ mod tests {
         assert_eq!(p.yaw, -1.0);
         assert_eq!(p.velocity, Vec3::ZERO);
         assert!(!p.airborne && !p.glide);
+    }
+
+    #[test]
+    fn water_return_skips_maps_without_kind_50_points() {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        let mut p = Pilot::new(ctrl, 0);
+        let wr = crate::map::WaterReturnPoints {
+            points: Vec::new(),
+            water_height: Some(127.0),
+        };
+        let fallback = crate::map::Start {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+        };
+        let ground = Collision::default();
+        // m3750 Agria/M42: env water_height 127, start (375.6, -1.1, 182.3), no kind-50
+        // return points. The dry interior must not respawn the AC every frame.
+        let mut pos = Vec3::new(375.6, -1.1, 182.3);
+        assert!(!check_water_return(
+            &mut p, &mut pos, &wr, fallback, &ground
+        ));
+        assert_eq!(pos, Vec3::new(375.6, -1.1, 182.3));
     }
 
     /// Boosters on hold the AC on the water surface; boosters off let it fall through into the
