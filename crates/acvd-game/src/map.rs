@@ -22,6 +22,7 @@ use anyhow::Result;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::math::Affine3A;
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::*;
 
 use crate::collision::Collision;
@@ -862,6 +863,48 @@ fn aircraft_clip(
         .then_some((clip, speed, looping))
 }
 
+/// Some map-object models (`o9341`) skin every visible vertex to the root bone while the
+/// ANI clip carries the flight route on the `body` bone (FLVER joints: meshes 1-6 are
+/// 100% weighted to `o9330`). In that case the root joint must copy that body transform,
+/// otherwise the mesh stays at the map part's origin. Detect it from the mesh weights so
+/// other aircraft keep their normal body-bone skinning. 360 map-object setup:
+/// `FUN_829ac7a0` builds the TAE/model animation (`FUN_829a9878`/`FUN_829aa288`,
+/// controller vtable `0x820bf6ec`); its ANI player `0x820bf578` copies actor `+0xe4/+0xec`.
+fn root_mesh_route(rig: &acvd_render::Rig, list: &[LoadedMesh]) -> Option<usize> {
+    let mut total = 0usize;
+    let mut rooted = 0usize;
+    for m in list {
+        let Some(VertexAttributeValues::Uint16x4(ix)) =
+            m.mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX)
+        else {
+            continue;
+        };
+        let Some(VertexAttributeValues::Float32x4(w)) =
+            m.mesh.attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT)
+        else {
+            continue;
+        };
+        for (ix, w) in ix.iter().zip(w.iter()) {
+            for k in 0..4 {
+                if w[k] > 0.0 {
+                    total += 1;
+                    if ix[k] == 0 {
+                        rooted += 1;
+                    }
+                }
+            }
+        }
+    }
+    if total == 0 || rooted * 10 < total * 9 {
+        return None;
+    }
+    let route = rig
+        .bones
+        .iter()
+        .position(|b| b.name.eq_ignore_ascii_case("body"))?;
+    (route > 0).then_some(route)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_animated_model(
     cache: &mut HashMap<String, Option<AnimatedModel>>,
@@ -885,7 +928,12 @@ fn load_animated_model(
         let asset = format!("model/obj/{model}/{model}_m.bnd.dcx|{model}.flv");
         match acvd_render::rigged_model(disc, &asset, &|_| acvd_render::RootPlace::IDENTITY) {
             Ok((list, rig)) if !list.is_empty() => {
-                let bank = EnemyAnimBank::load_object(disc, model, &rig);
+                let mut bank = EnemyAnimBank::load_object(disc, model, &rig);
+                if let Some(route) = root_mesh_route(&rig, &list) {
+                    if let Some(bank) = Arc::get_mut(&mut bank) {
+                        bank.root_route = Some(route);
+                    }
+                }
                 if bank.clips.is_empty() {
                     None
                 } else {
@@ -1884,5 +1932,34 @@ mod tests {
         assert!(prop.broken && prop.just_broken && prop.hp == 0.0);
         // Subsequent hits do not re-trigger break.
         assert!(!prop.apply_damage(500.0));
+    }
+
+    #[test]
+    fn root_skinned_bomber_follows_body_route() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let (list, rig) = acvd_render::rigged_model(
+            &disc,
+            "model/obj/o9341/o9341_m.bnd.dcx|o9341.flv",
+            &|_| acvd_render::RootPlace::IDENTITY,
+        )
+        .unwrap();
+        let route = root_mesh_route(&rig, &list).expect("o9341 is skinned to the root bone");
+        assert!(rig.bones[route].name.eq_ignore_ascii_case("body"));
+        let mut bank = EnemyAnimBank::load_object(&disc, "o9341", &rig);
+        Arc::get_mut(&mut bank).unwrap().root_route = Some(route);
+        let mut anim = EnemyAnim::new(bank, Vec::new(), 0.0);
+        anim.play(220, true, 1.0, 0.0);
+        let a = anim.sample_bone(0).translation;
+        anim.frame = 250.0;
+        let b = anim.sample_bone(0).translation;
+        assert!(
+            a.distance(b) > 1.0,
+            "o9341 root must follow the body route ({a:?} -> {b:?})"
+        );
     }
 }

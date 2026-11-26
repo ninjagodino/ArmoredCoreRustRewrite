@@ -311,6 +311,9 @@ pub struct EnemyAnimBank {
     /// Map-object clips author their route/pose in the ANI rest translation (`o9330` body
     /// rest z ≈ -2296), while enemy clips are offsets from the FLVER bind pose.
     pub absolute_translation: bool,
+    /// When the visible mesh is skinned to the root bone (`o9341`), this body bone carries
+    /// the route in the clip; the root joint copies its animated transform to move the mesh.
+    pub root_route: Option<usize>,
     /// Optional turret/upper-body yaw tracking bone (`y` on `e1020`, `body_01` on `e0110`,
     /// `l_arm_03` on `e0210`; `param/enemyjcondata.xml`).
     pub aim_yaw: Option<EnemyJcon>,
@@ -467,6 +470,7 @@ impl EnemyAnimBank {
             ani_bone_map,
             is_root,
             absolute_translation: !with_jcon,
+            root_route: None,
             aim_yaw,
             aim_pitch,
         })
@@ -699,6 +703,11 @@ impl EnemyAnim {
 
     /// Computes the posed local [`Transform`] for rig bone `i` at the current frame.
     pub fn sample_bone(&self, i: usize) -> Transform {
+        if i == 0 {
+            if let Some(route) = self.bank.root_route.filter(|&r| r > 0) {
+                return self.sample_bone(route);
+            }
+        }
         let mut out = self.bank.rest_locals[i];
         if let Some(clip) = self.bank.clips.get(&self.clip_id) {
             if let Some(ani_idx) = self.bank.ani_bone_map[i] {
