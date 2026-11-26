@@ -67,6 +67,10 @@ const GLIDE_TRAIL: i32 = 134;
 /// `private/xenia/P4D_GLIDE.jsonl`. `0x82892f08` selects the group.
 const MAIN_NOZZLES: std::ops::RangeInclusive<u8> = 31..=34;
 const LEG_NOZZLES: std::ops::RangeInclusive<u8> = 21..=24;
+/// Front-mounted `l2_boost`/`r2_boost` nozzles (core dummies 25/26, then 27/28). The sfx row
+/// calls this effect `ac_back_booster` (302); `0x82893ec0` records 25..28 -> 302 and design
+/// 5010 carries the dummies while 5001 does not (`sheets/assembly_slots.csv`).
+const FRONT_NOZZLES: std::ops::RangeInclusive<u8> = 25..=28;
 /// Quick Boost effect scales fed to `0x82891ce8` (`> 1.0 => ac_qb_large 305`, `< 1.0 =>
 /// ac_qb_shortage 304`, `== 1.0 => ac_qb_normal 303`).
 const QB_SHORTAGE_SCALE: f32 = 0.75;
@@ -2570,6 +2574,7 @@ fn booster_plays(
         return Vec::new();
     }
     let main = i32::from(row.ac_main_booster);
+    let back = i32::from(row.ac_back_booster);
     let foot = i32::from(row.ac_foot_booster);
     let light = i32::from(row.ac_booster_light);
     let mut out = Vec::new();
@@ -2593,8 +2598,12 @@ fn booster_plays(
     }
     // Slot records built by `0x82893ec0` (read at runtime in `private/xenia/P4D_GLIDE.jsonl`):
     // 21..24 -> foot 301, replaced by 120 while gliding; 31..34 -> main 300, replaced by 131;
-    // 41 -> light 299 in each of those groups. The glide run starts four 131s and two 120s,
-    // and the 5001 legs carry exactly the dummies 21/22 that take 120.
+    // 25..28 -> back 302 (front l2/r2 boosters); 41 -> light 299 in each group. The glide run
+    // starts four 131s and two 120s, and the 5001 legs carry exactly the dummies 21/22 that
+    // take 120. Design 5010 also carries the front dummies 25/26 for the 302 group.
+    if FRONT_NOZZLES.contains(&id) {
+        push(&mut out, back, 1.0);
+    }
     if LEG_NOZZLES.contains(&id) {
         if glide {
             push(&mut out, GLIDE_FOOT, 1.0);
@@ -3308,11 +3317,14 @@ mod tests {
             .collect::<Vec<_>>()
         };
         // Slot records built by 0x82893ec0, read in private/xenia/P4D_GLIDE.jsonl:
-        // 31..34 -> main 300 / glide 131, 21..24 -> foot 301 / glide 120, 41 -> light 299.
+        // 31..34 -> main 300 / glide 131, 21..24 -> foot 301 / glide 120, 25..28 -> back 302,
+        // 41 -> light 299.
         assert_eq!(ids(31, false), vec![i32::from(row.ac_main_booster)]);
         assert_eq!(ids(31, true), vec![GLIDE_MAIN]);
         assert_eq!(ids(21, false), vec![i32::from(row.ac_foot_booster)]);
         assert_eq!(ids(21, true), vec![GLIDE_FOOT]);
+        assert_eq!(ids(25, false), vec![i32::from(row.ac_back_booster)]);
+        assert_eq!(ids(25, true), vec![i32::from(row.ac_back_booster)]);
         assert_eq!(ids(41, true), vec![i32::from(row.ac_booster_light)]);
         assert!(
             !ids(31, true).contains(&GLIDE_FOOT),
