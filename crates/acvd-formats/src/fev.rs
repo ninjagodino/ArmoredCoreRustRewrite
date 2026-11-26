@@ -63,13 +63,28 @@ pub struct SoundRef {
     pub fade_out: f32,
 }
 
-/// A layer envelope over its parameter (x, value). `dsp` is the DSP parameter index:
-/// `0xFFFF_FFFF` is a volume envelope, other values are DSP units (`ParamEQ`, pitch, ...).
+/// A layer envelope over its parameter (x, value). `dsp` is the DSP target:
+/// `0xFFFF_FFFF` is a sound volume or a DSP unit record (the one carrying the unit `name`),
+/// other values are DSP parameter envelopes of that unit. `param` is the parameter index the
+/// record automates (ParamEQ: 0 center, 1 octave range, 2 frequency gain).
 #[derive(Debug, Clone)]
 pub struct Envelope {
     pub dsp: u32,
     pub name: String,
+    pub param: u32,
     pub points: Vec<(f32, f32)>,
+}
+
+/// The speed-automated ParamEQ of a layer (`FMOD ParamEQ` unit in the FEV). Curve values are
+/// normalized 0..1 over the parameter's authored range; `Event::param_eq` finds them.
+#[derive(Debug, Clone, Default)]
+pub struct ParamEq {
+    /// Center frequency curve (parameter 0).
+    pub center: Vec<(f32, f32)>,
+    /// Octave-range curve (parameter 1); empty when the unit keeps the default.
+    pub octave_range: Vec<(f32, f32)>,
+    /// Linear frequency-gain curve (parameter 2); empty when the unit keeps the default.
+    pub gain: Vec<(f32, f32)>,
 }
 
 /// A layer's automation parameter (`speed`, `(distance)`, ...).
@@ -101,6 +116,28 @@ impl Event {
             .iter()
             .flat_map(|l| l.envelopes.iter())
             .filter(|e| !e.name.is_empty())
+    }
+
+    /// The `FMOD ParamEQ` unit of `layer`: the named unit record carries parameter 0 (center
+    /// frequency) and the unit's remaining parameter envelopes follow it. The 360 loader builds
+    /// the DSP from this record (`0x82f91d00` registers the ParamEQ description at
+    /// `0x8374de50`; the FEV record is in `sound/acv2_se_booster.fev` event `b00000003`).
+    pub fn param_eq(&self, layer: usize) -> Option<ParamEq> {
+        let layer = self.mix.get(layer)?;
+        let unit = layer.envelopes.iter().find(|e| e.name == "FMOD ParamEQ")?;
+        let param = |index: u32| {
+            layer
+                .envelopes
+                .iter()
+                .find(|e| e.name.is_empty() && e.dsp != u32::MAX && e.param == index)
+                .map(|e| e.points.clone())
+                .unwrap_or_default()
+        };
+        Some(ParamEq {
+            center: unit.points.clone(),
+            octave_range: param(1),
+            gain: param(2),
+        })
     }
 
     /// Plain volume envelopes of a layer, in file order (first sound's gain/fade, then the next).
@@ -341,7 +378,9 @@ fn sound_ref(r: &mut Le) -> Result<SoundRef> {
 fn envelope(r: &mut Le) -> Result<Envelope> {
     let dsp = r.u32()?;
     let name = r.string()?;
-    r.skip(12)?;
+    // Parameter index, unit index, flags (the ParamEQ unit is index 4 with parameters 0..2).
+    let param = r.u32()?;
+    r.skip(8)?;
     let points = r.u32()? as usize;
     let mut pts = Vec::with_capacity(points);
     for _ in 0..points {
@@ -352,6 +391,7 @@ fn envelope(r: &mut Le) -> Result<Envelope> {
     Ok(Envelope {
         dsp,
         name,
+        param,
         points: pts,
     })
 }
@@ -518,6 +558,24 @@ mod tests {
         assert_eq!(speed.volume_envelopes(0)[1].points[0], (0.0, 0.678201));
         assert_eq!(speed.mix[1].sounds.len(), 1);
         assert_eq!(speed.volume_envelopes(1).len(), 3);
+        // Layer 0 also automates an `FMOD ParamEQ`: the named unit record is parameter 0
+        // (center frequency) and the two following DSP envelopes are parameters 1 and 2.
+        // The high-cut layer has no DSP unit.
+        assert!(speed.param_eq(1).is_none());
+        let eq = speed.param_eq(0).expect("layer 0 ParamEQ");
+        assert_eq!(eq.center.len(), 2);
+        assert!((eq.center[0].1 - 0.597222).abs() < 1e-5);
+        assert!((eq.center[1].0 - 0.254545).abs() < 1e-5);
+        assert!((eq.center[1].1 - 0.719723).abs() < 1e-5);
+        assert_eq!(eq.octave_range.len(), 1);
+        assert!((eq.octave_range[0].1 - 0.329676).abs() < 1e-5);
+        assert_eq!(eq.gain.len(), 6);
+        assert!((eq.gain[0].1 - 0.155709).abs() < 1e-5);
+        assert!((eq.gain[5].0 - 0.743182).abs() < 1e-5);
+        assert!((eq.gain[5].1 - 0.430556).abs() < 1e-5);
+        assert_eq!(speed.mix[0].envelopes[2].param, 0);
+        assert_eq!(speed.mix[0].envelopes[3].param, 1);
+        assert_eq!(speed.mix[0].envelopes[4].param, 2);
         let wave = project.defs[3].wave.as_ref().unwrap();
         assert_eq!(wave.bank, "se_booster");
         assert_eq!(wave.index, 1);

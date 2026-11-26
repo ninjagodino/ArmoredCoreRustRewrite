@@ -531,8 +531,10 @@ in order:
   16-21 m follow camera -> 0.58-0.68, matching the 0.6 retail-capture ratio in archive).
   The booster one-shots carry their own ranges and use the same gain at spawn: b00000000
   0..100, b00000006 0..240, b00000008 0..200, while b00000007 is 2D (`0x0018_0008`) and stays
-  at unity. Remaining: the ParamEQ DSP envelopes on b00000003 are not applied; weapon and
-  world 3D cues are still non-positional (they need per-emitter positions); the +0x11c writer
+  at unity. The layer-0 `FMOD ParamEQ` is applied on the same speed axis (center + octave
+  range + linear gain mapped onto the 360 DSP ranges `0x8374de50`, ~0 dB at the capture speed
+  and +2.4 dB at full speed). Remaining: weapon and world 3D cues are still non-positional
+  (they need per-emitter positions); the +0x11c writer
   is still untraced (no scalar store tied to the player AcSfxCtrl at owner+0x734, VMX128
   stores invisible to `acvd-index`), so 450 km/h is inferred from the
   starter AC top speeds (0.6% low on high boost). Confirm with a second AC or the garage

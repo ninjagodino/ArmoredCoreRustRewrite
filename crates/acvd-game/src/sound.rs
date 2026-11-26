@@ -9,15 +9,20 @@
 //! 360 `AcSfxCtrl` update (`0x8289a138`) drives (see `update_sfx_mix`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_formats::vfs::Disc;
 use acvd_formats::{env, fev, fsb};
+use bevy::asset::Asset;
 use bevy::audio::{
-    AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, GlobalVolume, PlaybackSettings, Volume,
+    AddAudioSource, AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, ChannelCount,
+    Decodable, GlobalVolume, PlaybackSettings, SampleRate, Source, Volume,
 };
 use bevy::prelude::*;
+use bevy::reflect::TypePath;
 
 use crate::control::{Pilot, Piloting};
 
@@ -54,6 +59,16 @@ pub enum AudioBus {
     Ui,
 }
 
+/// FMOD Ex 4.40.05 ParamEQ parameter descriptions (`0x8374de50`, registered by `0x82f91d00`;
+/// row `dsp.parameq` in `sheets/sound_cues.csv`): center frequency 20..22000 Hz, octave range
+/// 0.2..5.0 and linear frequency gain 0.05..3.0 (1.0 = unity, so the peak is `20 log10(gain)`).
+const PARAMEQ_CENTER: (f32, f32) = (20.0, 22000.0);
+const PARAMEQ_CENTER_DEFAULT: f32 = 8000.0;
+const PARAMEQ_OCTAVES: (f32, f32) = (0.2, 5.0);
+const PARAMEQ_OCTAVES_DEFAULT: f32 = 1.0;
+const PARAMEQ_GAIN: (f32, f32) = (0.05, 3.0);
+const PARAMEQ_GAIN_DEFAULT: f32 = 1.0;
+
 /// A looping voice whose gain follows the boost `speed` parameter (the FEV envelopes of
 /// `b00000003`): base gain times every authored curve sampled at the normalized speed, times
 /// the event's authored 3D distance gain (linear rolloff, `distance` = inner/outer metres).
@@ -64,6 +79,181 @@ struct SfxMix {
     /// The 360's smoothed `speed` target (`AcSfxCtrl+0x120`), in FEV axis units.
     smoothed: f32,
     distance: (f32, f32),
+    /// `b00000003` layer 0's speed-automated ParamEQ, driven from the same axis.
+    eq: Option<EqVoice>,
+}
+
+/// The authored ParamEQ curves plus the live filter state the audio thread reads.
+#[derive(Debug, Clone)]
+struct EqVoice {
+    curves: fev::ParamEq,
+    state: Arc<ParamEqState>,
+}
+
+/// Shared filter parameters (atomic f32 bits). `update_sfx_mix` writes one set per frame; the
+/// custom [`BoostEqSource`] recomputes its biquad coefficients when they change.
+#[derive(Debug)]
+struct ParamEqState {
+    center: AtomicU32,
+    octaves: AtomicU32,
+    gain: AtomicU32,
+}
+
+impl Default for ParamEqState {
+    fn default() -> Self {
+        Self {
+            center: AtomicU32::new(PARAMEQ_CENTER_DEFAULT.to_bits()),
+            octaves: AtomicU32::new(PARAMEQ_OCTAVES_DEFAULT.to_bits()),
+            gain: AtomicU32::new(PARAMEQ_GAIN_DEFAULT.to_bits()),
+        }
+    }
+}
+
+impl ParamEqState {
+    fn set(&self, center: f32, octaves: f32, gain: f32) {
+        self.center.store(center.to_bits(), Ordering::Relaxed);
+        self.octaves.store(octaves.to_bits(), Ordering::Relaxed);
+        self.gain.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    fn get(&self) -> (f32, f32, f32) {
+        (
+            f32::from_bits(self.center.load(Ordering::Relaxed)),
+            f32::from_bits(self.octaves.load(Ordering::Relaxed)),
+            f32::from_bits(self.gain.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+/// Decoded mono PCM of one booster layer voice plus the ParamEQ to apply while it plays.
+#[derive(Asset, TypePath, Clone, Debug)]
+struct BoostVoice {
+    samples: Arc<[f32]>,
+    rate: u32,
+    eq: Arc<ParamEqState>,
+}
+
+impl Decodable for BoostVoice {
+    type Decoder = BoostEqSource;
+
+    fn decoder(&self) -> Self::Decoder {
+        let params = self.eq.get();
+        BoostEqSource {
+            samples: self.samples.clone(),
+            index: 0,
+            rate: self.rate,
+            eq: self.eq.clone(),
+            filter: Biquad::peaking(self.rate as f32, params.0, params.1, params.2),
+            applied: params,
+            countdown: 0,
+        }
+    }
+}
+
+/// A finite rodio source over one loop of [`BoostVoice`]; `PlaybackSettings::LOOP` repeats it.
+/// The biquad coefficients track the shared speed automation every 64 samples.
+struct BoostEqSource {
+    samples: Arc<[f32]>,
+    index: usize,
+    rate: u32,
+    eq: Arc<ParamEqState>,
+    filter: Biquad,
+    applied: (f32, f32, f32),
+    countdown: u32,
+}
+
+impl Iterator for BoostEqSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.index >= self.samples.len() {
+            return None;
+        }
+        self.countdown += 1;
+        if self.countdown >= 64 {
+            self.countdown = 0;
+            let params = self.eq.get();
+            if (params.0 - self.applied.0).abs() > 1e-3
+                || (params.1 - self.applied.1).abs() > 1e-4
+                || (params.2 - self.applied.2).abs() > 1e-4
+            {
+                self.filter = Biquad::peaking(self.rate as f32, params.0, params.1, params.2);
+                self.applied = params;
+            }
+        }
+        let sample = self.samples[self.index];
+        self.index += 1;
+        Some(self.filter.process(sample))
+    }
+}
+
+impl Source for BoostEqSource {
+    fn current_span_len(&self) -> Option<usize> {
+        Some(self.samples.len().saturating_sub(self.index))
+    }
+
+    fn channels(&self) -> ChannelCount {
+        ChannelCount::new(1).unwrap()
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        SampleRate::new(self.rate.max(1)).unwrap()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        Some(Duration::from_secs_f64(
+            self.samples.len() as f64 / self.rate.max(1) as f64,
+        ))
+    }
+}
+
+/// RBJ peaking EQ biquad in transposed direct form II.
+#[derive(Debug, Clone, Copy)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
+
+impl Biquad {
+    /// FMOD's ParamEQ: linear frequency gain (`gain`) and a width in octaves. The RBJ peaking
+    /// response peaks at `20 log10(gain)` dB at `center_hz`.
+    fn peaking(rate: f32, center_hz: f32, octaves: f32, gain: f32) -> Self {
+        let a = gain.max(1e-4).sqrt();
+        let w0 = 2.0 * std::f32::consts::PI * (center_hz / rate).clamp(1e-5, 0.49);
+        let sin = w0.sin();
+        let cos = w0.cos();
+        let alpha = sin * ((2.0f32.ln() / 2.0) * octaves * w0 / sin.max(1e-6)).sinh();
+        let a0 = 1.0 + alpha / a;
+        Self {
+            b0: (1.0 + alpha * a) / a0,
+            b1: (-2.0 * cos) / a0,
+            b2: (1.0 - alpha * a) / a0,
+            a1: (-2.0 * cos) / a0,
+            a2: (1.0 - alpha / a) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
+}
+
+fn param_eq_value(curve: &[(f32, f32)], (min, max): (f32, f32), default: f32, x: f32) -> f32 {
+    if curve.is_empty() {
+        default
+    } else {
+        min + envelope_at(curve, x) * (max - min)
+    }
 }
 
 /// Listener (follow camera) to player AC distance in metres, the input the FEV 3D rolloff
@@ -105,6 +295,8 @@ pub struct Cues {
     voices: HashMap<u8, fev::Project>,
     banks: HashMap<String, fsb::Bank>,
     decoded: HashMap<(String, u32), Handle<AudioSource>>,
+    /// f32 mono PCM (and rate) for the ParamEQ-filtered booster layers.
+    pcm: HashMap<(String, u32), (Arc<[f32]>, u32)>,
     missing: HashSet<String>,
     sfx_volume: f32,
     ui_volume: f32,
@@ -136,6 +328,7 @@ impl Cues {
             voices: HashMap::new(),
             banks: HashMap::new(),
             decoded: HashMap::new(),
+            pcm: HashMap::new(),
             missing: HashSet::new(),
             sfx_volume: 1.0,
             ui_volume: 1.0,
@@ -203,6 +396,7 @@ impl Cues {
         &mut self,
         commands: &mut Commands,
         assets: &mut Assets<AudioSource>,
+        boost_assets: &mut Assets<BoostVoice>,
         cue: &str,
     ) -> Vec<Entity> {
         let Some((project, bus)) = self.projects.iter().find(|(p, _)| p.event(cue).is_some())
@@ -225,7 +419,11 @@ impl Cues {
         } else {
             (0.0, 0.0)
         };
-        let mut voices: Vec<(fev::Wave, f32, Vec<Vec<(f32, f32)>>)> = Vec::new();
+        let eq = event.param_eq(0).map(|curves| EqVoice {
+            curves,
+            state: Arc::new(ParamEqState::default()),
+        });
+        let mut voices: Vec<(usize, fev::Wave, f32, Vec<Vec<(f32, f32)>>)> = Vec::new();
         for (li, layer) in event.mix.iter().enumerate() {
             let envs = event.volume_envelopes(li);
             let paired = envs.len() == layer.sounds.len() * 2;
@@ -246,15 +444,40 @@ impl Cues {
                     }
                 }
                 let base = bus_vol * event.volume * sound.volume;
-                voices.push((wave.clone(), base, curves));
+                voices.push((li, wave.clone(), base, curves));
             }
         }
         let initial = voices
             .iter()
-            .map(|(_, base, curves)| base * mix_gain(curves, 0.0))
+            .map(|(_, _, base, curves)| base * mix_gain(curves, 0.0))
             .collect::<Vec<_>>();
         let mut spawned = Vec::with_capacity(voices.len());
-        for ((wave, base, curves), initial) in voices.into_iter().zip(initial) {
+        for ((li, wave, base, curves), initial) in voices.into_iter().zip(initial) {
+            let eq = if li == 0 { eq.clone() } else { None };
+            let mix = SfxMix {
+                base,
+                curves,
+                smoothed: 0.0,
+                distance,
+                eq,
+            };
+            if let Some(voice) = &mix.eq {
+                let Some(handle) = self.boost_source(boost_assets, &wave, voice.state.clone())
+                else {
+                    continue;
+                };
+                spawned.push(
+                    commands
+                        .spawn((
+                            AudioPlayer(handle),
+                            PlaybackSettings::LOOP.with_volume(Volume::Linear(initial)),
+                            bus,
+                            mix,
+                        ))
+                        .id(),
+                );
+                continue;
+            }
             let Some(handle) = self.source(assets, &wave) else {
                 continue;
             };
@@ -264,12 +487,7 @@ impl Cues {
                         AudioPlayer(handle),
                         PlaybackSettings::LOOP.with_volume(Volume::Linear(initial)),
                         bus,
-                        SfxMix {
-                            base,
-                            curves,
-                            smoothed: 0.0,
-                            distance,
-                        },
+                        mix,
                     ))
                     .id(),
             );
@@ -431,6 +649,40 @@ impl Cues {
         Some(handle)
     }
 
+    /// Decoded f32 copy of a wave for the ParamEQ-filtered sustain layers.
+    fn boost_source(
+        &mut self,
+        assets: &mut Assets<BoostVoice>,
+        wave: &fev::Wave,
+        eq: Arc<ParamEqState>,
+    ) -> Option<Handle<BoostVoice>> {
+        let key = (wave.bank.clone(), wave.index);
+        if !self.pcm.contains_key(&key) {
+            let decoded = self
+                .bank(&wave.bank)
+                .and_then(|b| b.samples.get(wave.index as usize))
+                .map(|sample| (sample.decode(), sample.frequency));
+            match decoded {
+                Some((Ok(pcm), rate)) => {
+                    self.pcm.insert(key.clone(), (Arc::from(pcm.samples), rate));
+                }
+                Some((Err(err), _)) => {
+                    eprintln!("sound: {}#{}: {err:#}", wave.bank, wave.index);
+                    return None;
+                }
+                None => {
+                    let name = format!("{}#{}", wave.bank, wave.index);
+                    if self.missing.insert(name.clone()) {
+                        eprintln!("sound: {name} is not in the bank");
+                    }
+                    return None;
+                }
+            }
+        }
+        let (samples, rate) = self.pcm.get(&key)?.clone();
+        Some(assets.add(BoostVoice { samples, rate, eq }))
+    }
+
     fn bank(&mut self, name: &str) -> Option<&fsb::Bank> {
         if !self.banks.contains_key(name) {
             match self
@@ -498,6 +750,7 @@ impl Plugin for SoundPlugin {
         app.insert_resource(Cues::load(&self.disc))
             .insert_resource(bgm)
             .init_resource::<ListenerDistance>()
+            .add_audio_source::<BoostVoice>()
             .add_systems(Startup, sync_initial_bus_volumes)
             .add_systems(
                 Update,
@@ -696,6 +949,7 @@ fn motion(
     mut commands: Commands,
     mut cues: ResMut<Cues>,
     mut assets: ResMut<Assets<AudioSource>>,
+    mut boost_assets: ResMut<Assets<BoostVoice>>,
     piloting: Res<Piloting>,
     listener: Res<ListenerDistance>,
     pilots: Query<&Pilot>,
@@ -759,7 +1013,8 @@ fn motion(
         );
     }
     if moving && heard.sustain.is_empty() {
-        heard.sustain = cues.play_boost(&mut commands, &mut assets, BOOST_SUSTAIN);
+        heard.sustain =
+            cues.play_boost(&mut commands, &mut assets, &mut boost_assets, BOOST_SUSTAIN);
     } else if !moving {
         stop(&mut commands, &mut heard.sustain);
     }
@@ -851,6 +1106,19 @@ fn update_sfx_mix(
         sink.set_volume(Volume::Linear(
             mix.base * mix_gain(&mix.curves, mix.smoothed) * falloff_gain(distance, mix.distance),
         ));
+        if let Some(eq) = &mix.eq {
+            let x = mix.smoothed;
+            eq.state.set(
+                param_eq_value(&eq.curves.center, PARAMEQ_CENTER, PARAMEQ_CENTER_DEFAULT, x),
+                param_eq_value(
+                    &eq.curves.octave_range,
+                    PARAMEQ_OCTAVES,
+                    PARAMEQ_OCTAVES_DEFAULT,
+                    x,
+                ),
+                param_eq_value(&eq.curves.gain, PARAMEQ_GAIN, PARAMEQ_GAIN_DEFAULT, x),
+            );
+        }
     }
 }
 
@@ -1069,5 +1337,111 @@ mod tests {
             fsb::read_sample(&disc, "sound/bgm_menu.fsb", garage_wave.index as usize).unwrap();
         assert!(gsample.xma());
         assert_eq!(gsample.channels, 2);
+    }
+
+    /// The `FMOD ParamEQ` of `b00000003` layer 0, mapped from its normalized FEV curves onto
+    /// the 360 DSP parameter ranges (`0x8374de50`): center 20..22000 Hz, 0.2..5.0 octaves,
+    /// linear gain 0.05..3.0. At the retail-capture speed (`~118 km/h`, axis 0.377) the filter
+    /// is ~unity, which is why the captured RMS matched the dry mix; at full speed it is +2.4 dB.
+    #[test]
+    fn boost_param_eq_uses_the_360_dsp_ranges() {
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        let Ok(disc) = Disc::open(&iso) else { return };
+        let cues = Cues::load(&disc);
+        let project = cues
+            .projects
+            .iter()
+            .find_map(|(p, _)| p.event(BOOST_SUSTAIN).map(|_| p))
+            .unwrap();
+        let event = project.event(BOOST_SUSTAIN).unwrap();
+        let eq = event.param_eq(0).expect("layer 0 ParamEQ");
+        assert!(event.param_eq(1).is_none());
+        let at = |x: f32| {
+            (
+                param_eq_value(&eq.center, PARAMEQ_CENTER, PARAMEQ_CENTER_DEFAULT, x),
+                param_eq_value(
+                    &eq.octave_range,
+                    PARAMEQ_OCTAVES,
+                    PARAMEQ_OCTAVES_DEFAULT,
+                    x,
+                ),
+                param_eq_value(&eq.gain, PARAMEQ_GAIN, PARAMEQ_GAIN_DEFAULT, x),
+            )
+        };
+        // Center 20 + 0.719723 * 21980, octave 0.2 + 0.329676 * 4.8.
+        let (center, octaves, gain) = at(0.377);
+        assert!((center - 15839.5).abs() < 5.0, "{center}");
+        assert!((octaves - 1.7824).abs() < 1e-3, "{octaves}");
+        assert!((gain - 1.007).abs() < 0.02, "{gain}");
+        // At the speed-envelope top the gain curve reaches 0.430556 -> 1.3202 (+2.41 dB).
+        let (center, _, gain) = at(1.0);
+        assert!((center - 15839.5).abs() < 5.0, "{center}");
+        assert!((gain - 1.3202).abs() < 1e-3, "{gain}");
+    }
+
+    /// Process a sine through the biquad and return its steady-state RMS gain.
+    fn filter_gain(center: f32, octaves: f32, gain: f32, freq: f32) -> f32 {
+        let rate = 44_100.0;
+        let mut filter = Biquad::peaking(rate, center, octaves, gain);
+        let mut sum_in = 0.0f64;
+        let mut sum_out = 0.0f64;
+        let n = 44_100;
+        for i in 0..n {
+            let t = i as f32 / rate;
+            let x = (2.0 * std::f32::consts::PI * freq * t).sin();
+            let y = filter.process(x);
+            if i > n / 2 {
+                sum_in += (x * x) as f64;
+                sum_out += (y * y) as f64;
+            }
+        }
+        (sum_out / sum_in).sqrt() as f32
+    }
+
+    #[test]
+    fn param_eq_biquad_peaks_at_the_authored_gain() {
+        // Unity gain is bit-exact identity (FMOD's default).
+        assert!((filter_gain(8000.0, 1.0, 1.0, 1000.0) - 1.0).abs() < 1e-5);
+        // A +6 dB linear gain of 2 peaks at the center and leaves low frequencies alone.
+        assert!((filter_gain(1000.0, 1.0, 2.0, 1000.0) - 2.0).abs() < 0.02);
+        assert!((filter_gain(1000.0, 1.0, 2.0, 100.0) - 1.0).abs() < 0.03);
+        // The authored top-speed state: 15.8 kHz, 1.78 octaves, 1.32 (+2.41 dB).
+        assert!((filter_gain(15839.5, 1.7824, 1.3202, 15839.5) - 1.3202).abs() < 0.02);
+    }
+
+    #[test]
+    fn boost_eq_source_follows_the_shared_speed_state() {
+        let rate = 44_100;
+        let freq = 1000.0;
+        let samples: Arc<[f32]> = (0..rate)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin())
+            .collect::<Vec<f32>>()
+            .into();
+        let eq = Arc::new(ParamEqState::default());
+        let voice = BoostVoice {
+            samples,
+            rate,
+            eq: eq.clone(),
+        };
+        let mut source = voice.decoder();
+        let mut sum = 0.0f32;
+        let mut count = 0;
+        for _ in 0..2048 {
+            sum += source.next().unwrap().abs();
+            count += 1;
+        }
+        let default_mean = sum / count as f32;
+        // A flat pass-through before `update_sfx_mix` sets the authored state.
+        assert!((default_mean - 0.6366).abs() < 0.01, "{default_mean}");
+        eq.set(freq, 1.0, 2.0);
+        let mut sum = 0.0f32;
+        let mut count = 0;
+        for _ in 0..8192 {
+            sum += source.next().unwrap().abs();
+            count += 1;
+        }
+        let boosted_mean = sum / count as f32;
+        // The +6 dB state takes effect within the 64-sample refresh.
+        assert!((boosted_mean - 2.0 * 0.6366).abs() < 0.05, "{boosted_mean}");
     }
 }
