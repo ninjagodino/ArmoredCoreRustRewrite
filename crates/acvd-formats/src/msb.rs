@@ -82,6 +82,11 @@ pub struct Part {
     pub model: String,
     /// 0 = map piece, 1 = object, 2 = enemy / AC.
     pub kind: u32,
+    /// `PARTS_PARAM_ST` `+0x08`: the map's unique part index (events/routes reference it).
+    pub param_index: u32,
+    /// `PARTS_PARAM_ST` `+0x44` sub-record: ASCII `MAPOBJ_PARAM_ST` row id (e.g. `810`) that
+    /// drives this object's behavior and `Mob_*TAE` fields.
+    pub behavior: Option<String>,
     pub translation: [f32; 3],
     pub rotation_deg: [f32; 3],
     pub scale: [f32; 3],
@@ -279,10 +284,30 @@ pub fn parts(data: &[u8]) -> Result<Vec<Part>> {
                 .and_then(|i| usize::try_from(i).ok())
                 .and_then(|i| layer_defs.get(i))
                 .map(|l| l.name.clone());
+            let behavior = if off + 0x48 <= data.len() {
+                let rel = r.u32(off + 0x44)? as usize;
+                if rel > 0 && off + rel + 4 <= data.len() {
+                    let len = r.u32(off + rel)? as usize;
+                    if (2..=32).contains(&len) && off + rel + 4 + len <= data.len() {
+                        std::str::from_utf8(&data[off + rel + 4..off + rel + 4 + len - 1])
+                            .ok()
+                            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(Part {
                 name,
                 model,
                 kind,
+                param_index: r.u32(off + 8)?,
+                behavior,
                 translation: vec3(&r, off + 0x14)?,
                 rotation_deg: vec3(&r, off + 0x20)?,
                 scale: vec3(&r, off + 0x2C)?,

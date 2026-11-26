@@ -22,6 +22,7 @@
 //! - `1`, `2`: Play sound cue (`params[0]` = sound category, `params[1]` = cue ID; formatted via
 //!   360 table `0x8371c688`)
 //! - `103`: Footstep (`params[0]` = foot side `0`/`1`, `params[1]` = step type)
+//! - `104`: Play a model ANI clip (`params[0]` = clip id, `params[4]` = speed; map objects)
 //! - `602`: Play AC sound (`params[0]` = cue ID in category 1 `c%08d`)
 //!
 //! All integers and floats are big-endian.
@@ -41,6 +42,9 @@ pub const KIND_SOUND: u32 = 2;
 pub const KIND_REATTACH: u32 = 101;
 pub const KIND_PURGE: u32 = 102;
 pub const KIND_FOOTSTEP: u32 = 103;
+/// Play a skeletal ANI clip from the model's `_a` binder: `params[0]` = clip id,
+/// `params[4]` = speed (`f32`). 360 TAE dispatcher `0x8289acd0` case `0x68`.
+pub const KIND_ANI: u32 = 104;
 pub const KIND_AC_SOUND: u32 = 602;
 
 /// Parsed `.tae` timeline file.

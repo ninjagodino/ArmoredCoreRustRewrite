@@ -12,6 +12,7 @@ use std::sync::Arc;
 use acvd_data::find;
 use acvd_data::generated::ac_unit::PARAM_ACOBJECTPARAM_BIN;
 use acvd_data::generated::enemy::PARAM_DESTROYAP_PARAM;
+use acvd_data::generated::map::PARAM_MAPOBJBEHAVIORPARAM_BIN;
 use acvd_data::generated::sfx::PARAM_SFXSESETPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_formats::vfs::{self, Disc};
@@ -590,13 +591,13 @@ pub fn spawn(
         let Some(binder) = binder(map, part) else {
             continue;
         };
-        // Flying formations shipped by the map itself (`o9310` Chinooks, `o9330` bombers).
-        // Their `_a` binders carry the rotor/flight clips; the map's PARTS section supplies
-        // the placement, so no traffic is invented here.
+        // Aircraft the map itself places. The part's `+0x44` behavior id selects a
+        // `MAPOBJ_PARAM_ST` row; its `Mob_DisperseTAE` names the TAE timeline, whose
+        // kind-104 event names the ANI clip in the model's `_a` binder. No traffic is added.
         if part.kind == KIND_OBJECT && is_aircraft_model(&part.model) {
             let pack = texture_pack(disc, part);
             let pack = pack.as_deref();
-            let Some(loaded) = load_animated_model(
+            if let Some(loaded) = load_animated_model(
                 &mut animated_models,
                 &mut textures,
                 meshes,
@@ -606,21 +607,24 @@ pub fn spawn(
                 disc,
                 &part.model,
                 pack,
-            ) else {
-                continue;
-            };
-            drawn += 1;
-            animated_parts += 1;
-            let root = commands
-                .spawn((
-                    MapPart,
-                    bevy_transform(&xform(part)),
-                    Visibility::default(),
-                    Name::new(part.name.clone()),
-                ))
-                .id();
-            spawn_animated_part(commands, root, &loaded, &part.model);
-            continue;
+            ) {
+                if let Some((clip, speed, looping)) =
+                    aircraft_clip(&loaded.bank, loaded.tae.as_ref(), part)
+                {
+                    drawn += 1;
+                    animated_parts += 1;
+                    let root = commands
+                        .spawn((
+                            MapPart,
+                            bevy_transform(&xform(part)),
+                            Visibility::default(),
+                            Name::new(part.name.clone()),
+                        ))
+                        .id();
+                    spawn_animated_part(commands, root, &loaded, clip, speed, looping);
+                    continue;
+                }
+            }
         }
         let asset = format!("{binder}|{}.flv", part.model);
         let pack = texture_pack(disc, part);
@@ -784,14 +788,11 @@ type Loaded = (
     Vec3,
 );
 
-/// Map-object models that ship skeletal `_a` flight clips. Their placements come from the
+/// Aircraft-like map-object families (`o92xx`..`o96xx`). Their placements come from the
 /// map's PARTS section; the rewrite only animates those parts and never spawns new traffic.
-const AIRCRAFT_MODELS: &[&str] = &["o9310", "o9330"];
-
 fn is_aircraft_model(model: &str) -> bool {
-    AIRCRAFT_MODELS
-        .iter()
-        .any(|m| model.eq_ignore_ascii_case(m))
+    let b = model.as_bytes();
+    b.len() >= 3 && b[0] == b'o' && b[1] == b'9' && matches!(b[2], b'2'..=b'6')
 }
 
 /// Marks the root of a map-placed aircraft formation so its flight clip can be stepped
@@ -799,8 +800,8 @@ fn is_aircraft_model(model: &str) -> bool {
 #[derive(Component)]
 pub struct MapAircraft;
 
-/// Advances the rotor/flight clips of map-placed aircraft (`o9310`/`o9330`). They carry no
-/// AI component, so `ai::update` never steps their [`EnemyAnim`] clocks.
+/// Advances the rotor/flight clips of map-placed aircraft. They carry no AI component, so
+/// `ai::update` never steps their [`EnemyAnim`] clocks.
 pub fn step_aircraft(time: Res<Time>, mut aircraft: Query<&mut EnemyAnim, With<MapAircraft>>) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
@@ -817,6 +818,48 @@ struct AnimatedModel {
     meshes: Vec<(Handle<Mesh>, Handle<StandardMaterial>, MapMeshMeta)>,
     inv_bindposes: Handle<SkinnedMeshInverseBindposes>,
     bank: Arc<EnemyAnimBank>,
+    tae: Option<tae::Tae>,
+}
+
+/// The TAE id and loop flag selected by a part's `+0x44` behavior row.
+fn behavior_tae(part: &msb::Part) -> Option<(u32, bool)> {
+    let id: u32 = part.behavior.as_deref()?.parse().ok()?;
+    let row = find(PARAM_MAPOBJBEHAVIORPARAM_BIN, id)?;
+    let data = &row.data;
+    let tae = [
+        data.mob_disperse_tae,
+        data.mob_disperse_loop_tae,
+        data.mob_regroup_tae,
+        data.mob_regroup_loop_tae,
+    ]
+    .into_iter()
+    .find(|&t| t != 0)?;
+    Some((u32::from(tae), matches!(data.behavior_type, 4 | 7)))
+}
+
+/// Resolves the ANI clip a map part plays: behavior row → `Mob_DisperseTAE` timeline →
+/// its kind-104 event (`[ani_id, flag, 0, 0, speed]`).
+fn aircraft_clip(
+    bank: &EnemyAnimBank,
+    tae: Option<&tae::Tae>,
+    part: &msb::Part,
+) -> Option<(u16, f32, bool)> {
+    let (tae_id, looping) = behavior_tae(part)?;
+    let anim = tae?.animations.iter().find(|a| a.id == tae_id)?;
+    let event = anim
+        .events
+        .iter()
+        .find(|e| e.kind == tae::KIND_ANI && e.params.len() >= 20)?;
+    let clip = u16::try_from(u32::from_be_bytes(event.params[0..4].try_into().ok()?)).ok()?;
+    let speed = f32::from_bits(u32::from_be_bytes(event.params[16..20].try_into().ok()?));
+    let speed = if speed.is_finite() && speed > 0.0 {
+        speed
+    } else {
+        1.0
+    };
+    bank.clips
+        .contains_key(&clip)
+        .then_some((clip, speed, looping))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -834,13 +877,16 @@ fn load_animated_model(
     if let Some(cached) = cache.get(model) {
         return cached.clone();
     }
-    let asset = format!("model/obj/{model}/{model}_m.bnd.dcx|{model}.flv");
-    let loaded =
+    let binder = format!("model/obj/{model}/{model}_a.bnd.dcx");
+    let tae_asset = format!("tae/obj/{model}/own000100.tae");
+    let loaded = if !disc.exists(&binder) || !disc.exists(&tae_asset) {
+        None
+    } else {
+        let asset = format!("model/obj/{model}/{model}_m.bnd.dcx|{model}.flv");
         match acvd_render::rigged_model(disc, &asset, &|_| acvd_render::RootPlace::IDENTITY) {
             Ok((list, rig)) if !list.is_empty() => {
                 let bank = EnemyAnimBank::load_object(disc, model, &rig);
                 if bank.clips.is_empty() {
-                    warn!("{asset}: no a00_NNN.ani clips in {model}_a.bnd.dcx");
                     None
                 } else {
                     let unboned = Affine3A::from_translation(Vec3::from(rig.unboned));
@@ -865,10 +911,14 @@ fn load_animated_model(
                             (meshes.add(m.mesh), material, meta)
                         })
                         .collect();
+                    let tae = vfs::open(disc, &tae_asset)
+                        .ok()
+                        .and_then(|bytes| tae::read(&bytes).ok());
                     Some(AnimatedModel {
                         meshes: meshes_mats,
                         inv_bindposes,
                         bank,
+                        tae,
                     })
                 }
             }
@@ -877,13 +927,21 @@ fn load_animated_model(
                 warn!("{asset}: {e:#}");
                 None
             }
-        };
+        }
+    };
     cache.insert(model.to_string(), loaded.clone());
     loaded
 }
 
 /// Spawns the skinned meshes and joint hierarchy under a map part's world placement.
-fn spawn_animated_part(commands: &mut Commands, root: Entity, loaded: &AnimatedModel, model: &str) {
+fn spawn_animated_part(
+    commands: &mut Commands,
+    root: Entity,
+    loaded: &AnimatedModel,
+    clip: u16,
+    speed: f32,
+    looping: bool,
+) {
     let mut joint_entities: Vec<Entity> = Vec::with_capacity(loaded.bank.rest_locals.len());
     for _ in 0..loaded.bank.rest_locals.len() {
         joint_entities.push(
@@ -919,18 +977,8 @@ fn spawn_animated_part(commands: &mut Commands, root: Entity, loaded: &AnimatedM
         ));
     }
 
-    // `a00_000` is the rotor-idle/flight loop for `o9310`; `o9330` only ships `a00_210`.
     let mut anim = EnemyAnim::new(loaded.bank.clone(), joint_entities, 0.0);
-    let preferred = if model.eq_ignore_ascii_case("o9330") {
-        210
-    } else {
-        0
-    };
-    if let Some(id) = loaded.bank.pick_clip(&[preferred, 0]) {
-        anim.play(id, true, 1.0, 0.0);
-    } else if let Some(&id) = loaded.bank.clips.keys().min() {
-        anim.play(id, true, 1.0, 0.0);
-    }
+    anim.play(clip, looping, speed, 0.0);
     commands.entity(root).insert((anim, MapAircraft));
 }
 
@@ -1424,6 +1472,8 @@ mod tests {
             name: String::new(),
             model: String::new(),
             kind: 0,
+            param_index: 0,
+            behavior: None,
             translation: [10.0, 2.0, -3.0],
             rotation_deg: [15.0, 70.0, -20.0],
             scale: [1.0, 2.0, 0.5],
@@ -1474,25 +1524,27 @@ mod tests {
         };
         let parts =
             msb::parts(&vfs::open(&disc, "model/map/m3330/m3330_map.msb").unwrap()).unwrap();
-        let aircraft: Vec<&msb::Part> = parts
-            .iter()
-            .filter(|p| p.kind == KIND_OBJECT && is_aircraft_model(&p.model))
-            .collect();
-        assert_eq!(aircraft.len(), 9, "m3330: 8 o9310 + 1 o9330");
+        let chinooks: Vec<&msb::Part> = parts.iter().filter(|p| p.model == "o9310").collect();
+        let bombers: Vec<&msb::Part> = parts.iter().filter(|p| p.model == "o9330").collect();
+        assert_eq!(chinooks.len(), 8, "m3330 o9310 placements");
+        assert_eq!(bombers.len(), 1, "m3330 o9330 placement");
         assert_eq!(
-            aircraft.iter().filter(|p| p.model == "o9310").count(),
-            8,
-            "o9310 Chinook formation placements"
+            chinooks
+                .iter()
+                .map(|p| p.behavior.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("775"),
+                Some("776"),
+                Some("777"),
+                Some("778"),
+                Some("778"),
+                Some("778"),
+                Some("777"),
+                Some("776"),
+            ]
         );
-        assert_eq!(
-            aircraft.iter().filter(|p| p.model == "o9330").count(),
-            1,
-            "o9330 bomber formation placement"
-        );
-        assert!(
-            !is_aircraft_model("o9223"),
-            "the static Chinook prop stays static"
-        );
+        assert_eq!(bombers[0].behavior.as_deref(), Some("770"));
 
         let (meshes, rig) =
             acvd_render::rigged_model(&disc, "model/obj/o9310/o9310_m.bnd.dcx|o9310.flv", &|_| {
@@ -1501,6 +1553,28 @@ mod tests {
             .unwrap();
         assert!(!meshes.is_empty());
         let bank = EnemyAnimBank::load_object(&disc, "o9310", &rig);
+        let tae9310 = tae::read(&vfs::open(&disc, "tae/obj/o9310/own000100.tae").unwrap()).unwrap();
+        for part in &chinooks {
+            let (tae_id, _) = behavior_tae(part).expect("o9310 behavior row");
+            let event = tae9310
+                .animations
+                .iter()
+                .find(|a| a.id == tae_id)
+                .and_then(|a| {
+                    a.events
+                        .iter()
+                        .find(|e| e.kind == tae::KIND_ANI && e.params.len() >= 20)
+                })
+                .expect("o9310 kind-104 ANI event");
+            let clip =
+                u16::try_from(u32::from_be_bytes(event.params[0..4].try_into().unwrap())).unwrap();
+            assert!(
+                bank.clips.contains_key(&clip),
+                "{} behavior {:?} -> clip {clip}",
+                part.name,
+                part.behavior
+            );
+        }
         let rotor = rig
             .bones
             .iter()
@@ -1536,6 +1610,130 @@ mod tests {
     }
 
     #[test]
+    fn migrant_transport_behavior_clips_spin_rotors() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+
+        let m3100 =
+            msb::parts(&vfs::open(&disc, "model/map/m3100/m3100_map.msb").unwrap()).unwrap();
+        let tae9340 = tae::read(&vfs::open(&disc, "tae/obj/o9340/own000100.tae").unwrap()).unwrap();
+        let transports: Vec<&msb::Part> = m3100.iter().filter(|p| p.model == "o9340").collect();
+        assert!(!transports.is_empty(), "m3100 migrant transports");
+        for part in &transports {
+            assert_eq!(part.behavior.as_deref(), Some("810"));
+            let (tae_id, looping) = behavior_tae(part).expect("o9340 behavior row");
+            assert_eq!(tae_id, 0x8c0);
+            assert!(looping, "behavior 4 loops");
+            let event = tae9340
+                .animations
+                .iter()
+                .find(|a| a.id == tae_id)
+                .and_then(|a| {
+                    a.events
+                        .iter()
+                        .find(|e| e.kind == tae::KIND_ANI && e.params.len() >= 20)
+                })
+                .expect("o9340 kind-104 ANI event");
+            let clip =
+                u16::try_from(u32::from_be_bytes(event.params[0..4].try_into().unwrap())).unwrap();
+            assert_eq!(clip, 220);
+        }
+
+        let (meshes, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9340/o9340_m.bnd.dcx|o9340.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
+        assert!(!meshes.is_empty());
+        let bank = EnemyAnimBank::load_object(&disc, "o9340", &rig);
+        assert!(bank.clips.contains_key(&220), "o9340 a00_220");
+        let rotor = rig
+            .bones
+            .iter()
+            .position(|b| b.name.eq_ignore_ascii_case("l_pro"))
+            .expect("o9340 l_pro rotor");
+        let mut anim = EnemyAnim::new(bank, Vec::new(), 0.0);
+        anim.play(220, true, 1.0, 0.0);
+        let mut prev = anim.sample_bone(rotor).rotation;
+        let mut max_delta = 0.0f32;
+        for step in 1..=40 {
+            anim.frame = step as f32 * 5.0;
+            let cur = anim.sample_bone(rotor).rotation;
+            max_delta = max_delta.max(prev.angle_between(cur));
+            prev = cur;
+        }
+        assert!(max_delta > 0.01, "o9340 l_pro rotor must spin");
+
+        let m3120 =
+            msb::parts(&vfs::open(&disc, "model/map/m3120/m3120_map.msb").unwrap()).unwrap();
+        let tae9341 = tae::read(&vfs::open(&disc, "tae/obj/o9341/own000100.tae").unwrap()).unwrap();
+        let tae9343 = tae::read(&vfs::open(&disc, "tae/obj/o9343/own000100.tae").unwrap()).unwrap();
+        for part in m3120.iter().filter(|p| p.model == "o9341") {
+            let behavior = part.behavior.as_deref().expect("o9341 behavior row");
+            let expected = match behavior {
+                "811" => (0x8c1, 221),
+                "775" => (0x89b, 210),
+                "776" => (0x89f, 211),
+                other => panic!("unexpected o9341 behavior {other}"),
+            };
+            let (tae_id, _) = behavior_tae(part).unwrap();
+            assert_eq!(tae_id, expected.0, "o9341 behavior {behavior}");
+            let event = tae9341
+                .animations
+                .iter()
+                .find(|a| a.id == tae_id)
+                .and_then(|a| a.events.iter().find(|e| e.kind == tae::KIND_ANI))
+                .unwrap();
+            let clip =
+                u16::try_from(u32::from_be_bytes(event.params[0..4].try_into().unwrap())).unwrap();
+            assert_eq!(clip, expected.1, "o9341 behavior {behavior}");
+        }
+        for part in m3120.iter().filter(|p| p.model == "o9343") {
+            assert_eq!(part.behavior.as_deref(), Some("812"));
+            let (tae_id, _) = behavior_tae(part).unwrap();
+            assert_eq!(tae_id, 0x8c2);
+            let event = tae9343
+                .animations
+                .iter()
+                .find(|a| a.id == tae_id)
+                .and_then(|a| a.events.iter().find(|e| e.kind == tae::KIND_ANI))
+                .unwrap();
+            let clip =
+                u16::try_from(u32::from_be_bytes(event.params[0..4].try_into().unwrap())).unwrap();
+            assert_eq!(clip, 222);
+        }
+
+        let (meshes, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9343/o9343_m.bnd.dcx|o9343.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
+        assert!(!meshes.is_empty());
+        let bank = EnemyAnimBank::load_object(&disc, "o9343", &rig);
+        assert!(bank.clips.contains_key(&222), "o9343 a00_222");
+        let rotor = rig
+            .bones
+            .iter()
+            .position(|b| b.name.eq_ignore_ascii_case("f_rotor"))
+            .expect("o9343 f_rotor");
+        let mut anim = EnemyAnim::new(bank, Vec::new(), 0.0);
+        anim.play(222, true, 1.0, 0.0);
+        let mut prev = anim.sample_bone(rotor).rotation;
+        let mut max_delta = 0.0f32;
+        for step in 1..=40 {
+            anim.frame = step as f32 * 5.0;
+            let cur = anim.sample_bone(rotor).rotation;
+            max_delta = max_delta.max(prev.angle_between(cur));
+            prev = cur;
+        }
+        assert!(max_delta > 0.01, "o9343 f_rotor must spin");
+    }
+
+    #[test]
     fn object_textures_resolve_from_their_own_pack() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -1547,6 +1745,8 @@ mod tests {
             name: String::new(),
             model: "o2076".into(),
             kind: KIND_OBJECT,
+            param_index: 0,
+            behavior: None,
             translation: [0.0; 3],
             rotation_deg: [0.0; 3],
             scale: [1.0; 3],

@@ -302,14 +302,15 @@ pub struct EnemyAnimBank {
     pub clips: HashMap<u16, ani::Anim>,
     /// Local bind transform (in Bevy axes) for each FLVER rig bone.
     pub rest_locals: Vec<Transform>,
-    /// FLVER-space local translation for each rig bone (for delta-translation animation).
-    pub bind_t: Vec<Vec3>,
     /// Parent index in `rig.bones`.
     pub parents: Vec<Option<usize>>,
     /// Mapping from FLVER rig bone index → `.ani` clip bone index (matched by bone name).
     pub ani_bone_map: Vec<Option<usize>>,
     /// Whether this rig bone is a root/master bone (held in place when animating).
     pub is_root: Vec<bool>,
+    /// Map-object clips author their route/pose in the ANI rest translation (`o9330` body
+    /// rest z ≈ -2296), while enemy clips are offsets from the FLVER bind pose.
+    pub absolute_translation: bool,
     /// Optional turret/upper-body yaw tracking bone (`y` on `e1020`, `body_01` on `e0110`,
     /// `l_arm_03` on `e0210`; `param/enemyjcondata.xml`).
     pub aim_yaw: Option<EnemyJcon>,
@@ -391,7 +392,6 @@ impl EnemyAnimBank {
         }
 
         let mut rest_locals = Vec::with_capacity(rig.bones.len());
-        let mut bind_t = Vec::with_capacity(rig.bones.len());
         let mut parents = Vec::with_capacity(rig.bones.len());
         let mut ani_bone_map = Vec::with_capacity(rig.bones.len());
         let mut is_root = Vec::with_capacity(rig.bones.len());
@@ -404,7 +404,6 @@ impl EnemyAnimBank {
             let local = parent_bind.inverse() * xform_to_affine(&b.bind);
             let (s, r, t) = local.to_scale_rotation_translation();
             rest_locals.push(pose::to_transform(t, r, s));
-            bind_t.push(t);
             parents.push(parent);
             let lower = b.name.to_ascii_lowercase();
             bone_by_name.insert(lower.clone(), i);
@@ -464,10 +463,10 @@ impl EnemyAnimBank {
         Arc::new(Self {
             clips,
             rest_locals,
-            bind_t,
             parents,
             ani_bone_map,
             is_root,
+            absolute_translation: !with_jcon,
             aim_yaw,
             aim_pitch,
         })
@@ -724,7 +723,14 @@ impl EnemyAnim {
                             .scale(self.frame)
                             .map(Vec3::from)
                             .unwrap_or(Vec3::ONE);
-                        let translation = self.bank.bind_t[i] + (ct - rest_t);
+                        // Map-object clips author their route/pose in the ANI rest translation
+                        // (`o9330` body rest z ≈ -2296), not in the FLVER bind layout; enemy
+                        // clips store bind-relative motion.
+                        let translation = if self.bank.absolute_translation {
+                            ct
+                        } else {
+                            self.bank.rest_locals[i].translation + (ct - rest_t)
+                        };
                         out = pose::to_transform(translation, rot, cs);
                     }
                 }
