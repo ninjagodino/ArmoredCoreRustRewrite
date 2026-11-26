@@ -1,8 +1,9 @@
 //! Map environment (`model/map/ch_env/{map}_env.msb`): the MSB section chain at version
 //! `msb::MAGIC_ENV` (VD) or `msb::MAGIC` (ACV), with every record in `EVENT_PARAM_ST`.
-//! ACV's type-100 lights use a packed byte layout (`acv_light`); its type-101 core scene is
-//! decoded by `acv_scene`, while the ACV fog and filter sub-blocks remain undecoded. Field
-//! layouts and the shader constants built from them are in `sheets/map_env.csv`.
+//! ACV's type-100 lights (including their compact fog block) use a packed byte layout
+//! (`acv_light`); its type-101 core scene is decoded by `acv_scene`, while the type-101 fog and
+//! filter sub-blocks remain undecoded. Field layouts and the shader constants built from them
+//! are in `sheets/map_env.csv`.
 //!
 //! Event record: `u32 name, i32 id, u32 type, u32 index, u32 data`, offsets relative to the
 //! record. Types: 100 light set, 101 scene parameters, 102 wind, 400 BGM (mission envs only).
@@ -32,29 +33,47 @@ pub struct Event {
     pub data: usize,
 }
 
-/// Fog block of a light set (data `+0xa0..+0xe4`).
+/// ACV type-100 fog fields with no VD equivalent: the lower alpha bounds and the two
+/// range-sign flags. The upper bounds are `Fog::color[3]` and `Fog::height_color[3]`.
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct AcvFog {
+    /// Lower distance-fog alpha (`+0x3b` byte / 255).
+    pub distance_min: f32,
+    /// Lower height-fog alpha (`+0x4b` byte / 255).
+    pub height_min: f32,
+    /// Nonzero: the runtime negates `1/range` (`+0x3d`).
+    pub distance_inverted: bool,
+    /// Nonzero: the runtime negates `1/height_range` (`+0x4d`).
+    pub height_inverted: bool,
+}
+
+/// Fog block of a light set. VD stores it at data `+0xa0..+0xe4`; ACV type-100 uses a
+/// compact block (see `acv_light`) and fills [`AcvFog`].
 #[derive(Debug, Clone, Copy, Serialize, Default)]
 pub struct Fog {
-    /// Distance fog colour; `w` is the fog's maximum (`+0xa0`).
+    /// Distance fog colour; `w` is the fog's maximum (`+0xa0`, ACV `+0x3c` / 255).
     pub color: [f32; 4],
-    /// Distance over which distance fog rises (`+0xb0`).
+    /// Distance over which distance fog rises (`+0xb0`); ACV stores view-space depth range.
     pub range: f32,
-    /// Horizontal distance where distance fog starts (`+0xb4`).
+    /// Horizontal distance where distance fog starts (`+0xb4`); ACV stores view-space depth.
     pub start: f32,
-    /// Height-fog falloff divisor, clamped to at least 0.1 (`+0xbc`).
+    /// Height-fog falloff divisor, clamped to at least 0.1 (`+0xbc`; VD only).
     pub falloff: f32,
-    /// Overall fog multiplier on both maxima (`+0xc0`).
+    /// Overall fog multiplier on both maxima (`+0xc0`; ACV uses 1).
     pub density: f32,
-    /// How much scene luminance tints the fog colours (`+0xc4`).
+    /// How much scene luminance tints the fog colours (`+0xc4`; ACV uses 0).
     pub luma_tint: f32,
-    /// Nonzero: positive height falloff (`+0xc8` byte).
+    /// Nonzero: positive height falloff (`+0xc8`); ACV: `!height_inverted`.
     pub rising: bool,
     /// Height-fog range (`+0xcc`); 0 turns height fog off.
     pub height_range: f32,
     /// World height where height fog starts (`+0xd0`).
     pub height_base: f32,
-    /// Height fog colour; `w` is its maximum (`+0xd4`).
+    /// Height fog colour; `w` is its maximum (`+0xd4`, ACV `+0x4c` / 255).
     pub height_color: [f32; 4],
+    /// ACV type-100 extras; `None` for VD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acv: Option<AcvFog>,
 }
 
 /// A type-100 event: two directional lights, a hemisphere ambient and a fog block. Draws pick
@@ -418,13 +437,19 @@ fn light(r: &Be, name: String, d: usize) -> Result<LightSet> {
             height_range: r.f32(d + 0xcc)?,
             height_base: r.f32(d + 0xd0)?,
             height_color: vec4(r, d + 0xd4)?,
+            acv: None,
         },
     })
 }
 
 /// ACV type-100 payload (`0x827626d8`): one group/id, two i16 angle pairs, six RGBA byte
-/// colours and a compact fog block. Fog is not mapped yet (the ACV destination object stores it
-/// at different offsets), so its fields stay zero.
+/// colours and the compact fog block at `+0x30..+0x4d`.
+///
+/// The runtime writes the fog into its 0xa0-byte slot as `+0/+4` distance start/range (s32
+/// converted to f32), `+0x10/+0x40` the two RGB colours, `+0x20/+0x24/+0x50/+0x54` the lower /
+/// upper distance and height alphas, and `+0x28/+0x58` the range-sign flags; `0x82b05428`
+/// converts the raw byte alphas and colours with 1/255 (`0x82017d6c`) into the final slot.
+/// Distance start/range are view-space z, not horizontal distance.
 fn acv_light(r: &Be, name: String, d: usize) -> Result<LightSet> {
     let color = |at: usize| -> Result<[f32; 4]> {
         Ok([
@@ -434,6 +459,11 @@ fn acv_light(r: &Be, name: String, d: usize) -> Result<LightSet> {
             r.u8(at + 3)? as f32 / 255.0,
         ])
     };
+    let unit = |v: u8| v as f32 / 255.0;
+    let distance_max = r.u8(d + 0x3c)?;
+    let height_max = r.u8(d + 0x4c)?;
+    let distance_inverted = r.u8(d + 0x3d)? != 0;
+    let height_inverted = r.u8(d + 0x4d)? != 0;
     Ok(LightSet {
         name,
         slot: r.u8(d + 1)? as u32 * 32 + r.u8(d)? as u32,
@@ -446,7 +476,34 @@ fn acv_light(r: &Be, name: String, d: usize) -> Result<LightSet> {
         sky: color(d + 0x26)?,
         ground: color(d + 0x2a)?,
         extra: [1.0; 4],
-        fog: Fog::default(),
+        fog: Fog {
+            color: [
+                unit(r.u8(d + 0x38)?),
+                unit(r.u8(d + 0x39)?),
+                unit(r.u8(d + 0x3a)?),
+                unit(distance_max),
+            ],
+            range: r.i32(d + 0x34)? as f32,
+            start: r.i32(d + 0x30)? as f32,
+            falloff: 1.0,
+            density: 1.0,
+            luma_tint: 0.0,
+            rising: !height_inverted,
+            height_range: r.i32(d + 0x44)? as f32,
+            height_base: r.i32(d + 0x40)? as f32,
+            height_color: [
+                unit(r.u8(d + 0x48)?),
+                unit(r.u8(d + 0x49)?),
+                unit(r.u8(d + 0x4a)?),
+                unit(height_max),
+            ],
+            acv: Some(AcvFog {
+                distance_min: unit(r.u8(d + 0x3b)?),
+                height_min: unit(r.u8(d + 0x4b)?),
+                distance_inverted,
+                height_inverted,
+            }),
+        },
     })
 }
 
@@ -589,8 +646,8 @@ pub fn read(data: &[u8]) -> Result<Env> {
         matches!(magic, msb::MAGIC_ENV | msb::MAGIC),
         "not an env MSB"
     );
-    // ACV's type-100 lights and type-101 core scene are packed layouts decoded by
-    // `acv_light` / `acv_scene`; ACV fog, filter and lens-flare sub-blocks stay unparsed.
+    // ACV's type-100 lights (with their compact fog) and type-101 core scene are packed
+    // layouts decoded by `acv_light` / `acv_scene`; type-101 fog/filter/lens-flare stay unparsed.
     let acv = magic == msb::MAGIC;
     let mut env = Env {
         events: Vec::new(),
@@ -819,6 +876,46 @@ mod tests {
     }
 
     #[test]
+    fn acv_light_fog_layout() {
+        let mut data = vec![0u8; 0x50];
+        data[0] = 1; // slot 1 = ID01 map basic light
+        data[0x30..0x34].copy_from_slice(&(-20i32).to_be_bytes());
+        data[0x34..0x38].copy_from_slice(&230i32.to_be_bytes());
+        data[0x38..0x3b].copy_from_slice(&[30, 120, 80]);
+        data[0x3b] = 0;
+        data[0x3c] = 90;
+        data[0x3d] = 0;
+        data[0x40..0x44].copy_from_slice(&(-66i32).to_be_bytes());
+        data[0x44..0x48].copy_from_slice(&106i32.to_be_bytes());
+        data[0x48..0x4b].copy_from_slice(&[100, 219, 225]);
+        data[0x4b] = 0;
+        data[0x4c] = 135;
+        data[0x4d] = 1;
+
+        let light = acv_light(&Be(&data), "test".into(), 0).unwrap();
+        assert_eq!(light.slot, 1);
+        let fog = light.fog;
+        assert!(near(fog.start, -20.0));
+        assert!(near(fog.range, 230.0));
+        assert!(near(fog.height_base, -66.0));
+        assert!(near(fog.height_range, 106.0));
+        assert!(near(fog.color[0], 30.0 / 255.0));
+        assert!(near(fog.color[1], 120.0 / 255.0));
+        assert!(near(fog.color[2], 80.0 / 255.0));
+        assert!(near(fog.color[3], 90.0 / 255.0));
+        assert!(near(fog.height_color[0], 100.0 / 255.0));
+        assert!(near(fog.height_color[1], 219.0 / 255.0));
+        assert!(near(fog.height_color[2], 225.0 / 255.0));
+        assert!(near(fog.height_color[3], 135.0 / 255.0));
+        assert!(!fog.rising);
+        let acv = fog.acv.expect("ACV fog extras");
+        assert!(near(acv.distance_min, 0.0));
+        assert!(near(acv.height_min, 0.0));
+        assert!(!acv.distance_inverted);
+        assert!(acv.height_inverted);
+    }
+
+    #[test]
     fn acv_env_from_mission_binder() {
         let Some(disc) = crate::vfs::test_disc_v() else {
             return;
@@ -859,6 +956,27 @@ mod tests {
         assert!(near(light.colors_b[0][1], 245.0 / 255.0));
         assert!(near(light.sky[0], 128.0 / 255.0));
         assert!(near(light.ground[3], 45.0 / 255.0));
+        assert!(env.lights.iter().all(|l| l.fog.acv.is_some()));
+
+        let map = env.light(1).expect("ID01 map basic light");
+        assert!(near(map.fog.start, -750.0));
+        assert!(near(map.fog.range, 820.0));
+        assert!(near(map.fog.height_base, 0.0));
+        assert!(near(map.fog.height_range, 24.0));
+        assert!(near(map.fog.color[0], 90.0 / 255.0));
+        assert!(near(map.fog.color[1], 120.0 / 255.0));
+        assert!(near(map.fog.color[2], 110.0 / 255.0));
+        assert!(near(map.fog.color[3], 90.0 / 255.0));
+        assert!(near(map.fog.height_color[0], 126.0 / 255.0));
+        assert!(near(map.fog.height_color[1], 215.0 / 255.0));
+        assert!(near(map.fog.height_color[2], 175.0 / 255.0));
+        assert!(near(map.fog.height_color[3], 100.0 / 255.0));
+        assert!(!map.fog.rising);
+        let acv_fog = map.fog.acv.expect("ACV fog extras");
+        assert!(near(acv_fog.distance_min, 0.0));
+        assert!(near(acv_fog.height_min, 0.0));
+        assert!(!acv_fog.distance_inverted);
+        assert!(acv_fog.height_inverted);
 
         let scene = env.scene.as_ref().expect("ACV core scene");
         assert_eq!(scene.clear, [0x25, 0x32, 0x31]);

@@ -1095,6 +1095,7 @@ mod tests {
                 height_range: 0.0,
                 height_base: 0.0,
                 height_color: [0.0; 4],
+                acv: None,
             },
         };
         let wp = water_params(&set, true, true, [37, 50, 49]);
