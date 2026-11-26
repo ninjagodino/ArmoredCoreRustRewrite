@@ -62,8 +62,9 @@ const GLIDE_FOOT: i32 = 120;
 /// it ends. Design 5010 has three of the six sockets (core 213/218, arm 223), matching the three
 /// starts in `private/xenia/glide_ids.jsonl`.
 const GLIDE_TRAIL: i32 = 134;
-/// Main nozzles, the booster light on them, leg back nozzles, and the side-booster pairs.
-/// Built in `0x82893ec0` and selected by `0x82892f08`.
+/// Main nozzles (31..34, main/glide jets) and leg foot nozzles (21..24, foot 301 / glide 120).
+/// Each slot record built by `0x82893ec0` is `{+8 effect id, +0xc dummy id}`; captured live in
+/// `private/xenia/P4D_GLIDE.jsonl`. `0x82892f08` selects the group.
 const MAIN_NOZZLES: std::ops::RangeInclusive<u8> = 31..=34;
 const LEG_NOZZLES: std::ops::RangeInclusive<u8> = 21..=24;
 /// Quick Boost effect scales fed to `0x82891ce8` (`> 1.0 => ac_qb_large 305`, `< 1.0 =>
@@ -2569,7 +2570,7 @@ fn booster_plays(
         return Vec::new();
     }
     let main = i32::from(row.ac_main_booster);
-    let back = i32::from(row.ac_back_booster);
+    let foot = i32::from(row.ac_foot_booster);
     let light = i32::from(row.ac_booster_light);
     let mut out = Vec::new();
     let push = |out: &mut Vec<Play>, id: i32, scale: f32| {
@@ -2582,10 +2583,7 @@ fn booster_plays(
             if rear_stick(stick) {
                 push(&mut out, main, 1.0);
             }
-            // Each glide frame `0x830e8ef8` leaves five effects at 0.6 and two at 1.0
-            // (`private/xenia/glide_fxscale.jsonl`), the five 131 and two 120 starts.
             push(&mut out, GLIDE_MAIN, glide_scale);
-            push(&mut out, GLIDE_FOOT, 1.0);
         } else {
             push(&mut out, main, 1.0);
         }
@@ -2593,17 +2591,25 @@ fn booster_plays(
     if id == 41 {
         push(&mut out, light, 1.0);
     }
-    if LEG_NOZZLES.contains(&id) && !glide {
-        push(&mut out, back, 1.0);
+    // Slot records built by `0x82893ec0` (read at runtime in `private/xenia/P4D_GLIDE.jsonl`):
+    // 21..24 -> foot 301, replaced by 120 while gliding; 31..34 -> main 300, replaced by 131;
+    // 41 -> light 299 in each of those groups. The glide run starts four 131s and two 120s,
+    // and the 5001 legs carry exactly the dummies 21/22 that take 120.
+    if LEG_NOZZLES.contains(&id) {
+        if glide {
+            push(&mut out, GLIDE_FOOT, 1.0);
+        } else {
+            push(&mut out, foot, 1.0);
+        }
     }
     if stick.x > SIDE_STICK && matches!(id, 11 | 12) {
-        push(&mut out, back, stick.x);
+        push(&mut out, foot, stick.x);
     }
     if stick.x > SIDE_STICK && id == 42 {
         push(&mut out, light, stick.x);
     }
     if stick.x < -SIDE_STICK && matches!(id, 13 | 14) {
-        push(&mut out, back, -stick.x);
+        push(&mut out, foot, -stick.x);
     }
     if stick.x < -SIDE_STICK && id == 43 {
         push(&mut out, light, -stick.x);
@@ -3265,9 +3271,10 @@ mod tests {
     use bevy::prelude::{Assets, Image, StandardMaterial, Vec2, Vec3, Vec4};
 
     use super::{
-        cached_material, ground_sfx_id, qb_sfx_id, qb_tae_ffx, rear_stick, ribbon_batch, Blend,
-        ColorCurve, Curve, GROUND_ROW_KICK, GROUND_ROW_LAND, GROUND_ROW_SLIDE, GROUND_ROW_WALK,
-        QB_LARGE_SCALE, QB_SHORTAGE_SCALE,
+        booster_plays, cached_material, ground_sfx_id, qb_sfx_id, qb_tae_ffx, rear_stick,
+        ribbon_batch, Blend, ColorCurve, Curve, GLIDE_FOOT, GLIDE_MAIN, GLIDE_SFX_SCALE,
+        GROUND_ROW_KICK, GROUND_ROW_LAND, GROUND_ROW_SLIDE, GROUND_ROW_WALK, QB_LARGE_SCALE,
+        QB_SHORTAGE_SCALE,
     };
     use crate::collision::GroundSurface;
 
@@ -3280,6 +3287,41 @@ mod tests {
         assert!(rear_stick(Vec2::new(0.0, -1.0)), "back");
         assert!(rear_stick(Vec2::new(0.5, -1.0)), "back-right");
         assert!(!rear_stick(Vec2::new(1.0, 0.4)), "forward-right");
+    }
+
+    #[test]
+    fn booster_slots_match_the_360_record_table() {
+        let row = &find(PARAM_MAPSFXPARAM_BIN, 0)
+            .expect("mapsfxparam row 0")
+            .data;
+        let ids = |point, glide| {
+            booster_plays(
+                point,
+                Vec2::new(0.0, 1.0),
+                glide,
+                true,
+                GLIDE_SFX_SCALE,
+                row,
+            )
+            .into_iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>()
+        };
+        // Slot records built by 0x82893ec0, read in private/xenia/P4D_GLIDE.jsonl:
+        // 31..34 -> main 300 / glide 131, 21..24 -> foot 301 / glide 120, 41 -> light 299.
+        assert_eq!(ids(31, false), vec![i32::from(row.ac_main_booster)]);
+        assert_eq!(ids(31, true), vec![GLIDE_MAIN]);
+        assert_eq!(ids(21, false), vec![i32::from(row.ac_foot_booster)]);
+        assert_eq!(ids(21, true), vec![GLIDE_FOOT]);
+        assert_eq!(ids(41, true), vec![i32::from(row.ac_booster_light)]);
+        assert!(
+            !ids(31, true).contains(&GLIDE_FOOT),
+            "120 is not a main-nozzle effect"
+        );
+        assert!(
+            !ids(21, false).contains(&i32::from(row.ac_back_booster)),
+            "21..24 take foot 301, not back 302"
+        );
     }
 
     #[test]
