@@ -469,9 +469,16 @@ in order:
   DLC mount. The callout set is the
   reliable combat subset (energy/AP thresholds, scan/combat mode, AC disabled, beginning
   operation); the mission-only lines (beacon, objective, enemy AC weight class, operation
-  pattern) need the mission/AI message dispatcher. AC TEST did not fire the `AI_MESSAGE_SOUND_MAP`
-  path (`0x82449518` / `0x824493d0`) in the Xenia probe (`private/xenia/voice_en.jsonl`); a
-  real mission run would confirm the offset->event table live. Voice currently rides the SFX
+  pattern) need the mission/AI message dispatcher. x360dis confirms the sound path:
+  `0x824492c0` computes `(base + 0x493e0) * 100 + voice offset`, `0x82449518` picks the base
+  from a four-entry play-obj table and the offset from the sound-map row, and the sound
+  singleton hands its `+0x94cb4` table to `0x82448fb8` at `0x82ad0764`. The AI-manager path
+  fills them from scene data (`0x827e8d20` reads `[this+0x320]+0x2ea70`), so they are not
+  hard-coded in the wrapper. AC TEST still did not fire `0x82449518` / `0x824493d0`
+  (`private/xenia/voice_en.jsonl`) or `0x82448fb8` (new `private/xenia/voice_bases.jsonl`,
+  empty), so offsets 38..44 remain the FEV event order rather than a live hit; the FEV also has
+  `20211` and `20301..20305` past the 44 message events (fevdump). The sound-map rows are
+  `lang/en/text/ai/aisys.tsmap`, not `param/aisys.bin`. Voice currently rides the SFX
   bus; a dedicated Voice Volume slider (the 360 `@VoiceVolumeSl`/`@VoiceVolumeValue` strings,
   `0x8204c8c4`/`0x8204c8d4`) is not exposed yet. Fired callouts now draw the retail
   `MissionText` subtitle window (`acvd-game::subtitle`, `sortie.drb` dialog 44 at
