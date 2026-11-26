@@ -309,9 +309,12 @@ impl LensFlare {
 /// `0x8275d4f0` copies `+1..+3`, the `+4..+0x30` floats, and the
 /// `+0x1c..+0x20` bytes into the filter singleton at `0x8387c700+0x55c0`
 /// through `0x82569e10`. Field meanings are still being traced, so this keeps
-/// the raw layout. m0300's last event is enabled with kind `0x3c`, `params[0]`
-/// `0.2`, `params[3]` `-0.13`, `params[5]` `0.06`; m0600's is kind `0xff`,
-/// `sub_kind` `0x3c/0x1e`, `params[0]` `0.35`.
+/// the raw layout. m0300's first (lightning) and last (scene) events carry the
+/// same record: enabled, kind `0x3c`, `params[0]` `0.2`, `params[3]` `-0.13`,
+/// `params[5]` `0.06`. m0600's first event is kind `0x50` (`params[0]` `0.5`,
+/// `params[3]` `0.1`, `params[4]` `-0.02`, `params[5]` `0.005`, flags
+/// `00/28/00/00/00`), while its last event is kind `0xff`, `sub_kind`
+/// `0x3c/0x1e`, `params[0]` `0.35`.
 #[derive(Debug, Clone, Copy, Serialize, Default)]
 pub struct AcvScreenFilter {
     /// `+0`: nonzero enables the filter.
@@ -443,6 +446,10 @@ pub struct Env {
     pub events: Vec<Event>,
     pub lights: Vec<LightSet>,
     pub scene: Option<Scene>,
+    /// ACV only: every type-101 scene event in encounter order. `scene` is the
+    /// last of these (last-event-wins); the first is the lightning-filter scene
+    /// on m0300/m0600 and carries its own `acv_filter` / `acv_dof`.
+    pub acv_scenes: Vec<Scene>,
     pub bgm: Option<Bgm>,
     /// Dynamic point lights from `POINT_PARAM_ST` (`kind == 1300`, `0x82be7be0`).
     pub point_lights: Vec<PointLight>,
@@ -453,6 +460,13 @@ pub struct Env {
 impl Env {
     pub fn light(&self, slot: u32) -> Option<&LightSet> {
         self.lights.iter().find(|l| l.slot == slot)
+    }
+
+    /// ACV only: the screen filter from the first type-101 scene event (the
+    /// lightning filter scene on m0300/m0600), kept apart from `scene` because
+    /// the last event overwrites the core values.
+    pub fn acv_first_filter(&self) -> Option<&AcvScreenFilter> {
+        self.acv_scenes.first()?.acv_filter.as_ref()
     }
 }
 
@@ -799,12 +813,14 @@ pub fn read(data: &[u8]) -> Result<Env> {
     );
     // ACV's type-100 lights (with their compact fog) and type-101 core scene + lens flare +
     // screen filter + DOF are packed layouts decoded by `acv_light` / `acv_scene` /
-    // `acv_lens_flare`; the type-101 atmosphere record stays unparsed.
+    // `acv_lens_flare`; every type-101 scene event is kept in `acv_scenes`, while `scene`
+    // is the last one. The type-101 atmosphere record stays unparsed.
     let acv = magic == msb::MAGIC;
     let mut env = Env {
         events: Vec::new(),
         lights: Vec::new(),
         scene: None,
+        acv_scenes: Vec::new(),
         bgm: None,
         point_lights: Vec::new(),
         spot_lights: Vec::new(),
@@ -825,7 +841,11 @@ pub fn read(data: &[u8]) -> Result<Env> {
         match e.kind {
             EVENT_LIGHT if acv => env.lights.push(acv_light(&r, e.name.clone(), e.data)?),
             EVENT_LIGHT => env.lights.push(light(&r, e.name.clone(), e.data)?),
-            EVENT_SCENE if acv => env.scene = Some(acv_scene(&r, e.data)?),
+            EVENT_SCENE if acv => {
+                let scene = acv_scene(&r, e.data)?;
+                env.scene = Some(scene.clone());
+                env.acv_scenes.push(scene);
+            }
             EVENT_SCENE if env.scene.is_none() => {
                 let sub = e.data + r.u32(e.data)? as usize;
                 let sub2_rel = r.u32(e.data + 8)? as usize;
@@ -1317,6 +1337,90 @@ mod tests {
         assert!(near(dof.params[0], 0.0));
         assert!(near(dof.params[12], 1.0));
         assert_eq!(dof.flags, [0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn acv_two_scene_events_keep_first_filter() {
+        let Some(disc) = crate::vfs::test_disc_v() else {
+            return;
+        };
+        let env_from_binder = |binder_path: &str, msb: &str| {
+            let binder = disc.asset(binder_path).unwrap();
+            let b = crate::bnd3::read(&binder).unwrap();
+            let entry = b
+                .entries
+                .iter()
+                .find(|e| e.name.as_deref().is_some_and(|n| n.ends_with(msb)))
+                .unwrap_or_else(|| panic!("{msb} in {binder_path}"));
+            let data = crate::vfs::undcx(entry.contents(&binder).unwrap().into_owned()).unwrap();
+            read(&data).unwrap()
+        };
+        let env = env_from_binder("bind/mission/mission_1200.bnd", "m0300_env.msb");
+
+        let names: Vec<&str> = env
+            .events
+            .iter()
+            .filter(|e| e.kind == EVENT_SCENE)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["カミナリのフィルター用シーン環境", "シーン環境パラメーター"]
+        );
+        assert_eq!(env.acv_scenes.len(), 2);
+
+        // m0300's lightning and scene events carry byte-identical +0x30 records
+        // (private/tmp/acv_type101_blocks.txt: 01 3c 00 00, 0.2, -0.13, 0.06).
+        let first = env.acv_scenes[0]
+            .acv_filter
+            .expect("m0300 first lightning filter");
+        let last = env.acv_scenes[1]
+            .acv_filter
+            .expect("m0300 last scene filter");
+        for filter in [&first, &last] {
+            assert!(filter.enabled);
+            assert_eq!(filter.kind, 0x3c);
+            assert_eq!(filter.sub_kind, [0, 0]);
+            assert!(near(filter.params[0], 0.2));
+            assert!(near(filter.params[3], -0.13));
+            assert!(near(filter.params[5], 0.06));
+        }
+        assert_eq!(env.acv_first_filter().unwrap().kind, first.kind);
+        assert_eq!(
+            env.acv_scenes[0].acv_dof.unwrap().params,
+            env.acv_scenes[1].acv_dof.unwrap().params
+        );
+
+        // `scene` keeps last-event-wins semantics.
+        let scene = env.scene.as_ref().expect("ACV core scene");
+        assert!(near(scene.far, env.acv_scenes[1].far));
+        assert_eq!(scene.acv_filter.unwrap().kind, 0x3c);
+
+        // m0600 is the map where the first filter differs from the last one; the
+        // first record must survive even though `scene` is the last event.
+        let m0600 = env_from_binder("bind/mission/mission_0006.bnd", "m0600_env.msb");
+        assert_eq!(m0600.acv_scenes.len(), 2);
+        let lightning = m0600.acv_scenes[0]
+            .acv_filter
+            .expect("m0600 first lightning filter");
+        let normal = m0600.acv_scenes[1]
+            .acv_filter
+            .expect("m0600 last scene filter");
+        assert_eq!(lightning.kind, 0x50);
+        assert_eq!(normal.kind, 0xff);
+        assert_ne!(lightning.kind, normal.kind);
+        assert!(near(lightning.params[0], 0.5));
+        assert!(near(lightning.params[3], 0.1));
+        assert!(near(lightning.params[4], -0.02));
+        assert!(near(lightning.params[5], 0.005));
+        assert_eq!(lightning.flags, [0, 0x28, 0, 0, 0]);
+        assert!(near(normal.params[0], 0.35));
+        assert_eq!(normal.sub_kind, [0x3c, 0x1e]);
+        assert_eq!(m0600.scene.as_ref().unwrap().acv_filter.unwrap().kind, 0xff);
+        assert_eq!(
+            m0600.acv_scenes[0].acv_dof.unwrap().params,
+            m0600.acv_scenes[1].acv_dof.unwrap().params
+        );
     }
 
     #[test]
