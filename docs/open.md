@@ -353,11 +353,36 @@ in order:
   `map_name_id` / thumbnail fields. `system/acv.ini` in `bind/boot.bnd` sets
   `$(AcTestMap)=m720/m720.msb`, `$(TutorialMap)=m710/m710.msb`,
   `$(VersusDefaultMap)=mission/BattleFeild_5000.xml`; `mission_6170.bnd` is a fully commented-out
-  arena XML that still names m0001. Open: a map MSB can reference piece models stored in another
-  `model/map/{map}` folder (m0300's MSBs use m1012, present only in
-  m0500/m0600/m0750/m0800/m2100/m2200), so the runtime model lookup is shared/global — trace
-  `MapPartsLinkModelDataProxy` in `ACV.pe` (source string at `0x820c6090`, same class as VD
-  `0x82d0eee0`). ACV `ch_env/*_env.msb` use the **plain** `msb::MAGIC` (0x00989A6A), not VD's
+  arena XML that still names m0001. Model sharing is **not** a plain global folder search. Only the
+  mission-specific MSBs (`m0300_mission1200/1201/1209/4023`) reference the 199 models
+  m1012..m1210 missing from `m0300`; `m0300_map.msb` and mission_0003/4022/4024/4025 reference
+  none, so the mission-0003 path is self-contained. Same-name FLVs are different assets: m1012 is
+  a 4 KB/3-vertex dummy in m0500/m0750/m0800/m2100/m2200 and a real 2.1 MB FLVER only in m0600;
+  of the 199, 151 have only dummy copies anywhere and 48 have exactly one real copy (46 in m2200,
+  2 in m0600). `MODEL_PARAM_ST` has a name rel at `+0x00` (inline at `+0x1c` for m1012) and a SIB
+  path rel at `+0x0c` (`N:\ACV\data\model\map\m0300\model_sib\m1012.sib`);
+  `PARTS_PARAM_ST` has a SIB path rel at `+0x10` (`...\m0300\layout\layout.SIB`). Those SIB
+  strings are build-source paths, not runtime archive paths. `_m.mlb` is the shipped link data:
+  697 type-`0x80` sections in `m0300_m.mlb` (724 in `m0500_m.mlb`), each with source SIB,
+  materials and model name; `m0300_m.mlb` has no m1012 section, m0500/m0600 do. ACV's
+  `MapPartsLinkModelDataProxy` is vtable `0x820c60f4` (slot `+0x38` = `0x82988038`), ctor
+  `0x82988a00`, factory `0x8298cc88`; `0x82988038` -> path builder `0x82a14540` -> loader
+  `0x82a13010`, and `0x82a14540` builds `bnddev_%s` (`0x820d372c`) with `%s:` (`0x820d3708`).
+  The ACV Xenia AC Test probe (recipe `private/xenia/acv_test.txt`, log
+  `private/xenia/acv_model.jsonl`) built `bnddev_m0100_m_dcx:/m0102.flv` and
+  `bnddev_m0100_m_dcx:/m0050.flv` and requested `m0012.flv` / `m0050.flv`, all of which exist
+  in the current map folder m0100; boot also preloaded `m0299_m.mlb` / `m0100_m.mlb`. No
+  global-name lookup was observed, so the rewrite rule is the current map's
+  `model/map/{map}/{model}.flv`, skipping absent models; treat the 151 dummy-only mission-1200
+  parts as unused/hidden; `vfs::tests::acv_map_models_resolve_in_the_current_map_folder` pins
+  the current-folder/dummy/real copies. Mission 1200 itself was not probed. The ACV static index
+  is usable after `acvd-index` was changed to locate the PE `.pdata` section (ACV `0x82215c00`,
+  VD's fixed `0x8225c200`): `build --pe private/x360/v/ACV.pe --root private/tmp/acvroot`
+  indexes 107,832 functions, and `q const 0x820d372c` finds only the key builder `0x82a14d60`.
+  VD's equivalent is vtable
+  `0x8210c624` (secondary vfptr at `+0x62c`), ctor `0x82d0f750`; slot 14 `0x82d0f680` ->
+  `0x82c2d4d0`, which appends the model name to `context+0xc`; VD source path `0x8210c5c0`,
+  ACV `0x820c6090` (`0x82d0eee0` was a thunk). ACV `ch_env/*_env.msb` use the **plain** `msb::MAGIC` (0x00989A6A), not VD's
   `MAGIC_ENV` (0x00989A6C), so `env::read` rejects all 37 of them even though `msbdump` reads the
   same EVENT header/kinds (100 light, 101 scene, 102 wind, 103 rain, 400 BGM); relax the magic
   check and verify the type-100/101 payloads against ACV before using `env.rs`. Also open:

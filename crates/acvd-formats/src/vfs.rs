@@ -620,6 +620,23 @@ mod tests {
     }
 
     #[test]
+    fn acv_map_models_resolve_in_the_current_map_folder() {
+        let Some(disc) = test_disc_v() else { return };
+        // AC Test loads through the m0100 binder (`bnddev_m0100_m_dcx:/...` in the Xenia probe).
+        assert!(disc.exists("model/map/m0100/m0102.flv"));
+        assert!(disc.exists("model/map/m0100/m0050.flv"));
+        // m0300's mission MSBs name m1012, but that model is absent from the map folder.
+        assert!(!disc.exists("model/map/m0300/m1012.flv"));
+        // The same-name copies elsewhere are a 4 KB dummy; m0600 ships the real FLV.
+        let dummy =
+            crate::dcx::decompress(&disc.read("model/map/m0500/m1012.flv").unwrap()).unwrap();
+        assert_eq!(dummy.len(), 4096);
+        let real =
+            crate::dcx::decompress(&disc.read("model/map/m0600/m1012.flv").unwrap()).unwrap();
+        assert!(real.len() > 1 << 20);
+    }
+
+    #[test]
     fn x360_disc_lists_named_entries() {
         let Some(disc) = iso() else { return };
         let menus = disc.list("lang/en/menu");
