@@ -27,13 +27,18 @@ pub const SEPARATOR: char = '|';
 /// The 360 disc image, relative to the repo root.
 pub const X360_ISO: &str =
     "armoredcoredumps/Armored Core - Verdict Day (USA)/Armored Core - Verdict Day (USA).iso";
+/// The Armored Core V (base game) 360 disc image, relative to the repo root.
+pub const X360_ISO_V: &str = "armoredcoredumps/Armored Core V (USA)/Armored Core V (USA).iso";
 /// Names of the BHD5 entries, relative to the repo root.
 pub const X360_NAMES: &str = "private/x360/dvdbnd_names.csv";
 
-const LAYERS: [(&str, &str); 2] = [
+/// Verdict Day splits the archive into two BHD5 layers.
+const LAYERS_VD: [(&str, &str); 2] = [
     ("bind/dvdbnd5_layer0.bhd", "bind/dvdbnd_layer0.bdt"),
     ("bind/dvdbnd5_layer1.bhd", "bind/dvdbnd_layer1.bdt"),
 ];
+/// Armored Core V (base game) ships one BHD5 layer over `bind/dvdbnd.bdt`.
+const LAYERS_V: [(&str, &str); 1] = [("bind/dvdbnd5.bhd", "bind/dvdbnd.bdt")];
 const SCRIPT: (&str, &str) = ("bind/script.bhd", "bind/script.bdt");
 const SCRIPT_DIR: &str = "script/";
 /// Load bundles, in lookup order: the boot binders (360 `$(Data)\bind\boot.bnd`,
@@ -201,6 +206,8 @@ impl Disc {
         Self::open_with_names(path, &repo_root().join(X360_NAMES))
     }
 
+    /// Opens a 360 ISO with an explicit BHD5 name listing. Only Verdict Day images read the
+    /// listing; ACV's BHD5 has no name source yet, so its entries are read by path hash.
     pub fn open_with_names(path: &Path, names: &Path) -> Result<Disc> {
         if !path.is_file() {
             bail!("no disc image at {}", path.display());
@@ -342,8 +349,10 @@ impl X360 {
                 .find(file)
                 .with_context(|| format!("{}: no {file}", path.display()))
         };
+        let verdict_day = image.find(LAYERS_VD[0].0).is_some();
+        let layers_spec: &[(&str, &str)] = if verdict_day { &LAYERS_VD } else { &LAYERS_V };
         let mut layers = Vec::new();
-        for (bhd, bdt) in LAYERS {
+        for (bhd, bdt) in layers_spec {
             let entries = bhd5::read(&image.read(bhd)?).with_context(|| bhd.to_string())?;
             layers.push((
                 extent(bdt)?.offset,
@@ -362,15 +371,19 @@ impl X360 {
         for (file, _) in image.files() {
             names.insert(file.to_string(), file.to_string());
         }
-        if let Ok(csv) = std::fs::read_to_string(names_csv) {
-            for line in csv.lines().skip(1) {
-                if let Some(p) = line
-                    .splitn(4, ',')
-                    .nth(3)
-                    .map(|p| p.trim_start_matches('/'))
-                    .filter(|p| !p.is_empty())
-                {
-                    names.insert(key(p), p.to_string());
+        // The committed listing is Verdict Day's; ACV's BHD5 has no name source yet, so those
+        // names must not be reported as files on an ACV image (lookups are by hash either way).
+        if verdict_day {
+            if let Ok(csv) = std::fs::read_to_string(names_csv) {
+                for line in csv.lines().skip(1) {
+                    if let Some(p) = line
+                        .splitn(4, ',')
+                        .nth(3)
+                        .map(|p| p.trim_start_matches('/'))
+                        .filter(|p| !p.is_empty())
+                    {
+                        names.insert(key(p), p.to_string());
+                    }
                 }
             }
         }
@@ -504,6 +517,13 @@ pub(crate) fn test_disc() -> Option<Disc> {
     path.is_file().then(|| Disc::open(&path).unwrap())
 }
 
+/// The Armored Core V 360 ISO, for tests that skip when it is absent.
+#[cfg(test)]
+pub(crate) fn test_disc_v() -> Option<Disc> {
+    let path = repo_root().join(X360_ISO_V);
+    path.is_file().then(|| Disc::open(&path).unwrap())
+}
+
 /// The hash in an `_unknown/<dir>/<decimal hash>.<ext>` name.
 fn unknown_hash(file: &str) -> Option<u32> {
     let k = key(file);
@@ -584,6 +604,19 @@ mod tests {
             .unwrap();
         assert_eq!(flv, flv_cached);
         assert_eq!(disc.0.binders.lock().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn acv_disc_reads_single_layer_archive() {
+        let Some(disc) = test_disc_v() else { return };
+        assert_eq!(disc.read("param/battlemapinfo.bin").unwrap().len(), 1463);
+        let binder = disc.asset("bind/mission/mission_0000.bnd").unwrap();
+        let b = bnd3::read(&binder).unwrap();
+        assert!(b.entries.iter().any(|e| {
+            e.name
+                .as_deref()
+                .is_some_and(|n| n.ends_with("m0050_map.msb"))
+        }));
     }
 
     #[test]

@@ -331,6 +331,38 @@ in order:
   selection"); the mission variants without their own `{map}_m.dcx.bnd` / `{map}_htdcx.bnd`
   (m3104, m3121, m3201, m3202, ...) still need the shared base-binder lookup before they can be
   listed.
+- **Armored Core V (base game) maps — started (2026-11-26)**: the ACV 360 disc reads through the
+  same VFS (`vfs::X360_ISO_V`); `X360::open` now picks the single `bind/dvdbnd5.bhd` +
+  `bind/dvdbnd.bdt` layer when Verdict Day's `bind/dvdbnd5_layer0.bhd` is absent
+  (`vfs::tests::acv_disc_reads_single_layer_archive`). ACV has no committed BHD5 name list, so
+  `files()` reports only the loose files, boot-bundle members and scripts (644 paths) and reads are
+  by path hash. `cargo run -p acvd-formats --example
+  acv_maps` surveys it: ACV ships map layout in **97** `bind/mission/{mission,BattleFeild}_XXXX.bnd`
+  BND3 binders (BHD5 entries, not loose like VD); each holds a `mission/*.xml` `<AreaList>` naming
+  the `<Chr>`/`<Map>` MSBs plus `<Env>`/`<Nav>`, while the map-piece FLVERs are individual
+  top-level files `model/map/{map}/{model}.flv` (+ `_l1.flv`), with `{map}_m.mlb` and
+  `{map}_l.tpf.dcx`, and no VD-style `{map}_m.dcx.bnd` / `{map}_htdcx.bnd`. All 174 referenced MSBs
+  parse with the shared `msb` reader, 0 failures (35,722 MODEL, 182,409 PARTS, 7,292 POINT
+  records); 20 top-level map folders have `_m.mlb` (m0050, m0100, m0299, m0300, m0400, m0500,
+  m0600, m0650, m0700, m0750, m0800, m0900, m1000, m2000, m2100, m2200, m2300, m2500, m5000,
+  m5001), 17 of them named by mission XMLs. ACV's `POINT_PARAM_ST` adds kinds 0, 1, 250, 260, 270,
+  280, 400, 500, 650, 1100, 2000, 3100 to VD's set, and `PARTS_PARAM_ST` has kinds 0/1/2/4 plus
+  0xFFFFFFFF (1,503 records). ACV `param/battlemapinfo.bin` (1,463 B, `BATTLE_MAP_INFO` PARAMDEF
+  104, **0x54**-byte rows vs VD's 0x5c) has 13 maps with `MapID` 3000-3004 / 5000-5700, new
+  `MapMinY`/`MapMaxY` (+0x3c/+0x40) and `BeginPlaygID` (+0x44), and no `practice_map_tex_id` /
+  `map_name_id` / thumbnail fields. `system/acv.ini` in `bind/boot.bnd` sets
+  `$(AcTestMap)=m720/m720.msb`, `$(TutorialMap)=m710/m710.msb`,
+  `$(VersusDefaultMap)=mission/BattleFeild_5000.xml`; `mission_6170.bnd` is a fully commented-out
+  arena XML that still names m0001. Open: a map MSB can reference piece models stored in another
+  `model/map/{map}` folder (m0300's MSBs use m1012, present only in
+  m0500/m0600/m0750/m0800/m2100/m2200), so the runtime model lookup is shared/global — trace
+  `MapPartsLinkModelDataProxy` in `ACV.pe` (source string at `0x820c6090`, same class as VD
+  `0x82d0eee0`). ACV `ch_env/*_env.msb` use the **plain** `msb::MAGIC` (0x00989A6A), not VD's
+  `MAGIC_ENV` (0x00989A6C), so `env::read` rejects all 37 of them even though `msbdump` reads the
+  same EVENT header/kinds (100 light, 101 scene, 102 wind, 103 rain, 400 BGM); relax the magic
+  check and verify the type-100/101 payloads against ACV before using `env.rs`. Also open:
+  HNAV/HTR, the `.mtd` binders, and the loaders for the `_m.mlb`-only folders
+  m0650/m1000/m5000/m5001.
 - **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), the per-enemy target lock-on HUD cursor (one pooled 256×128 `sortie.drb` box per enemy in the FCS cone, up to 8; text/bars/pips only on the FCS-selected target, `MissileLock1..6`), and Scan Mode / Target Scan / Recon Units (`ACV_ScanModeLockSight`, `ACV_Scan_Cur_EnemyParamInfo`, `ACV_MapScan_ReconInfo*`) are now in (see Done). Retail lock-cursor appearance/rule confirmed from the build instead of a sortie capture: `sortie.drb` authors every element (`LockOnText` msg 2313, `MissileLock1..6`, `EnemyName`/`EnemyAP`, and the 32x32 `_Target` with `LockColor1st` `0x006680ff` / `LockColor2nd` `0xff4000ff`); `0x829d4a90` bakes those color defaults and `0x829d4b88` overrides them from the dialog's named colors. `0x829d4558` -> `0x829d30e0` draws each wing only when the candidate's `+0` lock flag or `i16 +2` missile-lock count is set and `+1` or `f32 +4` >= 1.0; `0x829d1a10` shows `MissileLock1..n` from `i16 +2`, `0x829d1ac0` fills `CursorLine` from `f32 +4`. The Xenia runs drew no cursor because the tanks sat outside the FCS sight cone (aim), not because of a missing code path; the `_Target` 1st/2nd selection is the authored two-sprite dialog read through that candidate state.
 - **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics, range-decay, shoulder weapons & homing missiles, melee blades / heat piles / Boost Charge Kick, arm firing-stability reload scaling, weapon arms, sub-munition split missiles, Overed Weapons, and hand-weapon firing modes done; see Done):
   - Bay shift & purge are up to 360 parity (`acvd-game::bay`, `hanger`, `pose`, `sfx`, `sound`, `sheets/ac_states.csv`, `sheets/hanger_anim.csv`, `sheets/sound_cues.csv`, see Done): per-arm overlay (`r_kata`/`l_kata`), explicit TAE `2000..2003` / `2010..2013` (sparks FFX `4109`, steam puff FFX `98` at scale `1.5`, sounds `c00000047` / `c00000045`, `kind=101` Reattach at f40/f150, `kind=102` Purge at f10), dual-prong rack carousel (`a00_011`/`a00_021` + `r_hg_f`/`r_hg_b`), and dynamic `hanger_pose` updates.
