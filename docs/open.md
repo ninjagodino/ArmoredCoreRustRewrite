@@ -386,8 +386,15 @@ in order:
   `msb::MAGIC` (0x00989A6A), not VD's `MAGIC_ENV` (0x00989A6C). `env::read` now accepts both.
   ACV's type-100 handler `0x827626d8` gives two i16 angle pairs and six RGBA byte colours
   (`acv_light`; the m0300 test checks light 0 at 15/5 and 30/20), and the EVENT table/BGM parse
-  (50 events, BGM 103/1001). ACV's type-101 scene and fog use a different packed layout, so
-  `Env.scene` stays `None` and the light fog stays zero; decoding those remains open. `m1000`
+  (50 events, BGM 103/1001). ACV's type-101 handler `0x827621ec` keeps the core scene in the
+  first sub-block (`data + u32(data)`): clear RGB `+0..2`, draw distance `+4`, water height
+  `+8`, and sky scale `+0x1c` (used only when `> 1`). `acv_scene` now decodes those and the
+  last type-101 event wins; m0300 is clear `(0x25,0x32,0x31)`, far `10000`, water `-1000`,
+  sky scale `100`. The ACV fog block (type-100 payload `+0x30..+0x4d`) and the type-101
+  filter/lens-flare sub-blocks are not mapped to `Fog`/`ToneMap`/`LensFlare` yet, so the ACV
+  light fog stays zero and those use the VD defaults. The disc test
+  `env::tests::acv_env_from_mission_binder` is skipped while `armoredcoredumps/` is empty;
+  `acv_scene_core_layout` pins the parser without the disc. `m1000`
   is not a map with models: mission_0010 pairs `ch_env/m1000_env.msb` with
   m0300, and `script/event_include/m1000_*` exists. `m0650`/`m5000`/`m5001` are referenced by
   no mission XML, script, or executable string, so their `_m.mlb` files are unused/cut and need

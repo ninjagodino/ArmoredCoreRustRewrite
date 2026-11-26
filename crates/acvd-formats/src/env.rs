@@ -1,8 +1,8 @@
 //! Map environment (`model/map/ch_env/{map}_env.msb`): the MSB section chain at version
 //! `msb::MAGIC_ENV` (VD) or `msb::MAGIC` (ACV), with every record in `EVENT_PARAM_ST`.
-//! ACV's type-100 lights use a packed byte layout (`acv_light`); its type-101 scene and fog are
-//! a different packed layout and remain undecoded. Field layouts and the shader
-//! constants built from them are in `sheets/map_env.csv`.
+//! ACV's type-100 lights use a packed byte layout (`acv_light`); its type-101 core scene is
+//! decoded by `acv_scene`, while the ACV fog and filter sub-blocks remain undecoded. Field
+//! layouts and the shader constants built from them are in `sheets/map_env.csv`.
 //!
 //! Event record: `u32 name, i32 id, u32 type, u32 index, u32 data`, offsets relative to the
 //! record. Types: 100 light set, 101 scene parameters, 102 wind, 400 BGM (mission envs only).
@@ -450,6 +450,26 @@ fn acv_light(r: &Be, name: String, d: usize) -> Result<LightSet> {
     })
 }
 
+/// ACV type-101 core scene (`0x827621ec`): first sub-block at `data + u32(data)`.
+///
+/// Unlike VD, ACV keeps the core values in the first sub-block but at different offsets:
+/// `+4` draw distance, `+8` water height, `+0x1c` sky scale (only used when `> 1`). The
+/// ACV filter/tone-map and lens-flare sub-blocks are not decoded yet, so those stay at
+/// their defaults.
+fn acv_scene(r: &Be, d: usize) -> Result<Scene> {
+    let sub = d + r.u32(d)? as usize;
+    Ok(Scene {
+        clear: [r.u8(sub)?, r.u8(sub + 1)?, r.u8(sub + 2)?],
+        far: r.f32(sub + 4)?,
+        water_height: r.f32(sub + 8)?,
+        sky_scale: Some(r.f32(sub + 0x1c)?)
+            .filter(|&s| s > 1.0)
+            .unwrap_or(1.0),
+        tonemap: ToneMap::default(),
+        lens_flare: LensFlare::default(),
+    })
+}
+
 fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
     if s3 + 0x94 > len {
         return Ok(LensFlare::default());
@@ -569,8 +589,8 @@ pub fn read(data: &[u8]) -> Result<Env> {
         matches!(magic, msb::MAGIC_ENV | msb::MAGIC),
         "not an env MSB"
     );
-    // ACV's type-100 lights are a packed byte layout decoded by `acv_light`; its type-101
-    // scene and fog are a different packed layout, so leave those unparsed.
+    // ACV's type-100 lights and type-101 core scene are packed layouts decoded by
+    // `acv_light` / `acv_scene`; ACV fog, filter and lens-flare sub-blocks stay unparsed.
     let acv = magic == msb::MAGIC;
     let mut env = Env {
         events: Vec::new(),
@@ -596,7 +616,8 @@ pub fn read(data: &[u8]) -> Result<Env> {
         match e.kind {
             EVENT_LIGHT if acv => env.lights.push(acv_light(&r, e.name.clone(), e.data)?),
             EVENT_LIGHT => env.lights.push(light(&r, e.name.clone(), e.data)?),
-            EVENT_SCENE if !acv && env.scene.is_none() => {
+            EVENT_SCENE if acv => env.scene = Some(acv_scene(&r, e.data)?),
+            EVENT_SCENE if env.scene.is_none() => {
                 let sub = e.data + r.u32(e.data)? as usize;
                 let sub2_rel = r.u32(e.data + 8)? as usize;
                 let tonemap = if sub2_rel > 0 && e.data + sub2_rel + 0x14 <= data.len() {
@@ -783,20 +804,20 @@ mod tests {
     }
 
     #[test]
-    fn lensflare_assets_and_god_rays_from_disc() {
-        let Some(disc) = crate::vfs::test_disc() else {
-            return;
-        };
-        let tpf_bytes =
-            crate::vfs::open(&disc, "model/filter/lensflare/lensflare_t.bnd|lensflare.tpf")
-                .unwrap();
-        let tpf = crate::tpf::read(&tpf_bytes).unwrap();
-        let names: Vec<&str> = tpf.textures.iter().map(|t| t.name.as_str()).collect();
-        println!("lensflare.tpf ({} textures):", tpf.textures.len());
-        for t in &tpf.textures {
-            println!("  {} ({}x{}, fmt={:#x})", t.name, t.width, t.height, t.format);
-        }
-        for i in 0..=10 {
+    fn acv_scene_core_layout() {
+        let mut data = vec![0u8; 0x40];
+        data[..4].copy_from_slice(&0x20u32.to_be_bytes());
+        data[0x20..0x23].copy_from_slice(&[0x25, 0x32, 0x31]);
+        data[0x24..0x28].copy_from_slice(&10000.0f32.to_be_bytes());
+        data[0x28..0x2c].copy_from_slice(&(-1000.0f32).to_be_bytes());
+        data[0x3c..0x40].copy_from_slice(&100.0f32.to_be_bytes());
+        let scene = acv_scene(&Be(&data), 0).unwrap();
+        assert_eq!(scene.clear, [0x25, 0x32, 0x31]);
+        assert!(near(scene.far, 10000.0));
+        assert!(near(scene.water_height, -1000.0));
+        assert!(near(scene.sky_scale, 100.0));
+    }
+
     #[test]
     fn acv_env_from_mission_binder() {
         let Some(disc) = crate::vfs::test_disc_v() else {
@@ -835,13 +856,32 @@ mod tests {
         let light = env.light(0).unwrap();
         assert_eq!(light.angles, [[15, 5], [30, 20]]);
         assert!(near(light.colors[0][1], 196.0 / 255.0));
-        assert!(near(light.colors_b[0][0], 145.0 / 255.0));
+        assert!(near(light.colors_b[0][1], 245.0 / 255.0));
         assert!(near(light.sky[0], 128.0 / 255.0));
         assert!(near(light.ground[3], 45.0 / 255.0));
-        // VD's scene payload (sub-blocks and tonemap) is still the only decoded one.
-        assert!(env.scene.is_none());
+
+        let scene = env.scene.as_ref().expect("ACV core scene");
+        assert_eq!(scene.clear, [0x25, 0x32, 0x31]);
+        assert!(near(scene.far, 10000.0));
+        assert!(near(scene.water_height, -1000.0));
+        assert!(near(scene.sky_scale, 100.0));
     }
 
+    #[test]
+    fn lensflare_assets_and_god_rays_from_disc() {
+        let Some(disc) = crate::vfs::test_disc() else {
+            return;
+        };
+        let tpf_bytes =
+            crate::vfs::open(&disc, "model/filter/lensflare/lensflare_t.bnd|lensflare.tpf")
+                .unwrap();
+        let tpf = crate::tpf::read(&tpf_bytes).unwrap();
+        let names: Vec<&str> = tpf.textures.iter().map(|t| t.name.as_str()).collect();
+        println!("lensflare.tpf ({} textures):", tpf.textures.len());
+        for t in &tpf.textures {
+            println!("  {} ({}x{}, fmt={:#x})", t.name, t.width, t.height, t.format);
+        }
+        for i in 0..=10 {
             let expected = format!("lf{i:02}");
             assert!(
                 names.iter().any(|n| n.eq_ignore_ascii_case(&expected)),
