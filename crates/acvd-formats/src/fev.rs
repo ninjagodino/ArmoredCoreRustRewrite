@@ -30,6 +30,11 @@ pub struct Event {
     pub name: String,
     /// Authored event volume (linear gain, the FEV stores it converted from dB).
     pub volume: f32,
+    /// Event mode flags (`0x0408_0010` on 3D events, `0x0018_0008` on 2D ones).
+    pub mode: u32,
+    /// 3D rolloff inner/outer distances (m); linear from `min_distance` to `max_distance`.
+    pub min_distance: f32,
+    pub max_distance: f32,
     pub layers: Vec<u16>,
     /// Every layer's full sound list and automation; `layers` is the first sound of each.
     pub mix: Vec<Layer>,
@@ -76,6 +81,20 @@ pub struct Param {
 }
 
 impl Event {
+    /// 3D events attenuate by distance (FMOD linear rolloff, `min_distance`..`max_distance`).
+    pub fn is_3d(&self) -> bool {
+        self.mode & 0x0400_0000 != 0
+    }
+
+    /// Distance gain for a 3D event heard from `distance` metres: 1 at the inner distance,
+    /// falling linearly to 0 at `max_distance`. 2D events always return 1.
+    pub fn distance_gain(&self, distance: f32) -> f32 {
+        if !self.is_3d() || self.max_distance <= self.min_distance {
+            return 1.0;
+        }
+        ((self.max_distance - distance) / (self.max_distance - self.min_distance)).clamp(0.0, 1.0)
+    }
+
     /// DSP-unit envelopes (non-volume), e.g. the speed `ParamEQ`.
     pub fn dsp_envelopes(&self) -> impl Iterator<Item = &Envelope> {
         self.mix
@@ -204,8 +223,8 @@ fn event(r: &mut Le) -> Result<Event> {
     let kind = r.u32()?;
     let name = r.string()?;
     r.skip(16)?; // UUID, present from v0x3A
-    let volume = match event_header(r) {
-        Ok(volume) => volume,
+    let (volume, mode, min_distance, max_distance) = match event_header(r) {
+        Ok(header) => header,
         Err(err) => bail!("{name}: {err}"),
     };
     let (layers, mix, params) = if kind & 0x18 == 0x08 {
@@ -232,23 +251,29 @@ fn event(r: &mut Le) -> Result<Event> {
     Ok(Event {
         name,
         volume,
+        mode,
+        min_distance,
+        max_distance,
         layers,
         mix,
         params,
     })
 }
 
-/// Event header. Returns the authored linear volume.
-fn event_header(r: &mut Le) -> Result<f32> {
+/// Event header. Returns the authored linear volume, mode flags and 3D rolloff distances.
+fn event_header(r: &mut Le) -> Result<(f32, u32, f32, f32)> {
     // volume, pitch, pitch rand (v0x1B), volume rand (v0x20), priority (v0x0A), max playbacks,
     // steal priority (v0x38), mode + min/max distance.
     let volume = r.f32()?;
-    r.skip(4 + 4 + 4 + 4 + 4 + 4 + 12)?;
+    r.skip(4 + 4 + 4 + 4 + 4 + 4)?;
+    let mode = r.u32()?;
+    let min_distance = r.f32()?;
+    let max_distance = r.f32()?;
     // flags, speaker levels and cone (v0x09), playback flags + doppler (v0x0B),
     // reverb dry (v0x1C), reverb wet, speaker spread (v0x12), fades (v0x13),
     // spawn intensity and its rand (v0x2B, v0x2D), pan level (v0x16), position rand max (v0x28).
     r.skip(4 + 0x2C + 8 + 4 + 4 + 4 + 8 + 4 + 4 + 4 + 4)?;
-    Ok(volume)
+    Ok((volume, mode, min_distance, max_distance))
 }
 
 fn complex(r: &mut Le) -> Result<(Vec<u16>, Vec<Layer>, Vec<Param>)> {
@@ -447,11 +472,27 @@ mod tests {
         let on = project.event("b00000000").unwrap();
         assert_eq!(on.layers, [3]);
         assert!((on.volume - 0.467735).abs() < 1e-5, "{}", on.volume);
+        assert!(on.is_3d());
+        assert!((on.min_distance - 0.0).abs() < 1e-6);
+        assert!((on.max_distance - 100.0).abs() < 1e-4);
         // Two layers. The first holds two sounds (the speed crossfade); only its first
         // sound-def index is kept. The second layer is the high-cut.
         let speed = project.event("b00000003").unwrap();
         assert_eq!(speed.layers, [2, 5]);
         assert!((speed.volume - 0.316228).abs() < 1e-5, "{}", speed.volume);
+        assert!(speed.is_3d());
+        assert!((speed.min_distance - 0.0).abs() < 1e-6);
+        assert!((speed.max_distance - 50.0).abs() < 1e-4);
+        // Linear rolloff: unity at the inner distance, zero at the outer one.
+        assert!((speed.distance_gain(0.0) - 1.0).abs() < 1e-6);
+        assert!((speed.distance_gain(20.0) - 0.6).abs() < 1e-5);
+        assert!((speed.distance_gain(50.0) - 0.0).abs() < 1e-6);
+        assert!((speed.distance_gain(60.0) - 0.0).abs() < 1e-6);
+        // The high-boost pair is mixed: b00000007 is 2D, its partner b00000008 is 3D.
+        let quick = project.event("b00000007").unwrap();
+        assert!(!quick.is_3d());
+        assert_eq!(quick.distance_gain(500.0), 1.0);
+        assert!(project.event("b00000008").unwrap().is_3d());
         assert_eq!(speed.mix.len(), 2);
         assert_eq!(speed.mix[0].param, 0);
         assert_eq!(speed.mix[0].sounds.len(), 2);

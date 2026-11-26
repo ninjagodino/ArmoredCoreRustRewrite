@@ -55,13 +55,15 @@ pub enum AudioBus {
 }
 
 /// A looping voice whose gain follows the boost `speed` parameter (the FEV envelopes of
-/// `b00000003`): base gain times every authored curve sampled at the normalized speed.
+/// `b00000003`): base gain times every authored curve sampled at the normalized speed, times
+/// the event's authored 3D distance gain (linear rolloff, `distance` = inner/outer metres).
 #[derive(Component, Debug, Clone)]
 struct SfxMix {
     base: f32,
     curves: Vec<Vec<(f32, f32)>>,
     /// The 360's smoothed `speed` target (`AcSfxCtrl+0x120`), in FEV axis units.
     smoothed: f32,
+    distance: (f32, f32),
 }
 
 /// Piecewise-linear envelope sample, clamped to the first/last point.
@@ -193,6 +195,11 @@ impl Cues {
             AudioBus::Sfx => self.sfx_volume,
             AudioBus::Ui => self.ui_volume,
         };
+        let distance = if event.is_3d() {
+            (event.min_distance, event.max_distance)
+        } else {
+            (0.0, 0.0)
+        };
         let mut voices: Vec<(fev::Wave, f32, Vec<Vec<(f32, f32)>>)> = Vec::new();
         for (li, layer) in event.mix.iter().enumerate() {
             let envs = event.volume_envelopes(li);
@@ -236,6 +243,7 @@ impl Cues {
                             base,
                             curves,
                             smoothed: 0.0,
+                            distance,
                         },
                     ))
                     .id(),
@@ -775,22 +783,43 @@ fn motion(
 /// lerps its speed target toward `horizontal speed / 450 km/h` by 10% per 60 Hz tick and
 /// sends `target * 216` on the FEV `speed` parameter, whose max is 150, so the envelope axis
 /// is `v * 216 * 216 / (450 * 150)` (`SPEED_AXIS_FULL_TICK`). Each voice's gain is its base
-/// gain times the authored envelopes sampled there.
+/// gain times the authored envelopes sampled there, times the event's 3D distance gain: the
+/// FEV `b00000003` is a 3D event with a 0..50 m linear rolloff and the follow camera sits
+/// 16-21 m out (`sheets/camera_follow.csv`), so the sustain is 0.58-0.68 of its authored
+/// level (the retail capture in `private/xenia/retail_audio.raw` measures ~0.6).
 fn update_sfx_mix(
     time: Res<Time>,
-    pilots: Query<&Pilot>,
+    pilots: Query<(&Pilot, &Transform)>,
+    cameras: Query<&Transform, (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
     mut sinks: Query<(&mut AudioSink, &mut SfxMix)>,
 ) {
-    let Ok(pilot) = pilots.single() else { return };
+    let Ok((pilot, pilot_transform)) = pilots.single() else {
+        return;
+    };
+    let listener = cameras
+        .iter()
+        .next()
+        .map(|camera| camera.translation)
+        .unwrap_or(pilot_transform.translation);
+    let distance = listener.distance(pilot_transform.translation);
     let target = (pilot.velocity.with_y(0.0).length() / SPEED_AXIS_FULL_TICK).clamp(0.0, 1.0);
     // `cur += 0.1 * (target - cur)` at 60 Hz in the 360, expressed for the frame delta.
     let alpha = 1.0 - 0.9f32.powf(60.0 * time.delta_secs());
     for (mut sink, mut mix) in &mut sinks {
         mix.smoothed += (target - mix.smoothed) * alpha;
         sink.set_volume(Volume::Linear(
-            mix.base * mix_gain(&mix.curves, mix.smoothed),
+            mix.base * mix_gain(&mix.curves, mix.smoothed) * falloff_gain(distance, mix.distance),
         ));
     }
+}
+
+/// FMOD's linear 3D rolloff between the event's inner and outer distances. A non-3D voice
+/// (or an event without a usable range) plays at full gain.
+fn falloff_gain(distance: f32, (min_distance, max_distance): (f32, f32)) -> f32 {
+    if max_distance <= min_distance {
+        return 1.0;
+    }
+    ((max_distance - distance) / (max_distance - min_distance)).clamp(0.0, 1.0)
 }
 
 fn stop(commands: &mut Commands, entities: &mut Vec<Entity>) {
@@ -848,8 +877,7 @@ mod tests {
         assert_eq!(mix_gain(&[], 0.7), 1.0);
     }
 
-    /// The FEV `speed` axis the 360 feeds `b00000003`: `0x8289a138` sends `cur * 216` on a
-    /// 150-wide parameter where `cur` is the horizontal speed over 450 km/h, so the axis is
+    /// The FEV `speed` axis the 360 feeds `b00000003`: `0x8289a138` sends `cur * 216` on a    /// 150-wide parameter where `cur` is the horizontal speed over 450 km/h, so the axis is
     /// `cur * 1.44`. Checked against the probed targets for the starter AC (`sheets` preset
     /// 5010: boost 117.9 km/h -> cur 0.262, high boost 251.3 -> cur 0.555) and its computed
     /// top speeds.
@@ -861,6 +889,21 @@ mod tests {
         assert!((axis(251.3 / 216.0) - 0.555 * 1.44).abs() < 6e-3);
         // FMOD clamps the normalized parameter at 1.0.
         assert_eq!(axis(400.0 / 216.0), 1.0);
+    }
+
+    /// `b00000003` is a 3D event: FEV mode `0x0408_0010`, linear rolloff 0..50 m. At the
+    /// follow camera's 16-21 m the sustain is 0.58-0.68 of its authored level, matching the
+    /// retail capture (`private/xenia/retail_audio.raw`) against the decoded FSB samples.
+    #[test]
+    fn boost_sustain_follows_authored_3d_rolloff() {
+        let range = (0.0, 50.0);
+        assert!((falloff_gain(0.0, range) - 1.0).abs() < 1e-6);
+        assert!((falloff_gain(16.0, range) - 0.68).abs() < 1e-5);
+        assert!((falloff_gain(20.0, range) - 0.60).abs() < 1e-5);
+        assert_eq!(falloff_gain(50.0, range), 0.0);
+        assert_eq!(falloff_gain(80.0, range), 0.0);
+        // 2D voices (the quick-boost pair's `b00000007`) and events without a range are unity.
+        assert_eq!(falloff_gain(500.0, (0.0, 0.0)), 1.0);
     }
 
     #[test]
