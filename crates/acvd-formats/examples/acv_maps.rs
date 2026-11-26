@@ -168,7 +168,7 @@ fn main() -> anyhow::Result<()> {
         envs.len(),
         navs.len()
     );
-    println!("ACV env MSBs use the plain MSB magic; env::read parses their EVENT table, BGM, type-100 light colours/angles and compact fog, and the type-101 core scene (clear/far/water/sky scale), not the type-101 fog/filter/lens flare");
+    println!("ACV env MSBs use the plain MSB magic; env::read parses their EVENT table, BGM, type-100 light colours/angles and compact fog, the type-101 core scene (clear/far/water/sky scale), and the type-101 lens flare; type-101 fog/filter still need mapping");
     println!(
         "MSB records: {models} models, {parts} parts, {points} points; part kinds {part_kinds:?}; point kinds {point_kinds:?}"
     );

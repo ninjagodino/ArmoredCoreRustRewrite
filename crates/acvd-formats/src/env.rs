@@ -1,9 +1,9 @@
 //! Map environment (`model/map/ch_env/{map}_env.msb`): the MSB section chain at version
 //! `msb::MAGIC_ENV` (VD) or `msb::MAGIC` (ACV), with every record in `EVENT_PARAM_ST`.
 //! ACV's type-100 lights (including their compact fog block) use a packed byte layout
-//! (`acv_light`); its type-101 core scene is decoded by `acv_scene`, while the type-101 fog and
-//! filter sub-blocks remain undecoded. Field layouts and the shader constants built from them
-//! are in `sheets/map_env.csv`.
+//! (`acv_light`); its type-101 core scene and lens flare are decoded by `acv_scene` /
+//! `acv_lens_flare`, while the type-101 fog and filter sub-blocks remain undecoded. Field layouts
+//! and the shader constants built from them are in `sheets/map_env.csv`.
 //!
 //! Event record: `u32 name, i32 id, u32 type, u32 index, u32 data`, offsets relative to the
 //! record. Types: 100 light set, 101 scene parameters, 102 wind, 400 BGM (mission envs only).
@@ -268,6 +268,10 @@ impl Default for LensDust {
 
 /// Lens-flare, god-ray, and lens-dust block from type-101 sub-block 3 (`data + u32_be(data + 0xc)`,
 /// unpacked by `0x827fc548` -> `0x82800350` into `m_LensFlare` at `0x83a8b220`).
+///
+/// ACV uses the same header layout but shifts the glare/ghost/god-ray/dust offsets by +4:
+/// glares start at `+0x38`, ghosts at `+0x48`, god ray at `+0x90`, dust at `+0x94`
+/// (`0x8275de18`).
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct LensFlare {
     /// `+0x00`: nonzero enables the lens-flare / god-ray / dust pipeline.
@@ -511,10 +515,16 @@ fn acv_light(r: &Be, name: String, d: usize) -> Result<LightSet> {
 ///
 /// Unlike VD, ACV keeps the core values in the first sub-block but at different offsets:
 /// `+4` draw distance, `+8` water height, `+0x1c` sky scale (only used when `> 1`). The
-/// ACV filter/tone-map and lens-flare sub-blocks are not decoded yet, so those stay at
-/// their defaults.
+/// lens-flare sub-block is at `data + u32(data + 0x14)`; the fog and filter blocks are
+/// still not decoded, so those stay at their defaults.
 fn acv_scene(r: &Be, d: usize) -> Result<Scene> {
     let sub = d + r.u32(d)? as usize;
+    let flare_rel = r.u32(d + 0x14)? as usize;
+    let lens_flare = if flare_rel > 0 && d + flare_rel < r.len() {
+        acv_lens_flare(r, d + flare_rel, r.len())?
+    } else {
+        LensFlare::default()
+    };
     Ok(Scene {
         clear: [r.u8(sub)?, r.u8(sub + 1)?, r.u8(sub + 2)?],
         far: r.f32(sub + 4)?,
@@ -523,12 +533,47 @@ fn acv_scene(r: &Be, d: usize) -> Result<Scene> {
             .filter(|&s| s > 1.0)
             .unwrap_or(1.0),
         tonemap: ToneMap::default(),
-        lens_flare: LensFlare::default(),
+        lens_flare,
     })
 }
 
+#[derive(Clone, Copy)]
+struct LensFlareOffsets {
+    glares: usize,
+    ghosts: usize,
+    god_ray: usize,
+    dust: usize,
+}
+
+const VD_LENS_FLARE: LensFlareOffsets = LensFlareOffsets {
+    glares: 0x34,
+    ghosts: 0x44,
+    god_ray: 0x8c,
+    dust: 0x90,
+};
+
+const ACV_LENS_FLARE: LensFlareOffsets = LensFlareOffsets {
+    glares: 0x38,
+    ghosts: 0x48,
+    god_ray: 0x90,
+    dust: 0x94,
+};
+
 fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
-    if s3 + 0x94 > len {
+    lens_flare_at(r, s3, len, VD_LENS_FLARE)
+}
+
+fn acv_lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
+    lens_flare_at(r, s3, len, ACV_LENS_FLARE)
+}
+
+fn lens_flare_at(
+    r: &Be,
+    s3: usize,
+    len: usize,
+    offsets: LensFlareOffsets,
+) -> Result<LensFlare> {
+    if s3 + offsets.dust + 4 > len {
         return Ok(LensFlare::default());
     }
     let enabled = r.u32(s3)? != 0;
@@ -554,7 +599,7 @@ fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
 
     let mut glares = Vec::new();
     for i in 0..4 {
-        let rel = r.u32(s3 + 0x34 + i * 4)? as usize;
+        let rel = r.u32(s3 + offsets.glares + i * 4)? as usize;
         if rel > 0 && s3 + rel + 0x10 <= len {
             let p = s3 + rel;
             let tex_id = r.i32(p)?;
@@ -573,7 +618,7 @@ fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
 
     let mut ghosts = Vec::new();
     for i in 0..18 {
-        let rel = r.u32(s3 + 0x44 + i * 4)? as usize;
+        let rel = r.u32(s3 + offsets.ghosts + i * 4)? as usize;
         if rel > 0 && s3 + rel + 0x12 <= len {
             let p = s3 + rel;
             let tex_id = r.i32(p)?;
@@ -590,7 +635,7 @@ fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
         }
     }
 
-    let gr_rel = r.u32(s3 + 0x8c)? as usize;
+    let gr_rel = r.u32(s3 + offsets.god_ray)? as usize;
     let god_ray = if gr_rel > 0 && s3 + gr_rel + 0x2c <= len {
         let p = s3 + gr_rel;
         GodRay {
@@ -613,7 +658,7 @@ fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
         GodRay::default()
     };
 
-    let dust_rel = r.u32(s3 + 0x90)? as usize;
+    let dust_rel = r.u32(s3 + offsets.dust)? as usize;
     let dust = if dust_rel > 0 && s3 + dust_rel + 0x14 <= len {
         let p = s3 + dust_rel;
         LensDust {
@@ -646,8 +691,9 @@ pub fn read(data: &[u8]) -> Result<Env> {
         matches!(magic, msb::MAGIC_ENV | msb::MAGIC),
         "not an env MSB"
     );
-    // ACV's type-100 lights (with their compact fog) and type-101 core scene are packed
-    // layouts decoded by `acv_light` / `acv_scene`; type-101 fog/filter/lens-flare stay unparsed.
+    // ACV's type-100 lights (with their compact fog) and type-101 core scene + lens flare are
+    // packed layouts decoded by `acv_light` / `acv_scene` / `acv_lens_flare`; type-101 fog/filter
+    // stay unparsed.
     let acv = magic == msb::MAGIC;
     let mut env = Env {
         events: Vec::new(),
@@ -876,6 +922,96 @@ mod tests {
     }
 
     #[test]
+    fn acv_lens_flare_layout() {
+        let mut data = vec![0u8; 0x500];
+        data[..4].copy_from_slice(&0x20u32.to_be_bytes());
+        data[0x14..0x18].copy_from_slice(&0x80u32.to_be_bytes());
+        let f = 0x80;
+        data[f..f + 4].copy_from_slice(&1u32.to_be_bytes());
+        data[f + 4..f + 8].copy_from_slice(&17.0f32.to_be_bytes());
+        data[f + 8..f + 0xc].copy_from_slice(&29.0f32.to_be_bytes());
+        for (i, v) in [
+            255.0f32, 165.0, 115.0, 270.0, 154.0, 225.0, 255.0, 140.0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            data[f + 0x0c + i * 4..f + 0x10 + i * 4].copy_from_slice(&v.to_be_bytes());
+        }
+        data[f + 0x2c..f + 0x30].copy_from_slice(&0.05f32.to_be_bytes());
+        data[f + 0x30..f + 0x34].copy_from_slice(&0.05f32.to_be_bytes());
+        data[f + 0x34..f + 0x38].copy_from_slice(&4u32.to_be_bytes());
+        for (i, rel) in [0x200u32, 0x230, 0x260, 0x290].into_iter().enumerate() {
+            data[f + 0x38 + i * 4..f + 0x3c + i * 4].copy_from_slice(&rel.to_be_bytes());
+        }
+        data[f + 0x48..f + 0x4c].copy_from_slice(&0x300u32.to_be_bytes());
+        data[f + 0x90..f + 0x94].copy_from_slice(&0x350u32.to_be_bytes());
+        data[f + 0x94..f + 0x98].copy_from_slice(&0x3a0u32.to_be_bytes());
+
+        let g = f + 0x200;
+        data[g..g + 4].copy_from_slice(&0i32.to_be_bytes());
+        data[g + 4] = 136;
+        data[g + 8..g + 0xc].copy_from_slice(&3.3f32.to_be_bytes());
+        let g = f + 0x230;
+        data[g..g + 4].copy_from_slice(&1i32.to_be_bytes());
+        data[g + 4] = 255;
+        data[g + 8..g + 0xc].copy_from_slice(&0.6f32.to_be_bytes());
+        data[g + 0x0c] = 1;
+        data[g + 0x0d] = 1;
+        let g = f + 0x260;
+        data[g..g + 4].copy_from_slice(&10i32.to_be_bytes());
+        data[g + 4] = 48;
+        data[g + 8..g + 0xc].copy_from_slice(&6.8f32.to_be_bytes());
+
+        let h = f + 0x300;
+        data[h..h + 4].copy_from_slice(&8i32.to_be_bytes());
+        data[h + 4] = 255;
+        data[h + 8..h + 0xc].copy_from_slice(&1.0f32.to_be_bytes());
+        data[h + 0x10] = 0;
+        data[h + 0x11] = 1;
+
+        let gr = f + 0x350;
+        data[gr..gr + 4].copy_from_slice(&0xffffu32.to_be_bytes());
+        data[gr + 4..gr + 8].copy_from_slice(&1.0f32.to_be_bytes());
+        data[gr + 0x0c..gr + 0x10].copy_from_slice(&[10, 20, 30, 40]);
+        for (i, v) in [0.3f32, 0.98, 0.98, 1.0].into_iter().enumerate() {
+            data[gr + 0x10 + i * 4..gr + 0x14 + i * 4].copy_from_slice(&v.to_be_bytes());
+        }
+        data[gr + 0x20..gr + 0x24].copy_from_slice(&1.0f32.to_be_bytes());
+        data[gr + 0x24..gr + 0x26].copy_from_slice(&12u16.to_be_bytes());
+        data[gr + 0x26..gr + 0x28].copy_from_slice(&0u16.to_be_bytes());
+        data[gr + 0x28..gr + 0x2c].copy_from_slice(&[1, 2, 3, 4]);
+
+        let d = f + 0x3a0;
+        data[d + 4..d + 8].copy_from_slice(&208.0f32.to_be_bytes());
+        data[d + 8..d + 0xc].copy_from_slice(&512.0f32.to_be_bytes());
+        data[d + 0x0c..d + 0x10].copy_from_slice(&512.0f32.to_be_bytes());
+        data[d + 0x10..d + 0x14].copy_from_slice(&[255, 255, 255, 255]);
+
+        let scene = acv_scene(&Be(&data), 0).unwrap();
+        let lf = &scene.lens_flare;
+        assert!(lf.enabled);
+        assert!(near(lf.angles_deg[0], 17.0) && near(lf.angles_deg[1], 29.0));
+        assert!(near(lf.glare_color[3], 270.0 / 255.0));
+        assert!(near(lf.ghost_color[0], 154.0 / 255.0));
+        assert_eq!(lf.glares.len(), 4);
+        assert_eq!(lf.glares[1].tex_id, 1);
+        assert!(near(lf.glares[1].alpha, 1.0));
+        assert!(lf.glares[1].scale_by_vis && lf.glares[1].rotate);
+        assert_eq!(lf.ghosts.len(), 1);
+        assert_eq!(lf.ghosts[0].tex_id, 8);
+        assert!(!lf.ghosts[0].rotate && lf.ghosts[0].alt_scale);
+        assert_eq!(lf.god_ray.tex_id, -1);
+        assert_eq!(lf.god_ray.emitter_color, [10, 20, 30, 40]);
+        assert!(near(lf.god_ray.blur_params[0], 0.3));
+        assert_eq!(lf.god_ray.sample_mode, 12);
+        assert_eq!(lf.god_ray.merge_color, [1, 2, 3, 4]);
+        assert!(near(lf.dust.pos[1], 208.0));
+        assert!(near(lf.dust.size[0], 512.0));
+        assert_eq!(lf.dust.color, [255, 255, 255, 255]);
+    }
+
+    #[test]
     fn acv_light_fog_layout() {
         let mut data = vec![0u8; 0x50];
         data[0] = 1; // slot 1 = ID01 map basic light
@@ -983,6 +1119,32 @@ mod tests {
         assert!(near(scene.far, 10000.0));
         assert!(near(scene.water_height, -1000.0));
         assert!(near(scene.sky_scale, 100.0));
+        let lf = &scene.lens_flare;
+        assert!(lf.enabled);
+        assert!(near(lf.angles_deg[0], 17.0) && near(lf.angles_deg[1], 29.0));
+        assert!(near(lf.glare_color[1], 165.0 / 255.0));
+        assert!(near(lf.glare_color[3], 270.0 / 255.0));
+        assert!(near(lf.ghost_color[3], 140.0 / 255.0));
+        assert_eq!(lf.glares.len(), 4);
+        assert_eq!(lf.glares[0].tex_id, 0);
+        assert!(near(lf.glares[0].alpha, 136.0 / 255.0));
+        assert!(near(lf.glares[0].scale, 3.3));
+        assert_eq!(lf.glares[3].tex_id, 10);
+        assert!(lf.glares[3].scale_by_vis && lf.glares[3].rotate);
+        assert_eq!(lf.ghosts.len(), 5);
+        assert_eq!(lf.ghosts[0].tex_id, 8);
+        assert!(near(lf.ghosts[0].alpha, 1.0));
+        assert!(near(lf.ghosts[0].axis_pos, 0.0));
+        assert!(!lf.ghosts[0].rotate && lf.ghosts[0].alt_scale);
+        assert_eq!(lf.god_ray.tex_id, -1);
+        assert!(near(lf.god_ray.emitter_scale, 1.0));
+        assert!(near(lf.god_ray.blur_params[0], 0.3));
+        assert!(near(lf.god_ray.blur_params[1], 0.98));
+        assert!(near(lf.god_ray.blur_params[2], 0.98));
+        assert!(near(lf.god_ray.blur_params[3], 1.0));
+        assert!(near(lf.dust.pos[0], 0.0) && near(lf.dust.pos[1], 208.0));
+        assert!(near(lf.dust.size[0], 512.0) && near(lf.dust.size[1], 512.0));
+        assert_eq!(lf.dust.color, [255, 255, 255, 255]);
     }
 
     #[test]
