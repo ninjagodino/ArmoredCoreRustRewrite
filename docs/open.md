@@ -280,13 +280,19 @@ in order:
     Probe `private/xenia/glide_move.jsonl`: 0.4630 m/tick = 100.0 km/h held through states 4 and 5.
     Done: the vertical update `0x82820168` skips the gravity loop
     (`0x8281f960`) in states 4/5 (`0x8281f3d0` at `0x828201b4`), so a glide holds its height
-    and carries on over a drop. The activation itself ascends by a fixed amount: `0x8281dd28`
+    and carries on over a drop. `GlideState` (vtable `0x820926c8`, ctor `0x8283ddc8`,
+    activation `0x82844fd8`, update `0x82841b38`) runs the ground move (slot `+0x34` =
+    `0x8281f540`, state 4) for `glide_ground_phase` = **0.5 s** (`fRam83713a94`) and then the
+    air move (slot `+0x38` = `0x82823618` -> `0x8281f8c0`, state 5) until the glide ends
+    (`sheets/ac_ctrl_calc.csv`). The activation ascends by a fixed amount: `0x8281dd28`
     clamps the rise at glide block (+0x288) word +0x0 = **5.0 m** (`glide_lift_height`, built
     from the param table `+0x468` x f30 by `0x82821af0`) above the activation height (block
-    +0x2c = object `+0x2b4`, seeded by `0x8281f8c0`), stepping at `glide_rise_tick` = 0.1 m/tick
-    (Xenia probe `private/xenia/glide_cap.jsonl`: height 23.230 -> 28.230 over 374 ms, then
-    flat). The runtime lifts by that fixed amount from the activation point and then holds it;
-    leaving a ledge adds no ascent. On the ground: `glide_start` (acmotion row 217)
+    +0x2c = object `+0x2b4`, seeded by `0x8281f8c0`), stepping at `0.1 m/tick`. The ascent
+    spans both phases: Xenia probe `private/xenia/glide_cap.jsonl` stays in state 4 for 0.5 s
+    (23.230 -> ~25.7 m) and state 5 finishes the climb to 28.230 m at 0.1007 m/tick. The
+    runtime now switches phase at 0.5 s, marks the AC airborne then (the start clip hands over
+    to the air entry while still rising), and caps the absolute lift at activation + 5.0 m;
+    leaving a ledge after the ascent adds no further rise. On the ground: `glide_start` (acmotion row 217)
     then `glide` (row 218, 360-frame wheel, booster clip 1). In the air: one directional entry
     (rows 223-230, anims 63-70, 30 frames, sector `0x82825918` / builder `0x82883c80`) then
     `glide_air` (row 222 空中浮遊, anim 62, 360-frame wheel, booster clip 3, builder
@@ -297,10 +303,14 @@ in order:
     is a 10 deg allowance (Xenia probe `private/xenia/glide_gate.jsonl`: 0.17453292 rad at both
     entries), so the stick may sit up to 100 deg off the current velocity
     (`sheets/ac_ctrl_calc.csv` `glide_turn_cone`). The air entry also seeds the mover: horizontal
-    acceleration from the thrust block `+0x2cc` (recomputed per tick here) and vertical speed
-    `+0x1e8` from `+0x2dc` = 0, so an air glide holds a flat height. Done: the action-40 ribbon
+    acceleration from the thrust block `+0x2cc` (recomputed per tick here), while `+0x1e8` is
+    copied from `+0x2dc`, the lift accumulator that `0x8281db00` advances and `0x8281dd28` stops
+    at activation + 5.0 m (`glide_cap.jsonl` reads 0.00226 at the state-5 entry, then 0 at the
+    ceiling); after the ascent the air glide holds a flat height. Done: the action-40 ribbon
     trails (f0000134, 3 starts from `0x828a8088`, dummies 153/155/156/213/218/223 in TAE anims
-    63-70) render in `sfx.rs`. Left: damage rows 239-242 / 246-247 (not played).
+    63-70) render in `sfx.rs`. Left: the exact state-4 vertical rate (the runtime shares
+    `glide_rise_tick` across both phases; the probe's state-4 leg is ~0.074 m/tick vs 0.1007 in
+    state 5) and damage rows 239-242 / 246-247 (not played).
   - **Glide Boost VFX 1:1** (action-40 ribbon `f0000134`, `acvd-game::sfx`): action 40 is the
     Tracer, traced (see Done "Glide Boost start ascent & ribbon trail"): registered at
     `0x83198538`, def reader `0x835b3e10`, per-segment update `0x83197e90` -> `0x835b48f0` ->
