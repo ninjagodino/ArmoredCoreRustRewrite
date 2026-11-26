@@ -410,11 +410,11 @@ in order:
   `0x82762160` (scene branch `0x827621ec`) keeps the core scene in the first sub-block
   (`data + u32(data)`): clear RGB `+0..2`, draw distance `+4`, water height `+8`, and sky scale
   `+0x1c` (used only when `> 1`). `acv_scene` decodes those and the last type-101 event wins;
-  m0300 is clear `(0x25,0x32,0x31)`, far `10000`, water `-1000`, sky scale `100`. Each env has
-  two type-101 events (`lightning filter` then `scene environment parameters`), both carrying the
-  same 12-entry sub-block table, so the filter values need to be retained separately from the
-  core if the overlay is rendered. The type-101 lens flare at `data + u32(data + 0x14)`
-  (`0x8275de18`) is decoded: same header as VD, with glare offsets at `+0x38`, ghost offsets at
+  m0300 is clear `(0x25,0x32,0x31)`, far `10000`, water `-1000`, sky scale `100`. m0300 and m0600
+  have two type-101 events (`lightning filter` then `scene environment parameters`), both carrying
+  the same 12-entry sub-block table; m0100 has only the scene event. The filter values need to be
+  retained separately from the core if the overlay is rendered. The type-101 lens flare at
+  `data + u32(data + 0x14)` (`0x8275de18`) is decoded: same header as VD, with glare offsets at
   `+0x48`, god ray at `+0x90` and dust at `+0x94`. m0300's last scene has angles `17/29`, 4 glares,
   5 enabled ghosts (of 18 slots), god-ray `tex_id -1`, dust pos `(0,208)` size `(512,512)`.
   The type-101 `+0x1c` sub-block is not the type-100 fog: `0x8275e2c0` maps it into a 0x48-byte
