@@ -703,15 +703,39 @@ pub const SORTIE_TARGETS: &[(&str, &str)] = &[
     ("actest1", "Empty Range (Free Movement)"),
 ];
 
-/// Sortie maps selectable from the Garage AC TEST launcher.
-pub const SORTIE_MAPS: &[(&str, &str)] = &[
-    ("m4000", "AC TEST Facility (m4000)"),
-    ("m3200", "Contaminated Area (m3200)"),
-    ("m0000", "Urban Sector (m0000)"),
-    ("m1000", "Industrial Zone (m1000)"),
-    ("m2000", "Dam Complex (m2000)"),
-    ("m3000", "Alpine Basin (m3000)"),
-];
+/// Sortie maps selectable from the Garage AC TEST launcher: `m4000` (the AC TEST facility)
+/// plus every unique `practice_map_tex_id` folder in `param/battlemapinfo.bin`, named by its
+/// `map_name_id` in `lang/en/text/menu/menu.fmg`. Maps whose folder has no own
+/// `{map}_m.dcx.bnd` / `{map}_htdcx.bnd` (mission variants that reuse a sibling folder's
+/// geometry) are skipped until the shared-binder lookup is traced from the 360 build.
+pub fn sortie_maps(disc: &Disc, menu: Option<&Fmg>) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row in acvd_data::generated::mission::PARAM_BATTLEMAPINFO_BIN {
+        let tex = row.data.practice_map_tex_id;
+        if seen.insert(tex) {
+            rows.push((tex, row.data.map_name_id, row.name));
+        }
+    }
+    rows.sort_by_key(|(tex, _, _)| *tex);
+    let mut out = vec![("m4000".to_string(), "AC TEST Facility (m4000)".to_string())];
+    for (tex, name_id, row_name) in rows {
+        let map = format!("m{tex:04}");
+        if !disc.exists(&format!("model/map/{map}/{map}_map.msb"))
+            || !disc.exists(&format!("model/map/{map}/{map}_m.dcx.bnd"))
+            || !disc.exists(&format!("model/map/{map}/{map}_htdcx.bnd"))
+        {
+            continue;
+        }
+        let name = menu
+            .and_then(|m| m.get(name_id as i32))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&row_name);
+        out.push((map, format!("{name} (m{tex:04})")));
+    }
+    out
+}
 
 /// Curated tactical color swatches for quick painting in Custom Paint mode.
 const PAINT_SWATCHES: &[(&str, [u8; 4])] = &[
@@ -1442,6 +1466,8 @@ pub struct GarageState {
     /// Sortie launcher indices.
     pub sortie_map_idx: usize,
     pub sortie_target_idx: usize,
+    /// Selectable sortie maps as `(map folder, menu label)` (see [`sortie_maps`]).
+    pub sortie_maps: Vec<(String, String)>,
     /// Localized text bank (`lang/en/text/partsname_en.fmg`).
     pub parts_fmg: Option<Fmg>,
     /// Active camera interpolation state.
@@ -1497,9 +1523,10 @@ impl GarageState {
             .or_else(|| workshops.iter().position(|w| w.id == DEFAULT_GARAGE_ID))
             .unwrap_or(0);
         let color_presets = discover_color_presets(disc);
-        let sortie_map_idx = SORTIE_MAPS
+        let sortie_maps = sortie_maps(disc, menu_fmg.as_ref());
+        let sortie_map_idx = sortie_maps
             .iter()
-            .position(|(id, _)| *id == initial_map)
+            .position(|(id, _)| id.as_str() == initial_map)
             .unwrap_or(0);
         let sortie_target_idx = SORTIE_TARGETS
             .iter()
@@ -1538,6 +1565,7 @@ impl GarageState {
             com_voice_editor: None,
             sortie_map_idx,
             sortie_target_idx,
+            sortie_maps,
             parts_fmg,
             cam_yaw: -19.0f32.to_radians(),
             cam_pitch: 0.14,
@@ -2920,7 +2948,7 @@ pub fn handle_input(
                 return;
             }
             UiAction::SortieMapStep(delta) => {
-                let n = SORTIE_MAPS.len() as isize;
+                let n = state.sortie_maps.len() as isize;
                 state.sortie_map_idx =
                     (state.sortie_map_idx as isize + delta as isize).rem_euclid(n) as usize;
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
@@ -3531,7 +3559,7 @@ pub fn handle_input(
                     }
                 }
                 WheelAdjust::SortieMap => {
-                    let n = SORTIE_MAPS.len() as isize;
+                    let n = state.sortie_maps.len() as isize;
                     state.sortie_map_idx =
                         (state.sortie_map_idx as isize + delta as isize).rem_euclid(n) as usize;
                     sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
@@ -3779,7 +3807,7 @@ pub fn handle_input(
                 return;
             }
             1 => {
-                let n = SORTIE_MAPS.len() as isize;
+                let n = state.sortie_maps.len() as isize;
                 state.sortie_map_idx =
                     (state.sortie_map_idx as isize + delta).rem_euclid(n) as usize;
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
@@ -5047,7 +5075,7 @@ fn trigger_confirm(
                 state.ui_dirty = true;
             }
             1 => {
-                let n = SORTIE_MAPS.len();
+                let n = state.sortie_maps.len();
                 state.sortie_map_idx = (state.sortie_map_idx + 1) % n;
                 sound::cue(commands, cues, audio_assets, CUE_MOVE);
                 state.ui_dirty = true;
@@ -5188,8 +5216,12 @@ fn trigger_launch_sortie(
         return;
     }
     sound::cue(commands, cues, audio_assets, CUE_GARAGE_OUT);
-    let map = SORTIE_MAPS[state.sortie_map_idx].0.to_string();
-    let test = SORTIE_TARGETS[state.sortie_target_idx].0.to_string();
+    let map = state.sortie_maps[state.sortie_map_idx].0.clone();
+    let test = if map == "m4000" {
+        SORTIE_TARGETS[state.sortie_target_idx].0.to_string()
+    } else {
+        "none".to_string()
+    };
     mode_switch.target = Some(Mode::Sortie);
     mode_switch.sortie_map = Some(map);
     mode_switch.sortie_test = Some(test);
@@ -7142,8 +7174,13 @@ fn spawn_garage_sortie_menu(
 
     kit.spawn_header(commands, panel, "AC TEST SORTIE", Some("CONFIG"), scale);
 
-    let (_, target_label) = SORTIE_TARGETS[state.sortie_target_idx];
-    let (_, map_label) = SORTIE_MAPS[state.sortie_map_idx];
+    let on_ac_test = state.sortie_maps[state.sortie_map_idx].0 == "m4000";
+    let target_label = if on_ac_test {
+        SORTIE_TARGETS[state.sortie_target_idx].1
+    } else {
+        "No targets on this map"
+    };
+    let map_label = &state.sortie_maps[state.sortie_map_idx].1;
 
     spawn_sortie_config_row(
         commands,
@@ -11568,6 +11605,42 @@ mod tests {
                 slot
             );
         }
+    }
+
+    #[test]
+    fn sortie_maps_use_retail_battle_map_folders_and_english_names() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&acvd_formats::vfs::default_disc(&root)) else {
+            return;
+        };
+        let menu = disc
+            .asset("lang/en/text/menu/menu.fmg")
+            .ok()
+            .and_then(|b| acvd_formats::fmg::read(&b).ok());
+        let maps = sortie_maps(&disc, menu.as_ref());
+        assert_eq!(maps[0].0, "m4000");
+        assert!(
+            maps.len() > 20,
+            "expected the retail battle map folders, got {}",
+            maps.len()
+        );
+        assert!(maps
+            .iter()
+            .any(|(id, label)| id == "m3330" && label == "Fort Denis/Inner City (m3330)"));
+        assert!(maps
+            .iter()
+            .any(|(id, label)| id == "m3710" && label == "Windy City (m3710)"));
+        assert!(
+            !maps.iter().any(|(id, _)| id == "m0000"),
+            "m0000 has no map folder on the 360 disc"
+        );
+        let ids: Vec<&str> = maps.iter().map(|(id, _)| id.as_str()).collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "sortie map folders must be unique");
     }
 
     #[test]

@@ -326,7 +326,11 @@ in order:
   8 pending FLVERs (`0x20007` and FLVER0).
 - **Maps leftovers**: rest of MSB (MODEL/EVENT/POINT/ROUTE/LAYER/TREE), `.smd`, map FLVER
   visuals, water-layer materials (none named water on m3100), collision filters 0x100002 /
-  0x200002. HNAV/HTR navigation readers.
+  0x200002. HNAV/HTR navigation readers. The garage sortie launcher now lists the 33 retail
+  battle-map folders from `param/battlemapinfo.bin` + `menu.fmg` names (see Done "Sortie map
+  selection"); the mission variants without their own `{map}_m.dcx.bnd` / `{map}_htdcx.bnd`
+  (m3104, m3121, m3201, m3202, ...) still need the shared base-binder lookup before they can be
+  listed.
 - **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), the per-enemy target lock-on HUD cursor (one pooled 256×128 `sortie.drb` box per enemy in the FCS cone, up to 8; text/bars/pips only on the FCS-selected target, `MissileLock1..6`), and Scan Mode / Target Scan / Recon Units (`ACV_ScanModeLockSight`, `ACV_Scan_Cur_EnemyParamInfo`, `ACV_MapScan_ReconInfo*`) are now in (see Done). Retail lock-cursor reference still missing: AC TEST's default start has only allies, so `ac_test_lockhunt.txt` never locks; the `_Target` marker rule (1st color for a single missile on a target, 2nd once two are on it) is inferred from `0x829d4558` and not yet confirmed against the 360.
 - **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics, range-decay, shoulder weapons & homing missiles, melee blades / heat piles / Boost Charge Kick, arm firing-stability reload scaling, weapon arms, sub-munition split missiles, Overed Weapons, and hand-weapon firing modes done; see Done):
   - Bay shift & purge are up to 360 parity (`acvd-game::bay`, `hanger`, `pose`, `sfx`, `sound`, `sheets/ac_states.csv`, `sheets/hanger_anim.csv`, `sheets/sound_cues.csv`, see Done): per-arm overlay (`r_kata`/`l_kata`), explicit TAE `2000..2003` / `2010..2013` (sparks FFX `4109`, steam puff FFX `98` at scale `1.5`, sounds `c00000047` / `c00000045`, `kind=101` Reattach at f40/f150, `kind=102` Purge at f10), dual-prong rack carousel (`a00_011`/`a00_021` + `r_hg_f`/`r_hg_b`), and dynamic `hanger_pose` updates.
