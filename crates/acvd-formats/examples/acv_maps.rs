@@ -93,9 +93,9 @@ fn main() -> anyhow::Result<()> {
                 let data = vfs::undcx(entry.contents(&binder)?.into_owned())?;
                 if member.to_ascii_lowercase().contains("/ch_env/") {
                     // ACV `ch_env` files use the plain MSB magic; `env::read` accepts it and
-                    // decodes type-100 lights, the type-101 core scene and lens flare. The
-                    // type-101 atmosphere/filter/DOF layouts are documented but not parsed;
-                    // fog is the type-100 compact slot.
+                    // decodes type-100 lights, the type-101 core scene, lens flare, screen
+                    // filter and DOF. The type-101 atmosphere record is documented but not
+                    // parsed; fog is the type-100 compact slot.
                     env_msbs.insert(member.clone());
                 }
                 if !msb::is_msb(&data) {
@@ -170,7 +170,7 @@ fn main() -> anyhow::Result<()> {
         envs.len(),
         navs.len()
     );
-    println!("ACV env MSBs use the plain MSB magic; env::read parses their EVENT table, BGM, type-100 light colours/angles and compact fog, the type-101 core scene (clear/far/water/sky scale), and the type-101 lens flare; the type-101 atmosphere/filter/DOF layouts are documented but not parsed");
+    println!("ACV env MSBs use the plain MSB magic; env::read parses their EVENT table, BGM, type-100 light colours/angles and compact fog, the type-101 core scene (clear/far/water/sky scale), lens flare, screen filter and DOF; the type-101 atmosphere record is documented but not parsed");
     println!(
         "MSB records: {models} models, {parts} parts, {points} points; part kinds {part_kinds:?}; point kinds {point_kinds:?}"
     );

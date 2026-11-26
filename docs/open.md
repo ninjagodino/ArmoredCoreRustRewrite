@@ -426,11 +426,12 @@ in order:
   `+1..+3`, the `+4..+0x30` floats and `+0x1c..+0x20` bytes into the filter singleton at
   `0x8387c700+0x55c0` via `0x82569e10`. The `+0x34` sub-block matches DOF: m0600's `100/1.57/7/6/4`
   matches the Dof filter object (`0x82541fb8`, execute `0x825422fc` reads `+0xf8..+0x104`), while
-  m0300 is disabled (all zero except `+0x30=1`). Neither filter nor DOF is rendered yet; the disc
-  test `env::tests::acv_env_from_mission_binder` covers core + lens flare only.
-  `acv_scene_core_layout`, `acv_lens_flare_layout` and `acv_light_fog_layout` pin the parsers
-  without the disc. `m1000` is not a map with models: mission_0010 pairs
-  `ch_env/m1000_env.msb` with m0300, and `script/event_include/m1000_*` exists.
+  m0300 is disabled (all zero except `+0x30=1`). The layouts are now parsed into
+  `Scene.acv_filter` / `acv_dof`; neither is rendered yet. The disc test
+  `env::tests::acv_env_from_mission_binder` covers core, lens flare, filter and DOF.
+  `acv_scene_core_layout`, `acv_lens_flare_layout`, `acv_filter_dof_layout` and
+  `acv_light_fog_layout` pin the parsers without the disc. `m1000` is not a map with models:
+  mission_0010 pairs `ch_env/m1000_env.msb` with m0300, and `script/event_include/m1000_*` exists.
   `m0650`/`m5000`/`m5001` are referenced by no mission XML, script, or executable string, so
   their `_m.mlb` files are unused/cut and need no loader. Still open: ACV type-101
   screen-filter/DOF rendering, HNAV/HTR and the `.mtd` binders.

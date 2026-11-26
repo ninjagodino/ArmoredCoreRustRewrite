@@ -1,9 +1,9 @@
 //! Map environment (`model/map/ch_env/{map}_env.msb`): the MSB section chain at version
 //! `msb::MAGIC_ENV` (VD) or `msb::MAGIC` (ACV), with every record in `EVENT_PARAM_ST`.
 //! ACV's type-100 lights (including their compact fog block) use a packed byte layout
-//! (`acv_light`); its type-101 core scene and lens flare are decoded by `acv_scene` /
-//! `acv_lens_flare`, while the type-101 fog and filter sub-blocks remain undecoded. Field layouts
-//! and the shader constants built from them are in `sheets/map_env.csv`.
+//! (`acv_light`); its type-101 core scene, lens flare, screen filter and DOF are decoded by
+//! `acv_scene` / `acv_lens_flare`, while the type-101 atmosphere record remains unparsed. Field
+//! layouts and the shader constants built from them are in `sheets/map_env.csv`.
 //!
 //! Event record: `u32 name, i32 id, u32 type, u32 index, u32 data`, offsets relative to the
 //! record. Types: 100 light set, 101 scene parameters, 102 wind, 400 BGM (mission envs only).
@@ -304,6 +304,45 @@ impl LensFlare {
     }
 }
 
+/// ACV type-101 `+0x30` screen-filter record.
+///
+/// `0x8275d4f0` copies `+1..+3`, the `+4..+0x30` floats, and the
+/// `+0x1c..+0x20` bytes into the filter singleton at `0x8387c700+0x55c0`
+/// through `0x82569e10`. Field meanings are still being traced, so this keeps
+/// the raw layout. m0300's last event is enabled with kind `0x3c`, `params[0]`
+/// `0.2`, `params[3]` `-0.13`, `params[5]` `0.06`; m0600's is kind `0xff`,
+/// `sub_kind` `0x3c/0x1e`, `params[0]` `0.35`.
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct AcvScreenFilter {
+    /// `+0`: nonzero enables the filter.
+    pub enabled: bool,
+    /// `+1`: raw filter kind.
+    pub kind: u8,
+    /// `+2/+3`: raw signed sub-kinds.
+    pub sub_kind: [i8; 2],
+    /// `+4`, `+8`, `+0xc`, `+0x10`, `+0x14`, `+0x18`, `+0x20`, `+0x24`,
+    /// `+0x28`, `+0x2c`, `+0x30`.
+    pub params: [f32; 11],
+    /// `+0x1c..+0x20`: raw bytes (the `+0x20` byte shares a word with `params[6]`).
+    pub flags: [u8; 5],
+}
+
+/// ACV type-101 `+0x34` depth-of-field record.
+///
+/// `0x827621ec` copies the 13 floats to scene `+0xf8..+0x120`; the Dof filter
+/// object `0x82541fb8` initializes `+0xf8..+0x108` and its execute
+/// `0x825422fc` reads `+0xf8..+0x104`. m0600's first five values are
+/// `100/1.57/7/6/4`; m0300 is disabled (all zero except `+0x30 = 1`).
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct AcvDof {
+    /// `+0..+0x30`: 13 floats copied to the scene record.
+    pub params: [f32; 13],
+    /// `+0x38..+0x3d`: raw flag bytes.
+    pub flags: [u8; 6],
+    /// `+0x40/+0x44`: raw trailing words (not read by `0x827621ec`).
+    pub tail: [u32; 2],
+}
+
 /// The type-101 scene record's sub-blocks (`0x827ffa80`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Scene {
@@ -321,6 +360,10 @@ pub struct Scene {
     pub tonemap: ToneMap,
     /// Third sub-block (`data + 0xc`), lens-flare, god-ray, and lens-dust parameters.
     pub lens_flare: LensFlare,
+    /// ACV only: type-101 `+0x30` screen-filter record (parsed, not rendered yet).
+    pub acv_filter: Option<AcvScreenFilter>,
+    /// ACV only: type-101 `+0x34` depth-of-field record (parsed, not rendered yet).
+    pub acv_dof: Option<AcvDof>,
 }
 
 /// Type-400 BGM event data (`0x82800128`: `+0x00` → `r31+0x50`, `+0x04` → `+0x90`, `+0x08` → `+0x94`).
@@ -515,8 +558,69 @@ fn acv_light(r: &Be, name: String, d: usize) -> Result<LightSet> {
 ///
 /// Unlike VD, ACV keeps the core values in the first sub-block but at different offsets:
 /// `+4` draw distance, `+8` water height, `+0x1c` sky scale (only used when `> 1`). The
-/// lens-flare sub-block is at `data + u32(data + 0x14)`; the fog and filter blocks are
-/// still not decoded, so those stay at their defaults.
+/// lens-flare sub-block is at `data + u32(data + 0x14)`; the screen filter (`+0x30`) and
+/// DOF (`+0x34`) records are parsed but not rendered yet. The `+0x1c` atmosphere record
+/// is documented in `sheets/map_env.csv` but not parsed; it is not the type-100 fog.
+fn acv_screen_filter(r: &Be, d: usize) -> Result<Option<AcvScreenFilter>> {
+    let rel = r.u32(d + 0x30)? as usize;
+    if rel == 0 {
+        return Ok(None);
+    }
+    let s = d + rel;
+    if s + 0x34 > r.len() {
+        return Ok(None);
+    }
+    Ok(Some(AcvScreenFilter {
+        enabled: r.u8(s)? != 0,
+        kind: r.u8(s + 1)?,
+        sub_kind: [r.i8(s + 2)?, r.i8(s + 3)?],
+        params: [
+            r.f32(s + 4)?,
+            r.f32(s + 8)?,
+            r.f32(s + 0xc)?,
+            r.f32(s + 0x10)?,
+            r.f32(s + 0x14)?,
+            r.f32(s + 0x18)?,
+            r.f32(s + 0x20)?,
+            r.f32(s + 0x24)?,
+            r.f32(s + 0x28)?,
+            r.f32(s + 0x2c)?,
+            r.f32(s + 0x30)?,
+        ],
+        flags: [
+            r.u8(s + 0x1c)?,
+            r.u8(s + 0x1d)?,
+            r.u8(s + 0x1e)?,
+            r.u8(s + 0x1f)?,
+            r.u8(s + 0x20)?,
+        ],
+    }))
+}
+
+fn acv_dof(r: &Be, d: usize) -> Result<Option<AcvDof>> {
+    let rel = r.u32(d + 0x34)? as usize;
+    if rel == 0 {
+        return Ok(None);
+    }
+    let s = d + rel;
+    if s + 0x48 > r.len() {
+        return Ok(None);
+    }
+    let mut params = [0.0; 13];
+    for (i, p) in params.iter_mut().enumerate() {
+        *p = r.f32(s + i * 4)?;
+    }
+    let mut flags = [0; 6];
+    for (i, f) in flags.iter_mut().enumerate() {
+        *f = r.u8(s + 0x38 + i)?;
+    }
+    Ok(Some(AcvDof {
+        params,
+        flags,
+        tail: [r.u32(s + 0x40)?, r.u32(s + 0x44)?],
+    }))
+}
+
 fn acv_scene(r: &Be, d: usize) -> Result<Scene> {
     let sub = d + r.u32(d)? as usize;
     let flare_rel = r.u32(d + 0x14)? as usize;
@@ -534,6 +638,8 @@ fn acv_scene(r: &Be, d: usize) -> Result<Scene> {
             .unwrap_or(1.0),
         tonemap: ToneMap::default(),
         lens_flare,
+        acv_filter: acv_screen_filter(r, d)?,
+        acv_dof: acv_dof(r, d)?,
     })
 }
 
@@ -691,9 +797,9 @@ pub fn read(data: &[u8]) -> Result<Env> {
         matches!(magic, msb::MAGIC_ENV | msb::MAGIC),
         "not an env MSB"
     );
-    // ACV's type-100 lights (with their compact fog) and type-101 core scene + lens flare are
-    // packed layouts decoded by `acv_light` / `acv_scene` / `acv_lens_flare`; type-101 fog/filter
-    // stay unparsed.
+    // ACV's type-100 lights (with their compact fog) and type-101 core scene + lens flare +
+    // screen filter + DOF are packed layouts decoded by `acv_light` / `acv_scene` /
+    // `acv_lens_flare`; the type-101 atmosphere record stays unparsed.
     let acv = magic == msb::MAGIC;
     let mut env = Env {
         events: Vec::new(),
@@ -761,6 +867,8 @@ pub fn read(data: &[u8]) -> Result<Env> {
                     sky_scale: Some(r.f32(sub + 0x1c)?).filter(|&s| s > 0.0).unwrap_or(1.0),
                     tonemap,
                     lens_flare,
+                    acv_filter: None,
+                    acv_dof: None,
                 });
             }
             EVENT_BGM if env.bgm.is_none() && e.data + 12 <= data.len() => {
@@ -1012,6 +1120,58 @@ mod tests {
     }
 
     #[test]
+    fn acv_filter_dof_layout() {
+        let mut data = vec![0u8; 0x200];
+        data[..4].copy_from_slice(&0x20u32.to_be_bytes());
+        data[0x30..0x34].copy_from_slice(&0x100u32.to_be_bytes());
+        data[0x34..0x38].copy_from_slice(&0x140u32.to_be_bytes());
+
+        let f = 0x100;
+        data[f] = 1;
+        data[f + 1] = 0x3c;
+        data[f + 2] = 0xff;
+        data[f + 3] = 0xfe;
+        for (i, v) in [0.2f32, 0.0, 0.0, -0.13, 0.0, 0.06, 0.0, 0.0, 0.0, 0.0, 0.0]
+            .into_iter()
+            .enumerate()
+        {
+            data[f + 4 + i * 4..f + 8 + i * 4].copy_from_slice(&v.to_be_bytes());
+        }
+        data[f + 0x1c..f + 0x20].copy_from_slice(&[5, 6, 7, 8]);
+
+        let d = 0x140;
+        for (i, v) in [
+            100.0f32, 1.57, 7.0, 6.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            data[d + i * 4..d + 4 + i * 4].copy_from_slice(&v.to_be_bytes());
+        }
+        data[d + 0x38..d + 0x3e].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        data[d + 0x40..d + 0x44].copy_from_slice(&0x14u32.to_be_bytes());
+        data[d + 0x44..d + 0x48].copy_from_slice(&0x66u32.to_be_bytes());
+
+        let scene = acv_scene(&Be(&data), 0).unwrap();
+        let filter = scene.acv_filter.expect("ACV filter");
+        assert!(filter.enabled);
+        assert_eq!(filter.kind, 0x3c);
+        assert_eq!(filter.sub_kind, [-1, -2]);
+        assert!(near(filter.params[0], 0.2));
+        assert!(near(filter.params[3], -0.13));
+        assert!(near(filter.params[5], 0.06));
+        assert_eq!(filter.flags, [5, 6, 7, 8, 0]);
+
+        let dof = scene.acv_dof.expect("ACV DOF");
+        assert!(near(dof.params[0], 100.0));
+        assert!(near(dof.params[1], 1.57));
+        assert!(near(dof.params[4], 4.0));
+        assert!(near(dof.params[12], 1.0));
+        assert_eq!(dof.flags, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(dof.tail, [0x14, 0x66]);
+    }
+
+    #[test]
     fn acv_light_fog_layout() {
         let mut data = vec![0u8; 0x50];
         data[0] = 1; // slot 1 = ID01 map basic light
@@ -1145,6 +1305,18 @@ mod tests {
         assert!(near(lf.dust.pos[0], 0.0) && near(lf.dust.pos[1], 208.0));
         assert!(near(lf.dust.size[0], 512.0) && near(lf.dust.size[1], 512.0));
         assert_eq!(lf.dust.color, [255, 255, 255, 255]);
+
+        let filter = scene.acv_filter.expect("ACV screen filter");
+        assert!(filter.enabled);
+        assert_eq!(filter.kind, 0x3c);
+        assert_eq!(filter.sub_kind, [0, 0]);
+        assert!(near(filter.params[0], 0.2));
+        assert!(near(filter.params[3], -0.13));
+        assert!(near(filter.params[5], 0.06));
+        let dof = scene.acv_dof.expect("ACV DOF");
+        assert!(near(dof.params[0], 0.0));
+        assert!(near(dof.params[12], 1.0));
+        assert_eq!(dof.flags, [0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
