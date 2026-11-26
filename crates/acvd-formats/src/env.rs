@@ -733,6 +733,34 @@ fn acv_dof(r: &Be, d: usize) -> Result<Option<AcvDof>> {
     }))
 }
 
+/// ACV type-101 tone map at `data + u32(data + 4)` (`0x8275d8f0`).
+///
+/// The first five words match the Verdict Day `ToneMap` order (`mode`, `lum`, `mul`, `key`,
+/// `white`): m0300 = `1 / 0 / 10 / 0.8 / 20`, m0600 = `1 / 0 / 15 / 0.8 / 0`. ACV's `lum` 0
+/// selects its adaptive-luminance pass (`HDR_CalculateAdaptedLumPS`); the rewrite has no
+/// adaptation pass, so a zero here becomes the neutral `1.0`. The later ACV bloom fields are
+/// not decoded yet, so only the tone-map values are assigned; bloom stays off rather than
+/// borrowing Verdict Day's `+0x19..` block.
+fn acv_tonemap(r: &Be, d: usize) -> Result<ToneMap> {
+    let rel = r.u32(d + 4)? as usize;
+    if rel == 0 || d + rel + 0x14 > r.len() {
+        return Ok(ToneMap::default());
+    }
+    let s = d + rel;
+    let lum = r.f32(s + 4)?;
+    Ok(ToneMap {
+        mode: r.u32(s)?,
+        lum: if lum > 0.0 { lum } else { 1.0 },
+        mul: r.f32(s + 8)?,
+        key: r.f32(s + 0xc)?,
+        white: r.f32(s + 0x10)?,
+        bloom: Bloom {
+            enabled: false,
+            ..Default::default()
+        },
+    })
+}
+
 fn acv_scene(r: &Be, d: usize) -> Result<Scene> {
     let sub = d + r.u32(d)? as usize;
     let flare_rel = r.u32(d + 0x14)? as usize;
@@ -745,10 +773,8 @@ fn acv_scene(r: &Be, d: usize) -> Result<Scene> {
         clear: [r.u8(sub)?, r.u8(sub + 1)?, r.u8(sub + 2)?],
         far: r.f32(sub + 4)?,
         water_height: r.f32(sub + 8)?,
-        sky_scale: Some(r.f32(sub + 0x1c)?)
-            .filter(|&s| s > 1.0)
-            .unwrap_or(1.0),
-        tonemap: ToneMap::default(),
+        sky_scale: Some(r.f32(sub + 0x1c)?).filter(|&s| s > 1.0).unwrap_or(1.0),
+        tonemap: acv_tonemap(r, d)?,
         lens_flare,
         acv_filter: acv_screen_filter(r, d)?,
         acv_atmosphere: acv_atmosphere(r, d)?,
@@ -1150,6 +1176,26 @@ mod tests {
     }
 
     #[test]
+    fn acv_tonemap_layout() {
+        let mut data = vec![0u8; 0x60];
+        data[..4].copy_from_slice(&0x20u32.to_be_bytes());
+        data[4..8].copy_from_slice(&0x40u32.to_be_bytes());
+        let t = 0x40;
+        data[t..t + 4].copy_from_slice(&1u32.to_be_bytes());
+        data[t + 4..t + 8].copy_from_slice(&0.0f32.to_be_bytes());
+        data[t + 8..t + 0xc].copy_from_slice(&15.0f32.to_be_bytes());
+        data[t + 0xc..t + 0x10].copy_from_slice(&0.8f32.to_be_bytes());
+        data[t + 0x10..t + 0x14].copy_from_slice(&20.0f32.to_be_bytes());
+        let scene = acv_scene(&Be(&data), 0).unwrap();
+        assert_eq!(scene.tonemap.mode, 1);
+        assert!(near(scene.tonemap.lum, 1.0), "ACV adaptive lum fallback");
+        assert!(near(scene.tonemap.mul, 15.0));
+        assert!(near(scene.tonemap.key, 0.8));
+        assert!(near(scene.tonemap.white, 20.0));
+        assert!(!scene.tonemap.bloom.enabled);
+    }
+
+    #[test]
     fn acv_lens_flare_layout() {
         let mut data = vec![0u8; 0x500];
         data[..4].copy_from_slice(&0x20u32.to_be_bytes());
@@ -1525,6 +1571,21 @@ mod tests {
         );
         assert_eq!(env.acv_scenes.len(), 2);
 
+        // ACV's type-101 +4 record is the map's tone map. m0300's lightning and scene
+        // records share it (mode/lum/mul/key/white = 1/0/10/0.8/20; lum 0 is the
+        // adaptive-luminance selector and becomes 1.0 without the adaptation pass).
+        let m0300_tm = env.acv_scenes[0].tonemap;
+        assert_eq!(m0300_tm.mode, 1);
+        assert!(near(m0300_tm.lum, 1.0));
+        assert!(near(m0300_tm.mul, 10.0));
+        assert!(near(m0300_tm.key, 0.8));
+        assert!(near(m0300_tm.white, 20.0));
+        assert!(!m0300_tm.bloom.enabled);
+        assert_eq!(
+            env.acv_scenes[1].tonemap.mul,
+            env.acv_scenes[0].tonemap.mul
+        );
+
         // m0300's lightning and scene events carry byte-identical +0x30 records
         // (private/tmp/acv_type101_blocks.txt: 01 3c 00 00, 0.2, -0.13, 0.06).
         let first = env.acv_scenes[0]
@@ -1609,6 +1670,13 @@ mod tests {
         assert!(near(normal.params[0], 0.35));
         assert_eq!(normal.sub_kind, [0x3c, 0x1e]);
         assert_eq!(m0600.scene.as_ref().unwrap().acv_filter.unwrap().kind, 0xff);
+        let m0600_tm = m0600.acv_scenes[0].tonemap;
+        assert_eq!(m0600_tm.mode, 1);
+        assert!(near(m0600_tm.lum, 1.0));
+        assert!(near(m0600_tm.mul, 15.0));
+        assert!(near(m0600_tm.key, 0.8));
+        assert!(near(m0600_tm.white, 0.0));
+        assert_eq!(m0600.acv_scenes[1].tonemap.mul, m0600_tm.mul);
         assert_eq!(
             m0600.acv_scenes[0].acv_dof.unwrap().params,
             m0600.acv_scenes[1].acv_dof.unwrap().params

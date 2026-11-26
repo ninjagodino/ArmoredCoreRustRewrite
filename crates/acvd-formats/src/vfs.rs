@@ -417,6 +417,19 @@ impl X360 {
                 bundles.push(b.to_string());
             }
         }
+        // ACV's BHD5 has no name listing, so `bind/mission/*.bnd` never enters `names` above.
+        // Enumerate the two known mission-binder families by path hash; this makes the map
+        // MSBs/env files readable by their in-binder paths (`model/map/...`) like VD's.
+        if self.layers.len() == 1 {
+            for i in 0..10_000 {
+                for stem in [format!("mission_{i:04}"), format!("BattleFeild_{i:04}")] {
+                    let path = format!("bind/mission/{stem}.bnd");
+                    if self.archived(&path).is_some() {
+                        bundles.push(path);
+                    }
+                }
+            }
+        }
         let mut bundled = HashMap::new();
         for b in bundles {
             let Some((at, size)) = self.archived(&b) else {
@@ -617,6 +630,20 @@ mod tests {
                 .as_deref()
                 .is_some_and(|n| n.ends_with("m0050_map.msb"))
         }));
+    }
+
+    #[test]
+    fn acv_disc_reads_mission_bundle_members_by_path() {
+        let Some(disc) = test_disc_v() else { return };
+        assert!(disc.exists("model/map/m0300/m0300_map.msb"));
+        assert_eq!(
+            disc.read("model/map/m0300/m0300_map.msb").unwrap().len(),
+            1_399_344
+        );
+        assert_eq!(
+            disc.read("model/map/ch_env/m0300_env.msb").unwrap().len(),
+            45_044
+        );
     }
 
     #[test]

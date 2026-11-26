@@ -1,6 +1,8 @@
 //! Hit model (`.hmd`) inside map/part binders (`*_h.hmd`). Big-endian, magic `0x10000117`.
 //!
-//! Header (0x30): `u32 magic, u32 0x4A9, u32 file size, u32 material count, u32 mesh count,
+//! Verdict Day writes version `0x4A9`; Armored Core V writes `0x492` with the same layout
+//! (`model/map/m0300/m0200_h.hmd`). Header (0x30): `u32 magic, u32 version, u32 file size,
+//! u32 material count, u32 mesh count,
 //! u32 vertex count, u32 0, u32 node count, u32 triangle count, u32 0x40 (string-offset table),
 //! u32 first byte after the material strings, u32 triangle offset`. The table at 0x40 holds two
 //! offsets per material (name, empty companion).
@@ -25,7 +27,10 @@ use crate::flver::Xform;
 use crate::reader::Be;
 
 pub const MAGIC: u32 = 0x1000_0117;
+/// Verdict Day hit-model version.
 pub const VERSION: u32 = 0x4A9;
+/// Armored Core V hit-model version; same record layout (`model/map/m0300/m0200_h.hmd`).
+pub const VERSION_V: u32 = 0x492;
 pub const HEADER: usize = 0x30;
 pub const NODE: usize = 0x34;
 pub const TRIANGLE: usize = 10;
@@ -116,10 +121,10 @@ pub fn is_hmd(data: &[u8]) -> bool {
 pub fn read(data: &[u8]) -> Result<Hmd> {
     let r = Be(data);
     ensure!(r.u32(0)? == MAGIC, "not an HMD");
+    let version = r.u32(4)?;
     ensure!(
-        r.u32(4)? == VERSION,
-        "HMD version {:#x}, expected {VERSION:#x}",
-        r.u32(4)?
+        matches!(version, VERSION | VERSION_V),
+        "HMD version {version:#x}, expected {VERSION:#x} (VD) or {VERSION_V:#x} (ACV)"
     );
     let size = r.u32(8)? as usize;
     ensure!(
@@ -347,6 +352,20 @@ mod tests {
         assert_eq!(h.nodes[0].count, 1);
         assert_eq!(h.vertices[1], [2.0, 0.0, 0.0]);
         assert_eq!(h.model_vertices(), h.vertices);
+    }
+
+    #[test]
+    fn acv_map_hmd_uses_version_0492() {
+        let Some(disc) = crate::vfs::test_disc_v() else {
+            return;
+        };
+        let h = read(&crate::vfs::open(&disc, "model/map/m0300/m0200_h.hmd").unwrap()).unwrap();
+        assert_eq!(h.materials.len(), 2);
+        assert_eq!(h.meshes.len(), 1);
+        assert_eq!(h.nodes.len(), 0x287);
+        assert_eq!(h.vertices.len(), 0x574);
+        assert_eq!(h.triangles.len(), 0x8a0);
+        assert!(!h.triangles.is_empty());
     }
 
     #[test]
