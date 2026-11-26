@@ -45,6 +45,8 @@
 //! `a0000`..`a0003`, `all`), `--hits` draws the hit meshes
 //! instead of the map models, `--plane` is the old infinite floor, `--water` adds a test water
 //! plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
+//! Non-combat ambient air traffic (e2030/e2040 helicopters and an e6010 bomber flyover, see
+//! `ambient`) circles the sortie start; `--no-ambient` leaves it out.
 //! `--no-hud` leaves that HUD and the part-name overlay out, for looking at effects.
 //! Boosters, muzzle flashes, tracers and hits play FFX effects (see `sfx`); `--sfx <id>` keeps
 //! effect `id` playing in front of the AC. Shots, boost and jump play their FMOD cues (see
@@ -60,6 +62,7 @@
 //! cache (default `private/movies`). World/garage/`--map`/`--shot` args imply `--boot garage`.
 
 mod ai;
+mod ambient;
 mod assemble;
 mod bay;
 mod blur;
@@ -200,6 +203,8 @@ pub struct Scene {
     pub plane: bool,
     pub hits: bool,
     pub water: Option<f32>,
+    /// Spawn the non-combat ambient aircraft patrols (see [`ambient`]).
+    pub ambient: bool,
     /// True when the sortie was launched from the 3D Garage AC TEST flow.
     pub from_garage: bool,
 }
@@ -258,7 +263,7 @@ fn main() {
     let (mut layout, mut hits) = (Some("actest".to_string()), false);
     let mut test = targets::TestMode::default();
     let mut test_arg = "actest2".to_string();
-    let (mut preview, mut burst, mut no_hud) = (None, 1, false);
+    let (mut preview, mut burst, mut no_hud, mut no_ambient) = (None, 1, false, false);
     let (
         mut start_garage,
         mut garage_id,
@@ -418,6 +423,7 @@ fn main() {
             "--sfx" => preview = args.next().and_then(|s| s.parse::<i32>().ok()),
             "--burst" => burst = args.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1),
             "--no-hud" => no_hud = true,
+            "--no-ambient" => no_ambient = true,
             "--input" => {
                 if let Some(raw) = args.next() {
                     start_input = if raw.eq_ignore_ascii_case("gamepad")
@@ -747,6 +753,7 @@ fn main() {
         plane,
         hits,
         water,
+        ambient: !no_ambient,
         from_garage: false,
     })
     .insert_resource(collision)
@@ -851,6 +858,13 @@ fn main() {
                 .chain(),
         )
             .chain()
+            .run_if(world_ready),
+    )
+    .add_systems(
+        Update,
+        (ambient::spawn_system, ambient::step)
+            .chain()
+            .run_if(in_active_sortie)
             .run_if(world_ready),
     )
     .add_systems(
@@ -1344,6 +1358,7 @@ fn process_mode_switch(
             With<map::MapPart>,
             With<SortieDecor>,
             With<targets::Target>,
+            With<ambient::AmbientAircraft>,
             With<weapons::Projectile>,
             With<weapons::Missile>,
             With<scan::ReconUnit>,

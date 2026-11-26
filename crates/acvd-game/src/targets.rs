@@ -320,7 +320,7 @@ pub struct EnemyAnimBank {
     pub aim_pitch: Option<EnemyJcon>,
 }
 
-fn xform_to_affine(xf: &flver::Xform) -> Affine3A {
+pub(crate) fn xform_to_affine(xf: &flver::Xform) -> Affine3A {
     Affine3A::from_cols(
         Vec3::new(xf.m[0][0], xf.m[1][0], xf.m[2][0]).into(),
         Vec3::new(xf.m[0][1], xf.m[1][1], xf.m[2][1]).into(),
@@ -716,7 +716,7 @@ impl EnemyAnim {
 /// Steps all living [`EnemyAnim`] skeletons and writes their posed joint transforms.
 pub fn animate_enemies(
     time: Res<Time>,
-    mut enemies: Query<(&mut EnemyAnim, &TargetHealth)>,
+    mut enemies: Query<(&mut EnemyAnim, Option<&TargetHealth>)>,
     mut transforms: Query<&mut Transform>,
 ) {
     let dt = time.delta_secs();
@@ -724,7 +724,7 @@ pub fn animate_enemies(
         return;
     }
     for (mut anim, health) in &mut enemies {
-        if health.destroyed {
+        if health.is_some_and(|h| h.destroyed) {
             continue;
         }
         let was_blending = anim.blend_secs > 0.0 && anim.blend_t == 0.0;

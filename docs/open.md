@@ -38,6 +38,8 @@ in order:
   shots are dusk sky with no sun) and a runtime check that the sky dome's painted glow matches the
   msb sun angle.
 
+- **Ambient jets**: ambient `e2030`/`e2040`/`e6010` traffic is in (see Done "Ambient air traffic"), but no standalone fighter/jet mesh exists to match the reference screenshot. ACVD and ACV ship only the `e6010` flying-wing bomber and its `e6011`..`e6014` sections; the `e2200` m3104 bombers are param-only (no `model/ene/e2200`), and the `o22xx`/ACV candidates are roofs, wrecks and turrets. A fighter flyover needs an authored or borrowed FLVER; add its route in `ambient.rs`.
+
 - **Map look**: lighting / fog / sky / tone map / per-draw light-set ids, area bounds (POINT kinds 100-102), destructible map props (`_b.flv` / `_b_h.hmd`), and water return (`POINT` kind 50 + `env::Scene.water_height`, active only when the map has kind-50 points) are in (see below). The `o0006` `signboardGrow` screens' `movie` texture is a runtime render target, not an asset (see below).
   - Done: `acvd-formats::env` reads `ch_env/*_env.msb` (MSB chain at version 0x00989A6C,
     EVENT_PARAM_ST only); `sheets/map_env.csv` has every field, the shader constants built from

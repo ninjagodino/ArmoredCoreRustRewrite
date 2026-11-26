@@ -2,6 +2,7 @@
 //! owned disc.
 //!
 //! `acvd-viewer [model name or asset path] [--disc <360 ISO>] [--shot <png>] [--flat]`
+//! `--path <asset path>` renders one disc path without needing it in the generated index.
 //! Left/Right: previous/next model, PageUp/PageDown: jump 50, drag left mouse: orbit,
 //! wheel: zoom, R: reframe. `--shot` saves one frame of the first model and exits.
 
@@ -19,6 +20,7 @@ struct Viewer {
     models: Vec<&'static ModelRef>,
     current: usize,
     shown: Option<usize>,
+    custom: Option<String>,
     flat: bool,
     bounds: (Vec3, Vec3),
 }
@@ -28,12 +30,13 @@ struct ModelPart;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut wanted, mut disc, mut shot, mut flat) = (None, None, None, false);
+    let (mut wanted, mut disc, mut shot, mut flat, mut custom) = (None, None, None, false, None);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--disc" => disc = args.next().map(PathBuf::from),
             "--shot" => shot = args.next().map(|p| Shot::new(PathBuf::from(p))),
             "--flat" => flat = true,
+            "--path" => custom = args.next(),
             _ => wanted = Some(a),
         }
     }
@@ -55,7 +58,7 @@ fn main() {
         ..default()
     }))
     .insert_resource(ClearColor(Color::srgb(0.11, 0.12, 0.14)))
-    .insert_resource(Viewer { disc, models, current, shown: None, flat, bounds: (Vec3::ZERO, Vec3::ONE) })
+    .insert_resource(Viewer { disc, models, current, shown: None, custom, flat, bounds: (Vec3::ZERO, Vec3::ONE) })
     .add_systems(Startup, setup)
     .add_systems(Update, (browse, show, orbit).chain());
     if let Some(shot) = shot {
@@ -71,6 +74,9 @@ fn setup(mut commands: Commands) {
 }
 
 fn browse(keys: Res<ButtonInput<KeyCode>>, mut viewer: ResMut<Viewer>) {
+    if viewer.custom.is_some() {
+        return;
+    }
     let n = viewer.models.len() as isize;
     let step = [(KeyCode::ArrowRight, 1), (KeyCode::ArrowLeft, -1), (KeyCode::PageDown, 50), (KeyCode::PageUp, -50)]
         .iter()
@@ -95,7 +101,11 @@ fn show(
     mut window: Query<&mut Window, With<PrimaryWindow>>,
     shot: Option<ResMut<Shot>>,
 ) {
-    if viewer.shown == Some(viewer.current) {
+    let already_shown = match &viewer.custom {
+        Some(_) => viewer.shown == Some(usize::MAX),
+        None => viewer.shown == Some(viewer.current),
+    };
+    if already_shown {
         if keys.just_pressed(KeyCode::KeyR) {
             if let Ok(mut o) = orbit.single_mut() {
                 o.frame(viewer.bounds.0, viewer.bounds.1);
@@ -103,21 +113,33 @@ fn show(
         }
         return;
     }
-    let Some(&model) = viewer.models.get(viewer.current) else { return };
-    viewer.shown = Some(viewer.current);
+    let (path, mut status) = if let Some(custom) = viewer.custom.clone() {
+        viewer.shown = Some(usize::MAX);
+        (custom.clone(), format!("{custom} - custom path"))
+    } else {
+        let Some(&model) = viewer.models.get(viewer.current) else { return };
+        viewer.shown = Some(viewer.current);
+        (
+            model.path.to_string(),
+            format!("[{}/{}] {} - {} meshes, {} triangles", viewer.current + 1, viewer.models.len(), model.path, model.meshes, model.triangles),
+        )
+    };
     for e in &parts {
         commands.entity(e).despawn();
     }
 
-    let mut status = format!("[{}/{}] {} - {} meshes, {} triangles", viewer.current + 1, viewer.models.len(), model.path, model.meshes, model.triangles);
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    match acvd_render::model(&viewer.disc, model.path) {
+    match acvd_render::model(&viewer.disc, &path) {
         Ok(list) => {
             let mut packs = acvd_render::Packs::default();
             let mut missing = 0;
             for part in list {
-                min = min.min(Vec3::from(part.min));
-                max = max.max(Vec3::from(part.max));
+                let lo = Vec3::from(part.min);
+                let hi = Vec3::from(part.max);
+                if (hi - lo).max_element() < 500.0 {
+                    min = min.min(lo);
+                    max = max.max(hi);
+                }
                 let material = materials.add(acvd_render::material(&viewer.disc, &part, &mut packs, &mut images, viewer.flat, &mut missing));
                 commands.spawn((Mesh3d(meshes.add(part.mesh)), MeshMaterial3d(material), Transform::default(), ModelPart));
             }
