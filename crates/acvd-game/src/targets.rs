@@ -28,8 +28,8 @@ use acvd_data::generated::enemy::{
 use acvd_data::generated::sfx::PARAM_SFXSESETPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_data::{find, part_field};
-use acvd_formats::{ani, bnd3, flver, msb};
 use acvd_formats::vfs::{self, Disc};
+use acvd_formats::{ani, bnd3, flver, msb};
 use acvd_render::Packs;
 use anyhow::Result;
 use bevy::audio::AudioSource;
@@ -214,8 +214,8 @@ impl TargetHealth {
         .sum::<f32>()
         .max(1.0);
         let ctrl = AcCtrlParam::calculate(design);
-        let destroy_sfx = find(PARAM_SFXSESETPARAM_BIN, 502)
-            .map_or(4041, |r| i32::from(r.data.sfx_id));
+        let destroy_sfx =
+            find(PARAM_SFXSESETPARAM_BIN, 502).map_or(4041, |r| i32::from(r.data.sfx_id));
         let destroy_se = find(PARAM_ACSOUNDPARAM_BIN, 0)
             .filter(|r| r.data.se_destroy > 0)
             .map(|r| format!("c{:08}", r.data.se_destroy))
@@ -241,9 +241,7 @@ impl TargetHealth {
 
     /// World-space center of the target's primary hit sphere (for explosion VFX placement).
     pub fn center_offset_y(&self) -> f32 {
-        self.spheres
-            .first()
-            .map_or(3.0, |s| s.offset_y)
+        self.spheres.first().map_or(3.0, |s| s.offset_y)
     }
 }
 
@@ -333,9 +331,29 @@ impl EnemyAnimBank {
     /// Loads every `a00_NNN.ani` clip from `model/ene/{model}/{model}_a.bnd.dcx` and maps its
     /// bone tracks onto `rig`.
     pub fn load(disc: &Disc, model: &str, rig: &acvd_render::Rig) -> Arc<Self> {
+        Self::load_from_binder(disc, &enemy_anim_binder(model), rig, true)
+    }
+
+    /// Loads every `a00_NNN.ani` clip from a map object's `model/obj/{model}/{model}_a.bnd.dcx`
+    /// and maps its bone tracks onto `rig`. Map-object animations carry no `enemyjcondata`
+    /// turret/aim bones (`o9310`/`o9330` are formations, not turrets).
+    pub fn load_object(disc: &Disc, model: &str, rig: &acvd_render::Rig) -> Arc<Self> {
+        Self::load_from_binder(
+            disc,
+            &format!("model/obj/{model}/{model}_a.bnd.dcx"),
+            rig,
+            false,
+        )
+    }
+
+    fn load_from_binder(
+        disc: &Disc,
+        binder_path: &str,
+        rig: &acvd_render::Rig,
+        with_jcon: bool,
+    ) -> Arc<Self> {
         let mut clips = HashMap::new();
-        let binder_path = enemy_anim_binder(model);
-        if let Ok(binder_bytes) = vfs::open(disc, &binder_path) {
+        if let Ok(binder_bytes) = vfs::open(disc, binder_path) {
             if let Ok(bnd) = bnd3::read(&binder_bytes) {
                 for (i, entry) in bnd.entries.iter().enumerate() {
                     let Some(name) = entry.name.as_deref() else {
@@ -398,9 +416,9 @@ impl EnemyAnimBank {
         // - `e1020` (`[03] Cannon`): `y` (±180° yaw, 0.5 rad/s? -> 60 deg/s), `x` (-30..70° pitch).
         // - `e0110` (`[08] e0110`): `body_01` (±60° yaw, -30..40° pitch).
         // - `e0210` (`[07] e0210`): `l_arm_03` (-75..65° yaw, -15..60° pitch).
-        let (aim_yaw, aim_pitch) = if let (Some(&by), Some(&bx)) =
-            (bone_by_name.get("y"), bone_by_name.get("x"))
-        {
+        let (aim_yaw, aim_pitch) = if !with_jcon {
+            (None, None)
+        } else if let (Some(&by), Some(&bx)) = (bone_by_name.get("y"), bone_by_name.get("x")) {
             (
                 Some(EnemyJcon {
                     bone_idx: by,
@@ -457,7 +475,10 @@ impl EnemyAnimBank {
 
     /// Picks the first clip ID in `candidates` that exists in this enemy's `_a.bnd.dcx`.
     pub fn pick_clip(&self, candidates: &[u16]) -> Option<u16> {
-        candidates.iter().copied().find(|id| self.clips.contains_key(id))
+        candidates
+            .iter()
+            .copied()
+            .find(|id| self.clips.contains_key(id))
     }
 }
 
@@ -554,7 +575,11 @@ impl EnemyAnim {
                     &[0]
                 } else if fwd.abs() >= right.abs() {
                     if fwd >= 0.0 {
-                        if speed > walk_speed * 0.8 { &[17, 2, 0] } else { &[2, 0] }
+                        if speed > walk_speed * 0.8 {
+                            &[17, 2, 0]
+                        } else {
+                            &[2, 0]
+                        }
                     } else if speed > walk_speed * 0.8 {
                         &[18, 8, 0]
                     } else {
@@ -572,7 +597,11 @@ impl EnemyAnim {
             ai::Archetype::Tank => {
                 // `e1020`: hull clip `0` (idle) or `2`/`8` (drive); turret `y`/`x` tracked procedurally.
                 let candidates: &[u16] = if speed > 1.5 {
-                    if fwd >= 0.0 { &[2, 0] } else { &[8, 2, 0] }
+                    if fwd >= 0.0 {
+                        &[2, 0]
+                    } else {
+                        &[8, 2, 0]
+                    }
                 } else {
                     &[0]
                 };
@@ -597,14 +626,22 @@ impl EnemyAnim {
                     let dashing = speed > walk_speed.max(6.0) * 1.1;
                     let candidates: &[u16] = if dashing {
                         if fwd.abs() >= right.abs() {
-                            if fwd >= 0.0 { &[17, 55, 2, 0] } else { &[18, 56, 8, 2, 0] }
+                            if fwd >= 0.0 {
+                                &[17, 55, 2, 0]
+                            } else {
+                                &[18, 56, 8, 2, 0]
+                            }
                         } else if right >= 0.0 {
                             &[22, 12, 2, 0]
                         } else {
                             &[21, 10, 2, 0]
                         }
                     } else if fwd.abs() >= right.abs() {
-                        if fwd >= 0.0 { &[2, 1, 0] } else { &[8, 7, 2, 0] }
+                        if fwd >= 0.0 {
+                            &[2, 1, 0]
+                        } else {
+                            &[8, 7, 2, 0]
+                        }
                     } else if right >= 0.0 {
                         &[12, 11, 2, 0]
                     } else {
@@ -615,7 +652,11 @@ impl EnemyAnim {
                         self.play(id, true, rate, 0.15);
                     }
                 } else if yaw_rate.abs() > 0.2 {
-                    let candidates: &[u16] = if yaw_rate > 0.0 { &[33, 34, 0] } else { &[34, 33, 0] };
+                    let candidates: &[u16] = if yaw_rate > 0.0 {
+                        &[33, 34, 0]
+                    } else {
+                        &[34, 33, 0]
+                    };
                     if let Some(id) = self.bank.pick_clip(candidates) {
                         self.play(id, true, 1.0, 0.15);
                     }
@@ -824,57 +865,55 @@ pub fn spawn(
             continue;
         }
         let asset = enemy_asset(&part.model);
-        let entry = enemy_cache.entry(part.model.clone()).or_insert_with(|| {
-            match acvd_render::rigged_model(disc, &asset, &|_| acvd_render::RootPlace::IDENTITY) {
-                Ok((list, rig)) if !list.is_empty() => {
-                    let bank = EnemyAnimBank::load(disc, &part.model, &rig);
-                    let unboned = Affine3A::from_translation(Vec3::from(rig.unboned));
-                    let binds: Vec<Mat4> = rig
-                        .bones
-                        .iter()
-                        .map(|b| xform_to_affine(&b.bind))
-                        .chain([unboned])
-                        .map(|b| Mat4::from(pose::mirror(b).inverse()))
-                        .collect();
-                    let inv_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
-                    let meshes_mats = list
-                        .into_iter()
-                        .map(|m| {
-                            let mat = acvd_render::material(
-                                disc,
-                                &m,
-                                &mut packs,
-                                images,
-                                flat,
-                                &mut missing,
-                            );
-                            (meshes.add(m.mesh), materials.add(mat))
+        let entry =
+            enemy_cache.entry(part.model.clone()).or_insert_with(
+                || match acvd_render::rigged_model(disc, &asset, &|_| {
+                    acvd_render::RootPlace::IDENTITY
+                }) {
+                    Ok((list, rig)) if !list.is_empty() => {
+                        let bank = EnemyAnimBank::load(disc, &part.model, &rig);
+                        let unboned = Affine3A::from_translation(Vec3::from(rig.unboned));
+                        let binds: Vec<Mat4> = rig
+                            .bones
+                            .iter()
+                            .map(|b| xform_to_affine(&b.bind))
+                            .chain([unboned])
+                            .map(|b| Mat4::from(pose::mirror(b).inverse()))
+                            .collect();
+                        let inv_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
+                        let meshes_mats = list
+                            .into_iter()
+                            .map(|m| {
+                                let mat = acvd_render::material(
+                                    disc,
+                                    &m,
+                                    &mut packs,
+                                    images,
+                                    flat,
+                                    &mut missing,
+                                );
+                                (meshes.add(m.mesh), materials.add(mat))
+                            })
+                            .collect();
+                        Some(CachedEnemy {
+                            meshes: meshes_mats,
+                            inv_bindposes,
+                            bank,
                         })
-                        .collect();
-                    Some(CachedEnemy {
-                        meshes: meshes_mats,
-                        inv_bindposes,
-                        bank,
-                    })
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    warn!("target {} ({asset}): {e:#}", part.name);
-                    None
-                }
-            }
-        });
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        warn!("target {} ({asset}): {e:#}", part.name);
+                        None
+                    }
+                },
+            );
         let Some(cached) = entry.as_ref() else {
             continue;
         };
         let health = TargetHealth::from_enemy(&part.model);
         let init_yaw = ai::yaw_from_quat(xf.rotation);
-        let enemy_ai = ai::EnemyAi::for_enemy(
-            &part.model,
-            xf.translation,
-            init_yaw,
-            enemy_parts,
-        );
+        let enemy_ai = ai::EnemyAi::for_enemy(&part.model, xf.translation, init_yaw, enemy_parts);
         let root = commands
             .spawn((
                 Target {
@@ -926,9 +965,11 @@ pub fn spawn(
             ));
         }
 
-        commands
-            .entity(root)
-            .insert(EnemyAnim::new(cached.bank.clone(), joint_entities, init_yaw));
+        commands.entity(root).insert(EnemyAnim::new(
+            cached.bank.clone(),
+            joint_entities,
+            init_yaw,
+        ));
         spawned += 1;
     }
 
@@ -957,7 +998,10 @@ fn spawn_ac_target(
     flat: bool,
 ) -> bool {
     let Some(design) = find_design(design_id) else {
-        warn!("target {} ({}): design {design_id} not found", part.name, part.model);
+        warn!(
+            "target {} ({}): design {design_id} not found",
+            part.name, part.model
+        );
         return false;
     };
     let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
@@ -968,8 +1012,9 @@ fn spawn_ac_target(
     let mut known = vec![None; built.placements.len()];
     for (index, p) in built.placements.iter().enumerate() {
         let places = assemble::root_places(p, &built.placements, &known);
-        match acvd_render::rigged_model(disc, p.model.path, &|root| assemble::place_of(&places, root))
-        {
+        match acvd_render::rigged_model(disc, p.model.path, &|root| {
+            assemble::place_of(&places, root)
+        }) {
             Ok((part_meshes, rig)) => {
                 known[index] = Some(assemble::Stored {
                     places,
@@ -1058,8 +1103,8 @@ fn spawn_ac_target(
     true
 }
 
-/// Steps target stagger timers and handles destruction (explosion FFX/SFX + broken `_b.flv`
-/// model swap for enemies, or despawn for destroyed AC targets).
+/// Steps target stagger timers and handles destruction (explosion FFX/SFX + shattered skinned
+/// `_b.flv` gib physics via [`crate::debris::spawn`], or despawn for destroyed AC targets).
 #[allow(clippy::too_many_arguments)]
 pub fn tick(
     time: Res<Time>,
@@ -1068,14 +1113,20 @@ pub fn tick(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut cues: ResMut<sound::Cues>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
-    mut targets: Query<(Entity, &Target, &mut TargetHealth, &Transform, Option<&Children>)>,
+    mut targets: Query<(
+        Entity,
+        &Target,
+        &mut TargetHealth,
+        &Transform,
+        Option<&ai::EnemyAi>,
+    )>,
 ) {
     let dt = time.delta_secs();
     let mut packs = Packs::default();
-    let mut missing = 0usize;
-    for (entity, target, mut health, xf, children) in &mut targets {
+    for (entity, target, mut health, xf, enemy_ai) in &mut targets {
         if health.stagger_timer > 0.0 {
             health.stagger_timer = (health.stagger_timer - dt).max(0.0);
         }
@@ -1094,43 +1145,38 @@ pub fn tick(
             ));
         }
         if !health.destroy_se.is_empty() {
-            sound::cue(&mut commands, &mut cues, &mut audio_sources, &health.destroy_se);
+            sound::cue(
+                &mut commands,
+                &mut cues,
+                &mut audio_sources,
+                &health.destroy_se,
+            );
         }
         info!(
             "target {} ({}) destroyed at ({:.1}, {:.1}, {:.1})",
             target.name, target.model, center.x, center.y, center.z
         );
 
-        let swapped = health.broken_asset.as_deref().is_some_and(|asset| {
-            let Ok(list) = acvd_render::model(&garage.disc, asset) else {
-                return false;
-            };
-            if list.is_empty() {
-                return false;
-            }
-            if let Some(kids) = children {
-                for child in kids.iter() {
-                    commands.entity(child).try_despawn();
-                }
-            }
-            commands.entity(entity).with_children(|c| {
-                for m in list {
-                    let mat = acvd_render::material(
-                        &garage.disc,
-                        &m,
-                        &mut packs,
-                        &mut images,
-                        garage.flat,
-                        &mut missing,
-                    );
-                    c.spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(materials.add(mat))));
-                }
-            });
-            true
-        });
-        if !swapped {
-            commands.entity(entity).try_despawn();
+        let init_vel = enemy_ai.map_or(Vec3::ZERO, |a| a.velocity);
+        if let Some(asset) = health.broken_asset.as_deref() {
+            crate::debris::spawn(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut images,
+                &mut bindposes,
+                &garage.disc,
+                &mut packs,
+                garage.flat,
+                asset,
+                &target.name,
+                crate::debris::DebrisKind::Enemy,
+                *xf,
+                init_vel,
+                Vec3::ZERO,
+            );
         }
+        commands.entity(entity).try_despawn();
     }
 }
 
@@ -1165,8 +1211,8 @@ mod tests {
         let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
             return;
         };
-        let parts = msb::parts(&vfs::open(&disc, "model/map/m4000/m4000_actest.msb").unwrap())
-            .unwrap();
+        let parts =
+            msb::parts(&vfs::open(&disc, "model/map/m4000/m4000_actest.msb").unwrap()).unwrap();
         assert_eq!(select(&parts, &TestMode::parse("0")).len(), 0);
         assert_eq!(select(&parts, &TestMode::parse("1")).len(), 12);
         assert_eq!(select(&parts, &TestMode::parse("2")).len(), 6);
@@ -1187,14 +1233,12 @@ mod tests {
             } else {
                 let asset = enemy_asset(&part.model);
                 assert!(
-                    acvd_render::model(&disc, &asset)
-                        .is_ok_and(|list| !list.is_empty()),
+                    acvd_render::model(&disc, &asset).is_ok_and(|list| !list.is_empty()),
                     "enemy FLVER failed to load: {asset}"
                 );
                 let broken = enemy_broken_asset(&part.model);
                 assert!(
-                    acvd_render::model(&disc, &broken)
-                        .is_ok_and(|list| !list.is_empty()),
+                    acvd_render::model(&disc, &broken).is_ok_and(|list| !list.is_empty()),
                     "broken enemy FLVER failed to load: {broken}"
                 );
                 let mut hp = TargetHealth::from_enemy(&part.model);
@@ -1234,20 +1278,41 @@ mod tests {
 
             let mut anim = EnemyAnim::new(bank.clone(), Vec::new(), 0.0);
             // Drive forward movement and verify clip advances + bone poses stay finite.
-            anim.select_state(arch, Vec3::new(0.0, 0.0, -12.0), 10.0, 0.0, 0, false, false, 0.016);
+            anim.select_state(
+                arch,
+                Vec3::new(0.0, 0.0, -12.0),
+                10.0,
+                0.0,
+                0,
+                false,
+                false,
+                0.016,
+            );
             for _ in 0..30 {
                 anim.step(1.0 / 60.0, Some((0.5, 0.2)));
             }
             for i in 0..bank.rest_locals.len() {
                 let tf = anim.sample_bone(i);
-                assert!(tf.translation.is_finite(), "{model} bone {i} non-finite translation");
-                assert!(tf.rotation.is_finite(), "{model} bone {i} non-finite rotation");
+                assert!(
+                    tf.translation.is_finite(),
+                    "{model} bone {i} non-finite translation"
+                );
+                assert!(
+                    tf.rotation.is_finite(),
+                    "{model} bone {i} non-finite rotation"
+                );
             }
 
             if model == "e1020" {
                 assert!(bank.aim_yaw.is_some() && bank.aim_pitch.is_some());
-                assert!(anim.turret_yaw > 0.1, "e1020 turret yaw should track player");
-                assert!(anim.turret_pitch > 0.05, "e1020 barrel pitch should track player");
+                assert!(
+                    anim.turret_yaw > 0.1,
+                    "e1020 turret yaw should track player"
+                );
+                assert!(
+                    anim.turret_pitch > 0.05,
+                    "e1020 barrel pitch should track player"
+                );
             }
             if model == "e2030" {
                 // Verify rotor bone `pro_l` actually rotates across frames.
@@ -1310,9 +1375,15 @@ mod tests {
         npc.set_locomotion(&disc, Vec3::ZERO, 12.0, Some((0.4, 0.1)));
         assert_eq!(npc.motion.current_anim_id, 0);
         npc.set_locomotion(&disc, Vec3::new(0.0, 0.0, -8.0), 12.0, Some((0.4, 0.1)));
-        assert_ne!(npc.motion.current_anim_id, 0, "walk should switch off idle clip");
+        assert_ne!(
+            npc.motion.current_anim_id, 0,
+            "walk should switch off idle clip"
+        );
         npc.set_locomotion(&disc, Vec3::new(15.0, 0.0, -15.0), 12.0, Some((0.4, 0.1)));
-        assert!(npc.motion.wheel.is_some(), "dash speed should engage 360 wheel");
+        assert!(
+            npc.motion.wheel.is_some(),
+            "dash speed should engage 360 wheel"
+        );
         let f_before = npc.motion.frame;
         npc.step_clock(0.2);
         assert_ne!(npc.motion.frame, f_before);

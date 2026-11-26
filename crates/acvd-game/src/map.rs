@@ -7,6 +7,7 @@
 //! (part kind 1) load from `model/obj/{o}/{o}_m.bnd.dcx`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use acvd_data::find;
 use acvd_data::generated::ac_unit::PARAM_ACOBJECTPARAM_BIN;
@@ -17,11 +18,15 @@ use acvd_formats::vfs::{self, Disc};
 use acvd_formats::{bnd3, env as fmt_env, flver, mlb, msb, nav, tae};
 use acvd_render::{LoadedMesh, Packs};
 use anyhow::Result;
+use bevy::camera::visibility::NoFrustumCulling;
+use bevy::math::Affine3A;
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::prelude::*;
 
 use crate::collision::Collision;
 use crate::sfx;
 use crate::sound;
+use crate::targets::{self, EnemyAnim, EnemyAnimBank};
 
 /// Map part kinds that have a visual model and a hit model.
 const KIND_PIECE: u32 = 0;
@@ -460,9 +465,7 @@ impl AreaBounds {
     /// Clamps `pos` and outward velocity `vel` inside the operation area (`kind == 100`) and
     /// returns the resulting [`AreaZone`] (`AreaZone::Outside` when clamped at the boundary).
     pub fn enforce(&self, pos: &mut Vec3, vel: &mut Vec3) -> AreaZone {
-        let clamped = self
-            .operation
-            .is_some_and(|op| op.clamp(pos, vel, 1.0));
+        let clamped = self.operation.is_some_and(|op| op.clamp(pos, vel, 1.0));
         if clamped {
             AreaZone::Outside
         } else {
@@ -564,11 +567,13 @@ pub fn spawn(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
     disc: &Disc,
     map: &str,
 ) -> Result<usize> {
     let parts = msb::parts(&vfs::open(disc, &terrain_msb(disc, map))?)?;
     let mut models: HashMap<String, Option<Vec<Loaded>>> = HashMap::new();
+    let mut animated_models: HashMap<String, Option<AnimatedModel>> = HashMap::new();
     let mut members: HashMap<String, HashSet<String>> = HashMap::new();
     let mut textures = Textures {
         own: format!("{}/{map}_htdcx.bnd", folder(map)),
@@ -577,6 +582,7 @@ pub fn spawn(
     let mut drawn = 0;
     let mut low_parts = 0;
     let mut destructible_parts = 0;
+    let mut animated_parts = 0;
     let mut destroy_ap_cache: HashMap<String, Option<u16>> = HashMap::new();
     let mut object_fx: HashMap<String, Vec<(i32, [f32; 3], [f32; 3])>> = HashMap::new();
     let mut object_fx_spawned = 0usize;
@@ -584,6 +590,38 @@ pub fn spawn(
         let Some(binder) = binder(map, part) else {
             continue;
         };
+        // Flying formations shipped by the map itself (`o9310` Chinooks, `o9330` bombers).
+        // Their `_a` binders carry the rotor/flight clips; the map's PARTS section supplies
+        // the placement, so no traffic is invented here.
+        if part.kind == KIND_OBJECT && is_aircraft_model(&part.model) {
+            let pack = texture_pack(disc, part);
+            let pack = pack.as_deref();
+            let Some(loaded) = load_animated_model(
+                &mut animated_models,
+                &mut textures,
+                meshes,
+                materials,
+                images,
+                bindposes,
+                disc,
+                &part.model,
+                pack,
+            ) else {
+                continue;
+            };
+            drawn += 1;
+            animated_parts += 1;
+            let root = commands
+                .spawn((
+                    MapPart,
+                    bevy_transform(&xform(part)),
+                    Visibility::default(),
+                    Name::new(part.name.clone()),
+                ))
+                .id();
+            spawn_animated_part(commands, root, &loaded, &part.model);
+            continue;
+        }
         let asset = format!("{binder}|{}.flv", part.model);
         let pack = texture_pack(disc, part);
         let pack = pack.as_deref();
@@ -619,22 +657,21 @@ pub fn spawn(
             None
         };
         let broken_file = format!("{}_b.flv", part.model);
-        let broken = if part.kind == KIND_OBJECT
-            && binder_has(&mut members, disc, &binder, &broken_file)
-        {
-            load_model(
-                &mut models,
-                &mut textures,
-                meshes,
-                materials,
-                images,
-                disc,
-                &format!("{binder}|{broken_file}"),
-                pack,
-            )
-        } else {
-            None
-        };
+        let broken =
+            if part.kind == KIND_OBJECT && binder_has(&mut members, disc, &binder, &broken_file) {
+                load_model(
+                    &mut models,
+                    &mut textures,
+                    meshes,
+                    materials,
+                    images,
+                    disc,
+                    &format!("{binder}|{broken_file}"),
+                    pack,
+                )
+            } else {
+                None
+            };
         drawn += 1;
         let xf = bevy_transform(&xform(part));
         let (min, max) = mesh_bounds(&list);
@@ -734,12 +771,168 @@ pub fn spawn(
         warn!("map {map}: {} textures missing", textures.missing);
     }
     info!(
-        "map {map}: {drawn} parts, {low_parts} with an _l1 mesh, {destructible_parts} destructible (_b.flv), {object_fx_spawned} object FFX"
+        "map {map}: {drawn} parts, {low_parts} with an _l1 mesh, {destructible_parts} destructible (_b.flv), {object_fx_spawned} object FFX, {animated_parts} animated aircraft"
     );
     Ok(drawn)
 }
 
-type Loaded = (Handle<Mesh>, Handle<StandardMaterial>, MapMeshMeta, Vec3, Vec3);
+type Loaded = (
+    Handle<Mesh>,
+    Handle<StandardMaterial>,
+    MapMeshMeta,
+    Vec3,
+    Vec3,
+);
+
+/// Map-object models that ship skeletal `_a` flight clips. Their placements come from the
+/// map's PARTS section; the rewrite only animates those parts and never spawns new traffic.
+const AIRCRAFT_MODELS: &[&str] = &["o9310", "o9330"];
+
+fn is_aircraft_model(model: &str) -> bool {
+    AIRCRAFT_MODELS
+        .iter()
+        .any(|m| model.eq_ignore_ascii_case(m))
+}
+
+/// Marks the root of a map-placed aircraft formation so its flight clip can be stepped
+/// independently of the AI-driven enemies.
+#[derive(Component)]
+pub struct MapAircraft;
+
+/// Advances the rotor/flight clips of map-placed aircraft (`o9310`/`o9330`). They carry no
+/// AI component, so `ai::update` never steps their [`EnemyAnim`] clocks.
+pub fn step_aircraft(time: Res<Time>, mut aircraft: Query<&mut EnemyAnim, With<MapAircraft>>) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    for mut anim in &mut aircraft {
+        anim.step(dt, None);
+    }
+}
+
+/// One animated map-object model shared by every placement of it in the map.
+#[derive(Clone)]
+struct AnimatedModel {
+    meshes: Vec<(Handle<Mesh>, Handle<StandardMaterial>, MapMeshMeta)>,
+    inv_bindposes: Handle<SkinnedMeshInverseBindposes>,
+    bank: Arc<EnemyAnimBank>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_animated_model(
+    cache: &mut HashMap<String, Option<AnimatedModel>>,
+    textures: &mut Textures,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    disc: &Disc,
+    model: &str,
+    pack: Option<&str>,
+) -> Option<AnimatedModel> {
+    if let Some(cached) = cache.get(model) {
+        return cached.clone();
+    }
+    let asset = format!("model/obj/{model}/{model}_m.bnd.dcx|{model}.flv");
+    let loaded =
+        match acvd_render::rigged_model(disc, &asset, &|_| acvd_render::RootPlace::IDENTITY) {
+            Ok((list, rig)) if !list.is_empty() => {
+                let bank = EnemyAnimBank::load_object(disc, model, &rig);
+                if bank.clips.is_empty() {
+                    warn!("{asset}: no a00_NNN.ani clips in {model}_a.bnd.dcx");
+                    None
+                } else {
+                    let unboned = Affine3A::from_translation(Vec3::from(rig.unboned));
+                    let binds: Vec<Mat4> = rig
+                        .bones
+                        .iter()
+                        .map(|b| targets::xform_to_affine(&b.bind))
+                        .chain([unboned])
+                        .map(|b| Mat4::from(crate::pose::mirror(b).inverse()))
+                        .collect();
+                    let inv_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
+                    let meshes_mats = list
+                        .into_iter()
+                        .map(|m| {
+                            let material = textures.material(disc, pack, &m, materials, images);
+                            let meta = MapMeshMeta {
+                                mtd: m.mtd.clone(),
+                                diffuse2: m.diffuse2.as_deref().and_then(|n| {
+                                    textures.image_handle(disc, pack, n, false, images)
+                                }),
+                            };
+                            (meshes.add(m.mesh), material, meta)
+                        })
+                        .collect();
+                    Some(AnimatedModel {
+                        meshes: meshes_mats,
+                        inv_bindposes,
+                        bank,
+                    })
+                }
+            }
+            Ok(_) => None,
+            Err(e) => {
+                warn!("{asset}: {e:#}");
+                None
+            }
+        };
+    cache.insert(model.to_string(), loaded.clone());
+    loaded
+}
+
+/// Spawns the skinned meshes and joint hierarchy under a map part's world placement.
+fn spawn_animated_part(commands: &mut Commands, root: Entity, loaded: &AnimatedModel, model: &str) {
+    let mut joint_entities: Vec<Entity> = Vec::with_capacity(loaded.bank.rest_locals.len());
+    for _ in 0..loaded.bank.rest_locals.len() {
+        joint_entities.push(
+            commands
+                .spawn((Transform::default(), Visibility::default()))
+                .id(),
+        );
+    }
+    for (i, &ent) in joint_entities.iter().enumerate() {
+        let parent_ent = loaded.bank.parents[i].map_or(root, |p| joint_entities[p]);
+        commands
+            .entity(ent)
+            .insert((loaded.bank.rest_locals[i], ChildOf(parent_ent)));
+    }
+    let extra_unboned = commands
+        .spawn((Transform::default(), Visibility::default(), ChildOf(root)))
+        .id();
+    let mut skin_joints = joint_entities.clone();
+    skin_joints.push(extra_unboned);
+
+    for (mesh, material, meta) in &loaded.meshes {
+        commands.spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            meta.clone(),
+            SkinnedMesh {
+                inverse_bindposes: loaded.inv_bindposes.clone(),
+                joints: skin_joints.clone(),
+            },
+            NoFrustumCulling,
+            Transform::default(),
+            ChildOf(root),
+        ));
+    }
+
+    // `a00_000` is the rotor-idle/flight loop for `o9310`; `o9330` only ships `a00_210`.
+    let mut anim = EnemyAnim::new(loaded.bank.clone(), joint_entities, 0.0);
+    let preferred = if model.eq_ignore_ascii_case("o9330") {
+        210
+    } else {
+        0
+    };
+    if let Some(id) = loaded.bank.pick_clip(&[preferred, 0]) {
+        anim.play(id, true, 1.0, 0.0);
+    } else if let Some(&id) = loaded.bank.clips.keys().min() {
+        anim.play(id, true, 1.0, 0.0);
+    }
+    commands.entity(root).insert((anim, MapAircraft));
+}
 
 fn load_model(
     models: &mut HashMap<String, Option<Vec<Loaded>>>,
@@ -897,7 +1090,10 @@ pub fn step_destructibles(
         if let Some(low) = prop.low {
             set_vis(&mut vis, low, false);
         }
-        let broken_asset = format!("model/obj/{}/{}_m.bnd.dcx|{}_b.flv", prop.model, prop.model, prop.model);
+        let broken_asset = format!(
+            "model/obj/{}/{}_m.bnd.dcx|{}_b.flv",
+            prop.model, prop.model, prop.model
+        );
         let spawned_debris = crate::debris::spawn(
             &mut commands,
             &mut meshes,
@@ -1050,7 +1246,8 @@ fn spawn_object_effect(
 struct Textures {
     own: String,
     packs: Packs,
-    by_name: HashMap<(Option<String>, Option<String>, Option<String>, u8), Handle<StandardMaterial>>,
+    by_name:
+        HashMap<(Option<String>, Option<String>, Option<String>, u8), Handle<StandardMaterial>>,
     images: HashMap<(String, String, bool), Option<Handle<Image>>>,
     missing: usize,
 }
@@ -1086,7 +1283,9 @@ pub(crate) fn mtd_alpha_mode(mtd: &str) -> (AlphaMode, u8) {
 const RUNTIME_TEXTURES: [&str; 3] = ["movie", "g_color", "g_decal"];
 
 fn is_runtime_texture(name: &str) -> bool {
-    RUNTIME_TEXTURES.iter().any(|t| name.eq_ignore_ascii_case(t))
+    RUNTIME_TEXTURES
+        .iter()
+        .any(|t| name.eq_ignore_ascii_case(t))
 }
 
 impl Textures {
@@ -1246,13 +1445,88 @@ mod tests {
             return;
         };
         let fx = object_effects(&disc, "o0006", "model/obj/o0006/o0006_m.bnd.dcx|o0006.flv");
-        assert_eq!(fx.len(), 2, "o0006 TAE fires ffx 197 on two dummies: {fx:?}");
+        assert_eq!(
+            fx.len(),
+            2,
+            "o0006 TAE fires ffx 197 on two dummies: {fx:?}"
+        );
         for (id, pos, _) in fx {
             assert_eq!(id, 197);
             // Dummies 200/201 are the two lamp arms (±19.67, 18.47, -7.15) in model space.
             assert!((pos[1] - 18.47).abs() < 0.05, "pos {pos:?}");
             assert!((pos[0].abs() - 19.67).abs() < 0.05, "pos {pos:?}");
         }
+    }
+
+    #[test]
+    fn m3330_aircraft_formations_load_with_spinning_rotors() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let parts =
+            msb::parts(&vfs::open(&disc, "model/map/m3330/m3330_map.msb").unwrap()).unwrap();
+        let aircraft: Vec<&msb::Part> = parts
+            .iter()
+            .filter(|p| p.kind == KIND_OBJECT && is_aircraft_model(&p.model))
+            .collect();
+        assert_eq!(aircraft.len(), 9, "m3330: 8 o9310 + 1 o9330");
+        assert_eq!(
+            aircraft.iter().filter(|p| p.model == "o9310").count(),
+            8,
+            "o9310 Chinook formation placements"
+        );
+        assert_eq!(
+            aircraft.iter().filter(|p| p.model == "o9330").count(),
+            1,
+            "o9330 bomber formation placement"
+        );
+        assert!(
+            !is_aircraft_model("o9223"),
+            "the static Chinook prop stays static"
+        );
+
+        let (meshes, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9310/o9310_m.bnd.dcx|o9310.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
+        assert!(!meshes.is_empty());
+        let bank = EnemyAnimBank::load_object(&disc, "o9310", &rig);
+        let rotor = rig
+            .bones
+            .iter()
+            .position(|b| b.name.to_ascii_lowercase().starts_with("wing"))
+            .expect("o9310 rotor bone (`wing1`..`wing8`)");
+        assert!(
+            bank.clips.contains_key(&0),
+            "o9310 a00_000 is the rotor flight loop"
+        );
+        let mut anim = EnemyAnim::new(bank, Vec::new(), 0.0);
+        anim.play(0, true, 1.0, 0.0);
+        let mut prev = anim.sample_bone(rotor).rotation;
+        let mut max_delta = 0.0f32;
+        for step in 1..=40 {
+            anim.frame = step as f32 * 5.0;
+            let cur = anim.sample_bone(rotor).rotation;
+            max_delta = max_delta.max(prev.angle_between(cur));
+            prev = cur;
+        }
+        assert!(max_delta > 0.01, "o9310 rotor must move across a00_000");
+
+        let (meshes, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9330/o9330_m.bnd.dcx|o9330.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
+        assert!(!meshes.is_empty());
+        let bank = EnemyAnimBank::load_object(&disc, "o9330", &rig);
+        assert!(
+            bank.clips.contains_key(&210),
+            "o9330 _a binder ships only a00_210"
+        );
     }
 
     #[test]
@@ -1296,7 +1570,8 @@ mod tests {
     }
 
     #[test]
-    fn lod_bands_match_the_actest_pieces() {        // m0012 sits on the start camera (full). m0010 is a few hundred metres out (_l1).
+    fn lod_bands_match_the_actest_pieces() {
+        // m0012 sits on the start camera (full). m0010 is a few hundred metres out (_l1).
         let near = lod_metric(36.0, 144.0);
         let far = lod_metric(242.0, 128.0);
         assert!(near < 0.1, "{near}");
@@ -1318,17 +1593,29 @@ mod tests {
         let caut = bounds.caution.expect("m4000 caution area (kind 102)");
         assert_eq!(op.origin, Vec3::new(804.0, -15.0, 609.35));
         assert_eq!((op.half_x, op.half_z, op.height), (700.0, 450.0, 225.0));
-        assert_eq!((warn.half_x, warn.half_z, warn.height), (675.0, 425.0, 175.0));
-        assert_eq!((caut.half_x, caut.half_z, caut.height), (650.0, 400.0, 125.0));
+        assert_eq!(
+            (warn.half_x, warn.half_z, warn.height),
+            (675.0, 425.0, 175.0)
+        );
+        assert_eq!(
+            (caut.half_x, caut.half_z, caut.height),
+            (650.0, 400.0, 125.0)
+        );
 
         // AC start point (324.65, 29.0, 649.5) is safely inside all three boxes.
         let s = start(&disc, "m4000", Some("actest")).unwrap().unwrap();
         assert_eq!(bounds.zone(s.position), AreaZone::Inside);
 
         // Moving past caution (+660 m from center X=804 -> x=1464) triggers Caution (`LIMIT OF AREA`).
-        assert_eq!(bounds.zone(Vec3::new(1464.0, 30.0, 609.35)), AreaZone::Caution);
+        assert_eq!(
+            bounds.zone(Vec3::new(1464.0, 30.0, 609.35)),
+            AreaZone::Caution
+        );
         // Moving past warning (+685 m -> x=1489) triggers Warning (`LIMIT OF AREA`).
-        assert_eq!(bounds.zone(Vec3::new(1489.0, 30.0, 609.35)), AreaZone::Warning);
+        assert_eq!(
+            bounds.zone(Vec3::new(1489.0, 30.0, 609.35)),
+            AreaZone::Warning
+        );
         // Moving past operation (+720 m -> x=1524) is Outside and gets cleanly clamped back in.
         let mut p = Vec3::new(1524.0, 30.0, 609.35);
         let mut v = Vec3::new(2.0, 0.0, 0.5);
