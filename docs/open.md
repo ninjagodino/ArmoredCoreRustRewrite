@@ -438,26 +438,33 @@ in order:
   `data + u32(data + 0x14)` (`0x8275de18`) is decoded: same header as VD, with glare offsets at
   `+0x48`, god ray at `+0x90` and dust at `+0x94`. m0300's last scene has angles `17/29`, 4 glares,
   5 enabled ghosts (of 18 slots), god-ray `tex_id -1`, dust pos `(0,208)` size `(512,512)`.
-  The type-101 `+0x1c` sub-block is not the type-100 fog: `0x8275e2c0` maps it into a 0x48-byte
-  atmosphere/weather record and `0x82b12930` copies that record to `[0x838a99c0]+0x10+0xd130`
-  (defaults distance `150/300`, `500/9999`, `-1/-0.1`, `-0.0001`, `400/1`; m0300's lightning
-  event changes `60/2000`, `8/9999`, `0.0001`, `400/190/500`, its normal event `10/100`, `0.9/80`,
-  `0.15`, `400/80/140`). Type-102/103 are separate wind/rain payloads; fog remains the type-100
-  compact slot + `fog.bin`. The `+0x30` sub-block is the screen filter: `0x8275d4f0` copies
-  `+1..+3`, the `+4..+0x30` floats and `+0x1c..+0x20` bytes into the filter singleton at
-  `0x8387c700+0x55c0` via `0x82569e10`. The `+0x34` sub-block matches DOF: m0600's `100/1.57/7/6/4`
-  matches the Dof filter object (`0x82541fb8`, execute `0x825422fc` reads `+0xf8..+0x104`), while
-  m0300 is disabled (all zero except `+0x30=1`). The layouts are now parsed into
-  `Scene.acv_filter` / `acv_dof`; neither is rendered yet. The disc tests
-  `env::tests::acv_env_from_mission_binder` and
-  `env::tests::acv_two_scene_events_keep_first_filter` cover core, lens flare, both filters and DOF.
-  `acv_scene_core_layout`, `acv_lens_flare_layout`, `acv_filter_dof_layout` and
-  `acv_light_fog_layout` pin the parsers without the disc. `m1000` is not a map with models:
-  mission_0010 pairs `ch_env/m1000_env.msb` with m0300, and `script/event_include/m1000_*` exists.
+  The type-101 `+0x1c` sub-block is not the type-100 fog: `0x8275e2c0` reorders it into a 0x48-byte
+  atmosphere/weather runtime record and `0x82b12930` copies that to `[0x838a99c0]+0x10+0xd130`.
+  Source `+0x00..+0x24` and `+0x2c..+0x44` floats plus a `+0x28` byte map to runtime
+  `+0x00/+0x04/+0x3c/+0x40/+0x08/+0x0c/+0x14/+0x18/+0x1c/+0x44/+0x20/+0x24/+0x2c/+0x30/
+  +0x34/+0x10/+0x38` plus the byte at `+0x44`; runtime `+0x04/+0x08/+0x0c` fall back to the
+  `0x824f1488` defaults `150/300/500` unless strictly increasing. Runtime defaults are
+  `0/150/300/500/700/0/9999/-1/-0.1/0/-0.0001/0/0/0/0/1/400/0`; m0300's lightning source is
+  `0/60/2000/0/8/9999/-1/-0.1/0.0001/0/1/0.05/0.25/0.2/400/190/500/-0.1` and its normal event
+  `0/10/100/0/0.9/80/110/-0.1/0.0001/0/1/0.15/0.15/0.2/400/80/140/-0.1`. Type-102/103 are
+  separate wind/rain payloads; fog remains the type-100 compact slot + `fog.bin`. The `+0x30`
+  sub-block is the screen filter: `0x8275d4f0` copies `+1..+3`, the `+4..+0x30` floats and
+  `+0x1c..+0x20` bytes into the filter singleton at `0x8377c700+0x55c0` via `0x82569e10`. The
+  `+0x34` sub-block matches DOF: m0600's `100/1.57/7/6/4` matches the Dof filter object
+  (`0x82541fb8`, execute `0x825422fc` reads `+0xf8..+0x104`), while m0300 is disabled (all zero
+  except `+0x30=1`). The layouts are now parsed into `Scene.acv_atmosphere` / `acv_filter` /
+  `acv_dof`; none are rendered yet. The disc tests `env::tests::acv_env_from_mission_binder` and
+  `env::tests::acv_two_scene_events_keep_first_filter` cover core, lens flare, atmosphere, both
+  filters and DOF.
+  `acv_scene_core_layout`, `acv_lens_flare_layout`, `acv_filter_dof_layout`,
+  `acv_atmosphere_layout` and `acv_light_fog_layout` pin the parsers without the disc.
+  `m1000` is not a map with models: mission_0010 pairs `ch_env/m1000_env.msb` with m0300, and
+  `script/event_include/m1000_*` exists.
   `m0650`/`m5000`/`m5001` are referenced by no mission XML, script, or executable string, so
   their `_m.mlb` files are unused/cut and need no loader. Still open: ACV type-101
-  screen-filter/DOF rendering, the `+0x1c` atmosphere/tone-map parse and the remaining unnamed
-  sub-blocks, HNAV/HTR and the `.mtd` binders.
+  screen-filter/DOF rendering, the ACV tone-map source (`Scene.tonemap` is still the VD default)
+  and the remaining unnamed sub-blocks (`+0x4/+0x8/+0xc/+0x10/+0x18/+0x20/+0x2c`), HNAV/HTR and
+  the `.mtd` binders.
 - **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), the per-enemy target lock-on HUD cursor (one four-wing `_E`/`_T`/`_L`/`_R` group per enemy in the FCS cone, up to 8, each wing placing its authored 128×64 corner dialog on the distance-scaled 32×32 target rect; text/bars/pips only on the FCS-selected target, `MissileLock1..6`), and Scan Mode / Target Scan / Recon Units (`ACV_ScanModeLockSight`, `ACV_Scan_Cur_EnemyParamInfo`, `ACV_MapScan_ReconInfo*`) are now in (see Done). Retail lock-cursor appearance/rule confirmed from the build instead of a sortie capture: `sortie.drb` authors every element (`LockOnText` msg 2313, `MissileLock1..6`, `EnemyName`/`EnemyAP`, and the 32x32 `_Target` with `LockColor1st` `0x006680ff` / `LockColor2nd` `0xff4000ff`); `0x829d4a90` bakes those color defaults and `0x829d4b88` overrides them from the dialog's named colors. `0x829d4558` -> `0x829d30e0` draws each wing only when the candidate's `+0` lock flag or `i16 +2` missile-lock count is set and `+1` or `f32 +4` >= 1.0; `0x829d1a10` shows `MissileLock1..n` from `i16 +2`, `0x829d1ac0` fills `ReloadBar` from `f32 +4` while `CursorLine` stays at full fill. The Xenia runs drew no cursor because the tanks sat outside the FCS sight cone (aim), not because of a missing code path; the 32×32 `_Target` is only the `LockColor1st`/`LockColor2nd` source (never painted), and its 1st/2nd selection is read through that candidate state. `0x829d3b38` builds the box from `rectOf(group+4)`; `0x829d4dd8` -> `0x824ab278` instantiates `ACV_OutLine_LockCursor_Target` (dialog name at `0x820c35f0`, call site `0x829d50ec`), so that rect is the dialog's authored 32×32, scaled by `LockSight+0x2c` and centred on the projected point. The four corner arms are the 128×64 wings' `CursorLine` sprites anchored on that rect; the earlier "target-sized normal-mode frame" TODO is therefore closed (authored 32×32, no enemy AABB). The FCS remains live in Scan Mode: `AC + 0xdb0` is read by scan/control, not the `0x829d...` lock path, so `LOCK ON` and the enemy name stay visible while Scanning (matching the retail capture). `EnemyInfo` is a `Null` object in dialog 14 (no visible text), and the lock effect drawn over the enemy model remains open. Each wing now picks its own `LockColor1st`/`2nd` swatch from its candidate record (`0x829d19f0`) and the `ReloadBar` fills with clamp(`f32 +4`) (`0x829d1ac0`), not the weapon cooldown. The reference capture is the combat `ACV_LockSight_base` art (tick ring), not `ACV_ScanModeLockSight`. The two scan weapon panels are traced but not spawned: `ACV_Scan_Cur_EnemyWeaponInfo` (dialog 109 280×300, `0x829d3218` type 2 at `centerRect.x0 - 280s, centerRect.y1`; `EnemyWep0..4` are dialog 92 197×44 filled from the target struct `+8` count and `+0x20` array stride `0x1ac`: `WaponName +0`, `WeaponPlace +0x110`, `DamageType +0x15c`, `Damage +0x1a4`; `DamageType`/`Damage` hidden when damage `< 1`) and `ACV_Scan_Cur_WeaponInfo` (dialog 110 400×260, `0x829d3218` type 1 at `centerRect.x1, centerRect.y0 - 260s`; `ScanWeaponDlgItem0..4` are dialog 89 357×68, manager `0x825a60a0`/`0x825a5c90` over the five slots at `0x838c7fd0..0x838c7fe4`, 6×`0xc0` records, layout `0x825a49c0`). Normal-mode (Combat Mode) lock acquisition is now traced from the raw lock script: every candidate is accepted on the outer `sight + 2°` cone (bit 0 of `0x829d8850`; `0x829d8d58` accepts that bit alone and uses bit 1 only to mark the inner sight), `0x8287c560` records each candidate's 3D distance and `0x82876b40` keeps the current target while the slot tracker state is 2, re-feeding the candidate list only when it is not (`FUN_82877320`), so selection is nearest-distance with a sticky current target, and the old per-frame 0.85 keep-current bias is gone; the outer `+2°` cone is the hysteresis. Still open for exact 1:1: the shelter LOS sub-branch (`0x829d8d58` when lock-context `+0x124 != 0` and candidate `+0x18 == 0`, via `0x829e9380`/`0x829e87c8`/`0x829e8810`, with the range cap only when flag bit 2 is set).
 - **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics, range-decay, shoulder weapons & homing missiles, melee blades / heat piles / Boost Charge Kick, arm firing-stability reload scaling, weapon arms, sub-munition split missiles, Overed Weapons, and hand-weapon firing modes done; see Done):
   - Bay shift & purge are up to 360 parity (`acvd-game::bay`, `hanger`, `pose`, `sfx`, `sound`, `sheets/ac_states.csv`, `sheets/hanger_anim.csv`, `sheets/sound_cues.csv`, see Done): per-arm overlay (`r_kata`/`l_kata`), explicit TAE `2000..2003` / `2010..2013` (sparks FFX `4109`, steam puff FFX `98` at scale `1.5`, sounds `c00000047` / `c00000045`, `kind=101` Reattach at f40/f150, `kind=102` Purge at f10), dual-prong rack carousel (`a00_011`/`a00_021` + `r_hg_f`/`r_hg_b`), and dynamic `hanger_pose` updates.

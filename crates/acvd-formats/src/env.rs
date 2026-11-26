@@ -307,7 +307,7 @@ impl LensFlare {
 /// ACV type-101 `+0x30` screen-filter record.
 ///
 /// `0x8275d4f0` copies `+1..+3`, the `+4..+0x30` floats, and the
-/// `+0x1c..+0x20` bytes into the filter singleton at `0x8387c700+0x55c0`
+/// `+0x1c..+0x20` bytes into the filter singleton at `0x8377c700+0x55c0`
 /// through `0x82569e10`. Field meanings are still being traced, so this keeps
 /// the raw layout. m0300's first (lightning) and last (scene) events carry the
 /// same record: enabled, kind `0x3c`, `params[0]` `0.2`, `params[3]` `-0.13`,
@@ -346,6 +346,78 @@ pub struct AcvDof {
     pub tail: [u32; 2],
 }
 
+/// ACV type-101 `+0x1c` atmosphere/weather record.
+///
+/// `0x8275e2c0` reorders the authored record and `0x82b12930` copies the
+/// 0x48-byte runtime record to `[0x838a99c0] + 0x10 + 0xd130`. Runtime
+/// `+0x00..+0x44` is source
+/// `+0x00/+0x04/+0x3c/+0x40/+0x08/+0x0c/+0x14/+0x18/+0x1c/+0x44/+0x20/+0x24/
+/// +0x2c/+0x30/+0x34/+0x10/+0x38`, with the source `+0x28` byte at `+0x44`.
+/// `0x82b12930` replaces runtime `+0x04/+0x08/+0x0c` with the `0x824f1488`
+/// defaults (`150/300/500`) unless they are strictly greater than `+0x00/+0x04/
+/// +0x08`. Defaults (runtime): `0/150/300/500/700/0/9999/-1/-0.1/0/-0.0001/0/0/
+/// 0/0/1/400/0`. This is not the type-100 fog; fog remains `+ type-100 + fog.bin`.
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct AcvAtmosphere {
+    /// Source floats `+0x00/+0x04/+0x08/+0x0c/+0x10/+0x14/+0x18/+0x1c/+0x20/+0x24`.
+    pub head: [f32; 10],
+    /// Source `+0x28` byte flag (the next three bytes are padding).
+    pub flag: u8,
+    /// Source floats `+0x2c/+0x30/+0x34/+0x38/+0x3c/+0x40/+0x44`.
+    pub tail: [f32; 7],
+}
+
+/// Runtime order of an [`AcvAtmosphere`] (`[...]+0xd140`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct AcvAtmosphereRuntime {
+    /// Runtime `+0x00..+0x40` (17 floats).
+    pub params: [f32; 17],
+    /// Runtime `+0x44`, the zero-extended source `+0x28` byte.
+    pub flag: u32,
+}
+
+impl AcvAtmosphere {
+    /// Applies the `0x8275e2c0` reorder and the `0x82b12930` monotonic fallback.
+    pub fn runtime(&self) -> AcvAtmosphereRuntime {
+        const DEFAULT: [f32; 17] = [
+            0.0, 150.0, 300.0, 500.0, 700.0, 0.0, 9999.0, -1.0, -0.1, 0.0, -0.0001, 0.0, 0.0,
+            0.0, 0.0, 1.0, 400.0,
+        ];
+        let mut params = [
+            self.head[0],
+            self.head[1],
+            self.tail[4],
+            self.tail[5],
+            self.head[2],
+            self.head[3],
+            self.head[5],
+            self.head[6],
+            self.head[7],
+            self.tail[6],
+            self.head[8],
+            self.head[9],
+            self.tail[0],
+            self.tail[1],
+            self.tail[2],
+            self.head[4],
+            self.tail[3],
+        ];
+        if params[1] <= params[0] {
+            params[1] = DEFAULT[1];
+        }
+        if params[2] <= params[1] {
+            params[2] = DEFAULT[2];
+        }
+        if params[3] <= params[2] {
+            params[3] = DEFAULT[3];
+        }
+        AcvAtmosphereRuntime {
+            params,
+            flag: self.flag as u32,
+        }
+    }
+}
+
 /// The type-101 scene record's sub-blocks (`0x827ffa80`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Scene {
@@ -365,6 +437,8 @@ pub struct Scene {
     pub lens_flare: LensFlare,
     /// ACV only: type-101 `+0x30` screen-filter record (parsed, not rendered yet).
     pub acv_filter: Option<AcvScreenFilter>,
+    /// ACV only: type-101 `+0x1c` atmosphere/weather record (parsed, not rendered yet).
+    pub acv_atmosphere: Option<AcvAtmosphere>,
     /// ACV only: type-101 `+0x34` depth-of-field record (parsed, not rendered yet).
     pub acv_dof: Option<AcvDof>,
 }
@@ -568,13 +642,37 @@ fn acv_light(r: &Be, name: String, d: usize) -> Result<LightSet> {
     })
 }
 
+fn acv_atmosphere(r: &Be, d: usize) -> Result<Option<AcvAtmosphere>> {
+    let rel = r.u32(d + 0x1c)? as usize;
+    if rel == 0 {
+        return Ok(None);
+    }
+    let s = d + rel;
+    if s + 0x48 > r.len() {
+        return Ok(None);
+    }
+    let mut head = [0.0; 10];
+    for (i, v) in head.iter_mut().enumerate() {
+        *v = r.f32(s + i * 4)?;
+    }
+    let mut tail = [0.0; 7];
+    for (i, v) in tail.iter_mut().enumerate() {
+        *v = r.f32(s + 0x2c + i * 4)?;
+    }
+    Ok(Some(AcvAtmosphere {
+        head,
+        flag: r.u8(s + 0x28)?,
+        tail,
+    }))
+}
+
 /// ACV type-101 core scene (`0x827621ec`): first sub-block at `data + u32(data)`.
 ///
 /// Unlike VD, ACV keeps the core values in the first sub-block but at different offsets:
 /// `+4` draw distance, `+8` water height, `+0x1c` sky scale (only used when `> 1`). The
-/// lens-flare sub-block is at `data + u32(data + 0x14)`; the screen filter (`+0x30`) and
-/// DOF (`+0x34`) records are parsed but not rendered yet. The `+0x1c` atmosphere record
-/// is documented in `sheets/map_env.csv` but not parsed; it is not the type-100 fog.
+/// lens-flare sub-block is at `data + u32(data + 0x14)`; the atmosphere (`+0x1c`),
+/// screen filter (`+0x30`) and DOF (`+0x34`) records are parsed but not rendered yet.
+/// The `+0x1c` atmosphere record is not the type-100 fog.
 fn acv_screen_filter(r: &Be, d: usize) -> Result<Option<AcvScreenFilter>> {
     let rel = r.u32(d + 0x30)? as usize;
     if rel == 0 {
@@ -653,6 +751,7 @@ fn acv_scene(r: &Be, d: usize) -> Result<Scene> {
         tonemap: ToneMap::default(),
         lens_flare,
         acv_filter: acv_screen_filter(r, d)?,
+        acv_atmosphere: acv_atmosphere(r, d)?,
         acv_dof: acv_dof(r, d)?,
     })
 }
@@ -811,10 +910,10 @@ pub fn read(data: &[u8]) -> Result<Env> {
         matches!(magic, msb::MAGIC_ENV | msb::MAGIC),
         "not an env MSB"
     );
-    // ACV's type-100 lights (with their compact fog) and type-101 core scene + lens flare +
-    // screen filter + DOF are packed layouts decoded by `acv_light` / `acv_scene` /
-    // `acv_lens_flare`; every type-101 scene event is kept in `acv_scenes`, while `scene`
-    // is the last one. The type-101 atmosphere record stays unparsed.
+    // ACV's type-100 lights (with their compact fog) and type-101 core scene + atmosphere +
+    // lens flare + screen filter + DOF are packed layouts decoded by `acv_light` /
+    // `acv_scene` / `acv_lens_flare`; every type-101 scene event is kept in `acv_scenes`,
+    // while `scene` is the last one.
     let acv = magic == msb::MAGIC;
     let mut env = Env {
         events: Vec::new(),
@@ -888,6 +987,7 @@ pub fn read(data: &[u8]) -> Result<Env> {
                     tonemap,
                     lens_flare,
                     acv_filter: None,
+                    acv_atmosphere: None,
                     acv_dof: None,
                 });
             }
@@ -1192,6 +1292,62 @@ mod tests {
     }
 
     #[test]
+    fn acv_atmosphere_layout() {
+        let mut data = vec![0u8; 0x100];
+        data[..4].copy_from_slice(&0x20u32.to_be_bytes());
+        data[0x1c..0x20].copy_from_slice(&0x40u32.to_be_bytes());
+
+        let s = 0x40;
+        let head = [0.0f32, 10.0, 100.0, 0.5, 20.0, 600.0, 0.6, 1.0, 1.0, 2.0];
+        for (i, v) in head.into_iter().enumerate() {
+            data[s + i * 4..s + i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        data[s + 0x28] = 1;
+        let tail = [0.05f32, 0.25, 0.2, 400.0, 190.0, 420.0, -0.1];
+        for (i, v) in tail.into_iter().enumerate() {
+            data[s + 0x2c + i * 4..s + 0x30 + i * 4].copy_from_slice(&v.to_be_bytes());
+        }
+
+        let scene = acv_scene(&Be(&data), 0).unwrap();
+        let atmo = scene.acv_atmosphere.expect("ACV atmosphere");
+        assert_eq!(atmo.head, head);
+        assert_eq!(atmo.flag, 1);
+        assert_eq!(atmo.tail, tail);
+
+        // 0x8275e2c0 reorders source +0x3c/+0x40 into runtime +0x08/+0x0c and
+        // source +0x08/+0x0c into +0x10/+0x14; +0x3c/+0x40 stay increasing here.
+        let rt = atmo.runtime();
+        assert!(near(rt.params[0], 0.0));
+        assert!(near(rt.params[1], 10.0));
+        assert!(near(rt.params[2], 190.0));
+        assert!(near(rt.params[3], 420.0));
+        assert!(near(rt.params[4], 100.0));
+        assert!(near(rt.params[5], 0.5));
+        assert!(near(rt.params[6], 600.0));
+        assert!(near(rt.params[7], 0.6));
+        assert!(near(rt.params[8], 1.0));
+        assert!(near(rt.params[9], -0.1));
+        assert!(near(rt.params[10], 1.0));
+        assert!(near(rt.params[11], 2.0));
+        assert!(near(rt.params[12], 0.05));
+        assert!(near(rt.params[13], 0.25));
+        assert!(near(rt.params[14], 0.2));
+        assert!(near(rt.params[15], 20.0));
+        assert!(near(rt.params[16], 400.0));
+        assert_eq!(rt.flag, 1);
+
+        // 0x82b12930 replaces runtime +0x04/+0x08/+0x0c when the first three
+        // values are not strictly increasing (m0300's lightning record does this
+        // through source +0x3c/+0x40).
+        let mut lightning = atmo;
+        lightning.tail[4] = 0.25;
+        lightning.tail[5] = 0.2;
+        let rt = lightning.runtime();
+        assert!(near(rt.params[2], 300.0));
+        assert!(near(rt.params[3], 500.0));
+    }
+
+    #[test]
     fn acv_light_fog_layout() {
         let mut data = vec![0u8; 0x50];
         data[0] = 1; // slot 1 = ID01 map basic light
@@ -1391,6 +1547,42 @@ mod tests {
             env.acv_scenes[1].acv_dof.unwrap().params
         );
 
+        // +0x1c is per-event atmosphere/weather: m0300's lightning and normal
+        // events differ even though their core and +0x30 records match.
+        let lightning_atmo = env.acv_scenes[0]
+            .acv_atmosphere
+            .expect("m0300 lightning atmosphere");
+        let normal_atmo = env.acv_scenes[1]
+            .acv_atmosphere
+            .expect("m0300 normal atmosphere");
+        assert!(near(lightning_atmo.head[1], 60.0));
+        assert!(near(lightning_atmo.head[2], 2000.0));
+        assert!(near(lightning_atmo.head[4], 8.0));
+        assert!(near(lightning_atmo.head[5], 9999.0));
+        assert!(near(lightning_atmo.head[6], -1.0));
+        assert!(near(lightning_atmo.head[7], -0.1));
+        assert!(near(lightning_atmo.head[8], 0.0001));
+        assert_eq!(lightning_atmo.flag, 1);
+        assert!(near(lightning_atmo.tail[0], 0.05));
+        assert!(near(lightning_atmo.tail[1], 0.25));
+        assert!(near(lightning_atmo.tail[2], 0.2));
+        assert!(near(lightning_atmo.tail[3], 400.0));
+        assert!(near(lightning_atmo.tail[4], 190.0));
+        assert!(near(lightning_atmo.tail[5], 500.0));
+        assert!(near(lightning_atmo.tail[6], -0.1));
+        assert!(near(normal_atmo.head[1], 10.0));
+        assert!(near(normal_atmo.head[2], 100.0));
+        assert!(near(normal_atmo.head[4], 0.9));
+        assert!(near(normal_atmo.head[5], 80.0));
+        assert!(near(normal_atmo.head[6], 110.0));
+        assert!(near(normal_atmo.tail[4], 80.0));
+        assert!(near(normal_atmo.tail[5], 140.0));
+        let rt = lightning_atmo.runtime();
+        assert!(near(rt.params[2], 190.0));
+        assert!(near(rt.params[3], 500.0));
+        assert!(near(rt.params[15], 8.0));
+        assert_eq!(rt.flag, 1);
+
         // `scene` keeps last-event-wins semantics.
         let scene = env.scene.as_ref().expect("ACV core scene");
         assert!(near(scene.far, env.acv_scenes[1].far));
@@ -1421,6 +1613,20 @@ mod tests {
             m0600.acv_scenes[0].acv_dof.unwrap().params,
             m0600.acv_scenes[1].acv_dof.unwrap().params
         );
+        let m0600_lightning_atmo = m0600.acv_scenes[0]
+            .acv_atmosphere
+            .expect("m0600 lightning atmosphere");
+        assert!(near(m0600_lightning_atmo.head[1], 100.0));
+        assert!(near(m0600_lightning_atmo.head[2], 300.0));
+        assert!(near(m0600_lightning_atmo.head[4], 5.0));
+        assert!(near(m0600_lightning_atmo.head[5], 9999.0));
+        assert!(near(m0600_lightning_atmo.head[8], -0.0001));
+        assert!(near(m0600_lightning_atmo.tail[0], 0.5));
+        assert!(near(m0600_lightning_atmo.tail[4], 200.0));
+        assert!(near(m0600_lightning_atmo.tail[5], 420.0));
+        let rt = m0600_lightning_atmo.runtime();
+        assert!(near(rt.params[2], 200.0));
+        assert!(near(rt.params[3], 420.0));
     }
 
     #[test]
