@@ -28,7 +28,74 @@ pub struct Project {
 #[derive(Debug, Clone)]
 pub struct Event {
     pub name: String,
+    /// Authored event volume (linear gain, the FEV stores it converted from dB).
+    pub volume: f32,
     pub layers: Vec<u16>,
+    /// Every layer's full sound list and automation; `layers` is the first sound of each.
+    pub mix: Vec<Layer>,
+    /// Complex-event parameters (`speed`, `(distance)`, ...), referenced by `Layer::param`.
+    pub params: Vec<Param>,
+}
+
+/// One complex-event layer. The sounds follow parameter `param` (`Event::params`).
+#[derive(Debug, Clone, Default)]
+pub struct Layer {
+    /// Index into `Event::params` (`u16::MAX` when the header stored none).
+    pub param: u16,
+    pub sounds: Vec<SoundRef>,
+    pub envelopes: Vec<Envelope>,
+}
+
+/// One sound entry of a layer: position/width along the layer parameter, its own volume and
+/// start/stop fade times (seconds; -1 = engine default).
+#[derive(Debug, Clone)]
+pub struct SoundRef {
+    pub def: u16,
+    pub x: f32,
+    pub width: f32,
+    pub volume: f32,
+    pub fade_in: f32,
+    pub fade_out: f32,
+}
+
+/// A layer envelope over its parameter (x, value). `dsp` is the DSP parameter index:
+/// `0xFFFF_FFFF` is a volume envelope, other values are DSP units (`ParamEQ`, pitch, ...).
+#[derive(Debug, Clone)]
+pub struct Envelope {
+    pub dsp: u32,
+    pub name: String,
+    pub points: Vec<(f32, f32)>,
+}
+
+/// A layer's automation parameter (`speed`, `(distance)`, ...).
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: String,
+    /// Top of the parameter range as authored (`150.0` for the booster `speed`).
+    pub max: f32,
+}
+
+impl Event {
+    /// DSP-unit envelopes (non-volume), e.g. the speed `ParamEQ`.
+    pub fn dsp_envelopes(&self) -> impl Iterator<Item = &Envelope> {
+        self.mix
+            .iter()
+            .flat_map(|l| l.envelopes.iter())
+            .filter(|e| !e.name.is_empty())
+    }
+
+    /// Plain volume envelopes of a layer, in file order (first sound's gain/fade, then the next).
+    pub fn volume_envelopes(&self, layer: usize) -> Vec<&Envelope> {
+        self.mix
+            .get(layer)
+            .map(|l| {
+                l.envelopes
+                    .iter()
+                    .filter(|e| e.dsp == u32::MAX && e.name.is_empty() && e.points.len() > 1)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// A sound definition. `wave` is its first wavetable entry.
@@ -137,14 +204,24 @@ fn event(r: &mut Le) -> Result<Event> {
     let kind = r.u32()?;
     let name = r.string()?;
     r.skip(16)?; // UUID, present from v0x3A
-    if let Err(err) = skip_event_header(r) {
-        bail!("{name}: {err}");
-    }
-    let layers = if kind & 0x18 == 0x08 {
+    let volume = match event_header(r) {
+        Ok(volume) => volume,
+        Err(err) => bail!("{name}: {err}"),
+    };
+    let (layers, mix, params) = if kind & 0x18 == 0x08 {
         complex(r)?
     } else if kind & 0x18 == 0x10 {
         r.skip(4)?;
-        vec![sound_ref(r)?]
+        let s = sound_ref(r)?;
+        (
+            vec![s.def],
+            vec![Layer {
+                param: 0,
+                sounds: vec![s],
+                envelopes: Vec::new(),
+            }],
+            Vec::new(),
+        )
     } else {
         bail!("{name}: event kind {kind:#x}");
     };
@@ -152,65 +229,106 @@ fn event(r: &mut Le) -> Result<Event> {
     for _ in 0..n {
         r.string()?;
     }
-    Ok(Event { name, layers })
+    Ok(Event {
+        name,
+        volume,
+        layers,
+        mix,
+        params,
+    })
 }
 
-fn skip_event_header(r: &mut Le) -> Result<()> {
+/// Event header. Returns the authored linear volume.
+fn event_header(r: &mut Le) -> Result<f32> {
     // volume, pitch, pitch rand (v0x1B), volume rand (v0x20), priority (v0x0A), max playbacks,
     // steal priority (v0x38), mode + min/max distance.
-    r.skip(8 + 4 + 4 + 4 + 4 + 4 + 12)?;
+    let volume = r.f32()?;
+    r.skip(4 + 4 + 4 + 4 + 4 + 4 + 12)?;
     // flags, speaker levels and cone (v0x09), playback flags + doppler (v0x0B),
     // reverb dry (v0x1C), reverb wet, speaker spread (v0x12), fades (v0x13),
     // spawn intensity and its rand (v0x2B, v0x2D), pan level (v0x16), position rand max (v0x28).
     r.skip(4 + 0x2C + 8 + 4 + 4 + 4 + 8 + 4 + 4 + 4 + 4)?;
-    Ok(())
+    Ok(volume)
 }
 
-fn complex(r: &mut Le) -> Result<Vec<u16>> {
+fn complex(r: &mut Le) -> Result<(Vec<u16>, Vec<Layer>, Vec<Param>)> {
     let n = r.u32()? as usize;
     let mut layers = Vec::with_capacity(n);
+    let mut mix = Vec::with_capacity(n);
     for _ in 0..n {
-        // flags, priority (v0x25), param index (v0x27).
-        r.skip(6)?;
+        // uses software, priority (v0x25), param index (v0x27).
+        r.skip(4)?;
+        let param = r.u16()?;
         let sounds = r.u16()? as usize;
         let envelopes = r.u16()? as usize;
-        let first = (sounds > 0).then(|| sound_ref(r)).transpose()?;
-        for _ in 1..sounds {
-            sound_ref(r)?;
+        let mut refs = Vec::with_capacity(sounds);
+        for _ in 0..sounds {
+            refs.push(sound_ref(r)?);
         }
+        let mut envs = Vec::with_capacity(envelopes);
         for _ in 0..envelopes {
-            envelope(r)?;
+            envs.push(envelope(r)?);
         }
-        if let Some(index) = first {
-            layers.push(index);
-        }
+        layers.push(refs.first().map(|s| s.def).unwrap_or(u16::MAX));
+        mix.push(Layer {
+            param,
+            sounds: refs,
+            envelopes: envs,
+        });
     }
-    let params = r.u32()? as usize;
-    for _ in 0..params {
-        r.string()?;
-        // velocity through flags, seek speed (v0x12), then the sustain-point count.
-        r.skip(0x18)?;
+    let mut params = Vec::new();
+    let nparams = r.u32()? as usize;
+    for _ in 0..nparams {
+        let name = r.string()?;
+        // min, max, velocity, range min/max original, flags (0x18 bytes for v0x3D).
+        r.skip(8)?;
+        let max = r.f32()?;
+        r.skip(12)?;
+        // sustain-point count, then the points.
         let points = r.u32()? as usize;
         r.skip(points * 4)?;
+        params.push(Param { name, max });
     }
     properties(r)?;
-    Ok(layers)
+    Ok((layers, mix, params))
 }
 
-fn sound_ref(r: &mut Le) -> Result<u16> {
-    let index = r.u16()?;
+fn sound_ref(r: &mut Le) -> Result<SoundRef> {
+    let def = r.u16()?;
     // x, width, flags, loop count, auto pitch, fine tune, volume and fades. See module docs.
-    r.skip(0x38)?;
-    Ok(index)
+    let x = r.f32()?;
+    let width = r.f32()?;
+    r.skip(4 + 4 + 4 + 8 + 4 + 4)?;
+    let volume = r.f32()?;
+    let fade_in = r.f32()?;
+    let fade_out = r.f32()?;
+    r.skip(8)?;
+    Ok(SoundRef {
+        def,
+        x,
+        width,
+        volume,
+        fade_in,
+        fade_out,
+    })
 }
 
-fn envelope(r: &mut Le) -> Result<()> {
-    r.skip(4)?;
-    r.string()?;
+fn envelope(r: &mut Le) -> Result<Envelope> {
+    let dsp = r.u32()?;
+    let name = r.string()?;
     r.skip(12)?;
     let points = r.u32()? as usize;
-    r.skip(points * 12 + 8)?;
-    Ok(())
+    let mut pts = Vec::with_capacity(points);
+    for _ in 0..points {
+        pts.push((r.f32()?, r.f32()?));
+        r.skip(4)?;
+    }
+    r.skip(8)?;
+    Ok(Envelope {
+        dsp,
+        name,
+        points: pts,
+    })
 }
 
 fn properties(r: &mut Le) -> Result<()> {
@@ -268,6 +386,10 @@ impl<'a> Le<'a> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes(b.try_into().unwrap()))
     }
+    fn f32(&mut self) -> Result<f32> {
+        let b = self.take(4)?;
+        Ok(f32::from_le_bytes(b.try_into().unwrap()))
+    }
     fn skip(&mut self, n: usize) -> Result<()> {
         self.take(n).map(|_| ())
     }
@@ -322,10 +444,36 @@ mod tests {
         assert_eq!(project.banks, ["se_booster"]);
         assert_eq!(project.events.len(), 9);
         assert_eq!(project.defs.len(), 8);
-        assert_eq!(project.event("b00000000").unwrap().layers, [3]);
+        let on = project.event("b00000000").unwrap();
+        assert_eq!(on.layers, [3]);
+        assert!((on.volume - 0.467735).abs() < 1e-5, "{}", on.volume);
         // Two layers. The first holds two sounds (the speed crossfade); only its first
         // sound-def index is kept. The second layer is the high-cut.
-        assert_eq!(project.event("b00000003").unwrap().layers, [2, 5]);
+        let speed = project.event("b00000003").unwrap();
+        assert_eq!(speed.layers, [2, 5]);
+        assert!((speed.volume - 0.316228).abs() < 1e-5, "{}", speed.volume);
+        assert_eq!(speed.mix.len(), 2);
+        assert_eq!(speed.mix[0].param, 0);
+        assert_eq!(speed.mix[0].sounds.len(), 2);
+        let low = &speed.mix[0].sounds[0];
+        let high = &speed.mix[0].sounds[1];
+        assert_eq!(low.def, 2);
+        assert_eq!(high.def, 1);
+        assert!((low.x - 0.0).abs() < 1e-6 && (low.width - 0.561364).abs() < 1e-5);
+        assert!((high.x - 0.303409).abs() < 1e-5 && (high.width - 0.696591).abs() < 1e-5);
+        assert!((low.volume - 1.0).abs() < 1e-6);
+        assert!((high.fade_in - 0.370311).abs() < 1e-5);
+        assert!((low.fade_out - 0.459515).abs() < 1e-5);
+        // The speed parameter is the layer parameter, and the layer envelopes are the
+        // authored speed crossfade (two volume ramps, then per-sound fades).
+        assert_eq!(speed.params[0].name, "speed");
+        assert!((speed.params[0].max - 150.0).abs() < 1e-4);
+        assert_eq!(speed.volume_envelopes(0).len(), 4);
+        let env = speed.volume_envelopes(0)[0];
+        assert_eq!(env.points[0], (0.0, 0.357699));
+        assert_eq!(speed.volume_envelopes(0)[1].points[0], (0.0, 0.678201));
+        assert_eq!(speed.mix[1].sounds.len(), 1);
+        assert_eq!(speed.volume_envelopes(1).len(), 3);
         let wave = project.defs[3].wave.as_ref().unwrap();
         assert_eq!(wave.bank, "se_booster");
         assert_eq!(wave.index, 1);

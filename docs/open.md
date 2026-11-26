@@ -484,3 +484,15 @@ in order:
   `MissionText` subtitle window (`acvd-game::subtitle`, `sortie.drb` dialog 44 at
   `0x82519228`): every `ComLine` resolves its offset through `voice::text_id` to
   `lang/en/text/ai/aisys.fmg` and shows the line for the FSB clip length (`Cues::com_voice_seconds`).
+
+- **Booster sound mix follow-ups** (`acvd-game::sound`, `sheets/sound_cues.csv`): the sustain
+  `b00000003` now follows the 360 `AcSfxCtrl` speed path (`0x8289a138`: target +0x11c lerped 10%
+  per 60 Hz tick into +0x120, FMOD `speed` = cur*216 on a 150-wide FEV parameter, so the
+  envelope axis is cur*1.44; probed starter AC boost 117.9 km/h -> 0.262, high boost 251.3 ->
+  0.555, i.e. cur = km/h / 450), but the writer of +0x11c is not traced statically: no scalar
+  store to 0x11c is tied to the player's AcSfxCtrl at owner+0x734, and VMX128 stores are
+  invisible to `acvd-index`, so the 450 km/h normalizer is inferred from the starter AC's
+  computed top speeds (0.6% low on high boost). Confirm with a second AC or the garage speed
+  stat, and probe whether +0x11c is nonzero while walking with boost OFF (the 360 starts
+  b00000003 whenever cur*216 > 0.001; the rewrite gates it on boost/kick/blade dash). The
+  ParamEQ envelopes on b00000003 (FMOD DSP) are still not applied.

@@ -4,9 +4,9 @@
 //! Cue rows are `sheets/sound_cues.csv`.
 //!
 //! Playback is not positional. `FUN_82b46df0` takes a position, and the follow camera sits
-//! far enough out that Bevy's spatial rolloff would silence the source. Layer envelopes
-//! (the speed crossfade on `b00000003`) are not applied: each layer's first sound plays
-//! at full volume.
+//! far enough out that Bevy's spatial rolloff would silence the source. The speed crossfade
+//! on `b00000003` is applied: its layer volume envelopes follow the FEV `speed` parameter the
+//! 360 `AcSfxCtrl` update (`0x8289a138`) drives (see `update_sfx_mix`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex};
@@ -25,9 +25,21 @@ use crate::control::{Pilot, Piloting};
 const BOOST_MOVING: f32 = 0.05;
 /// `AcSfxCtrl` slot 2 (`0x82098cb0`, `FUN_82899280`) plays this on the emitter at object+0x124.
 const BOOST_ON: &str = "b00000000";
-/// Single-layer sustain in `acv2_se_booster.fev` (sound def → `se_booster` `main_boost11`).
-/// Not a traced call: the speed-crossfade event `b00000003` is left unplayed.
-const BOOST_LOOP: &str = "b00000010";
+/// Boost sustain: `AcSfxCtrl`'s update (`0x8289a138`, vtable `0x82098c88` slot 0; the caller
+/// reaches it from the AC update, LR `0x82893e20`) sends the FMOD parameter `"speed"`
+/// (`0x82054a3c`) to the event instances at this+0x124/this+0x138 and starts/stops this cue
+/// through `0x82899da8` (`b%08d`, id 3) while `cur*216` is above 0.001. It is the only booster
+/// event with a `speed` parameter: two `main_boost11`/`main_boost12` sounds in layer 0 plus a
+/// `main_boost03_hicut` layer, automated by the authored speed envelopes. The old single-layer
+/// `b00000010` (`main_boost11`, -18 dB) is not it.
+const BOOST_SUSTAIN: &str = "b00000003";
+/// Horizontal speed (m/tick) where the FEV `speed` axis reaches 1.0. `0x8289a138` lerps `cur`
+/// 10% per 60 Hz tick toward the speed target, sends `cur * 216.0000153` (`0x8200D0A0`) as the
+/// parameter value, and the FEV parameter max is 150; the target is the horizontal speed over
+/// 450 km/h (probed: starter AC boost 117.9 km/h -> 0.262, high boost 251.3 -> 0.555).
+/// `velocity` is m/tick and 216 km/h is 1 m/tick (`AcCtrlParam::calculate`), so
+/// `x = v_kmh * 216 / (450 * 150) = v_tick * 216 * 216 / (450 * 150)`.
+const SPEED_AXIS_FULL_TICK: f32 = 450.0 * 150.0 / (216.0 * 216.0);
 /// `AcSfxCtrl` slot +0x40 plays both (`boost_on06` + `boost11`, and `quick_boost03`): high boost.
 const QUICK_BOOST: [&str; 2] = ["b00000007", "b00000008"];
 /// `AcSfxCtrl` slots +0x30 / +0x3c (`dash00` + `boost_on06`), taken as the glide start; not traced
@@ -40,6 +52,41 @@ const GLIDE_ON: &str = "b00000006";
 pub enum AudioBus {
     Sfx,
     Ui,
+}
+
+/// A looping voice whose gain follows the boost `speed` parameter (the FEV envelopes of
+/// `b00000003`): base gain times every authored curve sampled at the normalized speed.
+#[derive(Component, Debug, Clone)]
+struct SfxMix {
+    base: f32,
+    curves: Vec<Vec<(f32, f32)>>,
+    /// The 360's smoothed `speed` target (`AcSfxCtrl+0x120`), in FEV axis units.
+    smoothed: f32,
+}
+
+/// Piecewise-linear envelope sample, clamped to the first/last point.
+fn envelope_at(points: &[(f32, f32)], x: f32) -> f32 {
+    let Some(&(first_x, first_y)) = points.first() else {
+        return 0.0;
+    };
+    if x <= first_x {
+        return first_y;
+    }
+    for pair in points.windows(2) {
+        let (x1, y1) = pair[1];
+        if x <= x1 {
+            let t = (x - pair[0].0) / (x1 - pair[0].0).max(1e-6);
+            return pair[0].1 + (y1 - pair[0].1) * t;
+        }
+    }
+    points.last().map(|p| p.1).unwrap_or(0.0)
+}
+
+/// Product of the voice's authored curves at `x`.
+fn mix_gain(curves: &[Vec<(f32, f32)>], x: f32) -> f32 {
+    curves
+        .iter()
+        .fold(1.0, |gain, points| gain * envelope_at(points, x))
 }
 
 /// Projects and the banks a cue has already pulled in.
@@ -100,14 +147,12 @@ impl Cues {
         cue: &str,
         looping: bool,
     ) -> Vec<Entity> {
-        let found: Option<(Vec<fev::Wave>, AudioBus)> = self
-            .projects
-            .iter()
-            .find_map(|(p, bus)| {
+        let found: Option<(Vec<fev::Wave>, f32, AudioBus)> =
+            self.projects.iter().find_map(|(p, bus)| {
                 p.event(cue)
-                    .map(|_| (p.waves(cue).into_iter().cloned().collect(), *bus))
+                    .map(|e| (p.waves(cue).into_iter().cloned().collect(), e.volume, *bus))
             });
-        let Some((waves, bus)) = found else {
+        let Some((waves, volume, bus)) = found else {
             if self.missing.insert(cue.to_string()) {
                 eprintln!("sound: no cue {cue}");
             }
@@ -119,7 +164,84 @@ impl Cues {
             }
             return Vec::new();
         }
-        self.play_waves(commands, assets, waves, bus, looping)
+        self.play_waves(commands, assets, waves, bus, looping, volume)
+    }
+
+    /// Plays the boost sustain with its authored speed mix: every sound of every layer
+    /// (`b00000003` has two `main_boost11`/`main_boost12` sounds plus the high-cut), at the
+    /// FEV event volume and sound volume. Layer 0's first two volume envelopes are the
+    /// per-sound speed gains and its next two are their speed fades; extra envelopes (the
+    /// high-cut layer) are gains with no sound left to pair, so they are not applied.
+    fn play_boost(
+        &mut self,
+        commands: &mut Commands,
+        assets: &mut Assets<AudioSource>,
+        cue: &str,
+    ) -> Vec<Entity> {
+        let Some((project, bus)) = self.projects.iter().find(|(p, _)| p.event(cue).is_some())
+        else {
+            if self.missing.insert(cue.to_string()) {
+                eprintln!("sound: no cue {cue}");
+            }
+            return Vec::new();
+        };
+        let bus = *bus;
+        let Some(event) = project.event(cue) else {
+            return Vec::new();
+        };
+        let bus_vol = match bus {
+            AudioBus::Sfx => self.sfx_volume,
+            AudioBus::Ui => self.ui_volume,
+        };
+        let mut voices: Vec<(fev::Wave, f32, Vec<Vec<(f32, f32)>>)> = Vec::new();
+        for (li, layer) in event.mix.iter().enumerate() {
+            let envs = event.volume_envelopes(li);
+            let paired = envs.len() == layer.sounds.len() * 2;
+            for (si, sound) in layer.sounds.iter().enumerate() {
+                let Some(def) = project.defs.get(sound.def as usize) else {
+                    continue;
+                };
+                let Some(wave) = def.wave.as_ref() else {
+                    continue;
+                };
+                let mut curves = Vec::new();
+                if let Some(gain) = envs.get(si) {
+                    curves.push(gain.points.clone());
+                }
+                if paired {
+                    if let Some(fade) = envs.get(layer.sounds.len() + si) {
+                        curves.push(fade.points.clone());
+                    }
+                }
+                let base = bus_vol * event.volume * sound.volume;
+                voices.push((wave.clone(), base, curves));
+            }
+        }
+        let initial = voices
+            .iter()
+            .map(|(_, base, curves)| base * mix_gain(curves, 0.0))
+            .collect::<Vec<_>>();
+        let mut spawned = Vec::with_capacity(voices.len());
+        for ((wave, base, curves), initial) in voices.into_iter().zip(initial) {
+            let Some(handle) = self.source(assets, &wave) else {
+                continue;
+            };
+            spawned.push(
+                commands
+                    .spawn((
+                        AudioPlayer(handle),
+                        PlaybackSettings::LOOP.with_volume(Volume::Linear(initial)),
+                        bus,
+                        SfxMix {
+                            base,
+                            curves,
+                            smoothed: 0.0,
+                        },
+                    ))
+                    .id(),
+            );
+        }
+        spawned
     }
 
     fn play_waves(
@@ -129,11 +251,12 @@ impl Cues {
         waves: Vec<fev::Wave>,
         bus: AudioBus,
         looping: bool,
+        volume: f32,
     ) -> Vec<Entity> {
         let bus_vol = match bus {
             AudioBus::Sfx => self.sfx_volume,
             AudioBus::Ui => self.ui_volume,
-        };
+        } * volume;
         let settings = if looping {
             PlaybackSettings::LOOP.with_volume(Volume::Linear(bus_vol))
         } else {
@@ -163,17 +286,19 @@ impl Cues {
             return Vec::new();
         };
         let cue = format!("{id:08}");
-        let waves = {
+        let (waves, volume) = {
             let Some(project) = self.voice_project(voice) else {
                 return Vec::new();
             };
-            project.waves(&cue).into_iter().cloned().collect::<Vec<_>>()
+            let waves = project.waves(&cue).into_iter().cloned().collect::<Vec<_>>();
+            let volume = project.event(&cue).map(|e| e.volume).unwrap_or(1.0);
+            (waves, volume)
         };
-        self.play_waves(commands, assets, waves, AudioBus::Sfx, false)
+        self.play_waves(commands, assets, waves, AudioBus::Sfx, false, volume)
     }
 
-    /// Decoded length of one COM / operator voice clip in seconds, from the FSB sample metadata
-    /// (`frames / frequency`). The subtitle window uses it to match the spoken line.
+    /// Length in seconds of one COM voice event, from the FSB sample count and frequency. The
+    /// mission subtitle stays up for this long (`0x825196a8` writes its timer at window +0x170).
     pub fn com_voice_seconds(&mut self, voice: u8, offset: u32) -> Option<f32> {
         let id = crate::voice::event_id(offset)?;
         let cue = format!("{id:08}");
@@ -340,7 +465,14 @@ impl Plugin for SoundPlugin {
         app.insert_resource(Cues::load(&self.disc))
             .insert_resource(bgm)
             .add_systems(Startup, sync_initial_bus_volumes)
-            .add_systems(Update, (motion.after(crate::weapons::fire), bgm_update));
+            .add_systems(
+                Update,
+                (
+                    motion.after(crate::weapons::fire),
+                    bgm_update,
+                    update_sfx_mix,
+                ),
+            );
     }
 }
 
@@ -540,7 +672,12 @@ fn motion(
         stop(&mut commands, &mut heard.sustain);
         heard.moving = false;
         heard.airborne = pilot.airborne;
-        (heard.glide, heard.quick_boosts, heard.wall_jumps, heard.kicks) = (
+        (
+            heard.glide,
+            heard.quick_boosts,
+            heard.wall_jumps,
+            heard.kicks,
+        ) = (
             pilot.glide,
             pilot.quick_boosts,
             pilot.wall_jumps,
@@ -557,19 +694,25 @@ fn motion(
     if pilot.glide && !heard.glide {
         cues.play(&mut commands, &mut assets, GLIDE_ON, false);
     }
-    (heard.glide, heard.quick_boosts, heard.wall_jumps, heard.kicks) = (
+    (
+        heard.glide,
+        heard.quick_boosts,
+        heard.wall_jumps,
+        heard.kicks,
+    ) = (
         pilot.glide,
         pilot.quick_boosts,
         pilot.wall_jumps,
         pilot.kicks_started,
     );
     let flat = Vec2::new(pilot.velocity.x, pilot.velocity.z);
-    let moving = (pilot.boost || pilot.in_kick() || pilot.in_blade_dash()) && flat.length() > BOOST_MOVING;
+    let moving =
+        (pilot.boost || pilot.in_kick() || pilot.in_blade_dash()) && flat.length() > BOOST_MOVING;
     if moving && !heard.moving {
         cues.play(&mut commands, &mut assets, BOOST_ON, false);
     }
     if moving && heard.sustain.is_empty() {
-        heard.sustain = cues.play(&mut commands, &mut assets, BOOST_LOOP, true);
+        heard.sustain = cues.play_boost(&mut commands, &mut assets, BOOST_SUSTAIN);
     } else if !moving {
         stop(&mut commands, &mut heard.sustain);
     }
@@ -610,7 +753,10 @@ fn motion(
                         anim.sound_param_id
                     };
                     let cue = format!("c{:08}", base + 33);
-                    if cues.play(&mut commands, &mut assets, &cue, false).is_empty() {
+                    if cues
+                        .play(&mut commands, &mut assets, &cue, false)
+                        .is_empty()
+                    {
                         cues.play(&mut commands, &mut assets, "c00000133", false);
                     }
                 }
@@ -622,6 +768,28 @@ fn motion(
                 | crate::pose::TaeFired::Purge { .. } => {}
             }
         }
+    }
+}
+
+/// Advances the boost sustain mix every frame. The 360 `AcSfxCtrl` update (`0x8289a138`)
+/// lerps its speed target toward `horizontal speed / 450 km/h` by 10% per 60 Hz tick and
+/// sends `target * 216` on the FEV `speed` parameter, whose max is 150, so the envelope axis
+/// is `v * 216 * 216 / (450 * 150)` (`SPEED_AXIS_FULL_TICK`). Each voice's gain is its base
+/// gain times the authored envelopes sampled there.
+fn update_sfx_mix(
+    time: Res<Time>,
+    pilots: Query<&Pilot>,
+    mut sinks: Query<(&mut AudioSink, &mut SfxMix)>,
+) {
+    let Ok(pilot) = pilots.single() else { return };
+    let target = (pilot.velocity.with_y(0.0).length() / SPEED_AXIS_FULL_TICK).clamp(0.0, 1.0);
+    // `cur += 0.1 * (target - cur)` at 60 Hz in the 360, expressed for the frame delta.
+    let alpha = 1.0 - 0.9f32.powf(60.0 * time.delta_secs());
+    for (mut sink, mut mix) in &mut sinks {
+        mix.smoothed += (target - mix.smoothed) * alpha;
+        sink.set_volume(Volume::Linear(
+            mix.base * mix_gain(&mix.curves, mix.smoothed),
+        ));
     }
 }
 
@@ -657,6 +825,44 @@ fn wav_pcm(samples: &[i16], channels: u16, rate: u32) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// `b00000003` layer 0: main_boost11 gain and fade-out, main_boost12 gain and fade-in.
+    #[test]
+    fn boost_speed_mix_uses_authored_envelopes() {
+        let low_gain = [(0.0, 0.357699), (0.897727, 0.524306)];
+        let low_fade = [(0.0, 1.0), (0.40884, 1.0), (1.0, 0.0)];
+        let high_gain = [(0.0, 0.678201), (0.727273, 1.0)];
+        let high_fade = [(0.0, 0.0), (0.095028, 0.0), (0.289503, 1.0)];
+        let low = vec![low_gain.to_vec(), low_fade.to_vec()];
+        let high = vec![high_gain.to_vec(), high_fade.to_vec()];
+        assert!((mix_gain(&low, 0.0) - 0.357699).abs() < 1e-5);
+        assert!(mix_gain(&high, 0.0).abs() < 1e-6);
+        // Half speed: the high fade is complete while its gain still rises; the low fade has
+        // just started.
+        assert!((mix_gain(&high, 0.5) - 0.8994).abs() < 5e-3);
+        assert!((mix_gain(&low, 0.5) - 0.3810).abs() < 5e-3);
+        // Full speed: main_boost11 is faded out, main_boost12 at its top.
+        assert!(mix_gain(&low, 1.0).abs() < 1e-6);
+        assert!((mix_gain(&high, 1.0) - 1.0).abs() < 1e-5);
+        // Clamped past the last point and empty curves are unity.
+        assert!((envelope_at(&low_gain, 2.0) - 0.524306).abs() < 1e-6);
+        assert_eq!(mix_gain(&[], 0.7), 1.0);
+    }
+
+    /// The FEV `speed` axis the 360 feeds `b00000003`: `0x8289a138` sends `cur * 216` on a
+    /// 150-wide parameter where `cur` is the horizontal speed over 450 km/h, so the axis is
+    /// `cur * 1.44`. Checked against the probed targets for the starter AC (`sheets` preset
+    /// 5010: boost 117.9 km/h -> cur 0.262, high boost 251.3 -> cur 0.555) and its computed
+    /// top speeds.
+    #[test]
+    fn boost_speed_axis_matches_360_parameter() {
+        let axis = |v_tick: f32| (v_tick / SPEED_AXIS_FULL_TICK).clamp(0.0, 1.0);
+        // Probed target * 1.44 (`0x8200D0A0` / FEV max 150).
+        assert!((axis(117.9 / 216.0) - 0.262 * 1.44).abs() < 2e-3);
+        assert!((axis(251.3 / 216.0) - 0.555 * 1.44).abs() < 6e-3);
+        // FMOD clamps the normalized parameter at 1.0.
+        assert_eq!(axis(400.0 / 216.0), 1.0);
+    }
+
     #[test]
     fn gameplay_cues_decode_x360() {
         let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
@@ -671,7 +877,7 @@ mod tests {
             "w00009600",
             "c00000089",
             BOOST_ON,
-            BOOST_LOOP,
+            BOOST_SUSTAIN,
             "c00000024",
             QUICK_BOOST[0],
             QUICK_BOOST[1],
@@ -717,7 +923,10 @@ mod tests {
         let sample = fsb::read_sample(&disc, "sound/bgm.fsb", wave.index as usize).unwrap();
         assert!(sample.xma());
         assert_eq!(sample.channels, 2);
-        assert!(sample.length > 44_100 * 30, "expected full-length BGM track");
+        assert!(
+            sample.length > 44_100 * 30,
+            "expected full-length BGM track"
+        );
 
         let (garage_cue, garage_wave) = resolve_bgm_wave(&disc, None).expect("garage bgm");
         assert_eq!(garage_cue, "grg");
