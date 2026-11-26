@@ -3,9 +3,12 @@
 //! This plays the sample that name indexes (XMA or 16-bit PCM, `acvd_formats::fsb::Sample::decode`).
 //! Cue rows are `sheets/sound_cues.csv`.
 //!
-//! Playback is not positional. `FUN_82b46df0` takes a position, and the follow camera sits
-//! far enough out that Bevy's spatial rolloff would silence the source. The speed crossfade
-//! on `b00000003` is applied: its layer volume envelopes follow the FEV `speed` parameter the
+//! The 360 `FUN_82b46df0` takes the emitter's position, not the listener's: its `param_4`
+//! points at three floats that it copies into the event instance (`lfs`/`stfs` at
+//! `0x82b46e4c..0x82b46e74`) before calling `FUN_82c65570`. Weapon and world cues therefore
+//! take their own world point through `Cues::play_at_position`; the authored FEV linear
+//! rolloff is sampled at the follow camera's distance to that point. The speed crossfade on
+//! `b00000003` is separate: its layer volume envelopes follow the FEV `speed` parameter the
 //! 360 `AcSfxCtrl` update (`0x8289a138`) drives (see `update_sfx_mix`).
 
 use std::collections::{HashMap, HashSet};
@@ -257,8 +260,8 @@ fn param_eq_value(curve: &[(f32, f32)], (min, max): (f32, f32), default: f32, x:
     }
 }
 
-/// Listener (follow camera) to player AC distance in metres, the input the FEV 3D rolloff
-/// uses. `update_sfx_mix` refreshes it every frame; one-shots read it at spawn.
+/// Listener (follow camera) to player AC distance in metres, used by the boost sustain's
+/// moving 3D rolloff. Weapon and world one-shots read their own emitter point instead.
 #[derive(Resource, Debug, Clone, Copy, Default)]
 struct ListenerDistance(f32);
 
@@ -301,6 +304,9 @@ pub struct Cues {
     missing: HashSet<String>,
     sfx_volume: f32,
     ui_volume: f32,
+    /// Follow-camera position, refreshed before `weapons::fire`. `play_at_position` turns
+    /// an emitter point into the FEV 3D rolloff distance.
+    listener: Vec3,
 }
 
 impl Cues {
@@ -333,12 +339,17 @@ impl Cues {
             missing: HashSet::new(),
             sfx_volume: 1.0,
             ui_volume: 1.0,
+            listener: Vec3::ZERO,
         }
     }
 
     pub fn set_bus_volumes(&mut self, sfx: f32, ui: f32) {
         self.sfx_volume = sfx.clamp(0.0, 1.0);
         self.ui_volume = ui.clamp(0.0, 1.0);
+    }
+
+    pub(crate) fn set_listener(&mut self, listener: Vec3) {
+        self.listener = listener;
     }
 
     fn play(
@@ -352,8 +363,8 @@ impl Cues {
     }
 
     /// One-shot (or looping) cue with the authored 3D rolloff sampled at `distance` metres.
-    /// Only pass a distance for events whose emitter is the player AC (booster cues); weapon
-    /// and world cues have their own emitter positions and stay non-positional for now.
+    /// `play_at_position` computes that distance from the emitter's world point; booster
+    /// calls pass the listener-to-AC distance directly.
     fn play_at(
         &mut self,
         commands: &mut Commands,
@@ -386,6 +397,23 @@ impl Cues {
             return Vec::new();
         }
         self.play_waves(commands, assets, waves, bus, looping, volume)
+    }
+
+    /// Plays a one-shot at an emitter world point. The 360's positional player
+    /// `FUN_82b46df0` copies `param_4[0..2]` into the event's 3D attributes; its direct
+    /// callers pass the bullet/impact/object point (e.g. `FUN_82892df0` reads bullet
+    /// `+0x30..0x38`, `FUN_828365a0` reads its `param_3`, `FUN_829bf278` its `param_5`).
+    /// Non-3D events return unity in `fev::Event::distance_gain`, so UI/2D cues are unaffected.
+    fn play_at_position(
+        &mut self,
+        commands: &mut Commands,
+        assets: &mut Assets<AudioSource>,
+        cue: &str,
+        looping: bool,
+        position: Vec3,
+    ) -> Vec<Entity> {
+        let distance = self.listener.distance(position);
+        self.play_at(commands, assets, cue, looping, Some(distance))
     }
 
     /// Plays the boost sustain with its authored speed mix: every sound of every layer
@@ -706,18 +734,41 @@ impl Cues {
     }
 }
 
-/// One weapon shot. `id` is `acweaponsoundparam.shoot`; category 4 formats it `w%08d`
-/// (`FUN_828995d0`). Zero and negative play nothing.
-pub fn shot(commands: &mut Commands, cues: &mut Cues, assets: &mut Assets<AudioSource>, id: i16) {
+/// One weapon shot at `at` (the 360 bullet object's `+0x30` position, `FUN_82892df0`).
+/// `id` is `acweaponsoundparam.shoot`; category 4 formats it `w%08d` (`FUN_828995d0`).
+/// Zero and negative play nothing.
+pub fn shot(
+    commands: &mut Commands,
+    cues: &mut Cues,
+    assets: &mut Assets<AudioSource>,
+    id: i16,
+    at: Vec3,
+) {
     if id > 0 {
-        cues.play(commands, assets, &format!("w{id:08}"), false);
+        cues.play_at_position(commands, assets, &format!("w{id:08}"), false, at);
     }
 }
 
-/// Plays a named one-shot cue (e.g. `w00009224` bullet hit, `w00009600` explosion, `c00000089` AC death).
+/// Plays a named one-shot cue (e.g. `w00009224` bullet hit, `w00009600` explosion,
+/// `c00000089` AC death) at a non-positional listener (UI, menu, voice).
 pub fn cue(commands: &mut Commands, cues: &mut Cues, assets: &mut Assets<AudioSource>, name: &str) {
     if !name.is_empty() {
         cues.play(commands, assets, name, false);
+    }
+}
+
+/// Plays a named weapon/world cue at its emitter point. The 360 exposes the same
+/// `FUN_82b46df0` position argument for bullet/impact/explosion callers; pass the world point
+/// the matching FFX is spawned at.
+pub fn cue_at(
+    commands: &mut Commands,
+    cues: &mut Cues,
+    assets: &mut Assets<AudioSource>,
+    name: &str,
+    at: Vec3,
+) {
+    if !name.is_empty() {
+        cues.play_at_position(commands, assets, name, false, at);
     }
 }
 
@@ -756,11 +807,23 @@ impl Plugin for SoundPlugin {
             .add_systems(
                 Update,
                 (
+                    update_listener.before(crate::weapons::fire),
                     motion.after(crate::weapons::fire),
                     bgm_update,
                     update_sfx_mix,
                 ),
             );
+    }
+}
+
+/// Refreshes the emitter-relative listener used by `Cues::play_at_position`. Runs before
+/// `weapons::fire`, so a shot spawned this frame uses this frame's camera position.
+fn update_listener(
+    cameras: Query<&Transform, (With<Camera3d>, Without<crate::env::WaterReflectionCamera>)>,
+    mut cues: ResMut<Cues>,
+) {
+    if let Some(camera) = cameras.iter().next() {
+        cues.set_listener(camera.translation);
     }
 }
 
@@ -953,11 +1016,13 @@ fn motion(
     mut boost_assets: ResMut<Assets<BoostVoice>>,
     piloting: Res<Piloting>,
     listener: Res<ListenerDistance>,
-    pilots: Query<&Pilot>,
+    pilots: Query<(&Pilot, &Transform)>,
     anim: Option<Res<crate::pose::Motion>>,
     mut heard: Local<Heard>,
 ) {
-    let Ok(pilot) = pilots.single() else { return };
+    let Ok((pilot, pilot_tf)) = pilots.single() else {
+        return;
+    };
     if !piloting.0 {
         stop(&mut commands, &mut heard.sustain);
         heard.moving = false;
@@ -1036,11 +1101,12 @@ fn motion(
     if jump {
         if let Some(row) = acvd_data::find(PARAM_ACSOUNDPARAM_BIN, 0).filter(|r| r.data.se_jump > 0)
         {
-            cues.play(
+            cues.play_at_position(
                 &mut commands,
                 &mut assets,
                 &format!("c{:08}", row.data.se_jump),
                 false,
+                pilot_tf.translation,
             );
         }
     }
@@ -1057,14 +1123,32 @@ fn motion(
                     };
                     let cue = format!("c{:08}", base + 33);
                     if cues
-                        .play(&mut commands, &mut assets, &cue, false)
+                        .play_at_position(
+                            &mut commands,
+                            &mut assets,
+                            &cue,
+                            false,
+                            pilot_tf.translation,
+                        )
                         .is_empty()
                     {
-                        cues.play(&mut commands, &mut assets, "c00000133", false);
+                        cues.play_at_position(
+                            &mut commands,
+                            &mut assets,
+                            "c00000133",
+                            false,
+                            pilot_tf.translation,
+                        );
                     }
                 }
                 crate::pose::TaeFired::Sound { cue } => {
-                    cues.play(&mut commands, &mut assets, cue, false);
+                    cues.play_at_position(
+                        &mut commands,
+                        &mut assets,
+                        cue,
+                        false,
+                        pilot_tf.translation,
+                    );
                 }
                 crate::pose::TaeFired::Ffx { .. }
                 | crate::pose::TaeFired::Reattach { .. }
@@ -1265,6 +1349,60 @@ mod tests {
                 (volume - expected).abs() < 1e-4,
                 "{volume} != {expected} in {volumes:?}"
             );
+        }
+    }
+
+    /// Category-4 `w%08d` events are the 360's positional weapon cues. `FUN_82892df0`
+    /// copies the bullet object's `+0x30..0x38` into `FUN_828995d0`'s position, and
+    /// `play_at_position` must attenuate a far emitter while a near one stays at the
+    /// authored event volume.
+    #[test]
+    fn weapon_cue_uses_the_emitter_position() {
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        let Ok(disc) = Disc::open(&iso) else { return };
+        let cues = Cues::load(&disc);
+        let cue = "w00000034";
+        let Some((project, _)) = cues.projects.iter().find(|(p, _)| p.event(cue).is_some()) else {
+            return;
+        };
+        let event = project.event(cue).unwrap().clone();
+        assert!(event.is_3d(), "{cue} must be a positional weapon cue");
+        assert!(event.max_distance > event.min_distance);
+        let waves = project.waves(cue).len();
+        assert!(waves > 0);
+
+        let far = Vec3::new(event.max_distance + 1.0, 0.0, 0.0);
+        let near = Vec3::new(event.min_distance, 0.0, 0.0);
+        let mut app = App::new();
+        app.insert_resource(Cues::load(&disc));
+        app.insert_resource(Assets::<AudioSource>::default());
+        app.add_systems(
+            Update,
+            move |mut commands: Commands,
+                  mut cues: ResMut<Cues>,
+                  mut assets: ResMut<Assets<AudioSource>>| {
+                cues.set_listener(Vec3::ZERO);
+                cues.play_at_position(&mut commands, &mut assets, cue, false, near);
+                cues.play_at_position(&mut commands, &mut assets, cue, false, far);
+            },
+        );
+        app.update();
+        let world = app.world_mut();
+        let mut query = world.query::<&PlaybackSettings>();
+        let mut volumes: Vec<f32> = query
+            .iter(world)
+            .map(|settings| match settings.volume {
+                Volume::Linear(v) => v,
+                _ => panic!("unexpected volume curve"),
+            })
+            .collect();
+        volumes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(volumes.len(), waves * 2, "{volumes:?}");
+        for volume in &volumes[..waves] {
+            assert!((*volume - 0.0).abs() < 1e-6, "{volumes:?}");
+        }
+        for volume in &volumes[waves..] {
+            assert!((*volume - event.volume).abs() < 1e-5, "{volumes:?}");
         }
     }
 

@@ -549,17 +549,3 @@ in order:
   `MissionText` subtitle window (`acvd-game::subtitle`, `sortie.drb` dialog 44 at
   `0x82519228`): every `ComLine` resolves its offset through `voice::text_id` to
   `lang/en/text/ai/aisys.fmg` and shows the line for the FSB clip length (`Cues::com_voice_seconds`).
-
-- **Booster sound mix follow-ups** (`acvd-game::sound`, `sheets/sound_cues.csv`): the sustain
-  `b00000003` follows the 360 `AcSfxCtrl` speed path and the authored 3D linear rolloff (mode
-  `0x0408_0010`, 0..50 m at the 16-21 m follow camera -> 0.58-0.68, matching the 0.6 retail
-  capture ratio in archive). The speed target is now traced: `0x82892f08` (LR `0x82892fa4`)
-  feeds `AcSfxCtrl+0x11c` = `|v| / 60` (m/tick) through the one-instruction setter
-  `0x82899028` (vtable `0x82098c88` slot +0x4), and `0x8289a138` sends `cur*216` km/h on the
-  150-max FEV `speed` parameter, so the envelope axis is `cur*1.44` (old 450 km/h inference
-  corrected; see Done "Booster speed-target writer"). Walking with boost OFF leaves +0x11c
-  at 0 and never calls the setter (`private/xenia/speed_int.jsonl`), so the boost gate is
-  correct. The layer-0 `FMOD ParamEQ` is applied on the same axis (center + octave range +
-  linear gain mapped onto the 360 DSP ranges `0x8374de50`, ~0 dB at the capture speed and
-  +2.4 dB at full speed). Remaining: weapon and world 3D cues are still non-positional (they
-  need per-emitter positions).

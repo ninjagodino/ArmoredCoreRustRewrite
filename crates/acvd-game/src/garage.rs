@@ -10801,6 +10801,7 @@ pub struct ViewActionRig<'w, 's> {
     pub points: Query<'w, 's, (Entity, &'static mut EffectPoint)>,
     pub hardpoints: Query<'w, 's, (Entity, &'static Hardpoint)>,
     pub shoulder_hp: Query<'w, 's, (Entity, &'static ShoulderHardpoint)>,
+    pub globals: Query<'w, 's, &'static GlobalTransform>,
     pub posed: Query<'w, 's, (&'static mut Transform, Option<&'static Driven>), With<ClipJoint>>,
 }
 
@@ -10957,13 +10958,26 @@ pub fn step_view_actions(
                         (true, Hand::Left) => "phys_blade_swing_l",
                     };
                     let mut dur = 1.0_f32;
+                    let shot_at = rig
+                        .hardpoints
+                        .iter()
+                        .find(|(_, h)| h.hand == hand)
+                        .map_or(Vec3::ZERO, |(e, _)| {
+                            rig.globals.get(e).map_or(Vec3::ZERO, |g| g.translation())
+                        });
                     if let Some(motion) = rig.motion.as_deref_mut() {
                         if play_view_body_state(motion, &garage.disc, &mut pilot, blade_state, None)
                         {
                             dur = (motion.clip.frames as f32 / crate::pose::FRAME_RATE).max(0.5);
                         }
                     }
-                    sound::shot(&mut commands, &mut cues, &mut audio_assets, gun.shoot);
+                    sound::shot(
+                        &mut commands,
+                        &mut cues,
+                        &mut audio_assets,
+                        gun.shoot,
+                        shot_at,
+                    );
                     if gun.fx.bullet > 0 {
                         if let Some((hp_e, _)) = rig.hardpoints.iter().find(|(_, h)| h.hand == hand)
                         {
@@ -11092,7 +11106,18 @@ pub fn step_view_actions(
                     }
                     let reload_secs = (gun.reload_time / crate::pose::FRAME_RATE).clamp(0.14, 0.85);
                     state.view_anim.hand_fire_cd[i] = reload_secs;
-                    sound::shot(&mut commands, &mut cues, &mut audio_assets, gun.shoot);
+                    sound::shot(
+                        &mut commands,
+                        &mut cues,
+                        &mut audio_assets,
+                        gun.shoot,
+                        rig.hardpoints
+                            .iter()
+                            .find(|(_, h)| h.hand == hand)
+                            .map_or(Vec3::ZERO, |(e, _)| {
+                                rig.globals.get(e).map_or(Vec3::ZERO, |g| g.translation())
+                            }),
+                    );
                     if let Some(anims) = rig.anims.as_deref_mut() {
                         if arms.weapon_arm {
                             anims.trigger_kick(Hand::Right, gun.sniper);
@@ -11146,6 +11171,9 @@ pub fn step_view_actions(
                 &mut cues,
                 &mut audio_assets,
                 arms.shoulder.shoot,
+                rig.shoulder_hp.single().ok().map_or(Vec3::ZERO, |(e, _)| {
+                    rig.globals.get(e).map_or(Vec3::ZERO, |g| g.translation())
+                }),
             );
             if arms.shoulder.fx.muzzle > 0 {
                 if let Ok((sh_e, _)) = rig.shoulder_hp.single() {

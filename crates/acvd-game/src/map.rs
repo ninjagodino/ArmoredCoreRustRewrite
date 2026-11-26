@@ -1130,7 +1130,13 @@ pub fn step_destructibles(
             .filter(|r| r.data.se_destroy > 0)
             .map(|r| format!("c{:08}", r.data.se_destroy))
         {
-            sound::cue(&mut commands, &mut cues, &mut audio_sources, &se);
+            sound::cue_at(
+                &mut commands,
+                &mut cues,
+                &mut audio_sources,
+                &se,
+                prop.center,
+            );
         }
         info!(
             "destructible prop {} (id {}) broken at ({:.1}, {:.1}, {:.1}) (debris={})",

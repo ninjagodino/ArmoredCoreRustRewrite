@@ -1741,7 +1741,7 @@ pub(crate) fn spawn_enemy_shot(
         return;
     }
     if gun.shoot > 0 {
-        sound::shot(commands, cues, sources, gun.shoot);
+        sound::shot(commands, cues, sources, gun.shoot, origin);
     }
     if gun.fx.muzzle > 0 {
         commands.spawn((
@@ -2057,6 +2057,7 @@ pub fn fire(
                             &mut speaker.cues,
                             &mut speaker.sources,
                             gun.shoot,
+                            fallback_origin,
                         );
                     }
                 }
@@ -2123,6 +2124,7 @@ pub fn fire(
                             &mut speaker.cues,
                             &mut speaker.sources,
                             arms.hands[0].shoot,
+                            origin,
                         );
                         if arms.hands[0].fx.muzzle > 0 {
                             if let Some(point) = muzzle_ent {
@@ -2210,6 +2212,7 @@ pub fn fire(
                     &mut speaker.cues,
                     &mut speaker.sources,
                     gun.shoot,
+                    muzzles.first().map_or(fallback_origin, |&(_, p)| p),
                 );
                 // Spawn muzzle flash once per active barrel (up to `shots`).
                 let barrel_count = muzzles.len().min(shots);
@@ -2351,6 +2354,11 @@ pub fn fire(
     for (i, gun) in arms.hands.iter_mut().enumerate() {
         gun.cooldown = (gun.cooldown - dt * TICK_RATE).max(0.0);
         let hand = if i == 0 { Hand::Right } else { Hand::Left };
+        let origin = rigging
+            .hardpoints
+            .iter()
+            .find(|(h, _)| h.hand == hand)
+            .map_or(ac_tf.translation, |(_, t)| t.translation());
         if gun.kind == Kind::Blade {
             let Some(blade) = gun.blade else { continue };
             let has_ammo = blade.infinite_ammo || gun.remaining > 0;
@@ -2398,6 +2406,7 @@ pub fn fire(
                         &mut speaker.cues,
                         &mut speaker.sources,
                         gun.shoot,
+                        origin,
                     );
                 }
             }
@@ -2445,6 +2454,7 @@ pub fn fire(
                         &mut speaker.cues,
                         &mut speaker.sources,
                         gun.charge_se,
+                        origin,
                     );
                 }
                 continue;
@@ -2468,11 +2478,6 @@ pub fn fire(
             status.en = pilot.en;
             status.en_max = pilot.en_max;
         }
-        let origin = rigging
-            .hardpoints
-            .iter()
-            .find(|(h, _)| h.hand == hand)
-            .map_or(ac_tf.translation, |(_, t)| t.translation());
         let hand_aim = fcs
             .as_deref()
             .map_or(aim, |f| f.aim_for_hand(i, origin, gun.init_speed, aim));
@@ -2486,6 +2491,7 @@ pub fn fire(
             &mut speaker.cues,
             &mut speaker.sources,
             gun.shoot,
+            origin,
         );
         let column = if hand == Hand::Right {
             "armwep_r"
@@ -2646,6 +2652,7 @@ pub fn fire(
                     &mut speaker.cues,
                     &mut speaker.sources,
                     arms.shoulder.shoot,
+                    origin,
                 );
                 if arms.shoulder.fx.muzzle > 0 {
                     commands.spawn((
@@ -2778,11 +2785,12 @@ fn apply_impact_blast(
         0.38,
     );
     if blast.hit_se > 0 {
-        sound::cue(
+        sound::cue_at(
             commands,
             &mut speaker.cues,
             &mut speaker.sources,
             &format!("w{:08}", blast.hit_se),
+            center,
         );
     }
     let r2 = blast.radius * blast.radius;
@@ -2833,11 +2841,12 @@ fn apply_missile_impact_blast(
         0.38,
     );
     if blast.hit_se > 0 {
-        sound::cue(
+        sound::cue_at(
             commands,
             &mut speaker.cues,
             &mut speaker.sources,
             &format!("w{:08}", blast.hit_se),
+            center,
         );
     }
     let r2 = blast.radius * blast.radius;
@@ -3008,7 +3017,13 @@ pub fn step_overed_weapon(
                         }
                     }
                 }
-                sound::cue(&mut commands, &mut speaker.cues, &mut speaker.sources, "b00000000");
+                sound::cue_at(
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    "b00000000",
+                    ac_tf.translation,
+                );
                 if let Some(m) = motion.as_deref_mut() {
                     if m.has_ow_clip(200) {
                         let _ = m.play_upper(&garage.disc, 200, false, 1.0, [0.15; 8], 9);
@@ -3024,7 +3039,13 @@ pub fn step_overed_weapon(
                 );
             }
             OwEvent::ChargeComplete => {
-                sound::cue(&mut commands, &mut speaker.cues, &mut speaker.sources, "c00000024");
+                sound::cue_at(
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    "c00000024",
+                    ac_tf.translation,
+                );
                 info!("OW {} CHARGE COMPLETE — release trigger to unleash!", ow.spec.part_id);
             }
             OwEvent::Fired => {
@@ -3039,7 +3060,13 @@ pub fn step_overed_weapon(
                     .unwrap_or(ac_tf.translation + Vec3::Y * 5.0);
                 let gun = &ow.spec.gun;
                 if gun.shoot > 0 {
-                    sound::shot(&mut commands, &mut speaker.cues, &mut speaker.sources, gun.shoot);
+                    sound::shot(
+                        &mut commands,
+                        &mut speaker.cues,
+                        &mut speaker.sources,
+                        gun.shoot,
+                        ow_muzzle,
+                    );
                 }
                 if let Some(m) = motion.as_deref_mut() {
                     if m.has_ow_clip(202) {
@@ -3172,7 +3199,13 @@ pub fn step_overed_weapon(
                         let _ = m.play_upper(&garage.disc, 205, false, 1.0, [0.15; 8], 10);
                     }
                 }
-                sound::cue(&mut commands, &mut speaker.cues, &mut speaker.sources, "c00000024");
+                sound::cue_at(
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    "c00000024",
+                    ac_tf.translation,
+                );
                 info!(
                     "OW {} AUTO-PURGED — entering {:.0}s EN/FCS lockout",
                     ow.spec.part_id, ow.spec.lockout_secs
@@ -3274,11 +3307,12 @@ pub fn step_projectiles(
                                 shot.hit_se.low
                             };
                             if se > 0 {
-                                sound::cue(
+                                sound::cue_at(
                                     &mut commands,
                                     &mut speaker.cues,
                                     &mut speaker.sources,
                                     &format!("w{se:08}"),
+                                    pos,
                                 );
                             }
                             info!(
@@ -3351,11 +3385,12 @@ pub fn step_projectiles(
                                     shot.hit_se.low
                                 };
                                 if se > 0 {
-                                    sound::cue(
+                                    sound::cue_at(
                                         &mut commands,
                                         &mut speaker.cues,
                                         &mut speaker.sources,
                                         &format!("w{se:08}"),
+                                        pos,
                                     );
                                 }
                                 info!(
@@ -3394,11 +3429,12 @@ pub fn step_projectiles(
                 ));
             }
             if shot.hit_se.low > 0 {
-                sound::cue(
+                sound::cue_at(
                     &mut commands,
                     &mut speaker.cues,
                     &mut speaker.sources,
                     &format!("w{:08}", shot.hit_se.low),
+                    at,
                 );
             }
             if shot.owner == Owner::Player {
@@ -3483,11 +3519,12 @@ pub fn step_missiles(
                 commands.spawn((Sfx::new(burst.split_fx), Transform::from_translation(next)));
             }
             if burst.split_se > 0 {
-                sound::cue(
+                sound::cue_at(
                     &mut commands,
                     &mut speaker.cues,
                     &mut speaker.sources,
                     &format!("w{:08}", burst.split_se),
+                    next,
                 );
             }
             for (spawn_pos, child) in burst.children {
@@ -3616,11 +3653,12 @@ pub fn step_missiles(
                                 missile.hit_se.low
                             };
                             if se > 0 {
-                                sound::cue(
+                                sound::cue_at(
                                     &mut commands,
                                     &mut speaker.cues,
                                     &mut speaker.sources,
                                     &format!("w{se:08}"),
+                                    pos,
                                 );
                             }
                             info!(
@@ -3703,11 +3741,12 @@ pub fn step_missiles(
                                     missile.hit_se.low
                                 };
                                 if se > 0 {
-                                    sound::cue(
+                                    sound::cue_at(
                                         &mut commands,
                                         &mut speaker.cues,
                                         &mut speaker.sources,
                                         &format!("w{se:08}"),
+                                        pos,
                                     );
                                 }
                                 info!(
@@ -3751,11 +3790,12 @@ pub fn step_missiles(
                 ));
             }
             if missile.hit_se.low > 0 {
-                sound::cue(
+                sound::cue_at(
                     &mut commands,
                     &mut speaker.cues,
                     &mut speaker.sources,
                     &format!("w{:08}", missile.hit_se.low),
+                    at,
                 );
             }
             if missile.owner == Owner::Player {
@@ -3830,11 +3870,12 @@ pub fn tick_player_health(
             .filter(|r| r.data.se_destroy > 0)
             .map(|r| format!("c{:08}", r.data.se_destroy))
             .unwrap_or_else(|| "c00000089".to_string());
-        sound::cue(
+        sound::cue_at(
             &mut commands,
             &mut speaker.cues,
             &mut speaker.sources,
             &destroy_se,
+            center,
         );
         info!(
             "player AC destroyed at ({:.1}, {:.1}, {:.1}); respawning in {:.1}s",
@@ -3988,7 +4029,13 @@ pub fn step_melee(
                         kick_se.low
                     };
                     if se > 0 {
-                        sound::shot(&mut commands, &mut speaker.cues, &mut speaker.sources, se);
+                        sound::shot(
+                            &mut commands,
+                            &mut speaker.cues,
+                            &mut speaker.sources,
+                            se,
+                            hit_pos,
+                        );
                     }
                     info!(
                         "BOOST KICK {} ({}) at {:.1} km/h: {} {:.0} dmg (recoil {:.0}, AP {:.0}/{:.0}){}{}",
@@ -4104,7 +4151,13 @@ pub fn step_melee(
                     blade.launch.hit_low_se
                 };
                 if se > 0 {
-                    sound::shot(&mut commands, &mut speaker.cues, &mut speaker.sources, se);
+                    sound::shot(
+                        &mut commands,
+                        &mut speaker.cues,
+                        &mut speaker.sources,
+                        se,
+                        hit_pos,
+                    );
                 }
                 blade.hit_entities.push(entity);
                 pilot.blade_hits += 1;

@@ -1145,11 +1145,12 @@ pub fn tick(
             ));
         }
         if !health.destroy_se.is_empty() {
-            sound::cue(
+            sound::cue_at(
                 &mut commands,
                 &mut cues,
                 &mut audio_sources,
                 &health.destroy_se,
+                center,
             );
         }
         info!(
