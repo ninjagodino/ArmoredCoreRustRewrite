@@ -621,9 +621,17 @@ in order:
   `camera_follow.csv` `look_at_height`, `base_transform`, `pitch` (probe the AC+0x234 pitch
   update; its 360 address is still to find from the AC update `0x828bef18`), `follow_ease`,
   `dash_inv`, `side_moving`, `shake`, `eye_lift`. Pending 360 addresses: the per-id part
-  getters behind `0x8246fbb0` (`ac_part_fields.csv`), the AC+0x1104 update gate, the
-  camera-effects view builder, the offset-row lerp. All of these are reachable unattended in
-  AC TEST (`ac_test_walk.txt` / `boost_vfx.txt`).
+  getters behind `0x8246fbb0` (`ac_part_fields.csv`), the AC+0x1104 update gate, and the
+  offset-row lerp. The camera-effects view builder is now traced: `CamFx_stateFollow`
+  `0x82bfb238` eases the shown eye/look-at at `this+0x20`/`+0x30`, and `0x82bfb344` builds the
+  view matrix from them. `tools/xenia-probe` hooks `0x82bfb338` and forces those vectors (live
+  `eye_error_m=4.4e-7`; docs/xenia-probes.md "Generated caves"). All of these are reachable
+  unattended in AC TEST (`ac_test_walk.txt` / `boost_vfx.txt`).
+- **Animated map-aircraft camera target (`tools/xenia-probe`)**: `--look-at o9341` resolves the
+  MSB placement (`0,0,0`), but m3120's bomber is TAE/ANI-animated (behavior `811` -> TAE
+  `0x8c1` -> clip 221, speed 0.4, 1 km altitude) and its root route is far from that anchor.
+  The camera override is verified, but a model-visible shot needs the runtime animation root
+  (map object actor `+0xe4`/`+0xec`), not the static MSB translation.
 - **Movies**: the 360 ships ASF `movie/jp/*.wmv` (WMV3 video, WMA2 / WMA Pro audio, see
   `formats.csv` `.wmv`); nothing decodes them in Rust. The boot intro now uses the FFmpeg cache
   (`tools/acvd-movies` -> `private/movies/`, played by `acvd-game::movie`); a pure-Rust VC-1

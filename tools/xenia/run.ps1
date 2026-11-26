@@ -14,6 +14,7 @@ param(
     [string]$Recipe,
     [int]$Port = 1, # the signed-in profile (logged_profile_slot_1_xuid) is in slot 1
     [string]$Iso = "armoredcoredumps\Armored Core - Verdict Day (USA)\Armored Core - Verdict Day (USA).iso",
+    [switch]$ApplyPatches,
     [string[]]$Extra = @()
 )
 $ErrorActionPreference = "Stop"
@@ -29,11 +30,12 @@ $input_file = [IO.Path]::ChangeExtension($Log, ".input")
 Remove-Item $Log -ErrorAction SilentlyContinue
 
 # protect_zero=false: the game crashes leaving any mission without it (Xenia compatibility issue
-# #278). readback_resolve=full: AC parts render black otherwise. Neither touches guest code; no
-# game patches are loaded.
+# #278). readback_resolve=full: AC parts render black otherwise. Neither touches guest code; game
+# patches are off unless -ApplyPatches is given.
+$apply = if ($ApplyPatches) { "true" } else { "false" }
 $xargs = @(
     "--acvd_probes=`"$Probes`"", "--acvd_probe_log=`"$Log`"",
-    "--protect_zero=false", "--readback_resolve=full", "--apply_patches=false",
+    "--protect_zero=false", "--readback_resolve=full", "--apply_patches=$apply",
     "--log_file=`"$([IO.Path]::ChangeExtension($Log, '.xenia.log'))`""
 )
 if ($Drive) { $xargs += "--acvd_input=`"$input_file`"", "--acvd_input_port=$Port" }

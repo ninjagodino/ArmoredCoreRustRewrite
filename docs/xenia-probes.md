@@ -290,6 +290,51 @@ hits are the draws you care about.
 Device shader-constant shadow: `[[dev+0x384]+0x10]` + `0x780 + 16*n` is vertex constant
 `c<n>`; pixel constants start at `+0x1780` (pixel `c19` at `+0x18b0`).
 
+## Generated caves (`tools/xenia-probe`)
+
+`tools/xenia-probe` generates a Xenia patch TOML with three leaf caves plus a fixed host ring
+(`0x83803400`, magic `AXPR`; header `0x70` bytes, data `+0x100`) and launches Xenia directly
+with `--apply_patches=true`. `run.ps1` also accepts `-ApplyPatches`; it stays off by default.
+
+```powershell
+# Static: PE hash, hook words, branch/cave ranges, patch shape. No Xenia.
+py -3 tools\xenia-probe\xenia_probe.py --verify --map m3120
+# => mission 3120, mission_source map_mission, warp 0; be32 30 / arrays 2;
+#    caves ffx 204, camera 224, mapwarp 0
+
+# Live: Mission 3120, 18 FFX records, camera override at o9341's map anchor.
+py -3 tools\xenia-probe\xenia_probe.py --map m3120 --look-at o9341 --dump-ffx --annotate `
+  --shot private\xenia\shots\m3120_o9341.png --out-dir <run-name>
+```
+
+- **Default mission path:** `--map mXXXX` uses `mission/chXXXX.xml` whenever it exists
+  (`m3120` -> mission 3120, warp 0). Only maps with no `chXXXX.xml` fall back to the AC Test
+  warp (mission 6000 + map-string rewrite). AC Test + `m3120` warp loads the map assets but
+  returns to the menu/black screen; it is not a playable mission.
+- **FFX:** hook `0x82B88A78`, cave `0x8260E290..0x8260E490`. Records are 24 bytes at
+  ring+`0x100`; the header holds `write_index` / `dropped` / `ring_cap` / `ring_recsz`.
+- **Camera:** hook `0x82BFB338` (`addi r6,r31,0x20`) in `CamFx_stateFollow`, cave
+  `0x8260E490..0x8260E690`. `r31` is the `CamFx` object; its shown eye is `+0x20` and look-at
+  `+0x30`, and `0x82BFB344` builds the view matrix from those two vectors. The cave publishes
+  the pointer, clears the camera-clip flag at block+`0x60`, and (when `CAM_ENABLE` is set)
+  writes the host vectors. `eye_error_m` / `target_error_m` are read back from the same
+  `+0x20` / `+0x30` after the write, so they measure the actual view input. The earlier
+  `0x828603A0` / `CamCtrl` hook only changed camera inputs and did not move the rendered view;
+  that is a dead end.
+- **Map warp (fallback only):** hook `0x82B40614` (formatter `0x82B405A0` tail), cave
+  `0x8260E700..`; at the hook `r3` is the string object and `[r3+4]` is the destination buffer.
+  The cave increments `warp_calls` / `warp_map` / `warp_msb` at header `0x60` / `0x64` /
+  `0x68`. AC Test warp counters proved the string rewrite (`map=18`, `msb=4`), but the
+  fallback mission itself is not playable.
+- **Animated look-at caveat:** `--look-at o9341` resolves its **MSB placement**
+  (`o9341_1000` at `0,0,0`, `m3120_map.msb`). The m3120 bomber is TAE/ANI-animated (behavior
+  `811` -> TAE `0x8c1` -> clip 221, speed 0.4): its root route starts ~24 km away at
+  `(-24288, 1039, -13029)` and reaches `(-89, 1039, -143)` at frame 900, 1 km up. A shot at the
+  static anchor therefore shows the water/cliff view, not the bomber. Track the runtime
+  animation root if a model-visible shot is required; do not use MSB `t` for a moving part.
+- **Latest live result:** `env_bgm` 121083.576 ms, camera ready 1516 ms, `eye=(20,0.05,0)`,
+  `eye_error_m=4.4e-7`, `target_error_m=0`, FFX 18 valid, `o9341` authored 0 FFX.
+
 ## Agent checklist
 
 1. `acvd-index q func` / `q callers` the site; decompile or disassemble that range.
