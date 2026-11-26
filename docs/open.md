@@ -383,11 +383,12 @@ in order:
   `0x8210c624` (secondary vfptr at `+0x62c`), ctor `0x82d0f750`; slot 14 `0x82d0f680` ->
   `0x82c2d4d0`, which appends the model name to `context+0xc`; VD source path `0x8210c5c0`,
   ACV `0x820c6090` (`0x82d0eee0` was a thunk). ACV `ch_env/*_env.msb` use the **plain**
-  `msb::MAGIC` (0x00989A6A), not VD's `MAGIC_ENV` (0x00989A6C). `env::read` now accepts both;
-  it parses ACV's EVENT table and BGM (`env::tests::acv_env_from_mission_binder`: m0300 has 50
-  events, BGM 103/1001), but ACV type-100/101 payloads are packed byte fields, not VD's f32
-  light/scene blocks, so `Env.lights`/`scene` stay empty for ACV; decoding those packed blocks
-  is open. `m1000` is not a map with models: mission_0010 pairs `ch_env/m1000_env.msb` with
+  `msb::MAGIC` (0x00989A6A), not VD's `MAGIC_ENV` (0x00989A6C). `env::read` now accepts both.
+  ACV's type-100 handler `0x827626d8` gives two i16 angle pairs and six RGBA byte colours
+  (`acv_light`; the m0300 test checks light 0 at 15/5 and 30/20), and the EVENT table/BGM parse
+  (50 events, BGM 103/1001). ACV's type-101 scene and fog use a different packed layout, so
+  `Env.scene` stays `None` and the light fog stays zero; decoding those remains open. `m1000`
+  is not a map with models: mission_0010 pairs `ch_env/m1000_env.msb` with
   m0300, and `script/event_include/m1000_*` exists. `m0650`/`m5000`/`m5001` are referenced by
   no mission XML, script, or executable string, so their `_m.mlb` files are unused/cut and need
   no loader. Still open: HNAV/HTR and the `.mtd` binders.

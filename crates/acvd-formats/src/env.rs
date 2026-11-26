@@ -1,7 +1,7 @@
 //! Map environment (`model/map/ch_env/{map}_env.msb`): the MSB section chain at version
 //! `msb::MAGIC_ENV` (VD) or `msb::MAGIC` (ACV), with every record in `EVENT_PARAM_ST`.
-//! ACV's type-100/101 payloads are packed differently, so `read` exposes only its events and
-//! BGM; VD's light/scene decoding remains the full path. Field layouts and the shader
+//! ACV's type-100 lights use a packed byte layout (`acv_light`); its type-101 scene and fog are
+//! a different packed layout and remain undecoded. Field layouts and the shader
 //! constants built from them are in `sheets/map_env.csv`.
 //!
 //! Event record: `u32 name, i32 id, u32 type, u32 index, u32 data`, offsets relative to the
@@ -33,7 +33,7 @@ pub struct Event {
 }
 
 /// Fog block of a light set (data `+0xa0..+0xe4`).
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Default)]
 pub struct Fog {
     /// Distance fog colour; `w` is the fog's maximum (`+0xa0`).
     pub color: [f32; 4],
@@ -422,6 +422,34 @@ fn light(r: &Be, name: String, d: usize) -> Result<LightSet> {
     })
 }
 
+/// ACV type-100 payload (`0x827626d8`): one group/id, two i16 angle pairs, six RGBA byte
+/// colours and a compact fog block. Fog is not mapped yet (the ACV destination object stores it
+/// at different offsets), so its fields stay zero.
+fn acv_light(r: &Be, name: String, d: usize) -> Result<LightSet> {
+    let color = |at: usize| -> Result<[f32; 4]> {
+        Ok([
+            r.u8(at)? as f32 / 255.0,
+            r.u8(at + 1)? as f32 / 255.0,
+            r.u8(at + 2)? as f32 / 255.0,
+            r.u8(at + 3)? as f32 / 255.0,
+        ])
+    };
+    Ok(LightSet {
+        name,
+        slot: r.u8(d + 1)? as u32 * 32 + r.u8(d)? as u32,
+        angles: [
+            [r.i16(d + 2)?, r.i16(d + 4)?],
+            [r.i16(d + 0xe)?, r.i16(d + 0x10)?],
+        ],
+        colors: [color(d + 6)?, color(d + 0x12)?],
+        colors_b: [color(d + 0xa)?, color(d + 0x16)?],
+        sky: color(d + 0x26)?,
+        ground: color(d + 0x2a)?,
+        extra: [1.0; 4],
+        fog: Fog::default(),
+    })
+}
+
 fn lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
     if s3 + 0x94 > len {
         return Ok(LensFlare::default());
@@ -541,8 +569,8 @@ pub fn read(data: &[u8]) -> Result<Env> {
         matches!(magic, msb::MAGIC_ENV | msb::MAGIC),
         "not an env MSB"
     );
-    // ACV's type-100/101 payloads are packed differently from VD's f32 blocks; only the
-    // event table and BGM record are layout-compatible, so leave lights/scene unparsed.
+    // ACV's type-100 lights are a packed byte layout decoded by `acv_light`; its type-101
+    // scene and fog are a different packed layout, so leave those unparsed.
     let acv = magic == msb::MAGIC;
     let mut env = Env {
         events: Vec::new(),
@@ -566,7 +594,8 @@ pub fn read(data: &[u8]) -> Result<Env> {
             data: off + r.u32(off + 0x10)? as usize,
         };
         match e.kind {
-            EVENT_LIGHT if !acv => env.lights.push(light(&r, e.name.clone(), e.data)?),
+            EVENT_LIGHT if acv => env.lights.push(acv_light(&r, e.name.clone(), e.data)?),
+            EVENT_LIGHT => env.lights.push(light(&r, e.name.clone(), e.data)?),
             EVENT_SCENE if !acv && env.scene.is_none() => {
                 let sub = e.data + r.u32(e.data)? as usize;
                 let sub2_rel = r.u32(e.data + 8)? as usize;
@@ -802,8 +831,14 @@ mod tests {
         assert_eq!(env.events.iter().filter(|e| e.kind == EVENT_BGM).count(), 1);
         let bgm = env.bgm.unwrap();
         assert_eq!((bgm.id, bgm.param_a, bgm.param_b), (103, 1001, 0));
-        // VD's f32 light/scene blocks do not describe ACV's packed payloads.
-        assert!(env.lights.is_empty());
+        assert_eq!(env.lights.len(), 44);
+        let light = env.light(0).unwrap();
+        assert_eq!(light.angles, [[15, 5], [30, 20]]);
+        assert!(near(light.colors[0][1], 196.0 / 255.0));
+        assert!(near(light.colors_b[0][0], 145.0 / 255.0));
+        assert!(near(light.sky[0], 128.0 / 255.0));
+        assert!(near(light.ground[3], 45.0 / 255.0));
+        // VD's scene payload (sub-blocks and tonemap) is still the only decoded one.
         assert!(env.scene.is_none());
     }
 

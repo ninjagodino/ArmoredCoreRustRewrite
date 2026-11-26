@@ -92,8 +92,8 @@ fn main() -> anyhow::Result<()> {
                 msb_paths.insert(member.clone());
                 let data = vfs::undcx(entry.contents(&binder)?.into_owned())?;
                 if member.to_ascii_lowercase().contains("/ch_env/") {
-                    // ACV `ch_env` files use the plain MSB magic; `env::read` accepts it but
-                    // their type-100/101 payloads are a separate (open) packed layout.
+                    // ACV `ch_env` files use the plain MSB magic; `env::read` accepts it and
+                    // decodes type-100 lights, while the type-101 scene/fog stay open.
                     env_msbs.insert(member.clone());
                 }
                 if !msb::is_msb(&data) {
@@ -168,7 +168,7 @@ fn main() -> anyhow::Result<()> {
         envs.len(),
         navs.len()
     );
-    println!("ACV env MSBs use the plain MSB magic; env::read parses their EVENT table and BGM, not the packed type-100/101 payloads");
+    println!("ACV env MSBs use the plain MSB magic; env::read parses their EVENT table, BGM and type-100 light colours/angles, not the type-101 scene/fog");
     println!(
         "MSB records: {models} models, {parts} parts, {points} points; part kinds {part_kinds:?}; point kinds {point_kinds:?}"
     );
