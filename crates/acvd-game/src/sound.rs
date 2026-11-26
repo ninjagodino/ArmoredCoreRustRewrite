@@ -172,6 +172,32 @@ impl Cues {
         self.play_waves(commands, assets, waves, AudioBus::Sfx, false)
     }
 
+    /// Plays a user-supplied COM voice line from disk (`.mp3`/`.wav`/`.ogg`/`.flac`, decoded by
+    /// Bevy's audio loaders). Missing files log once and stay silent; the line rides the SFX bus.
+    pub fn custom_voice(
+        &mut self,
+        commands: &mut Commands,
+        assets: &mut Assets<AudioSource>,
+        path: &str,
+    ) -> Vec<Entity> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if self.missing.insert(path.to_string()) {
+                    eprintln!("sound: custom voice {path}: {err}");
+                }
+                return Vec::new();
+            }
+        };
+        let handle = assets.add(AudioSource {
+            bytes: bytes.into(),
+        });
+        let settings = PlaybackSettings::DESPAWN.with_volume(Volume::Linear(self.sfx_volume));
+        vec![commands
+            .spawn((AudioPlayer(handle), settings, AudioBus::Sfx))
+            .id()]
+    }
+
     fn voice_project(&mut self, voice: u8) -> Option<&fev::Project> {
         if voice == 0 || voice > crate::settings::COM_VOICE_MAX {
             return None;

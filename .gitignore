@@ -11,8 +11,9 @@
 /decals/
 /camos/
 
-# Local player options (fullscreen / master volume).
+# Local player options (fullscreen / master volume) and custom COM voice packs.
 /settings.json
+/custom_voices.json
 
 /target/
 *.gpr

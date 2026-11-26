@@ -461,9 +461,12 @@ in order:
   `LogAI` state names; no sheet yet).
 
 
-- **COM / operator voice follow-ups** (`acvd-game::voice`, `sheets/voice.csv`): only the on-disc
-  Type 1..5 packs (`acv2_voice_com_00..04.fev`) are selectable; Type 6..18 are DLC (`com_05..17`,
-  `dlc_sound:/%s_com_%02d.fev` `0x82001f94`) and need the DLC mount. The callout set is the
+- **COM / operator voice follow-ups** (`acvd-game::voice`, `garage`, `sheets/voice.csv`): the
+  slider walks OFF, the on-disc Type 1..5 packs (`acv2_voice_com_00..04.fev`), then any user
+  packs saved from Options > Sound > `+ ADD CUSTOM COM VOICE` (modal pack name + one
+  .mp3/.wav/.ogg/.flac per callout, `custom_voices.json`, paint-style unsaved-exit prompt).
+  Type 6..18 remain DLC (`com_05..17`, `dlc_sound:/%s_com_%02d.fev` `0x82001f94`) and need the
+  DLC mount. The callout set is the
   reliable combat subset (energy/AP thresholds, scan/combat mode, AC disabled, beginning
   operation); the mission-only lines (beacon, objective, enemy AC weight class, operation
   pattern) need the mission/AI message dispatcher. AC TEST did not fire the `AI_MESSAGE_SOUND_MAP`

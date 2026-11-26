@@ -4,14 +4,23 @@
 //! for each `AI_MESSAGE_SOUND_MAP` row is the FEV event `%08d` reached through
 //! `Sound_formatCue` (`0x82b47758`). See `sheets/voice.csv` for every address and message id.
 
+use std::collections::BTreeMap;
+
 use bevy::audio::AudioSource;
 use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::control::{Pilot, Piloting};
 use crate::damage::PlayerHealth;
 use crate::hud::Status;
 use crate::settings::GameSettings;
 use crate::sound::Cues;
+
+/// Local (gitignored) manifest of user-made COM voice packs, in the working directory beside
+/// `settings.json`. Rewrite-only feature; the retail 360 game only has the five on-disc packs.
+pub const CUSTOM_VOICE_MANIFEST: &str = "custom_voices.json";
+/// Maximum length of a user pack name shown in the Options slider.
+pub const MAX_PACK_NAME: usize = 20;
 
 /// `AI_MESSAGE_SOUND_MAP` row ids used here (text ids in `lang/en/text/ai/aisys.fmg`).
 pub mod msg {
@@ -45,6 +54,221 @@ pub fn com_voice_label(index: u8) -> &'static str {
         4 => "TYPE 4",
         5 => "TYPE 5",
         _ => "OFF",
+    }
+}
+
+/// One callout a custom pack can replace: the `AI_MESSAGE_SOUND_MAP` offset plus the editor label.
+#[derive(Debug, Clone, Copy)]
+pub struct ComEditorEvent {
+    pub offset: u32,
+    pub label: &'static str,
+}
+
+/// Callouts exposed in the custom COM voice editor, in display order. Offsets match
+/// `sheets/voice.csv`; `PREVIEW` also backs the slider's sample line.
+pub const EDITOR_EVENTS: &[ComEditorEvent] = &[
+    ComEditorEvent {
+        offset: msg::OP_START,
+        label: "BEGINNING OPERATION",
+    },
+    ComEditorEvent {
+        offset: msg::ENERGY_30,
+        label: "ENERGY AT 30%",
+    },
+    ComEditorEvent {
+        offset: msg::ENERGY_EMPTY,
+        label: "ENERGY DEPLETED",
+    },
+    ComEditorEvent {
+        offset: msg::AP_50,
+        label: "AP AT 50%",
+    },
+    ComEditorEvent {
+        offset: msg::AP_30,
+        label: "AP AT 30%",
+    },
+    ComEditorEvent {
+        offset: msg::DESTROYED,
+        label: "AC DISABLED",
+    },
+    ComEditorEvent {
+        offset: msg::SCAN_MODE,
+        label: "SCAN MODE",
+    },
+    ComEditorEvent {
+        offset: msg::COMBAT_MODE,
+        label: "COMBAT MODE",
+    },
+    ComEditorEvent {
+        offset: msg::PREVIEW,
+        label: "TARGET SIGHTED (PREVIEW)",
+    },
+];
+
+/// User-made COM voice pack: a display name plus one audio file per callout offset.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CustomVoicePack {
+    pub name: String,
+    /// `AI_MESSAGE_SOUND_MAP` offset -> absolute audio path (`.mp3`/`.wav`/`.ogg`/`.flac`).
+    #[serde(default)]
+    pub lines: BTreeMap<u32, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct VoiceManifest {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    packs: Vec<CustomVoicePack>,
+}
+
+/// Loaded custom COM voice packs (`custom_voices.json`). The Options slider walks
+/// `OFF`, the five on-disc types, then these packs by saved name.
+#[derive(Resource, Default)]
+pub struct VoiceLibrary {
+    pub packs: Vec<CustomVoicePack>,
+}
+
+impl VoiceLibrary {
+    /// Reads `custom_voices.json`; a missing or malformed manifest yields an empty library.
+    pub fn load() -> Self {
+        let Ok(text) = std::fs::read_to_string(CUSTOM_VOICE_MANIFEST) else {
+            return Self::default();
+        };
+        match serde_json::from_str::<VoiceManifest>(&text) {
+            Ok(manifest) => Self {
+                packs: manifest.packs,
+            },
+            Err(err) => {
+                eprintln!("voice: {CUSTOM_VOICE_MANIFEST}: {err}");
+                Self::default()
+            }
+        }
+    }
+
+    /// Writes the manifest (pretty JSON) back to the working directory.
+    pub fn save(&self) -> anyhow::Result<()> {
+        let manifest = VoiceManifest {
+            version: 1,
+            packs: self.packs.clone(),
+        };
+        std::fs::write(CUSTOM_VOICE_MANIFEST, serde_json::to_string_pretty(&manifest)?)?;
+        Ok(())
+    }
+
+    /// Slider slot count: `OFF` + five on-disc types + one slot per custom pack.
+    pub fn slot_count(&self) -> usize {
+        6 + self.packs.len()
+    }
+
+    /// Active slider slot for `settings` (custom pack name wins when it still exists).
+    pub fn selection(&self, settings: &GameSettings) -> usize {
+        if let Some(name) = settings.com_voice_custom.as_deref() {
+            if let Some(idx) = self.packs.iter().position(|p| p.name == name) {
+                return 6 + idx;
+            }
+        }
+        settings.com_voice().min(5) as usize
+    }
+
+    /// Display label for one slider slot (`OFF`, `TYPE 1..5`, or the custom pack name).
+    pub fn label_at(&self, slot: usize) -> String {
+        match slot {
+            0 => "OFF".to_string(),
+            1..=5 => format!("TYPE {slot}"),
+            _ => self
+                .packs
+                .get(slot - 6)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "OFF".to_string()),
+        }
+    }
+
+    /// Display label for the current selection.
+    pub fn label(&self, settings: &GameSettings) -> String {
+        self.label_at(self.selection(settings))
+    }
+
+    /// Normalized `0.0..=1.0` gauge fill across every selectable slot.
+    pub fn fill(&self, settings: &GameSettings) -> f32 {
+        let count = self.slot_count();
+        if count <= 1 {
+            return 0.0;
+        }
+        self.selection(settings) as f32 / (count - 1) as f32
+    }
+
+    /// Selects a slider slot, updating both the built-in index and the custom pack name.
+    pub fn apply_slot(&self, settings: &mut GameSettings, slot: usize) {
+        let slot = slot.min(self.slot_count().saturating_sub(1));
+        if slot <= 5 {
+            settings.com_voice = slot as u8;
+            settings.com_voice_custom = None;
+        } else if let Some(pack) = self.packs.get(slot - 6) {
+            settings.com_voice_custom = Some(pack.name.clone());
+        }
+    }
+
+    /// Cycles selection through `OFF` -> `TYPE 1..5` -> custom packs (wraps both ways).
+    pub fn step(&self, settings: &mut GameSettings, delta_steps: i8) {
+        let count = self.slot_count() as isize;
+        if count <= 0 {
+            return;
+        }
+        let next = (self.selection(settings) as isize + delta_steps as isize).rem_euclid(count);
+        self.apply_slot(settings, next as usize);
+    }
+
+    /// Selects the slot nearest a `0.0..=1.0` slider fill (gauge click/drag).
+    pub fn set_from_fill(&self, settings: &mut GameSettings, fill: f32) {
+        let last = self.slot_count().saturating_sub(1) as f32;
+        if last <= 0.0 {
+            return;
+        }
+        let slot = (fill.clamp(0.0, 1.0) * last).round() as usize;
+        self.apply_slot(settings, slot);
+    }
+
+    /// The selected custom pack, if the current slot is one.
+    pub fn selected_pack(&self, settings: &GameSettings) -> Option<&CustomVoicePack> {
+        let slot = self.selection(settings);
+        if slot < 6 {
+            return None;
+        }
+        self.packs.get(slot - 6)
+    }
+
+    /// Audio path for one callout offset in the selected pack.
+    pub fn line_for(&self, settings: &GameSettings, offset: u32) -> Option<&str> {
+        self.selected_pack(settings)?
+            .lines
+            .get(&offset)
+            .map(String::as_str)
+    }
+
+    /// Inserts a pack, replacing any existing pack with the same name (case-insensitive).
+    pub fn upsert(&mut self, pack: CustomVoicePack) {
+        match self
+            .packs
+            .iter_mut()
+            .find(|p| p.name.eq_ignore_ascii_case(&pack.name))
+        {
+            Some(existing) => *existing = pack,
+            None => self.packs.push(pack),
+        }
+    }
+
+    /// First unused `CUSTOM n` name for a fresh editor session.
+    pub fn next_name(&self) -> String {
+        (1..)
+            .map(|n| format!("CUSTOM {n}"))
+            .find(|name| {
+                !self
+                    .packs
+                    .iter()
+                    .any(|p| p.name.eq_ignore_ascii_case(name))
+            })
+            .unwrap_or_else(|| "CUSTOM".to_string())
     }
 }
 
@@ -89,6 +313,7 @@ pub fn trigger_messages(
     piloting: Res<Piloting>,
     time: Res<Time>,
     mut state: ResMut<ComVoiceState>,
+    library: Res<VoiceLibrary>,
     players: Query<(&Pilot, &Status, &PlayerHealth)>,
 ) {
     if !piloting.0 {
@@ -160,15 +385,19 @@ pub fn trigger_messages(
         state.destroyed = false;
     }
 
+    let custom = settings.com_voice_custom.is_some();
     let voice = settings.com_voice();
     for offset in want {
-        if voice == 0 || state.cooldown > 0.0 {
+        if (voice == 0 && !custom) || state.cooldown > 0.0 {
             break;
         }
-        if !cues
-            .com_voice(&mut commands, &mut assets, voice, offset)
-            .is_empty()
-        {
+        let played = match library.line_for(&settings, offset) {
+            Some(path) => cues.custom_voice(&mut commands, &mut assets, path),
+            // A custom pack replaces the built-in voice; unset lines stay silent.
+            None if custom => Vec::new(),
+            None => cues.com_voice(&mut commands, &mut assets, voice, offset),
+        };
+        if !played.is_empty() {
             state.cooldown = 2.0;
         }
     }
@@ -178,7 +407,8 @@ pub struct ComVoicePlugin;
 
 impl Plugin for ComVoicePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ComVoiceState>()
+        app.insert_resource(VoiceLibrary::load())
+            .init_resource::<ComVoiceState>()
             .add_systems(Update, trigger_messages);
     }
 }
@@ -205,5 +435,87 @@ mod tests {
         assert_eq!(com_voice_label(1), "TYPE 1");
         assert_eq!(com_voice_label(5), "TYPE 5");
         assert_eq!(com_voice_label(9), "OFF");
+    }
+
+    /// A two-pack library selects, labels, and resolves lines by saved name.
+    fn test_library() -> VoiceLibrary {
+        let mut lines = BTreeMap::new();
+        lines.insert(msg::ENERGY_30, "C:/sounds/energy.mp3".to_string());
+        let mut lib = VoiceLibrary::default();
+        lib.upsert(CustomVoicePack {
+            name: "ALPHA".to_string(),
+            lines,
+        });
+        lib.upsert(CustomVoicePack {
+            name: "BRAVO".to_string(),
+            lines: BTreeMap::new(),
+        });
+        lib
+    }
+
+    #[test]
+    fn library_slots_cover_builtin_and_custom_packs() {
+        let lib = test_library();
+        let mut s = GameSettings {
+            com_voice: 3,
+            com_voice_custom: None,
+            ..Default::default()
+        };
+        assert_eq!(lib.slot_count(), 8);
+        assert_eq!(lib.selection(&s), 3);
+        assert_eq!(lib.label(&s), "TYPE 3");
+        lib.step(&mut s, 1);
+        assert_eq!(s.com_voice, 4);
+        assert_eq!(s.com_voice_custom, None);
+        lib.step(&mut s, 1);
+        assert_eq!(s.com_voice, 5);
+        lib.step(&mut s, 1);
+        assert_eq!(lib.selection(&s), 6);
+        assert_eq!(lib.label(&s), "ALPHA");
+        assert_eq!(s.com_voice_custom.as_deref(), Some("ALPHA"));
+        assert_eq!(
+            lib.line_for(&s, msg::ENERGY_30),
+            Some("C:/sounds/energy.mp3")
+        );
+        assert_eq!(lib.line_for(&s, msg::AP_30), None);
+        lib.step(&mut s, 1);
+        assert_eq!(lib.label(&s), "BRAVO");
+        lib.step(&mut s, 1);
+        assert_eq!(lib.label(&s), "OFF");
+        lib.step(&mut s, -1);
+        assert_eq!(lib.label(&s), "BRAVO");
+        lib.set_from_fill(&mut s, 1.0);
+        assert_eq!(lib.selection(&s), 7);
+        lib.set_from_fill(&mut s, 0.0);
+        assert_eq!(lib.selection(&s), 0);
+    }
+
+    #[test]
+    fn library_ignores_deleted_custom_selection() {
+        let lib = VoiceLibrary::default();
+        let mut s = GameSettings {
+            com_voice: 2,
+            com_voice_custom: Some("MISSING".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(lib.selection(&s), 2);
+        lib.apply_slot(&mut s, 5);
+        assert_eq!(s.com_voice, 5);
+        assert_eq!(s.com_voice_custom, None);
+    }
+
+    #[test]
+    fn manifest_round_trips_custom_packs() {
+        let manifest = VoiceManifest {
+            version: 1,
+            packs: test_library().packs,
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let back: VoiceManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.packs.len(), 2);
+        assert_eq!(
+            back.packs[0].lines.get(&msg::ENERGY_30).map(String::as_str),
+            Some("C:/sounds/energy.mp3")
+        );
     }
 }

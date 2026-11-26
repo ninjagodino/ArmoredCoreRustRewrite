@@ -1163,6 +1163,16 @@ fn pick_image_file_native() -> Option<PathBuf> {
 
 #[cfg(windows)]
 pub(crate) fn pick_image_file_native_with_title(dialog_title: &str) -> Option<PathBuf> {
+    pick_file_native_with_filter(
+        dialog_title,
+        "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif\0All Files (*.*)\0*.*\0\0",
+    )
+}
+
+/// Native Windows Explorer Open File dialog with a caller-supplied Win32 filter string
+/// (`GetOpenFileNameW`, `OFN_NOCHANGEDIR`) so other uploads (e.g. COM voice audio) reuse it.
+#[cfg(windows)]
+pub(crate) fn pick_file_native_with_filter(dialog_title: &str, filter: &str) -> Option<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -1203,10 +1213,7 @@ pub(crate) fn pick_image_file_native_with_title(dialog_title: &str) -> Option<Pa
     const OFN_FILEMUSTEXIST: u32 = 0x0000_1000;
     const OFN_NOCHANGEDIR: u32 = 0x0000_0008;
 
-    let filter: Vec<u16> =
-        "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif\0All Files (*.*)\0*.*\0\0"
-            .encode_utf16()
-            .collect();
+    let filter: Vec<u16> = filter.encode_utf16().collect();
     let mut title: Vec<u16> = dialog_title.encode_utf16().collect();
     title.push(0);
     let mut file_buf = vec![0u16; 4096];
@@ -1256,6 +1263,11 @@ fn pick_image_file_native() -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 pub(crate) fn pick_image_file_native_with_title(_dialog_title: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn pick_file_native_with_filter(_dialog_title: &str, _filter: &str) -> Option<PathBuf> {
     None
 }
 

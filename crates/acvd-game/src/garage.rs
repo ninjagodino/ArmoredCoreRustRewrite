@@ -19,7 +19,9 @@
 //!   View Mode, and seamless AC TEST sortie transition with real `sound/acv2_se_menu.fev` cues
 //!   and `acv2_bgm_menu_bgm_menu.fev` `grg` BGM.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Mutex};
 use std::f32::consts::PI;
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, PARAM_ACMOTION_BIN};
@@ -43,6 +45,7 @@ use acvd_render::Packs;
 use bevy::audio::{AudioSink, AudioSource, GlobalVolume};
 use bevy::camera::Exposure;
 use bevy::ecs::system::SystemParam;
+use bevy::input::keyboard::KeyboardInput;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
@@ -61,6 +64,7 @@ use crate::settings::{
     self, AudioChannel, DisplayParam, GameSettings, OptionRow, OptionsTab, ShadowDistance,
 };
 use crate::sfx::{EffectPoint, Sfx};
+use crate::voice::{CustomVoicePack, VoiceLibrary, EDITOR_EVENTS, MAX_PACK_NAME};
 use crate::sound::{self, AudioBus, BgmPlayer, BgmState, Cues};
 use crate::weapons::{
     Armament, ClipJoint, Hand, Hardpoint, Kind, Shift, ShoulderHardpoint, WeaponAnims,
@@ -189,6 +193,13 @@ pub enum UiAction {
     DisplayParamStep(DisplayParam, i8),
     ShadowDistanceStep(i8),
     VolumeStep(AudioChannel, i8),
+    ComVoiceAdd,
+    ComVoiceNameFocus,
+    ComVoicePickLine(usize),
+    ComVoiceClearLine(usize),
+    ComVoiceSave,
+    ComVoiceCancel,
+    ComVoiceExitDiscard,
     ComVoiceStep(i8),
     ViewAction(GarageViewAction),
     ToggleViewUi,
@@ -672,8 +683,9 @@ fn options_row_desc(tab: OptionsTab, cursor: usize) -> &'static str {
             2 => "Adjust weapon, booster, and\ncombat sound effects volume.",
             3 => "Adjust menu navigation and\nUI feedback sound volume.",
             4 => "Select the CPU voice that reports\nAP, energy, and combat status.",
-            5 => "Return to the Garage main menu.",
-            6 => "Exit the game and return\nto the desktop.",
+            5 => "Build a custom COM voice pack\nfrom your own MP3 callouts.",
+            6 => "Return to the Garage main menu.",
+            7 => "Exit the game and return\nto the desktop.",
             _ => "",
         },
     }
@@ -1259,6 +1271,115 @@ pub fn acsis_camera_pose(
         fov_deg,
     }
 }
+/// Modal editor for a user-made COM voice pack (`custom_voices.json`): a name plus one audio
+/// file per `EDITOR_EVENTS` callout. Opened from Options > Sound > ADD CUSTOM COM VOICE.
+pub struct ComVoiceEditor {
+    pub name: String,
+    /// `AI_MESSAGE_SOUND_MAP` offset -> chosen audio path.
+    pub lines: BTreeMap<u32, String>,
+    /// Row cursor: `0` = name, `1..=EDITOR_EVENTS.len()` = callouts, then save / cancel.
+    pub cursor: usize,
+    pub name_editing: bool,
+    /// True until the first keypress after (re)entering the name field: replaces the prefilled
+    /// default name instead of appending to it.
+    pub name_fresh: bool,
+    pub dirty: bool,
+    /// True while the paint-style "SAVE BEFORE EXIT?" prompt is open over the editor.
+    pub confirm_exit: bool,
+    /// Selected prompt choice (`true` = YES / save, `false` = NO / discard).
+    pub confirm_choice: bool,
+    picker_rx: Option<Mutex<mpsc::Receiver<Option<PathBuf>>>>,
+    picker_offset: Option<u32>,
+}
+
+impl ComVoiceEditor {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            lines: BTreeMap::new(),
+            cursor: 0,
+            name_editing: false,
+            name_fresh: false,
+            dirty: false,
+            confirm_exit: false,
+            confirm_choice: true,
+            picker_rx: None,
+            picker_offset: None,
+        }
+    }
+
+    pub fn save_row(&self) -> usize {
+        1 + EDITOR_EVENTS.len()
+    }
+
+    pub fn cancel_row(&self) -> usize {
+        self.save_row() + 1
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.cancel_row() + 1
+    }
+
+    /// Short file name for a set callout (`None` = not set).
+    pub fn file_name(&self, offset: u32) -> Option<String> {
+        self.lines.get(&offset).map(|path| {
+            Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone())
+        })
+    }
+
+    /// Clears one callout line; returns `true` when something was removed.
+    pub fn clear_line(&mut self, offset: u32) -> bool {
+        let removed = self.lines.remove(&offset).is_some();
+        if removed {
+            self.dirty = true;
+        }
+        removed
+    }
+
+    /// Starts the native file picker on a background thread for one callout offset.
+    pub fn open_picker(&mut self, offset: u32) -> bool {
+        if self.picker_rx.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.picker_rx = Some(Mutex::new(rx));
+        self.picker_offset = Some(offset);
+        std::thread::spawn(move || {
+            let picked = crate::decal::pick_file_native_with_filter(
+                "Select COM Voice Audio (MP3/WAV/OGG/FLAC)",
+                "Audio Files (*.mp3;*.wav;*.ogg;*.flac)\0*.mp3;*.wav;*.ogg;*.flac\0All Files (*.*)\0*.*\0\0",
+            );
+            let _ = tx.send(picked);
+        });
+        true
+    }
+
+    /// Non-blocking poll of the picker thread: `(offset, chosen path)` once it resolves.
+    pub fn poll_picker(&mut self) -> Option<(u32, Option<PathBuf>)> {
+        let polled = {
+            let rx = self.picker_rx.as_ref()?;
+            rx.lock()
+                .map(|rx| rx.try_recv())
+                .unwrap_or(Err(mpsc::TryRecvError::Disconnected))
+        };
+        match polled {
+            Ok(picked) => {
+                self.picker_rx = None;
+                self.picker_offset.take().map(|offset| (offset, picked))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.picker_rx = None;
+                self.picker_offset = None;
+                None
+            }
+        }
+    }
+}
+
 
 /// Persistent Garage controller state.
 #[derive(Resource)]
@@ -1315,6 +1436,8 @@ pub struct GarageState {
     /// True when the "Save paint changes before exit?" modal prompt is open.
     pub paint_exit_prompt: bool,
     /// Selected choice in the paint exit prompt (`true` = YES / Save, `false` = NO / Discard).
+    /// Open custom COM voice pack editor modal (Options > Sound > ADD CUSTOM COM VOICE).
+    pub com_voice_editor: Option<ComVoiceEditor>,
     pub paint_exit_prompt_choice: bool,
     /// Sortie launcher indices.
     pub sortie_map_idx: usize,
@@ -1411,6 +1534,7 @@ impl GarageState {
             paint_history: PaintUndoHistory::default(),
             wheel_consumed: false,
             paint_exit_prompt: false,
+            com_voice_editor: None,
             paint_exit_prompt_choice: true,
             sortie_map_idx,
             sortie_target_idx,
@@ -2151,6 +2275,8 @@ pub struct OptionsCtx<'w, 's> {
     audio_buses: Query<'w, 's, &'static AudioBus>,
     windows: Query<'w, 's, &'static mut Window, With<bevy::window::PrimaryWindow>>,
     app_exit: MessageWriter<'w, AppExit>,
+    voice_lib: ResMut<'w, VoiceLibrary>,
+    key_events: MessageReader<'w, 's, KeyboardInput>,
     custom_camos: ResMut<'w, paint::CustomCamoLibrary>,
 }
 
@@ -2222,8 +2348,8 @@ pub fn handle_input(
             || gp.just_pressed(GamepadButton::RightTrigger);
     }
 
-    // View mode toggle (`V` or Gamepad North).
-    if keys.just_pressed(KeyCode::KeyV) || gp_view {
+    // View mode toggle (`V` or Gamepad North); the COM voice editor owns the screen while open.
+    if state.com_voice_editor.is_none() && (keys.just_pressed(KeyCode::KeyV) || gp_view) {
         sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_VIEW_MODE);
         if state.screen == GarageScreen::ViewMode {
             state.screen = GarageScreen::Top;
@@ -2917,6 +3043,88 @@ pub fn handle_input(
                     delta,
                 );
                 return;
+            UiAction::ComVoiceAdd => {
+                if state.screen == GarageScreen::Options
+                    && state.options_tab == OptionsTab::Sound
+                    && state.com_voice_editor.is_none()
+                {
+                    open_com_voice_editor(
+                        &mut commands,
+                        &mut state,
+                        &mut options,
+                        &mut cues,
+                        &mut audio_assets,
+                    );
+                }
+                return;
+            }
+            UiAction::ComVoiceNameFocus => {
+                if let Some(editor) = state.com_voice_editor.as_mut() {
+                    editor.cursor = 0;
+                    editor.name_editing = true;
+                    editor.name_fresh = true;
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_MOVE);
+                    state.ui_dirty = true;
+                }
+                return;
+            }
+            UiAction::ComVoicePickLine(idx) => {
+                let offset = EDITOR_EVENTS.get(idx).map(|e| e.offset);
+                let opened = match (offset, state.com_voice_editor.as_mut()) {
+                    (Some(offset), Some(editor)) => {
+                        editor.cursor = 1 + idx;
+                        editor.open_picker(offset)
+                    }
+                    _ => false,
+                };
+                if opened {
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_OK);
+                    state.set_banner(
+                        "SELECT AN AUDIO FILE (MP3/WAV/OGG/FLAC)...",
+                        Color::srgb(0.38, 0.86, 0.96),
+                    );
+                    state.ui_dirty = true;
+                }
+                return;
+            }
+            UiAction::ComVoiceClearLine(idx) => {
+                let removed = EDITOR_EVENTS.get(idx).is_some_and(|event| {
+                    state
+                        .com_voice_editor
+                        .as_mut()
+                        .is_some_and(|editor| editor.clear_line(event.offset))
+                });
+                if removed {
+                    sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
+                    state.ui_dirty = true;
+                }
+                return;
+            }
+            UiAction::ComVoiceSave => {
+                save_com_voice_editor(
+                    &mut commands,
+                    &mut state,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                );
+                return;
+            }
+            UiAction::ComVoiceCancel => {
+                request_close_com_voice_editor(
+                    &mut commands,
+                    &mut state,
+                    &mut cues,
+                    &mut audio_assets,
+                );
+                return;
+            }
+            UiAction::ComVoiceExitDiscard => {
+                state.com_voice_editor = None;
+                sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_CANCEL);
+                state.ui_dirty = true;
+                return;
+            }
             }
             UiAction::QuitToDesktop => {
                 options.app_exit.write(AppExit::Success);
@@ -3029,6 +3237,43 @@ pub fn handle_input(
         }
         return;
     }
+    // Custom COM voice editor modal: collects typed text, keyboard navigation, and the
+    // paint-style "SAVE BEFORE EXIT?" prompt before the regular garage input runs.
+    if state.com_voice_editor.is_some() {
+        poll_com_voice_editor_picker(&mut commands, &mut state, &mut cues, &mut audio_assets);
+        let mut typed = String::new();
+        let mut backspace = false;
+        for ev in options.key_events.read() {
+            if ev.state != bevy::input::ButtonState::Pressed {
+                continue;
+            }
+            if let Some(text) = ev.text.as_deref() {
+                typed.push_str(text);
+            }
+            if ev.key_code == KeyCode::Backspace && !ev.repeat {
+                backspace = true;
+            }
+        }
+        handle_com_voice_editor_input(
+            &mut commands,
+            &mut state,
+            &mut options,
+            &mut cues,
+            &mut audio_assets,
+            &keys,
+            &typed,
+            backspace,
+            gp_up,
+            gp_down,
+            gp_left,
+            gp_right,
+            gp_confirm,
+            gp_cancel,
+        );
+        state.wheel_consumed = true;
+        return;
+    }
+
 
     // Mouse clicks on list rows.
     for (interaction, UiRow(idx)) in &row_buttons {
@@ -3785,7 +4030,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
         GarageScreen::Options => match state.options_tab {
             OptionsTab::Graphics => 9, // Fullscreen, UI Scale, HUD Sway, Gamma, Brightness, Contrast, Shadow Dist, Back, Quit
-            OptionsTab::Sound => 7, // Master, Music, SFX, Menu/UI, COM Voice, Back, Quit to Desktop
+            OptionsTab::Sound => 8, // Master, Music, SFX, Menu/UI, COM Voice, Add Custom COM Voice, Back, Quit
         },
         GarageScreen::ViewMode => 0,
     }
@@ -3935,20 +4180,375 @@ fn step_com_voice_setting(
     state: &mut GarageState,
     delta: i8,
 ) {
-    let before = options.settings.com_voice();
-    options.settings.step_com_voice(delta);
+    let before = options.voice_lib.selection(&options.settings);
+    options.voice_lib.step(&mut options.settings, delta);
     options.settings.save();
     sound::cue(commands, cues, audio_assets, CUE_MOVE);
-    let after = options.settings.com_voice();
+    let after = options.voice_lib.selection(&options.settings);
     if after != 0 && after != before {
-        cues.com_voice(commands, audio_assets, after, crate::voice::msg::PREVIEW);
+        preview_com_voice(options, cues, commands, audio_assets);
     }
     state.set_banner(
-        format!("COM VOICE: {}", options.settings.com_voice_label()),
+        format!("COM VOICE: {}", options.voice_lib.label(&options.settings)),
         Color::srgb(0.45, 0.92, 0.62),
     );
     state.ui_dirty = true;
 }
+/// Plays the selected pack's preview line (custom packs: their `PREVIEW` file, else the first
+/// set line; built-in packs: the FEV `PREVIEW` event).
+fn preview_com_voice(
+    options: &OptionsCtx,
+    cues: &mut Cues,
+    commands: &mut Commands,
+    audio_assets: &mut Assets<AudioSource>,
+) {
+    if let Some(path) = options.voice_lib.line_for(&options.settings, crate::voice::msg::PREVIEW)
+    {
+        let path = path.to_string();
+        cues.custom_voice(commands, audio_assets, &path);
+    } else if let Some(pack) = options.voice_lib.selected_pack(&options.settings) {
+        if let Some(path) = pack.lines.values().next().cloned() {
+            cues.custom_voice(commands, audio_assets, &path);
+        }
+    } else if options.settings.com_voice() != 0 {
+        cues.com_voice(
+            commands,
+            audio_assets,
+            options.settings.com_voice(),
+            crate::voice::msg::PREVIEW,
+        );
+    }
+}
+
+/// Opens the custom COM voice pack editor with a fresh, unique default name.
+fn open_com_voice_editor(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+) {
+    if state.com_voice_editor.is_some() {
+        return;
+    }
+    let name = options.voice_lib.next_name();
+    state.com_voice_editor = Some(ComVoiceEditor::new(name));
+    sound::cue(commands, cues, audio_assets, CUE_OK);
+    state.set_banner(
+        "NEW CUSTOM COM VOICE - NAME IT AND SET AUDIO LINES",
+        Color::srgb(0.38, 0.86, 0.96),
+    );
+    state.ui_dirty = true;
+}
+
+/// Polls the editor's native file picker; on success stores the line and plays it as a preview.
+fn poll_com_voice_editor_picker(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+) {
+    let Some((offset, picked)) = state
+        .com_voice_editor
+        .as_mut()
+        .and_then(ComVoiceEditor::poll_picker)
+    else {
+        return;
+    };
+    let Some(path) = picked else {
+        sound::cue(commands, cues, audio_assets, CUE_CANCEL);
+        return;
+    };
+    let display = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let mut preview = None;
+    if let Some(editor) = state.com_voice_editor.as_mut() {
+        let stored = path.to_string_lossy().into_owned();
+        editor.lines.insert(offset, stored.clone());
+        editor.dirty = true;
+        preview = Some(stored);
+    }
+    sound::cue(commands, cues, audio_assets, CUE_OK);
+    if let Some(path) = preview {
+        cues.custom_voice(commands, audio_assets, &path);
+    }
+    state.set_banner(
+        format!("VOICE LINE SET: {display}"),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+}
+
+/// Requests closing the editor: with unsaved lines it opens the paint-style YES/NO prompt.
+fn request_close_com_voice_editor(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+) {
+    let dirty = state
+        .com_voice_editor
+        .as_ref()
+        .is_some_and(|e| e.dirty || e.lines.values().next().is_some());
+    if dirty {
+        if let Some(editor) = state.com_voice_editor.as_mut() {
+            editor.confirm_exit = true;
+            editor.confirm_choice = true;
+        }
+        sound::cue(commands, cues, audio_assets, CUE_CATEGORY);
+    } else {
+        state.com_voice_editor = None;
+        sound::cue(commands, cues, audio_assets, CUE_CANCEL);
+    }
+    state.ui_dirty = true;
+}
+
+/// Saves the editor's pack into `custom_voices.json`, selects it, and closes the editor.
+/// Returns `true` on success; an empty name or empty pack keeps the editor open with an error.
+fn save_com_voice_editor(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+) -> bool {
+    let Some(editor) = state.com_voice_editor.as_ref() else {
+        return false;
+    };
+    let name = editor.name.trim().to_string();
+    let lines = editor.lines.clone();
+    if name.is_empty() {
+        sound::cue(commands, cues, audio_assets, CUE_ERROR);
+        state.set_banner("ENTER A PACK NAME", Color::srgb(0.96, 0.40, 0.36));
+        return false;
+    }
+    if lines.is_empty() {
+        sound::cue(commands, cues, audio_assets, CUE_ERROR);
+        state.set_banner(
+            "SET AT LEAST ONE VOICE LINE",
+            Color::srgb(0.96, 0.40, 0.36),
+        );
+        return false;
+    }
+    options.voice_lib.upsert(CustomVoicePack {
+        name: name.clone(),
+        lines,
+    });
+    if let Err(err) = options.voice_lib.save() {
+        eprintln!("voice: failed to save custom pack: {err:#}");
+        sound::cue(commands, cues, audio_assets, CUE_ERROR);
+        state.set_banner(
+            "FAILED TO SAVE CUSTOM COM VOICE",
+            Color::srgb(0.96, 0.40, 0.36),
+        );
+        return false;
+    }
+    options.settings.com_voice_custom = Some(name.clone());
+    options.settings.save();
+    let preview = options
+        .voice_lib
+        .line_for(&options.settings, crate::voice::msg::PREVIEW)
+        .map(str::to_string);
+    if let Some(path) = preview {
+        cues.custom_voice(commands, audio_assets, &path);
+    }
+    state.com_voice_editor = None;
+    sound::cue(commands, cues, audio_assets, CUE_OK);
+    state.set_banner(
+        format!("CUSTOM COM VOICE SAVED: {}", name.to_ascii_uppercase()),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+    true
+}
+
+/// Keyboard/gamepad handling for the open editor (text entry, navigation, save/cancel).
+#[allow(clippy::too_many_arguments)]
+fn handle_com_voice_editor_input(
+    commands: &mut Commands,
+    state: &mut GarageState,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    keys: &ButtonInput<KeyCode>,
+    typed: &str,
+    backspace: bool,
+    gp_up: bool,
+    gp_down: bool,
+    gp_left: bool,
+    gp_right: bool,
+    gp_confirm: bool,
+    gp_cancel: bool,
+) {
+    let confirm_open = state
+        .com_voice_editor
+        .as_ref()
+        .is_some_and(|e| e.confirm_exit);
+    if confirm_open {
+        let toggle = keys.just_pressed(KeyCode::ArrowLeft)
+            || keys.just_pressed(KeyCode::ArrowRight)
+            || keys.just_pressed(KeyCode::KeyA)
+            || keys.just_pressed(KeyCode::KeyD)
+            || keys.just_pressed(KeyCode::Tab)
+            || gp_left
+            || gp_right;
+        if toggle {
+            if let Some(editor) = state.com_voice_editor.as_mut() {
+                editor.confirm_choice = !editor.confirm_choice;
+            }
+            sound::cue(commands, cues, audio_assets, CUE_MOVE);
+            state.ui_dirty = true;
+            return;
+        }
+        if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) || gp_confirm {
+            let save = state
+                .com_voice_editor
+                .as_ref()
+                .is_some_and(|e| e.confirm_choice);
+            if save {
+                save_com_voice_editor(commands, state, options, cues, audio_assets);
+            } else {
+                state.com_voice_editor = None;
+                sound::cue(commands, cues, audio_assets, CUE_CANCEL);
+                state.ui_dirty = true;
+            }
+            return;
+        }
+        if keys.just_pressed(KeyCode::Escape)
+            || keys.just_pressed(KeyCode::Backspace)
+            || gp_cancel
+        {
+            if let Some(editor) = state.com_voice_editor.as_mut() {
+                editor.confirm_exit = false;
+            }
+            sound::cue(commands, cues, audio_assets, CUE_CANCEL);
+            state.ui_dirty = true;
+        }
+        return;
+    }
+
+    // Name text entry (uppercase, `MAX_PACK_NAME` characters).
+    if state
+        .com_voice_editor
+        .as_ref()
+        .is_some_and(|e| e.name_editing)
+    {
+        if let Some(editor) = state.com_voice_editor.as_mut() {
+            // First keypress replaces the prefilled default name.
+            if editor.name_fresh && (!typed.is_empty() || backspace) {
+                editor.name.clear();
+                editor.name_fresh = false;
+            }
+            for ch in typed.chars() {
+                if (ch.is_ascii_graphic() || ch == ' ')
+                    && editor.name.chars().count() < MAX_PACK_NAME
+                {
+                    editor.name.push(ch.to_ascii_uppercase());
+                    editor.dirty = true;
+                }
+            }
+            if backspace && editor.name.pop().is_some() {
+                editor.dirty = true;
+            }
+        }
+        if keys.just_pressed(KeyCode::Enter)
+            || keys.just_pressed(KeyCode::Escape)
+            || gp_confirm
+            || gp_cancel
+        {
+            if let Some(editor) = state.com_voice_editor.as_mut() {
+                editor.name_editing = false;
+                editor.name_fresh = false;
+            }
+            sound::cue(commands, cues, audio_assets, CUE_MOVE);
+        }
+        state.ui_dirty = true;
+        return;
+    }
+
+    let Some(rows) = state.com_voice_editor.as_ref().map(ComVoiceEditor::row_count) else {
+        return;
+    };
+    if rows == 0 {
+        return;
+    }
+    let step: isize = if keys.just_pressed(KeyCode::ArrowUp) || gp_up {
+        -1
+    } else if keys.just_pressed(KeyCode::ArrowDown) || gp_down {
+        1
+    } else {
+        0
+    };
+    if step != 0 {
+        if let Some(editor) = state.com_voice_editor.as_mut() {
+            editor.cursor = (editor.cursor as isize + step).rem_euclid(rows as isize) as usize;
+        }
+        sound::cue(commands, cues, audio_assets, CUE_MOVE);
+        state.ui_dirty = true;
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::Delete) {
+        let focused = state.com_voice_editor.as_ref().map(|e| e.cursor).unwrap_or(0);
+        if (1..=EDITOR_EVENTS.len()).contains(&focused) {
+            let offset = EDITOR_EVENTS[focused - 1].offset;
+            let removed = state
+                .com_voice_editor
+                .as_mut()
+                .is_some_and(|e| e.clear_line(offset));
+            if removed {
+                sound::cue(commands, cues, audio_assets, CUE_CANCEL);
+                state.ui_dirty = true;
+            }
+        }
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) || gp_confirm {
+        let cursor = state.com_voice_editor.as_ref().map(|e| e.cursor).unwrap_or(0);
+        if cursor == 0 {
+            if let Some(editor) = state.com_voice_editor.as_mut() {
+                editor.name_editing = true;
+                editor.name_fresh = true;
+            }
+            sound::cue(commands, cues, audio_assets, CUE_MOVE);
+            state.ui_dirty = true;
+        } else if (1..=EDITOR_EVENTS.len()).contains(&cursor) {
+            let offset = EDITOR_EVENTS[cursor - 1].offset;
+            let opened = state
+                .com_voice_editor
+                .as_mut()
+                .is_some_and(|e| e.open_picker(offset));
+            if opened {
+                sound::cue(commands, cues, audio_assets, CUE_OK);
+                state.set_banner(
+                    "SELECT AN AUDIO FILE (MP3/WAV/OGG/FLAC)...",
+                    Color::srgb(0.38, 0.86, 0.96),
+                );
+            }
+        } else {
+            let save_row = state
+                .com_voice_editor
+                .as_ref()
+                .map(ComVoiceEditor::save_row)
+                .unwrap_or(usize::MAX);
+            if cursor == save_row {
+                save_com_voice_editor(commands, state, options, cues, audio_assets);
+            } else {
+                request_close_com_voice_editor(commands, state, cues, audio_assets);
+            }
+        }
+        state.ui_dirty = true;
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::Backspace) || gp_cancel {
+        request_close_com_voice_editor(commands, state, cues, audio_assets);
+    }
+}
+
 
 fn clamp_scroll_win(scroll: &mut usize, cursor: usize, count: usize, window: usize) {
     if count <= window {
@@ -4505,6 +5105,9 @@ fn trigger_confirm(
             (OptionsTab::Graphics, 7) => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
             }
+                trigger_cancel(commands, state, garage, cues, audio_assets);
+            }
+            (OptionsTab::Graphics, 9) => {
             (OptionsTab::Graphics, 8) => {
                 options.app_exit.write(AppExit::Success);
             }
@@ -4552,10 +5155,14 @@ fn trigger_confirm(
                     1,
                 );
             }
-            (OptionsTab::Sound, 4) => {
+            (OptionsTab::Sound, 4) => {}
+            (OptionsTab::Sound, 5) => {
+                open_com_voice_editor(commands, state, options, cues, audio_assets);
+            }
+            (OptionsTab::Sound, 6) => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
             }
-            (OptionsTab::Sound, 5) => {
+            (OptionsTab::Sound, 7) => {
                 options.app_exit.write(AppExit::Success);
             }
             _ => {}
@@ -5245,9 +5852,9 @@ pub fn handle_slider_track_drag(
             }
         }
         SliderTrackTarget::ComVoice => {
-            let prev = options.settings.com_voice();
-            options.settings.set_com_voice_from_fill(fill);
-            let next = options.settings.com_voice();
+            let prev = options.voice_lib.selection(&options.settings);
+            options.voice_lib.set_from_fill(&mut options.settings, fill);
+            let next = options.voice_lib.selection(&options.settings);
             if next != prev || just_pressed {
                 options.settings.save();
                 let row = OptionRow::ComVoice.cursor_index();
@@ -5259,12 +5866,7 @@ pub fn handle_slider_track_drag(
                     state.ui_dirty = true;
                 }
                 if next != 0 && next != prev {
-                    cues.com_voice(
-                        &mut commands,
-                        &mut audio_assets,
-                        next,
-                        crate::voice::msg::PREVIEW,
-                    );
+                    preview_com_voice(&options, &mut cues, &mut commands, &mut audio_assets);
                 }
                 changed = true;
             }
@@ -5399,6 +6001,7 @@ pub fn sync_ui(
     mut decals: ResMut<DecalState>,
     mut custom_camos: ResMut<paint::CustomCamoLibrary>,
     mut assemble_assets: ResMut<crate::garage_assemble::AssembleUiAssets>,
+    voice_lib: Res<VoiceLibrary>,
     mut picker_assets: ResMut<PaintPickerAssets>,
     mut images: ResMut<Assets<Image>>,
     shift: Option<Res<Shift>>,
@@ -5581,6 +6184,7 @@ pub fn sync_ui(
             &kit,
             &settings,
             &state,
+            &voice_lib,
             &picker_assets,
             state.cursor,
             scale,
@@ -6888,6 +7492,7 @@ fn spawn_garage_options_menu(
     kit: &AcvdUiKit,
     settings: &GameSettings,
     state: &GarageState,
+    voice_lib: &VoiceLibrary,
     picker_assets: &PaintPickerAssets,
     cursor: usize,
     scale: f32,
@@ -7164,14 +7769,14 @@ fn spawn_garage_options_menu(
                     .insert((Button, UiAction::VolumeStep(channel, 1)));
             }
 
-            // Row 4: COM / operator voice pack (OFF, Type 1..5 on disc; sheets/voice.csv).
+            // Row 4: COM / operator voice pack (OFF, Type 1..5 on disc, then user packs).
             let cv_row = OptionRow::ComVoice.cursor_index();
             let cv_slider = kit.spawn_slider_row(
                 commands,
                 list,
                 "COM VOICE",
-                settings.com_voice_label(),
-                settings.com_voice_fill(),
+                &voice_lib.label(settings),
+                voice_lib.fill(settings),
                 None,
                 cursor == cv_row,
                 104.0,
@@ -7190,7 +7795,26 @@ fn spawn_garage_options_menu(
                 .entity(cv_slider.inc_btn)
                 .insert((Button, UiAction::ComVoiceStep(1)));
 
-            (5, 6)
+            // Row 5: open the custom pack editor (MP3 per callout, saved by name).
+            let add_row = cv_row + 1;
+            let add_state = if cursor == add_row {
+                ButtonState::Selected
+            } else {
+                ButtonState::Normal
+            };
+            let add_btn = kit.spawn_button(
+                commands,
+                list,
+                "+ ADD CUSTOM COM VOICE",
+                Some("NEW"),
+                add_state,
+                scale,
+            );
+            commands
+                .entity(add_btn)
+                .insert((Button, UiAction::ComVoiceAdd));
+
+            (6, 7)
         }
     };
 
@@ -7259,6 +7883,303 @@ fn spawn_garage_options_menu(
         active_desc,
         scale * 0.86,
         palette::TEXT_BRIGHT,
+
+    // Custom COM voice pack editor modal layered over the Options screen.
+    if let Some(editor) = &state.com_voice_editor {
+        spawn_com_voice_editor(commands, root, kit, editor, scale, device);
+    }
+}
+
+/// Modal "ADD CUSTOM COM VOICE" editor: pack name, one audio file per callout, save/cancel.
+fn spawn_com_voice_editor(
+    commands: &mut Commands,
+    root: Entity,
+    kit: &AcvdUiKit,
+    editor: &ComVoiceEditor,
+    scale: f32,
+    device: InputDevice,
+) {
+    let overlay = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(0.0),
+                left: px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            ZIndex(20),
+            BackgroundColor(Color::srgba(0.02, 0.03, 0.04, 0.68)),
+            Interaction::default(),
+            ChildOf(root),
+        ))
+        .id();
+
+    let panel = kit.spawn_panel(
+        commands,
+        Some(overlay),
+        PanelStyle::Framed,
+        Node {
+            width: px((600.0 * scale).round()),
+            max_height: Val::Percent(94.0),
+            padding: UiRect::all(px((18.0 * scale).round())),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((5.0 * scale).round()),
+            ..default()
+        },
+        scale,
+    );
+
+    kit.spawn_text(
+        commands,
+        panel,
+        FontRole::Header,
+        "CUSTOM COM VOICE",
+        scale * 1.02,
+        palette::ACCENT_AMBER,
+    );
+    kit.spawn_text(
+        commands,
+        panel,
+        FontRole::Small,
+        "SET AN AUDIO FILE PER CALLOUT, THEN SAVE PACK.",
+        scale * 0.84,
+        palette::TEXT_MUTED,
+    );
+
+    // Row 0: pack name (ENTER starts typing, `MAX_PACK_NAME` characters).
+    let name_value = if editor.name_editing {
+        format!("{}_", editor.name)
+    } else {
+        editor.name.clone()
+    };
+    let name_btn = kit.spawn_button(
+        commands,
+        panel,
+        "PACK NAME",
+        Some(&name_value),
+        if editor.cursor == 0 {
+            ButtonState::Selected
+        } else {
+            ButtonState::Normal
+        },
+        scale,
+    );
+    commands
+        .entity(name_btn)
+        .insert((Button, UiAction::ComVoiceNameFocus));
+
+    // Rows 1..=N: one clickable file slot per callout (click = picker, DEL = clear).
+    for (idx, event) in EDITOR_EVENTS.iter().enumerate() {
+        let value = editor
+            .file_name(event.offset)
+            .unwrap_or_else(|| "NOT SET".to_string());
+        let state = if editor.cursor == idx + 1 {
+            ButtonState::Selected
+        } else if editor.lines.contains_key(&event.offset) {
+            ButtonState::Active
+        } else {
+            ButtonState::Normal
+        };
+        let row = kit.spawn_button(commands, panel, event.label, Some(&value), state, scale);
+        commands
+            .entity(row)
+            .insert((Button, UiAction::ComVoicePickLine(idx)));
+    }
+
+    // Save / cancel.
+    let btn_row = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                margin: UiRect::top(px((4.0 * scale).round())),
+                flex_direction: FlexDirection::Row,
+                column_gap: px((10.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(panel),
+        ))
+        .id();
+    let save_state = if editor.cursor == editor.save_row() {
+        ButtonState::Active
+    } else {
+        ButtonState::Normal
+    };
+    let save_btn = spawn_kit_pill(
+        commands,
+        kit,
+        btn_row,
+        "SAVE PACK",
+        save_state,
+        1.0,
+        14.0,
+        8.0,
+        0.94,
+        scale,
+    );
+    commands
+        .entity(save_btn)
+        .insert((Button, UiAction::ComVoiceSave));
+    let cancel_state = if editor.cursor == editor.cancel_row() {
+        ButtonState::Selected
+    } else {
+        ButtonState::Normal
+    };
+    let cancel_btn = spawn_kit_pill(
+        commands,
+        kit,
+        btn_row,
+        "CANCEL",
+        cancel_state,
+        1.0,
+        14.0,
+        8.0,
+        0.94,
+        scale,
+    );
+    commands
+        .entity(cancel_btn)
+        .insert((Button, UiAction::ComVoiceCancel));
+
+    kit.spawn_text(
+        commands,
+        panel,
+        FontRole::Small,
+        &format!(
+            "W/S NAVIGATE   ENTER EDIT/PICK   DEL CLEAR LINE   {} BACK",
+            back_tag(device)
+        ),
+        scale * 0.78,
+        palette::TEXT_MUTED,
+    );
+
+    if editor.confirm_exit {
+        spawn_com_voice_exit_prompt(commands, overlay, kit, editor.confirm_choice, scale);
+    }
+}
+
+/// Paint-style "SAVE BEFORE EXIT?" prompt shown when closing the editor with unsaved lines.
+fn spawn_com_voice_exit_prompt(
+    commands: &mut Commands,
+    parent: Entity,
+    kit: &AcvdUiKit,
+    save_selected: bool,
+    scale: f32,
+) {
+    let overlay = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(0.0),
+                left: px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            ZIndex(30),
+            BackgroundColor(Color::srgba(0.02, 0.03, 0.04, 0.70)),
+            Interaction::default(),
+            ChildOf(parent),
+        ))
+        .id();
+
+    let modal = kit.spawn_panel(
+        commands,
+        Some(overlay),
+        PanelStyle::Framed,
+        Node {
+            width: px((420.0 * scale).round()),
+            padding: UiRect::axes(px((22.0 * scale).round()), px((18.0 * scale).round())),
+            flex_direction: FlexDirection::Column,
+            row_gap: px((12.0 * scale).round()),
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        scale,
+    );
+
+    kit.spawn_text(
+        commands,
+        modal,
+        FontRole::Header,
+        "SAVE BEFORE EXIT?",
+        scale * 1.05,
+        palette::ACCENT_AMBER,
+    );
+    kit.spawn_text(
+        commands,
+        modal,
+        FontRole::Body,
+        "Your custom COM voice has unsaved changes.",
+        scale * 0.90,
+        palette::TEXT_PRIMARY,
+    );
+
+    let btn_row = commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                margin: UiRect::top(px((4.0 * scale).round())),
+                flex_direction: FlexDirection::Row,
+                column_gap: px((10.0 * scale).round()),
+                ..default()
+            },
+            ChildOf(modal),
+        ))
+        .id();
+
+    let yes_btn = spawn_kit_pill(
+        commands,
+        kit,
+        btn_row,
+        "YES - SAVE",
+        if save_selected {
+            ButtonState::Active
+        } else {
+            ButtonState::Normal
+        },
+        1.0,
+        14.0,
+        8.0,
+        0.94,
+        scale,
+    );
+    commands
+        .entity(yes_btn)
+        .insert((Button, UiAction::ComVoiceSave));
+    let no_btn = spawn_kit_pill(
+        commands,
+        kit,
+        btn_row,
+        "NO - DISCARD",
+        if !save_selected {
+            ButtonState::Active
+        } else {
+            ButtonState::Normal
+        },
+        1.0,
+        14.0,
+        8.0,
+        0.94,
+        scale,
+    );
+    commands
+        .entity(no_btn)
+        .insert((Button, UiAction::ComVoiceExitDiscard));
+
+    kit.spawn_text(
+        commands,
+        modal,
+        FontRole::Small,
+        "ENTER CONFIRM   -   LEFT/RIGHT SELECT   -   ESC CANCEL",
+        scale * 0.78,
+        palette::TEXT_MUTED,
+    );
     );
 }
 
@@ -10504,6 +11425,22 @@ fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+    #[test]
+    fn com_voice_editor_rows_and_lines() {
+        let mut editor = ComVoiceEditor::new("CUSTOM 1".to_string());
+        assert_eq!(editor.row_count(), 1 + EDITOR_EVENTS.len() + 2);
+        assert_eq!(editor.save_row(), 1 + EDITOR_EVENTS.len());
+        assert_eq!(editor.cancel_row(), editor.save_row() + 1);
+        assert!(!editor.dirty);
+        let offset = EDITOR_EVENTS[1].offset;
+        editor.lines.insert(offset, "C:/voice/energy.mp3".to_string());
+        assert_eq!(editor.file_name(offset).as_deref(), Some("energy.mp3"));
+        assert_eq!(editor.file_name(EDITOR_EVENTS[0].offset), None);
+        assert!(editor.clear_line(offset));
+        assert!(editor.dirty);
+        assert!(!editor.clear_line(offset));
+    }
+
 
     #[test]
     fn all_13_retail_workshops_have_models_and_lighting() {
@@ -10880,7 +11817,7 @@ mod tests {
                 sz.x
             );
         }
-        for (tab, count) in [(OptionsTab::Graphics, 9usize), (OptionsTab::Sound, 7usize)] {
+        for (tab, count) in [(OptionsTab::Graphics, 9usize), (OptionsTab::Sound, 8usize)] {
             for i in 0..count {
                 let desc = options_row_desc(tab, i);
                 assert!(!desc.is_empty(), "options_row_desc({tab:?}, {i}) is empty");

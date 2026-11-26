@@ -44,3 +44,7 @@ messages,41,"offset 41 = Operation change: pattern 1 (text 9041)",aisys.tsmap ro
 messages,42,"offset 42 = Operation change: pattern 2 (text 9042)",aisys.tsmap row 42; aisys.fmg 9042
 messages,43,"offset 43 = Operation change: pattern 3 (text 9043)",aisys.tsmap row 43; aisys.fmg 9043
 messages,44,"offset 44 = Test OK. Continuing operation. (text 9044)",aisys.tsmap row 44; aisys.fmg 9044
+custom,manifest,"rewrite-only: custom packs live in custom_voices.json (gitignored) as packs[] with a name and lines{offset: audio path}; slider order is OFF, Type 1..5, then custom packs by saved name","not in the 360 build; rewrite feature (crates/acvd-game/src/voice.rs VoiceLibrary, garage.rs ComVoiceEditor)"
+custom,editor_events,"editor callout offsets 19,22,23,1,2,3,26,27,24 = beginning operation, energy 30, energy empty, AP 50, AP 30, AC disabled, scan mode, combat mode, target sighted/preview","offsets from messages rows above; labels match aisys.fmg text ids 9031/9014/9015/9018/9019/9020/9016/9017/9001"
+custom,playback,".mp3/.wav/.ogg/.flac are decoded by Bevy audio (crate feature mp3) and played on AudioBus::Sfx; missing files log once and stay silent","crates/acvd-game/Cargo.toml; sound.rs Cues::custom_voice"
+custom,editor_ui,"Options > Sound row 5 = + ADD CUSTOM COM VOICE; modal sets pack name and one audio file per callout; ESC with unsaved lines shows the paint-style SAVE BEFORE EXIT prompt","crates/acvd-game/src/garage.rs ComVoiceEditor, spawn_com_voice_editor, spawn_com_voice_exit_prompt"
