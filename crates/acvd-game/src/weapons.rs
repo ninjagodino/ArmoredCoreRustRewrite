@@ -7,9 +7,10 @@
 //! `a00_003` stow (`ready_position` on that sheet). A weapon with `ready_position` and a deploy
 //! clip stays stowed until fire is held, plays the deploy to its end before the first shot, and
 //! plays the stow when fire is released. Any weapon with a fire clip restarts it on each shot.
-//! The 360 call that starts these clips was not found; the flag and the clip names are the evidence.
-//! The arm part's `a00_001` / `a00_003` play on that side while the weapon is deployed, but only
-//! on the bones the clip actually moves (the shoulder pads). The other tracks are a two-key
+//! The 360 part shoot handler `0x8289de30` requests the arm clip for the shoulder slot (`0xe`,
+//! `0x82882b58`) every frame its trigger is held; `AimArm` `0x8284a570` requests it (`0x82882ad0`)
+//! for a held hand weapon. The arm part's `a00_001` / `a00_003` play on that side while either is
+//! active, but only on the bones the clip actually moves (the shoulder pads). The other tracks are a two-key
 //! identity hold; writing them would plant the arm on the bind and erase the body stance.
 //! Every ready weapon also plays the body clips in
 //! `sheets/ac_states.csv` (`sniper_ready_*`, then `sniper_stow_*`); their blend rows are named
@@ -2346,6 +2347,7 @@ pub fn fire(
         return;
     }
 
+    let mut hand_deploy = [false; 2];
     for (i, gun) in arms.hands.iter_mut().enumerate() {
         gun.cooldown = (gun.cooldown - dt * TICK_RATE).max(0.0);
         let hand = if i == 0 { Hand::Right } else { Hand::Left };
@@ -2424,12 +2426,7 @@ pub fn fire(
                 }
                 None => (want[i] && can, false),
             };
-            if deploy {
-                if let Some(arm) = anims.arms.iter_mut().find(|r| r.hand == hand) {
-                    arm.playback.tick(want[i], false, frames);
-                    arm.apply(&mut posed);
-                }
-            }
+            hand_deploy[i] = deploy;
             if gun.fire_mode == FireMode::Charge || gun.fire_mode == FireMode::Burst {
                 stance_ready
             } else {
@@ -2566,6 +2563,22 @@ pub fn fire(
                 };
                 commands.spawn((Mesh3d(assets.mesh.clone()), MeshMaterial3d(material), shot));
             }
+        }
+    }
+
+    // Shoulder pods: the arm `a00_001` / `a00_003` shoulder-piece clips open while the shoulder
+    // trigger is held and stow on release, the same playback the Garage View Mode action test
+    // drives. 360: the shoulder slot (`0xe`) branch of the part shoot handler `0x8289de30`
+    // requests the arm motion (`0x82882b58`) every frame the trigger is down.
+    let pods = want_shoulder && arms.shoulder.kind != Kind::Skip;
+    if let Some(anims) = body.anims.as_mut() {
+        for arm in &mut anims.arms {
+            let i = if arm.hand == Hand::Left { 1 } else { 0 };
+            if !shifting[i] {
+                arm.playback
+                    .tick(pods || hand_deploy[i], false, frames);
+            }
+            arm.apply(&mut posed);
         }
     }
 

@@ -335,8 +335,13 @@ in order:
     `0x828a1820`), shoulder weapons & homing missiles (`bulletmissile`), melee blades & heat piles (`bulletblade`), Boost Charge Kick (`KickState`), and target hit shapes / defense mitigation are now wired. The lock-sight HUD shows AP, live energy, the
     `AlphaAnimSprite` gauges, hand-weapon / weapon-arm ammo counts, shoulder-weapon ammo (`SWep*` / `Gauge_SWeapon`), and OW lock-sight / overload error banners (`acvd-game::hud`).
   - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
-    360 call that starts `a00_001` on a held trigger was not found (joint-control bit 31 at
-    `0x82456f68` selects `sniper_$(LR)` vs `gun_$(LR)` and was not tied back to +0x153).
+    arm clip request is `AimArm` `0x8284a570` -> `0x8289e808` -> `0x82882ad0` (clip 1) for a held
+    hand weapon, and the shoulder-slot branch of the part shoot handler `0x8289de30`
+    (`0x82882b58`, clip 3, re-requested every frame the shoulder trigger is down; probe
+    `private/xenia/shoulder_anim2.txt`, 0x82847e20 tail-calls it). Combat now ticks the arm's
+    shoulder-piece clips from the shoulder trigger too, matching the garage action test. Open:
+    joint-control bit 31 at
+    `0x82456f68` selects `sniper_$(LR)` vs `gun_$(LR)` and is not tied back to +0x153.
     Shots wait until the deploy clip ends; that timing is the clip, not a TAE event.
     Ready weapons (`ready_position`: cannons, sniper cannons, the other heavy classes) play
     acmotion 78/75 while fire is held and 79/76 on release (`sheets/ac_states.csv`; the blend
@@ -344,7 +349,8 @@ in order:
     clip only overrides the bones it animates (the `r_shoul_p*` / `l_shoul_p*` pads), so it
     does not plant the rest of the arm back on the clip bind: those tracks are two identical
     identity keys, and writing them was erasing acmotion 78's `r_arm01` pose. The arm's
-    `a00_001`/`a00_003` play on that side's bones while a ready weapon is deployed.
+    `a00_001`/`a00_003` play on that side's bones while a ready weapon is deployed or the
+    shoulder trigger is held.
   - Arm raise / aim (done, separate from the kick; `weapons.rs` `ArmAim`). Probe file
     `private/xenia/armraise.txt` (user fired right rifle, left sniper rifle, then held fire):
     `AimArm` `0x8284a570` is sent every frame (r4 1 = right, 0 = left; slot 0x0a / 0x0b) from
