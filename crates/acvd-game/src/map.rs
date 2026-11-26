@@ -2,9 +2,10 @@
 //!
 //! A map folder `model/map/{map}` holds `{map}_map.msb` (terrain and objects), optional layout
 //! MSBs such as `{map}_actest.msb` (the garage AC test: start points, areas, test enemies, no
-//! terrain), `{map}_m.dcx.bnd` (map piece `m####.flv` / `_h.hmd`) and `{map}_htdcx.bnd` (one
-//! `{texture}.tpf.dcx` per texture; `{map}_l.tpf.dcx` is the low-resolution copy). Objects
-//! (part kind 1) load from `model/obj/{o}/{o}_m.bnd.dcx`.
+//! terrain). Verdict Day packs map pieces in `{map}_m.dcx.bnd` and textures in
+//! `{map}_htdcx.bnd`; Armored Core V stores pieces loose as `{model}.flv` / `_l1.flv` / `_h.hmd`
+//! and shares `{map}_l.tpf.dcx`. Objects (part kind 1) load from `model/obj/{o}/{o}_m.bnd.dcx`
+//! on both games.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,13 +49,33 @@ pub fn terrain_msb(disc: &Disc, map: &str) -> String {
     }
 }
 
-/// Binder asset holding `part`'s models, or `None` for kinds without map geometry.
-pub fn binder(map: &str, part: &msb::Part) -> Option<String> {
+/// Asset path holding `part`'s file, or `None` for kinds without map geometry.
+///
+/// Verdict Day pieces live in `{map}_m.dcx.bnd` entries; Armored Core V keeps the same files
+/// loose under `model/map/{map}`. Objects use their `_m.bnd.dcx` entry on both games.
+pub fn model_asset(disc: &Disc, map: &str, part: &msb::Part, file: &str) -> Option<String> {
     match part.kind {
-        KIND_PIECE => Some(format!("{}/{map}_m.dcx.bnd", folder(map))),
-        KIND_OBJECT => Some(format!("model/obj/{0}/{0}_m.bnd.dcx", part.model)),
+        KIND_PIECE => {
+            let binder = format!("{}/{map}_m.dcx.bnd", folder(map));
+            if disc.exists(&binder) {
+                Some(format!("{binder}|{file}"))
+            } else {
+                Some(format!("{}/{file}", folder(map)))
+            }
+        }
+        KIND_OBJECT => Some(format!("model/obj/{0}/{0}_m.bnd.dcx|{file}", part.model)),
         _ => None,
     }
+}
+
+/// TPF shared by an Armored Core V map's loose pieces (`{map}_l.tpf.dcx`). `None` when the map
+/// has a Verdict Day `_m` binder (its textures are per-name `{map}_htdcx.bnd` members).
+pub fn map_texture_pack(disc: &Disc, map: &str) -> Option<String> {
+    if disc.exists(&format!("{}/{map}_m.dcx.bnd", folder(map))) {
+        return None;
+    }
+    let pack = format!("{}/{map}_l.tpf.dcx", folder(map));
+    disc.exists(&pack).then_some(pack)
 }
 
 /// TPF holding `part`'s textures, or `None` for map pieces whose textures live as
@@ -647,6 +668,7 @@ pub fn spawn(
     map: &str,
 ) -> Result<usize> {
     let parts = msb::parts(&vfs::open(disc, &terrain_msb(disc, map))?)?;
+    let map_pack = map_texture_pack(disc, map);
     let mut models: HashMap<String, Option<Vec<Loaded>>> = HashMap::new();
     let mut animated_models: HashMap<String, Option<AnimatedModel>> = HashMap::new();
     let mut members: HashMap<String, HashSet<String>> = HashMap::new();
@@ -663,15 +685,15 @@ pub fn spawn(
     let mut object_fx: HashMap<String, Vec<(i32, [f32; 3], [f32; 3])>> = HashMap::new();
     let mut object_fx_spawned = 0usize;
     for (part_idx, part) in parts.iter().enumerate() {
-        let Some(binder) = binder(map, part) else {
+        let Some(asset) = model_asset(disc, map, part, &format!("{}.flv", part.model)) else {
             continue;
         };
+        let own_pack = texture_pack(disc, part);
+        let pack = own_pack.as_deref().or(map_pack.as_deref());
         // Aircraft the map itself places. The part's `+0x44` behavior id selects a
         // `MAPOBJ_PARAM_ST` row; its `Mob_DisperseTAE` names the TAE timeline, whose
         // kind-104 event names the ANI clip in the model's `_a` binder. No traffic is added.
         if part.kind == KIND_OBJECT && is_aircraft_model(&part.model) {
-            let pack = texture_pack(disc, part);
-            let pack = pack.as_deref();
             if let Some(loaded) = load_animated_model(
                 &mut animated_models,
                 &mut textures,
@@ -704,9 +726,6 @@ pub fn spawn(
                 }
             }
         }
-        let asset = format!("{binder}|{}.flv", part.model);
-        let pack = texture_pack(disc, part);
-        let pack = pack.as_deref();
         let Some(list) = load_model(
             &mut models,
             &mut textures,
@@ -723,24 +742,10 @@ pub fn spawn(
             continue;
         }
         let low_file = format!("{}_l1.flv", part.model);
-        let low = if binder_has(&mut members, disc, &binder, &low_file) {
-            low_parts += 1;
-            load_model(
-                &mut models,
-                &mut textures,
-                meshes,
-                materials,
-                images,
-                disc,
-                &format!("{binder}|{low_file}"),
-                pack,
-            )
-        } else {
-            None
-        };
-        let broken_file = format!("{}_b.flv", part.model);
-        let broken =
-            if part.kind == KIND_OBJECT && binder_has(&mut members, disc, &binder, &broken_file) {
+        let low_asset = model_asset(disc, map, part, &low_file);
+        let low = match low_asset {
+            Some(low_asset) if asset_has(&mut members, disc, &low_asset) => {
+                low_parts += 1;
                 load_model(
                     &mut models,
                     &mut textures,
@@ -748,12 +753,31 @@ pub fn spawn(
                     materials,
                     images,
                     disc,
-                    &format!("{binder}|{broken_file}"),
+                    &low_asset,
                     pack,
                 )
-            } else {
-                None
-            };
+            }
+            _ => None,
+        };
+        let broken_file = format!("{}_b.flv", part.model);
+        let broken_asset = model_asset(disc, map, part, &broken_file);
+        let broken = match broken_asset {
+            Some(broken_asset)
+                if part.kind == KIND_OBJECT && asset_has(&mut members, disc, &broken_asset) =>
+            {
+                load_model(
+                    &mut models,
+                    &mut textures,
+                    meshes,
+                    materials,
+                    images,
+                    disc,
+                    &broken_asset,
+                    pack,
+                )
+            }
+            _ => None,
+        };
         drawn += 1;
         let xf = bevy_transform(&xform(part));
         let (min, max) = mesh_bounds(&list);
@@ -772,9 +796,7 @@ pub fn spawn(
         let effects = if part.kind == KIND_OBJECT {
             object_fx
                 .entry(part.model.clone())
-                .or_insert_with(|| {
-                    object_effects(disc, &part.model, &format!("{binder}|{}.flv", part.model))
-                })
+                .or_insert_with(|| object_effects(disc, &part.model, &asset))
                 .clone()
         } else {
             Vec::new()
@@ -811,7 +833,8 @@ pub fn spawn(
             let destroy_ap_id = *destroy_ap_cache
                 .entry(part.model.clone())
                 .or_insert_with(|| {
-                    let mlb_path = format!("{binder}|{}_m.mlb", part.model);
+                    let mlb_path = model_asset(disc, map, part, &format!("{}_m.mlb", part.model))
+                        .unwrap_or_default();
                     vfs::open(disc, &mlb_path)
                         .ok()
                         .and_then(|b| mlb::read_destroy_ap_ids(&b).ok())
@@ -1239,6 +1262,17 @@ fn load_model(
     };
     models.insert(asset.to_string(), loaded.clone());
     loaded
+}
+
+fn asset_has(
+    cache: &mut HashMap<String, HashSet<String>>,
+    disc: &Disc,
+    asset: &str,
+) -> bool {
+    match asset.split_once('|') {
+        Some((binder, file)) => binder_has(cache, disc, binder, file),
+        None => disc.exists(asset),
+    }
 }
 
 fn binder_has(
@@ -1705,6 +1739,60 @@ mod tests {
         let game = xf.apply(p);
         let bevy = t.transform_point(Vec3::new(-p[0], p[1], p[2]));
         assert!((bevy - Vec3::new(-game[0], game[1], game[2])).length() < 1e-4);
+    }
+
+    #[test]
+    fn map_assets_use_binder_on_vd_and_loose_files_on_acv() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(vd) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let piece = msb::Part {
+            name: String::new(),
+            model: "m0000".into(),
+            kind: KIND_PIECE,
+            param_index: 0,
+            behavior: None,
+            translation: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: [1.0; 3],
+            light_set: 0,
+            follow_camera_xz: false,
+            is_sky: false,
+            layer_index: None,
+            layer: None,
+            ac_design_id: None,
+        };
+        assert_eq!(
+            model_asset(&vd, "m4000", &piece, "m0000.flv").as_deref(),
+            Some("model/map/m4000/m4000_m.dcx.bnd|m0000.flv")
+        );
+        assert_eq!(map_texture_pack(&vd, "m4000"), None);
+
+        let path = root.join(vfs::X360_ISO_V);
+        if !path.is_file() {
+            return;
+        }
+        let acv = Disc::open(&path).unwrap();
+        let asset = model_asset(&acv, "m0300", &piece, "m0200.flv").unwrap();
+        assert_eq!(asset, "model/map/m0300/m0200.flv");
+        assert!(acv.exists(&asset));
+        assert!(acv.exists("model/map/m0300/m0200_h.hmd"));
+        assert_eq!(
+            map_texture_pack(&acv, "m0300").as_deref(),
+            Some("model/map/m0300/m0300_l.tpf.dcx")
+        );
+        let object = msb::Part {
+            kind: KIND_OBJECT,
+            model: "o0006".into(),
+            ..piece
+        };
+        assert_eq!(
+            model_asset(&acv, "m0300", &object, "o0006.flv").as_deref(),
+            Some("model/obj/o0006/o0006_m.bnd.dcx|o0006.flv")
+        );
     }
 
     #[test]

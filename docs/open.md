@@ -412,11 +412,11 @@ in order:
   hit-model version with the VD layout (`hmd::tests::acv_map_hmd_uses_version_0492`, m0200_h:
   2 materials / 1 mesh / 647 nodes / 1,396 vertices / 2,208 triangles), and `acv_tonemap` reads
   type-101 `+0x4` as mode/lum/mul/key/white (m0300 `1/0/10/0.8/20`, m0600 `1/0/15/0.8/0`;
-  lum 0 -> 1.0, bloom off). A working-tree `--map m0300 --layout none --test actest1` run draws
-  2,349 parts (473 `_l1`, 1,598 destructible, 3 object FFX), loads 245,495 hit triangles and 0
-  kind-50 water-return points (`private/shots/acv_m0300_sim.png`); 32 texture names remain
-  unresolved. The game-side spawn/collision wiring for these formats is in the
-  working tree but left uncommitted while `acvd-game` map/collision move into `acvd-sim`. The ACV static index
+  lum 0 -> 1.0, bloom off). `--map m0300 --layout none --test actest1` draws 2,349 parts
+  (473 `_l1`, 1,598 destructible, 3 object FFX), loads 245,495 hit triangles and 0 water-return
+  points (`private/shots/acv_m0300_sim.png`); `--map m0600` draws 1,308 parts and loads 111,847
+  hit triangles (`private/shots/acv_m0600.png`). 32/13 texture names remain unresolved on
+  m0300/m0600. The game-side spawn/collision wiring reads these paths; the ACV static index
   is usable after `acvd-index` was changed to locate the PE `.pdata` section (ACV `0x82215c00`,
   VD's fixed `0x8225c200`): `build --pe private/x360/v/ACV.pe --root private/tmp/acvroot`
   indexes 107,832 functions, and `q const 0x820d372c` finds only the key builder `0x82a14d60`.

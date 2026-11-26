@@ -14,6 +14,12 @@ use bevy::prelude::*;
 /// Half the length of the eye-floor ray, above and below its start (360 0x8371914c).
 pub const RAY_HALF: f32 = 50.0;
 
+/// Tangent of the walkable slope limit used by the ground probe.
+pub const WALKABLE_SLOPE_TAN: f32 = 1.428_148_1;
+
+/// Maximum static ledge height the ground snap climbs instead of blocking.
+pub const STEP_UP: f32 = 1.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layer {
     /// What the AC stands on. Filter 0x100002: the AC's down rays are cast by the
@@ -1056,7 +1062,8 @@ fn mirror(v: [f32; 3]) -> Vec3 {
 }
 
 /// Load the terrain MSB (`map::terrain_msb`) and every map piece or object whose `{model}_h.hmd`
-/// is in its binder (`map::binder`). Destructible `KIND_OBJECT` props that ship `{model}_b.flv`
+/// resolves through `map::model_asset` (a VD binder entry or an ACV loose file). Destructible
+/// `KIND_OBJECT` props that ship `{model}_b.flv`
 /// also tag their intact triangles with `prop_id = part_idx + 1` and preload any `{model}_b_h.hmd`
 /// broken collision triangles as `only_when_broken = true` (360 `0x82c02498`, `0x82c84a60`).
 pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
@@ -1117,14 +1124,19 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
         }
     };
     for (part_idx, part) in parts.iter().enumerate() {
-        let Some(binder) = crate::map::binder(map, part) else {
+        let Some(mesh_asset) =
+            crate::map::model_asset(disc, map, part, &format!("{}.flv", part.model))
+        else {
             continue;
         };
         let prop_id = if part.kind == crate::map::KIND_OBJECT {
-            let broken_flv = format!("{binder}|{}_b.flv", part.model);
+            let broken_flv =
+                crate::map::model_asset(disc, map, part, &format!("{}_b.flv", part.model));
             let is_destr = *destructible_cache
-                .entry(broken_flv.clone())
-                .or_insert_with(|| vfs::open(disc, &broken_flv).is_ok());
+                .entry(mesh_asset.clone())
+                .or_insert_with(|| {
+                    broken_flv.is_some_and(|asset| vfs::open(disc, &asset).is_ok())
+                });
             if is_destr {
                 (part_idx + 1) as u32
             } else {
@@ -1133,7 +1145,10 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
         } else {
             0
         };
-        let asset = format!("{binder}|{}_h.hmd", part.model);
+        let Some(asset) = crate::map::model_asset(disc, map, part, &format!("{}_h.hmd", part.model))
+        else {
+            continue;
+        };
         load_hmd(&mut cache, &asset);
         let xf = crate::map::xform(part);
         let flags = object_flags(&part.model);
@@ -1141,10 +1156,13 @@ pub fn load_map(disc: &Disc, map: &str) -> Result<Collision> {
             push_hmd(&mut hits, h, verts, &xf, flags, prop_id, false);
         }
         if prop_id != 0 {
-            let broken_asset = format!("{binder}|{}_b_h.hmd", part.model);
-            load_hmd(&mut cache, &broken_asset);
-            if let Some((h, verts)) = cache[&broken_asset].as_ref() {
-                push_hmd(&mut hits, h, verts, &xf, flags, prop_id, true);
+            if let Some(broken_asset) =
+                crate::map::model_asset(disc, map, part, &format!("{}_b_h.hmd", part.model))
+            {
+                load_hmd(&mut cache, &broken_asset);
+                if let Some((h, verts)) = cache[&broken_asset].as_ref() {
+                    push_hmd(&mut hits, h, verts, &xf, flags, prop_id, true);
+                }
             }
         }
     }
@@ -1392,6 +1410,21 @@ mod tests {
                 .is_some(),
             "downward ray from m4000 start should hit ground"
         );
+    }
+
+    #[test]
+    fn acv_m0300_collision_loads_hit_triangles() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let path = root.join(vfs::X360_ISO_V);
+        if !path.is_file() {
+            return;
+        }
+        let disc = Disc::open(&path).unwrap();
+        let c = load_map(&disc, "m0300").expect("load ACV m0300 collision");
+        assert!(c.hits.len() > 1_000, "m0300 hits = {}", c.hits.len());
+        assert!(!c.bvh.nodes.is_empty());
     }
 
     #[test]
