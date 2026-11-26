@@ -27,6 +27,7 @@ Source-only Rust/Bevy 0.19 clean-room reconstruction of *Armored Core: Verdict D
 6. **Coordinates & Endianness**: All 360 disc formats are **big-endian**. FLVER is left-handed CW; `acvd-render` mirrors X (`[-x, y, z]`) into Bevy right-handed CCW. FLVER semantic 6 (`TangentS8`) stores bitangent `+dP/dv` with `w = ±1`; all normal maps use `flip_normal_map_y: false`.
 7. **UI Sliders**: Any slider/gauge/stepper must support hover-to-scroll (`garage::wheel_step_direction` / `UiAction::wheel_adjust()`) and set `state.wheel_consumed = true` so the 3D garage camera never zooms.
 8. **Task End**: Update `docs/open.md` + `docs/archive.md` (and `sheets/systems.csv` if system status changed), run tests + `acvd-index audit`, stage ONLY touched files, commit, `git pull --rebase`, `git push`.
+9. **Never Delete Through Junctions/Reparse Points**: Before ANY destructive removal (`git worktree remove`, `Remove-Item -Recurse`, `rm -rf`, cleaning a shared path), enumerate reparse points first and stop if any resolve outside the target: `Get-ChildItem -LiteralPath <path> -Recurse -Force -Attributes ReparsePoint`. A worktree must never contain junctions into `armoredcoredumps/`, `private/`, `external/`, or `crates/acvd-data/src/generated/`; if one exists, unlink only the junction (e.g. `cmd /c rmdir <link>`) and verify the real target is untouched. Deleting through a junction already destroyed the 360 ISO once and was unrecoverable — check first, every time.
 
 ## Workspace Map
 
