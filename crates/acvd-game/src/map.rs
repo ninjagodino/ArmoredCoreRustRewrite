@@ -585,6 +585,7 @@ pub fn spawn(
     let mut low_parts = 0;
     let mut destructible_parts = 0;
     let mut animated_parts = 0;
+    let mut animated_fx_parts = 0;
     let mut destroy_ap_cache: HashMap<String, Option<u16>> = HashMap::new();
     let mut object_fx: HashMap<String, Vec<(i32, [f32; 3], [f32; 3])>> = HashMap::new();
     let mut object_fx_spawned = 0usize;
@@ -614,6 +615,9 @@ pub fn spawn(
                 {
                     drawn += 1;
                     animated_parts += 1;
+                    if aircraft_fx_timeline(&loaded, clip).is_some() {
+                        animated_fx_parts += 1;
+                    }
                     let root = commands
                         .spawn((
                             MapPart,
@@ -776,7 +780,7 @@ pub fn spawn(
         warn!("map {map}: {} textures missing", textures.missing);
     }
     info!(
-        "map {map}: {drawn} parts, {low_parts} with an _l1 mesh, {destructible_parts} destructible (_b.flv), {object_fx_spawned} object FFX, {animated_parts} animated aircraft"
+        "map {map}: {drawn} parts, {low_parts} with an _l1 mesh, {destructible_parts} destructible (_b.flv), {object_fx_spawned} object FFX, {animated_parts} animated aircraft ({animated_fx_parts} with TAE FFX)"
     );
     Ok(drawn)
 }
@@ -801,15 +805,76 @@ fn is_aircraft_model(model: &str) -> bool {
 #[derive(Component)]
 pub struct MapAircraft;
 
+/// One FFX dummy of an aircraft model: TAE event `dummy_id` is FLVER dummy `color[1]`
+/// (`Rig::effects`), parented to the dummy's bone so the effect follows the animated joint.
+#[derive(Clone)]
+struct FxSocket {
+    id: u8,
+    joint: usize,
+    position: [f32; 3],
+    forward: [f32; 3],
+}
+
+/// TAE kind-0 (`KIND_FFX`) timeline of an aircraft's current ANI clip. The 360 plays the
+/// `.tae` animation whose id equals the ANI clip id alongside the clip itself; its FFX events
+/// name an `sfx/acv_commoneffects.ffxbnd` effect and a dummy id (o9330 clip 210 fires
+/// 5709/5710/7510, 1000 fires 4083; o9340 210/211/220 fire 4806/5105/5202/4085).
+#[derive(Component)]
+pub(crate) struct AircraftFx {
+    timeline: tae::Animation,
+    sockets: Vec<FxSocket>,
+}
+
 /// Advances the rotor/flight clips of map-placed aircraft. They carry no AI component, so
-/// `ai::update` never steps their [`EnemyAnim`] clocks.
-pub fn step_aircraft(time: Res<Time>, mut aircraft: Query<&mut EnemyAnim, With<MapAircraft>>) {
+/// `ai::update` never steps their [`EnemyAnim`] clocks. Crossing a kind-0 TAE event spawns its
+/// FFX on the named model dummy, parented to that dummy's joint (`Rig::effects`).
+pub fn step_aircraft(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut aircraft: Query<(&mut EnemyAnim, Option<&AircraftFx>), With<MapAircraft>>,
+) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
-    for mut anim in &mut aircraft {
+    for (mut anim, fx) in &mut aircraft {
+        let prev = anim.frame;
+        let frames = anim
+            .bank
+            .clips
+            .get(&anim.clip_id)
+            .map_or(1.0, |c| c.frames.max(1) as f32);
         anim.step(dt, None);
+        let Some(fx) = fx else {
+            continue;
+        };
+        for fired in crate::pose::crossed_events(&fx.timeline, prev, anim.frame, frames, anim.looping)
+        {
+            let crate::pose::TaeFired::Ffx {
+                ffx_id,
+                dummy_id,
+                ..
+            } = fired
+            else {
+                continue;
+            };
+            let Some(sock) = fx.sockets.iter().find(|s| s.id == dummy_id) else {
+                continue;
+            };
+            let Some(&joint) = anim.joints.get(sock.joint) else {
+                continue;
+            };
+            let position = Vec3::new(-sock.position[0], sock.position[1], sock.position[2]);
+            let forward = Vec3::new(-sock.forward[0], sock.forward[1], sock.forward[2])
+                .normalize_or(Vec3::Z);
+            commands.spawn((
+                sfx::Sfx::new(ffx_id),
+                Transform::from_translation(position)
+                    .with_rotation(Quat::from_rotation_arc(Vec3::Z, forward)),
+                Visibility::default(),
+                ChildOf(joint),
+            ));
+        }
     }
 }
 
@@ -820,6 +885,7 @@ struct AnimatedModel {
     inv_bindposes: Handle<SkinnedMeshInverseBindposes>,
     bank: Arc<EnemyAnimBank>,
     tae: Option<tae::Tae>,
+    fx_sockets: Vec<FxSocket>,
 }
 
 /// The TAE id and loop flag selected by a part's `+0x44` behavior row.
@@ -836,6 +902,16 @@ fn behavior_tae(part: &msb::Part) -> Option<(u32, bool)> {
     .into_iter()
     .find(|&t| t != 0)?;
     Some((u32::from(tae), matches!(data.behavior_type, 4 | 7)))
+}
+
+/// TAE animation whose id equals the ANI clip id and carries `KIND_FFX` events. The 360 runs
+/// that timeline alongside the clip; the behavior timeline only selects the clip (kind 104).
+fn aircraft_fx_timeline(loaded: &AnimatedModel, clip: u16) -> Option<&tae::Animation> {
+    loaded
+        .tae
+        .as_ref()?
+        .animation(u32::from(clip))
+        .filter(|a| a.events.iter().any(|e| e.kind == tae::KIND_FFX))
 }
 
 /// Resolves the ANI clip a map part plays: behavior row → `Mob_DisperseTAE` timeline →
@@ -934,6 +1010,18 @@ fn load_animated_model(
                         bank.root_route = Some(route);
                     }
                 }
+                let fx_sockets = rig
+                    .effects
+                    .iter()
+                    .filter_map(|e| {
+                        Some(FxSocket {
+                            id: e.id,
+                            joint: e.bone?,
+                            position: e.position,
+                            forward: e.forward,
+                        })
+                    })
+                    .collect();
                 if bank.clips.is_empty() {
                     None
                 } else {
@@ -967,6 +1055,7 @@ fn load_animated_model(
                         inv_bindposes,
                         bank,
                         tae,
+                        fx_sockets,
                     })
                 }
             }
@@ -1028,6 +1117,12 @@ fn spawn_animated_part(
     let mut anim = EnemyAnim::new(loaded.bank.clone(), joint_entities, 0.0);
     anim.play(clip, looping, speed, 0.0);
     commands.entity(root).insert((anim, MapAircraft));
+    if let Some(timeline) = aircraft_fx_timeline(loaded, clip) {
+        commands.entity(root).insert(AircraftFx {
+            timeline: timeline.clone(),
+            sockets: loaded.fx_sockets.clone(),
+        });
+    }
 }
 
 fn load_model(
@@ -1961,5 +2056,58 @@ mod tests {
             a.distance(b) > 1.0,
             "o9341 root must follow the body route ({a:?} -> {b:?})"
         );
+    }
+
+    #[test]
+    fn bomber_tae_effects_name_model_dummies() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let bomber = tae::read(&vfs::open(&disc, "tae/obj/o9330/own000100.tae").unwrap()).unwrap();
+        let flight = bomber.animation(210).expect("o9330 flight timeline");
+        let effects: Vec<(i32, u8)> = flight.events.iter().filter_map(|e| e.as_ffx()).collect();
+        assert!(effects.contains(&(5709, 150)), "o9330 flight trail dummy 150");
+        assert!(effects.contains(&(5710, 170)), "o9330 flight trail dummy 170");
+        assert!(effects.contains(&(7510, 171)), "o9330 flight burst dummy 171");
+        let fired = crate::pose::crossed_events(&flight, 80.0, 100.0, 1800.0, true);
+        assert!(
+            fired.iter().any(|e| matches!(
+                e,
+                crate::pose::TaeFired::Ffx {
+                    ffx_id: 5710,
+                    dummy_id: 170,
+                    ..
+                }
+            )),
+            "crossing frame 93 fires 5710 on dummy 170"
+        );
+        let startup = bomber.animation(1000).expect("o9330 startup timeline");
+        assert!(startup.events.iter().filter_map(|e| e.as_ffx()).any(|(id, d)| id == 4083 && d == 160));
+
+        let (_, rig) = acvd_render::rigged_model(
+            &disc,
+            "model/obj/o9330/o9330_m.bnd.dcx|o9330.flv",
+            &|_| acvd_render::RootPlace::IDENTITY,
+        )
+        .unwrap();
+        let socket = rig
+            .effects
+            .iter()
+            .find(|e| e.id == 170)
+            .expect("o9330 dummy 170");
+        assert_eq!(
+            rig.bones[socket.bone.expect("dummy bone")].name,
+            "bauntbox"
+        );
+
+        // The flying-wing bomber's clip timelines carry no FFX events.
+        let wing = tae::read(&vfs::open(&disc, "tae/obj/o9341/own000100.tae").unwrap()).unwrap();
+        assert!(wing
+            .animations
+            .iter()
+            .all(|a| !a.events.iter().any(|e| e.kind == tae::KIND_FFX)));
     }
 }

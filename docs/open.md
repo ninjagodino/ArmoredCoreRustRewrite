@@ -166,6 +166,17 @@ in order:
       `o0006_sign_tae_spawns_ffx_197_on_its_two_lamp_dummies`; dump any TAE with
       `cargo run --release -p acvd-formats --example taedump -- tae/obj/o0006/own000100.tae`
       (all 176 in `private/tmp/obj_tae_dump.txt`). Other object models' glows ride the same path.
+    - **Dynamic aircraft TAE FFX (done, 2026-11-26)**: an aircraft placement plays the `.tae`
+      animation whose id equals its ANI clip id alongside the clip (the behavior timeline only
+      selects the clip via kind 104). `map::step_aircraft` crosses that timeline with the clip
+      frame and spawns each `KIND_FFX` event as `sfx::Sfx` on the model's `Rig::effects` socket
+      (`dummy.color[1]`), parented to the dummy bone so body/rotor sockets follow the pose.
+      `o9330` clip 210 fires 5709/5710/7510 on dummies 150-154/162/170-173 and clip 1000 fires
+      4083 on 160-166; `o9340` clips 210/211/220 fire 4806/5105/5202/4085 (dummies 201/211-213/
+      244-246). `o9341`/`o9344` TAE files carry **no** `KIND_FFX` events, so the flying-wing
+      variants have no authored FX. Verified live on m3330 (`9 animated aircraft, 2 with TAE FFX`;
+      shot `private/shots/bomber_fx_m3330b.png`); test
+      `map::tests::bomber_tae_effects_name_model_dummies` pins ids, sockets and crossing frame.
     - **Per-model map texture pack (`map.rs` `texture_pack` / `Textures::load_tex`)**: object
       models (`KIND_OBJECT`, e.g. the road fence `o2076`) resolved every texture name through the
       disc-wide `best_texture_ref`, so `net`/`barbed_wire`/`o2036` came from unrelated packs
