@@ -154,15 +154,18 @@ in order:
       in-tree fake billboards were removed. **Never re-derive placements from screenshots** (HUD
       end-caps at (460,365)/(530,365)/(189,364)/(273,364) in the three `ac_test_*` frames prove
       the trap; one view cannot recover depth).
-    - **Map-object TAE FFX — found, not yet spawned (open)**: map objects ship
+    - **Map-object TAE FFX (done, 2026-11-25)**: map objects ship
       `tae/obj/<oXXXX>/own000100.tae` (176 files); 141 of them carry `KIND_FFX` (0) events that
-      spawn an FFX id on a FLVER dummy. `m4000` places six `o0006` signboards, and each runs
-      `own000100.tae` → `ffx 197` on dummies `200`/`201` (8 warm-white `(1.0,0.78,0.70)` billboard
-      actions, size 3 m, texture id 226), i.e. 12 sign glows in the arena. The rewrite dispatches
-      AC TAE FFX only (`pose.rs:372`), so map-object glows are absent. Dump any TAE with
+      spawn an FFX id on a FLVER dummy (`dummy.color[1]` is the TAE dummy id, as on AC parts).
+      `map::object_effects` now reads each placed `KIND_OBJECT` part's TAE, keeps the frame-0 FFX
+      events, resolves the dummy through `Flver::bone_transforms`, and `map::spawn` attaches a
+      persistent `sfx::Sfx` at the mirrored dummy socket. `m4000` logs **12 object FFX** — its six
+      `o0006` signboards each fire `ffx 197` (texture 226, 3 m warm-white `(1.0,0.78,0.70)` additive
+      billboard, node life -1/60 s = infinite, action 59) on dummies `200`/`201`, the two lamp arms
+      at ±19.67, 18.47, -7.15 m. Test
+      `o0006_sign_tae_spawns_ffx_197_on_its_two_lamp_dummies`; dump any TAE with
       `cargo run --release -p acvd-formats --example taedump -- tae/obj/o0006/own000100.tae`
-      (all 176 dumped to `private/tmp/obj_tae_dump.txt`); the FFX 197 draw node still needs a
-      `ffxtree --params 197` → renderer mapping before spawning it.
+      (all 176 in `private/tmp/obj_tae_dump.txt`). Other object models' glows ride the same path.
     - **Per-model map texture pack (`map.rs` `texture_pack` / `Textures::load_tex`)**: object
       models (`KIND_OBJECT`, e.g. the road fence `o2076`) resolved every texture name through the
       disc-wide `best_texture_ref`, so `net`/`barbed_wire`/`o2036` came from unrelated packs

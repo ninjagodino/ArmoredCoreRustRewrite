@@ -414,8 +414,9 @@
   shaft mesh, every `*_env.msb` has 0 spot lights, and the spot-light entity built at `0x82be7d08`
   (ctor `0x82c03640`, vtable `0x820f59a8`) has no draw path. `lens_flare::M4000_BEAMS` and the
   `beam.m4000.*` rows were deleted. Map objects do spawn FFX from their TAE (`tae/obj/*`,
-  `KIND_FFX`): each of m4000's six `o0006` signs spawns `ffx 197` on dummies 200/201 (tracked
-  Open as map-object FFX spawning).
+  `KIND_FFX`): each of m4000's six `o0006` signs spawns `ffx 197` on dummies 200/201. Map-object
+  TAE FFX is now spawned (`map::object_effects` / `spawn`, 12 effects in m4000; test
+  `o0006_sign_tae_spawns_ffx_197_on_its_two_lamp_dummies`).
 - Map piece LOD (`sheets/map_lod.csv`, `acvd-game::map`). m4000's piece binder has 57 full
   FLVERs and 39 `{model}_l1.flv` (54 of 72 kind-0 parts; no `_l2`; face flags 0). The model
   LOD metric is `max(distance - radius, 0.1) / (2 * radius)` (`0x82d13e70`, radius at model

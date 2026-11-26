@@ -14,7 +14,7 @@ use acvd_data::generated::enemy::PARAM_DESTROYAP_PARAM;
 use acvd_data::generated::sfx::PARAM_SFXSESETPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{bnd3, env as fmt_env, flver, mlb, msb, nav};
+use acvd_formats::{bnd3, env as fmt_env, flver, mlb, msb, nav, tae};
 use acvd_render::{LoadedMesh, Packs};
 use anyhow::Result;
 use bevy::prelude::*;
@@ -578,6 +578,8 @@ pub fn spawn(
     let mut low_parts = 0;
     let mut destructible_parts = 0;
     let mut destroy_ap_cache: HashMap<String, Option<u16>> = HashMap::new();
+    let mut object_fx: HashMap<String, Vec<(i32, [f32; 3], [f32; 3])>> = HashMap::new();
+    let mut object_fx_spawned = 0usize;
     for (part_idx, part) in parts.iter().enumerate() {
         let Some(binder) = binder(map, part) else {
             continue;
@@ -648,6 +650,16 @@ pub fn spawn(
                 Name::new(part.name.clone()),
             ))
             .id();
+        let effects = if part.kind == KIND_OBJECT {
+            object_fx
+                .entry(part.model.clone())
+                .or_insert_with(|| {
+                    object_effects(disc, &part.model, &format!("{binder}|{}.flv", part.model))
+                })
+                .clone()
+        } else {
+            Vec::new()
+        };
         commands.entity(parent).with_children(|c| {
             full = spawn_lod(c, &list, Visibility::Inherited);
             if let Some(low) = &low {
@@ -655,6 +667,10 @@ pub fn spawn(
             }
             if let Some(broken) = &broken {
                 broken_entity = Some(spawn_lod(c, broken, Visibility::Hidden));
+            }
+            for (ffx_id, position, forward) in effects {
+                spawn_object_effect(c, ffx_id, position, forward);
+                object_fx_spawned += 1;
             }
         });
         commands.entity(parent).insert(MapLod {
@@ -718,7 +734,7 @@ pub fn spawn(
         warn!("map {map}: {} textures missing", textures.missing);
     }
     info!(
-        "map {map}: {drawn} parts, {low_parts} with an _l1 mesh, {destructible_parts} destructible (_b.flv)"
+        "map {map}: {drawn} parts, {low_parts} with an _l1 mesh, {destructible_parts} destructible (_b.flv), {object_fx_spawned} object FFX"
     );
     Ok(drawn)
 }
@@ -952,6 +968,82 @@ pub(crate) fn bevy_transform(xf: &flver::Xform) -> Transform {
     Transform::from_matrix(mat)
 }
 
+/// FFX ids a static object TAE fires at frame 0, with each event dummy's model-space position
+/// and forward. TAE `dummy_id` is FLVER dummy `color[1]`, as on AC parts (`sfx::effect_points`).
+/// Object TAEs are the `tae/obj/<oXXXX>/own000100.tae` files on the 360 disc (loader `0x8284e7c8`,
+/// `acvd_formats::tae`); they carry the same `KIND_FFX` (0) dispatch as AC TAEs (`0x8289acd0`).
+fn object_effects(disc: &Disc, model: &str, asset: &str) -> Vec<(i32, [f32; 3], [f32; 3])> {
+    let Ok(bytes) = vfs::open(disc, &format!("tae/obj/{model}/own000100.tae")) else {
+        return Vec::new();
+    };
+    let Ok(tae) = tae::read(&bytes) else {
+        return Vec::new();
+    };
+    let mut fired: Vec<(i32, u8)> = Vec::new();
+    for anim in &tae.animations {
+        for ev in &anim.events {
+            if ev.start_frame != 0 {
+                continue;
+            }
+            if let Some((id, dummy)) = ev.as_ffx() {
+                if id > 0 && !fired.contains(&(id, dummy)) {
+                    fired.push((id, dummy));
+                }
+            }
+        }
+    }
+    if fired.is_empty() {
+        return Vec::new();
+    }
+    let Ok(data) = vfs::open(disc, asset) else {
+        return Vec::new();
+    };
+    let Ok(f) = flver::read(&data) else {
+        return Vec::new();
+    };
+    let bones = f.bone_transforms().unwrap_or_default();
+    let mut out = Vec::new();
+    for (id, dummy_id) in fired {
+        let Some(d) = f.dummies.iter().find(|d| d.color[1] == dummy_id) else {
+            continue;
+        };
+        let bt = usize::try_from(d.parent_bone)
+            .ok()
+            .and_then(|i| bones.get(i));
+        let (position, forward) = match bt {
+            Some(bt) => {
+                let f = [0, 1, 2].map(|r| {
+                    bt.m[r][0] * d.forward[0]
+                        + bt.m[r][1] * d.forward[1]
+                        + bt.m[r][2] * d.forward[2]
+                });
+                (bt.apply(d.position), f)
+            }
+            None => (d.position, d.forward),
+        };
+        out.push((id, position, forward));
+    }
+    out
+}
+
+/// Spawns a persistent map-object FFX on its TAE dummy: the effect sits at the dummy socket with
+/// +Z along the dummy forward, mirrored into Bevy axes like the model.
+fn spawn_object_effect(
+    c: &mut ChildSpawnerCommands,
+    ffx_id: i32,
+    position: [f32; 3],
+    forward: [f32; 3],
+) {
+    let position = Vec3::new(-position[0], position[1], position[2]);
+    let forward = Vec3::new(-forward[0], forward[1], forward[2]).normalize_or(Vec3::Z);
+    c.spawn((
+        sfx::Sfx::new(ffx_id),
+        Transform::from_translation(position)
+            .with_rotation(Quat::from_rotation_arc(Vec3::Z, forward)),
+        Visibility::default(),
+    ));
+}
+
 /// Map materials keyed by `(diffuse, bump, alpha_kind)` so opaque and alpha-blended/masked/additive
 /// MTDs sharing a texture name never collide.
 #[derive(Default)]
@@ -1143,6 +1235,24 @@ mod tests {
         let game = xf.apply(p);
         let bevy = t.transform_point(Vec3::new(-p[0], p[1], p[2]));
         assert!((bevy - Vec3::new(-game[0], game[1], game[2])).length() < 1e-4);
+    }
+
+    #[test]
+    fn o0006_sign_tae_spawns_ffx_197_on_its_two_lamp_dummies() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let fx = object_effects(&disc, "o0006", "model/obj/o0006/o0006_m.bnd.dcx|o0006.flv");
+        assert_eq!(fx.len(), 2, "o0006 TAE fires ffx 197 on two dummies: {fx:?}");
+        for (id, pos, _) in fx {
+            assert_eq!(id, 197);
+            // Dummies 200/201 are the two lamp arms (±19.67, 18.47, -7.15) in model space.
+            assert!((pos[1] - 18.47).abs() < 0.05, "pos {pos:?}");
+            assert!((pos[0].abs() - 19.67).abs() < 0.05, "pos {pos:?}");
+        }
     }
 
     #[test]
