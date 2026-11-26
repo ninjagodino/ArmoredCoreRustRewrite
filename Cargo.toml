@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/acvd-formats", "crates/acvd-data", "crates/acvd-render", "crates/acvd-viewer", "crates/acvd-game", "tools/acvd-sheets", "tools/acvd-index", "tools/acvd-movies"]
+members = ["crates/acvd-formats", "crates/acvd-data", "crates/acvd-sim", "crates/acvd-proto", "crates/acvd-net", "crates/acvd-server", "crates/acvd-render", "crates/acvd-viewer", "crates/acvd-game", "tools/acvd-sheets", "tools/acvd-index", "tools/acvd-movies", "tools/acvd-shot"]
 # acvd-data (and everything built on it) only exists after `acvd-sheets gen` has run against an owned disc.
 default-members = ["crates/acvd-formats", "tools/acvd-sheets"]
 
@@ -11,6 +11,8 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+bytes = "1"
+log = "0.4"
 encoding_rs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -18,6 +20,16 @@ csv = "1"
 roxmltree = "0.20"
 miniz_oxide = "0.8"
 bevy = "0.19"
+glam = "0.32"
+
+# AC TEST m4000 drops to ~17 fps with Bevy's default debug-assertions over ~3100 Mesh3d
+# entities (550 map parts + water reflection camera). Disabling assertions/overflow checks
+# and using opt-level 1 brings debug to ~120 fps (same as `--release` on this scene) without
+# a full release rebuild. Deps stay at opt-level 3 below.
+[profile.dev]
+opt-level = 1
+debug-assertions = false
+overflow-checks = false
 
 [profile.dev.package."*"]
 opt-level = 3
@@ -26,8 +38,7 @@ opt-level = 3
 debug = false
 
 # Pure format/untile/decode hot loops (Xenos TPF untiling, CTX1/HT-BC3, FLVER/DCX/ANI parsing)
-# and mesh/texture asset builders run ~15x faster optimized in debug builds without slowing down
-# `acvd-game` incremental builds.
+# and mesh/texture asset builders run ~15x faster optimized in debug builds.
 [profile.dev.package.acvd-formats]
 opt-level = 3
 [profile.dev.package.acvd-render]

@@ -25,12 +25,12 @@ use acvd_data::{ac_state, find};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
-use crate::Garage;
 use crate::control::{Held, Pilot, Piloting};
 use crate::hanger::HangerPose;
 use crate::pose::{Motion, TaeFired};
 use crate::sfx::EffectPoint;
 use crate::weapons::{Armament, Hand, HandShift, Hardpoint, Kind, Shift, WeaponAnims};
+use crate::Garage;
 use acvd_render::app::ShotMark;
 
 /// Fallback seat frame for bay shift (`own000100.tae` `2000..2003` `kind=101` at frame 40).
@@ -240,12 +240,7 @@ pub(crate) fn step_active_shifts(
                 );
                 hs.grabbed = true;
             } else {
-                seat(
-                    commands.reborrow(),
-                    loadout,
-                    hanger.as_deref_mut(),
-                    &hs,
-                );
+                seat(commands.reborrow(), loadout, hanger.as_deref_mut(), &hs);
             }
         }
         if grab_hit {
@@ -390,6 +385,7 @@ pub(crate) fn shift(
     hardpoints: Query<(Entity, &Hardpoint)>,
     meshes: Query<(Entity, &WeaponMesh)>,
     mut motion: Option<ResMut<Motion>>,
+    net: Option<Res<crate::net::NetRuntime>>,
     time: Res<Time>,
     mut edges: Local<Edges>,
 ) {
@@ -425,14 +421,27 @@ pub(crate) fn shift(
         time.delta_secs(),
     );
 
-    // 2. Check for new bay shift / purge input on any idle hand.
-    if !press.modifier() {
-        edges.right = false;
-        edges.left = false;
-        return;
-    }
-    let right = press.down(Hand::Right);
-    let left = press.down(Hand::Left);
+    // 2. Check for new bay shift / purge input on any idle hand. Online, the predicted
+    // `acvd-sim::weapons::Armament` rack state drives the visual swap (server-authoritative after
+    // reconciliation) instead of raw keys.
+    let (right, left) = if let Some(net) = &net {
+        let Some(prediction) = net.session.prediction.as_ref() else {
+            edges.right = false;
+            edges.left = false;
+            return;
+        };
+        (
+            prediction.ac.armament.swapping(0),
+            prediction.ac.armament.swapping(1),
+        )
+    } else {
+        if !press.modifier() {
+            edges.right = false;
+            edges.left = false;
+            return;
+        }
+        (press.down(Hand::Right), press.down(Hand::Left))
+    };
     let rising = [
         (Hand::Right, right && !edges.right),
         (Hand::Left, left && !edges.left),

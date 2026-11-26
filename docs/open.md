@@ -19,6 +19,9 @@ replace the older "user at the controls" runs; ask the user only for states no r
 
 Rough priority order; reorder freely.
 
+- **Multiplayer netcode Phase 4+ (headless 64-bot soak/budget, bots, match orchestration)**: Phase 0-3 are in (see Done "Multiplayer netcode Phase 3 — authoritative combat, lag compensation, weapon racks"): `acvd-sim`/`acvd-proto`/`acvd-net`/`acvd-server` and `acvd-game::net` cover fixed 60 Hz movement, prediction/reconciliation, remote interpolation, server-authoritative weapon/projectile/missile/melee combat, 90-tick lag compensation, bay/rack replication, destructible bitset late join, and kill/respawn. Remaining from `.kilo/plans/1795715079540-multiplayer-netcode-architecture.md`: the headless 64-bot soak/budget gate (Phase 4) and any bot/match-flow work that consumes the Phase 3 `RespawnDrop` presentation hook (`net::combat::RespawnDropIn`, currently an unused component). Phase 3 gates pass: `acvd-server/tests/phase3.rs` 5/5, all five crate suites green, `tools/check-headless.ps1` PASS, `acvd-index audit` 1798 cited / 0 mismatches / 0 PS3. Phase 2's two gaps are fixed (`LocalPlayerState` now replays `glide_qb`; `NetView` uses the legs' `walk_max`).
+
+
 **Goal: a playable AC test demo** (garage AC TEST: map m4000 + `m4000_actest.msb`, see Done
 "AC test scene"). Gameplay should match the 360 build; menus may stay partial. Tasks toward it,
 in order:

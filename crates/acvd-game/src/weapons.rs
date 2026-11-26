@@ -34,16 +34,17 @@ use acvd_data::generated::bullet::{
     PARAM_ENEMY_BULLET_ENEMYBULLETRIGID_BIN,
 };
 use acvd_data::generated::ctrl::AcCtrlParam;
-use acvd_data::generated::tuning::NEW_AC_BEHAVIOR;
 use acvd_data::generated::sfx::{PARAM_ACWEAPONSFXPARAM_BIN, PARAM_ENEMYWEAPONSFXPARAM_BIN};
 use acvd_data::generated::sound::{
     PARAM_ACSOUNDPARAM_BIN, PARAM_ACWEAPONSOUNDPARAM_BIN, PARAM_ENEMYWEAPONSOUNDPARAM_BIN,
 };
+use acvd_data::generated::tuning::NEW_AC_BEHAVIOR;
 use acvd_data::{ac_state, find, part_field};
 use acvd_formats::reader::Be;
 use acvd_formats::vfs::{self, Disc};
 use acvd_formats::{acv_parts, ani, jcon};
 use acvd_render::Rig;
+use acvd_sim::weapons as simw;
 use bevy::audio::AudioSource;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -148,7 +149,10 @@ pub enum TriggerAction {
     /// Rising edge of a charge hold (plays `acweaponsoundparam.charge`).
     StartCharge,
     /// Fire `pellets` projectile(s) with damage/speed multiplier `power_scale`.
-    Fire { power_scale: f32, pellets: usize },
+    Fire {
+        power_scale: f32,
+        pellets: usize,
+    },
 }
 
 /// Secondary AoE explosion blast spawned on projectile/missile impact (`BULLET_ARISE_ST` ->
@@ -360,7 +364,10 @@ impl OveredWeaponState {
 
     /// 360 LCG roll (`0x828861d0`: `seed = seed * 0x41c64e6d + 0x3039`, `((seed >> 16) & 0x7fff) / 32767.0`).
     fn roll_dmg_interval(&mut self) -> f32 {
-        self.rng_state = self.rng_state.wrapping_mul(0x41c6_4e6d).wrapping_add(0x3039);
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(0x41c6_4e6d)
+            .wrapping_add(0x3039);
         let u = ((self.rng_state >> 16) & 0x7fff) as f32 / 32767.0;
         self.spec.dmgtime_min + (self.spec.dmgtime_max - self.spec.dmgtime_min) * u
     }
@@ -542,7 +549,9 @@ impl OwArmAttach {
         } else {
             (self.stowed_parent, self.stowed_local)
         };
-        commands.entity(self.root_60).insert((ChildOf(parent), local));
+        commands
+            .entity(self.root_60)
+            .insert((ChildOf(parent), local));
         true
     }
 }
@@ -783,11 +792,7 @@ pub struct Gun {
 /// - `t = (reload_stab_factor - 1.0) / (attack_stab_max_rate - 1.0)`.
 /// - `factor = (1.0 - t) + t * balance`.
 /// - When `!ready_position`, multiplies by `ctrl.arm_shoot_stability` (`AcCtrlParam +0x18c`).
-pub fn reload_multiplier(
-    ctrl: &AcCtrlParam,
-    reload_stab_factor: f32,
-    ready_position: bool,
-) -> f32 {
+pub fn reload_multiplier(ctrl: &AcCtrlParam, reload_stab_factor: f32, ready_position: bool) -> f32 {
     let balance = if ready_position {
         ctrl.snipe_attack_balance
     } else {
@@ -1795,7 +1800,12 @@ pub(crate) fn spawn_enemy_shot(
                 ))
                 .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
         } else {
-            commands.spawn((Mesh3d(assets.mesh.clone()), MeshMaterial3d(material), tf, shot));
+            commands.spawn((
+                Mesh3d(assets.mesh.clone()),
+                MeshMaterial3d(material),
+                tf,
+                shot,
+            ));
         }
     }
 }
@@ -1926,10 +1936,9 @@ pub fn fire(
     // A shifting hand's weapon is on the rack: its arm overlay owns the bones, and the other
     // hand keeps aiming normally. `Shift` is a persistent resource, so test the hands, not the
     // resource's presence.
-    let shifting = body
-        .shift
-        .as_ref()
-        .map_or([false, false], |s| [s.is_active(Hand::Right), s.is_active(Hand::Left)]);
+    let shifting = body.shift.as_ref().map_or([false, false], |s| {
+        [s.is_active(Hand::Right), s.is_active(Hand::Left)]
+    });
     let sniper_hand = (0..2).find(|&i| arms.hands[i].stance && want[i]).map(|i| {
         if i == 0 {
             Hand::Right
@@ -1948,10 +1957,7 @@ pub fn fire(
     // Ready-position camera stance (`0x8285db68` row 40 -> 49 + `0x8285e418` zoom FOV override).
     pilot.ready_cam = if let Some(hand) = sniper_hand {
         let gun = &arms.hands[usize::from(hand == Hand::Left)];
-        let deployed = body
-            .anims
-            .as_ref()
-            .is_none_or(|a| a.sniper.allows(hand));
+        let deployed = body.anims.as_ref().is_none_or(|a| a.sniper.allows(hand));
         if deployed && gun.snipe_fov > 0.0 {
             ReadyCamera::Zoomed {
                 fov_deg: gun.snipe_fov,
@@ -2022,7 +2028,7 @@ pub fn fire(
                     let target = fcs
                         .as_deref()
                         .and_then(|f| f.locked.as_ref())
-                        .map(|l| (l.entity, l.world_pos));
+                        .map(|l| (l.entity.to_bits(), l.world_pos));
                     let launch = BladeLaunch {
                         hand_idx: 0,
                         physical: blade.physical,
@@ -2091,7 +2097,8 @@ pub fn fire(
                     }
                 } else {
                     // Rocket / dumbfire weapon arm (e.g. am7230 wep 9230: burst_count=2, lock_once=8).
-                    let salvo_count = (burst * arms.hands[0].weapon_lock_max.max(1) as usize).min(rem);
+                    let salvo_count =
+                        (burst * arms.hands[0].weapon_lock_max.max(1) as usize).min(rem);
                     for _ in 0..salvo_count {
                         arms.arm_salvo.push(None);
                     }
@@ -2153,7 +2160,11 @@ pub fn fire(
                             aim
                         };
                         let right = wa_aim.cross(Vec3::Y).normalize_or_zero();
-                        let side = if arms.arm_salvo_index % 2 == 0 { 1.0 } else { -1.0 };
+                        let side = if arms.arm_salvo_index % 2 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
                         let launch_dir = if target_opt.is_some() {
                             (wa_aim + Vec3::Y * 0.25 + right * (0.22 * side)).normalize_or(wa_aim)
                         } else {
@@ -2161,7 +2172,8 @@ pub fn fire(
                         };
                         arms.arm_salvo_index = arms.arm_salvo_index.wrapping_add(1);
                         let missile = Missile::from_gun(&arms.hands[0], launch_dir, target_opt);
-                        let tf = Transform::from_translation(origin).looking_to(launch_dir, Vec3::Y);
+                        let tf =
+                            Transform::from_translation(origin).looking_to(launch_dir, Vec3::Y);
                         if arms.hands[0].fx.bullet > 0 {
                             commands
                                 .spawn((
@@ -2171,7 +2183,10 @@ pub fn fire(
                                     Mesh3d(assets.mesh.clone()),
                                     MeshMaterial3d(assets.missile.clone()),
                                 ))
-                                .with_child((Sfx::new(arms.hands[0].fx.bullet), Transform::default()));
+                                .with_child((
+                                    Sfx::new(arms.hands[0].fx.bullet),
+                                    Transform::default(),
+                                ));
                         } else {
                             commands.spawn((
                                 Mesh3d(assets.mesh.clone()),
@@ -2323,24 +2338,35 @@ pub fn fire(
             }
             for (i, hand) in [Hand::Right, Hand::Left].into_iter().enumerate() {
                 let muzzle = if hand == Hand::Right {
-                    right_muzzles.first().or_else(|| left_muzzles.first()).map(|m| m.1)
+                    right_muzzles
+                        .first()
+                        .or_else(|| left_muzzles.first())
+                        .map(|m| m.1)
                 } else {
-                    left_muzzles.first().or_else(|| right_muzzles.first()).map(|m| m.1)
+                    left_muzzles
+                        .first()
+                        .or_else(|| right_muzzles.first())
+                        .map(|m| m.1)
                 };
                 let origin = rigging
                     .hardpoints
                     .iter()
                     .find(|(h, _)| h.hand == hand)
                     .map_or(fallback_origin, |(_, t)| t.translation());
-                let hand_aim = fcs
-                    .as_deref()
-                    .map_or(aim, |f| f.aim_for_hand(0, origin, arms.hands[0].init_speed, aim));
+                let hand_aim = fcs.as_deref().map_or(aim, |f| {
+                    f.aim_for_hand(0, origin, arms.hands[0].init_speed, aim)
+                });
                 if shifting[i] {
                     continue;
                 }
                 let arm = &mut anims.aim[i];
                 arm.sniper = arms.hands[0].sniper;
-                arm.step(want_wa && arms.hands[0].kind != Kind::Skip && arms.hands[0].kind != Kind::Blade, frames);
+                arm.step(
+                    want_wa
+                        && arms.hands[0].kind != Kind::Skip
+                        && arms.hands[0].kind != Kind::Blade,
+                    frames,
+                );
                 arm.frame = arm
                     .shoulder
                     .and_then(|s| rigging.aim_frame(s, hand, muzzle, hand_aim));
@@ -2372,7 +2398,7 @@ pub fn fire(
                 let target = fcs
                     .as_deref()
                     .and_then(|f| f.locked.as_ref())
-                    .map(|l| (l.entity, l.world_pos));
+                    .map(|l| (l.entity.to_bits(), l.world_pos));
                 let launch = BladeLaunch {
                     hand_idx: i,
                     physical: blade.physical,
@@ -2581,8 +2607,7 @@ pub fn fire(
         for arm in &mut anims.arms {
             let i = if arm.hand == Hand::Left { 1 } else { 0 };
             if !shifting[i] {
-                arm.playback
-                    .tick(pods || hand_deploy[i], false, frames);
+                arm.playback.tick(pods || hand_deploy[i], false, frames);
             }
             arm.apply(&mut posed);
         }
@@ -2960,8 +2985,8 @@ pub fn step_overed_weapon(
         tri_held |= pad.pressed(GamepadButton::North);
     }
     // `manual.fmg` 20405: hold `△` (or dedicated `U` key) without pressing fire buttons to arm OW.
-    let activate_held = !pilot.scan_mode
-        && (down(KeyCode::KeyU) || (tri_held && !fire_held && !left_fire));
+    let activate_held =
+        !pilot.scan_mode && (down(KeyCode::KeyU) || (tri_held && !fire_held && !left_fire));
     let trigger_for_ow = !pilot.scan_mode && fire_held;
 
     let res = ow.step(dt, activate_held, trigger_for_ow);
@@ -2978,7 +3003,11 @@ pub fn step_overed_weapon(
         if att.set_deployed(&mut commands, ow.is_active()) {
             info!(
                 "OW root 60 {} arm dummy 60",
-                if ow.is_active() { "re-attached to" } else { "stowed from" }
+                if ow.is_active() {
+                    "re-attached to"
+                } else {
+                    "stowed from"
+                }
             );
         }
     }
@@ -3046,7 +3075,10 @@ pub fn step_overed_weapon(
                     "c00000024",
                     ac_tf.translation,
                 );
-                info!("OW {} CHARGE COMPLETE — release trigger to unleash!", ow.spec.part_id);
+                info!(
+                    "OW {} CHARGE COMPLETE — release trigger to unleash!",
+                    ow.spec.part_id
+                );
             }
             OwEvent::Fired => {
                 pilot.trigger_impact_shake(250.0);
@@ -3102,7 +3134,7 @@ pub fn step_overed_weapon(
                         let launch = BladeLaunch {
                             hand_idx: 0,
                             physical: blade.physical,
-                            target: locked.map(|l| (l.entity, l.world_pos)),
+                            target: locked.map(|l| (l.entity.to_bits(), l.world_pos)),
                             hit_radius: blade.hit_radius,
                             blade_radius: blade.blade_radius,
                             max_hits: blade.max_hits,
@@ -3212,7 +3244,10 @@ pub fn step_overed_weapon(
                 );
             }
             OwEvent::LockoutEnded => {
-                info!("OW {} lockout ended — EN/FCS systems restored", ow.spec.part_id);
+                info!(
+                    "OW {} lockout ended — EN/FCS systems restored",
+                    ow.spec.part_id
+                );
             }
         }
     }
@@ -3288,7 +3323,11 @@ pub fn step_projectiles(
                             let (res, lethal) = health.apply_hit(shot.damage_type, power, recoil);
                             health.record_hit_from(prev);
                             let ffx = if res.effective {
-                                if shot.hit_hi > 0 { shot.hit_hi } else { shot.hit }
+                                if shot.hit_hi > 0 {
+                                    shot.hit_hi
+                                } else {
+                                    shot.hit
+                                }
                             } else if shot.hit_low > 0 {
                                 shot.hit_low
                             } else {
@@ -3319,11 +3358,19 @@ pub fn step_projectiles(
                                 "hit {} ({}) [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
                                 target.name,
                                 target.model,
-                                if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                                if res.effective {
+                                    "EFFECTIVE"
+                                } else {
+                                    "RICOCHET"
+                                },
                                 res.damage,
                                 health.ap,
                                 health.ap_max,
-                                if health.is_staggered() { " STAGGER" } else { "" },
+                                if health.is_staggered() {
+                                    " STAGGER"
+                                } else {
+                                    ""
+                                },
                                 if lethal { " DESTROYED" } else { "" },
                             );
                         }
@@ -3366,7 +3413,11 @@ pub fn step_projectiles(
                                     s.ap = health.ap_u32();
                                 }
                                 let ffx = if res.effective {
-                                    if shot.hit_hi > 0 { shot.hit_hi } else { shot.hit }
+                                    if shot.hit_hi > 0 {
+                                        shot.hit_hi
+                                    } else {
+                                        shot.hit
+                                    }
                                 } else if shot.hit_low > 0 {
                                     shot.hit_low
                                 } else {
@@ -3395,11 +3446,19 @@ pub fn step_projectiles(
                                 }
                                 info!(
                                     "player hit [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
-                                    if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                                    if res.effective {
+                                        "EFFECTIVE"
+                                    } else {
+                                        "RICOCHET"
+                                    },
                                     res.damage,
                                     health.ap,
                                     health.ap_max,
-                                    if health.is_staggered() { " STAGGER" } else { "" },
+                                    if health.is_staggered() {
+                                        " STAGGER"
+                                    } else {
+                                        ""
+                                    },
                                     if lethal { " DESTROYED" } else { "" },
                                 );
                                 commands.entity(e).despawn();
@@ -3415,7 +3474,7 @@ pub fn step_projectiles(
             if let Some(pid) = prop_id {
                 let (power, _) = shot.effective_damage();
                 for mut prop in &mut props {
-                    if prop.prop_id == pid {
+                    if prop.prop_id.0 == pid {
                         prop.apply_damage(power.max(1.0));
                         break;
                     }
@@ -3665,11 +3724,19 @@ pub fn step_missiles(
                                 "missile hit {} ({}) [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
                                 target.name,
                                 target.model,
-                                if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                                if res.effective {
+                                    "EFFECTIVE"
+                                } else {
+                                    "RICOCHET"
+                                },
                                 res.damage,
                                 health.ap,
                                 health.ap_max,
-                                if health.is_staggered() { " STAGGER" } else { "" },
+                                if health.is_staggered() {
+                                    " STAGGER"
+                                } else {
+                                    ""
+                                },
                                 if lethal { " DESTROYED" } else { "" },
                             );
                         }
@@ -3751,11 +3818,19 @@ pub fn step_missiles(
                                 }
                                 info!(
                                     "player missile hit [{}] -{:.0} AP ({:.0}/{:.0}){}{}",
-                                    if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                                    if res.effective {
+                                        "EFFECTIVE"
+                                    } else {
+                                        "RICOCHET"
+                                    },
                                     res.damage,
                                     health.ap,
                                     health.ap_max,
-                                    if health.is_staggered() { " STAGGER" } else { "" },
+                                    if health.is_staggered() {
+                                        " STAGGER"
+                                    } else {
+                                        ""
+                                    },
                                     if lethal { " DESTROYED" } else { "" },
                                 );
                                 commands.entity(e).despawn();
@@ -3771,7 +3846,7 @@ pub fn step_missiles(
             if let Some(pid) = prop_id {
                 let (power, _) = missile.effective_damage();
                 for mut prop in &mut props {
-                    if prop.prop_id == pid {
+                    if prop.prop_id.0 == pid {
                         prop.apply_damage(power.max(1.0));
                         break;
                     }
@@ -3835,7 +3910,12 @@ pub fn tick_player_health(
     collision: Res<Collision>,
     mut speaker: Speaker,
     mut commands: Commands,
-    mut acs: Query<(&mut PlayerHealth, &mut Pilot, &mut Transform, Option<&mut Status>)>,
+    mut acs: Query<(
+        &mut PlayerHealth,
+        &mut Pilot,
+        &mut Transform,
+        Option<&mut Status>,
+    )>,
 ) {
     let dt = time.delta_secs();
     let Ok((mut health, mut pilot, mut tf, mut status)) = acs.single_mut() else {
@@ -3879,7 +3959,10 @@ pub fn tick_player_health(
         );
         info!(
             "player AC destroyed at ({:.1}, {:.1}, {:.1}); respawning in {:.1}s",
-            center.x, center.y, center.z, damage::PLAYER_RESPAWN_SECS
+            center.x,
+            center.y,
+            center.z,
+            damage::PLAYER_RESPAWN_SECS
         );
     }
     if health.destroyed {
@@ -3917,10 +4000,7 @@ pub fn step_melee(
     mut commands: Commands,
     mut acs: Query<(&mut Pilot, &Transform, Option<&PlayerHealth>)>,
     hardpoints: Query<(&Hardpoint, &GlobalTransform)>,
-    mut targets: Query<
-        (Entity, &Target, &mut TargetHealth, &mut Transform),
-        Without<Pilot>,
-    >,
+    mut targets: Query<(Entity, &Target, &mut TargetHealth, &mut Transform), Without<Pilot>>,
     mut props: Query<&mut crate::map::DestructibleProp>,
 ) {
     if !piloting.0 {
@@ -3941,7 +4021,7 @@ pub fn step_melee(
     // Keep blade homing target position fresh while target is alive.
     if let Some(blade) = pilot.blade.as_mut() {
         if let Some((tent, _)) = blade.launch.target {
-            if let Ok((_, _, health, tf)) = targets.get(tent) {
+            if let Ok((_, _, health, tf)) = targets.get(Entity::from_bits(tent)) {
                 if !health.destroyed {
                     blade.target_pos = Some(tf.translation + Vec3::Y * health.center_offset_y());
                 } else {
@@ -3955,8 +4035,8 @@ pub fn step_melee(
     //    `PARAM_BULLETHITSFXPARAM_BIN` / `PARAM_BULLETHITSEPARAM_BIN` row 99000).
     if let Some(kick) = pilot.kick {
         if !kick.hit_applied {
-            let kick_radius = find(BULLET_BULLETEXPLOSION_BIN, 4100)
-                .map_or(7.0, |r| r.data.init_radius.max(3.0));
+            let kick_radius =
+                find(BULLET_BULLETEXPLOSION_BIN, 4100).map_or(7.0, |r| r.data.init_radius.max(3.0));
             let offset = Vec3::Y * 4.0 + kick.dir * 2.5;
             let a = prev_pos + offset;
             let b = cur_pos + offset;
@@ -3987,14 +4067,8 @@ pub fn step_melee(
             );
             for mut prop in &mut props {
                 if !prop.broken
-                    && damage::swept_sphere_hits_sphere(
-                        a,
-                        b,
-                        kick_radius,
-                        prop.center,
-                        prop.radius,
-                    )
-                    .is_some()
+                    && damage::swept_sphere_hits_sphere(a, b, kick_radius, prop.center, prop.radius)
+                        .is_some()
                 {
                     prop.apply_damage(kick_dmg.max(1.0));
                 }
@@ -4065,11 +4139,14 @@ pub fn step_melee(
             } else {
                 Hand::Left
             };
-            let forward = (Quat::from_rotation_y(pilot.yaw) * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
+            let forward =
+                (Quat::from_rotation_y(pilot.yaw) * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
             let origin = hardpoints
                 .iter()
                 .find(|(h, _)| h.hand == hand)
-                .map_or(cur_pos + Vec3::Y * 4.5 + forward * 2.0, |(_, t)| t.translation());
+                .map_or(cur_pos + Vec3::Y * 4.5 + forward * 2.0, |(_, t)| {
+                    t.translation()
+                });
 
             // Spawn blade trail / laser beam FFX once on entering Swing (e.g. FFX 4104).
             if !blade.trail_spawned {
@@ -4106,15 +4183,19 @@ pub fn step_melee(
                 if blade.hit_entities.len() >= max_hits {
                     break;
                 }
-                if health.destroyed || blade.hit_entities.contains(&entity) {
+                if health.destroyed || blade.hit_entities.contains(&entity.to_bits()) {
                     continue;
                 }
                 let mut hit_pos = None;
                 for sphere in &health.spheres {
                     let center = tf.translation + Vec3::Y * sphere.offset_y;
-                    if let Some((_, p, _)) =
-                        damage::swept_sphere_hits_sphere(origin, tip, sweep_r, center, sphere.radius)
-                    {
+                    if let Some((_, p, _)) = damage::swept_sphere_hits_sphere(
+                        origin,
+                        tip,
+                        sweep_r,
+                        center,
+                        sphere.radius,
+                    ) {
                         hit_pos = Some(p);
                         break;
                     }
@@ -4159,19 +4240,31 @@ pub fn step_melee(
                         hit_pos,
                     );
                 }
-                blade.hit_entities.push(entity);
+                blade.hit_entities.push(entity.to_bits());
                 pilot.blade_hits += 1;
                 info!(
                     "BLADE {} ({}) ({}): {} {:.0} dmg (recoil {:.0}, AP {:.0}/{:.0}){}{}",
                     target.name,
                     target.model,
-                    if blade.launch.physical { "physical/pile" } else { "laser" },
-                    if res.effective { "EFFECTIVE" } else { "RICOCHET" },
+                    if blade.launch.physical {
+                        "physical/pile"
+                    } else {
+                        "laser"
+                    },
+                    if res.effective {
+                        "EFFECTIVE"
+                    } else {
+                        "RICOCHET"
+                    },
                     res.damage,
                     res.recoil,
                     health.ap,
                     health.ap_max,
-                    if health.is_staggered() { " STAGGER" } else { "" },
+                    if health.is_staggered() {
+                        " STAGGER"
+                    } else {
+                        ""
+                    },
                     if lethal { " DESTROYED" } else { "" },
                 );
             }
@@ -4323,7 +4416,11 @@ fn gun_from_category(id: i64, category: u8, arms_mount: u8) -> Gun {
         },
         snipe_turn_scale: if category == 10 {
             let s = part_field(id, 10, "snipe_turn_scale");
-            if s > 0.0 { s } else { 1.0 }
+            if s > 0.0 {
+                s
+            } else {
+                1.0
+            }
         } else {
             1.0
         },
@@ -4506,16 +4603,15 @@ fn enemy_flight(id: u32, init_speed: f32) -> (Kind, Flight, Option<MissileFlight
             max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
             hit_radius: d.hit_radius,
             proximity_fuse_range: d.proximity_fuse_range,
-            split: (d.close_act_id == 8 && d.shoot_bullet_id > 0 && d.once_shoot_count > 0).then_some(
-                MissileSplit {
+            split: (d.close_act_id == 8 && d.shoot_bullet_id > 0 && d.once_shoot_count > 0)
+                .then_some(MissileSplit {
                     force_trace_frame: d.force_trace_frame as f32,
                     start_frame: d.close_act_start_frame as f32,
                     start_dist: d.close_act_start_dist,
                     arise_id: d.shoot_bullet_id,
                     count: d.once_shoot_count,
                     shoot_speed: d.shoot_speed as f32,
-                },
-            ),
+                }),
         };
         let spd = if init_speed > 0.0 {
             init_speed
@@ -4655,16 +4751,15 @@ fn flight(id: u32, init_speed: f32) -> (Kind, Flight, Option<MissileFlight>, f32
             max_speed: d.max_speed_km_h as f32 / KMH_PER_MS,
             hit_radius: d.hit_radius,
             proximity_fuse_range: d.proximity_fuse_range,
-            split: (d.close_act_id == 8 && d.shoot_bullet_id > 0 && d.once_shoot_count > 0).then_some(
-                MissileSplit {
+            split: (d.close_act_id == 8 && d.shoot_bullet_id > 0 && d.once_shoot_count > 0)
+                .then_some(MissileSplit {
                     force_trace_frame: d.force_trace_frame as f32,
                     start_frame: d.close_act_start_frame as f32,
                     start_dist: d.close_act_start_dist,
                     arise_id: d.shoot_bullet_id,
                     count: d.once_shoot_count,
                     shoot_speed: d.shoot_speed as f32,
-                },
-            ),
+                }),
         };
         return (
             Kind::Missile,
@@ -5610,7 +5705,10 @@ impl WeaponAnims {
 
 /// Logs each hand's arm-raise state during a `--shot` run, so the raise can be traced
 /// (`SHOT aim r=(hold=.. weight=.. err=..)`).
-pub(crate) fn probe_shot(shot: Option<Res<acvd_render::app::Shot>>, anims: Option<Res<WeaponAnims>>) {
+pub(crate) fn probe_shot(
+    shot: Option<Res<acvd_render::app::Shot>>,
+    anims: Option<Res<WeaponAnims>>,
+) {
     let Some(shot) = shot else {
         return;
     };
@@ -6271,7 +6369,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(ignited_at, Some(30), "booster ignites at accel_start_frame = 30");
+        assert_eq!(
+            ignited_at,
+            Some(30),
+            "booster ignites at accel_start_frame = 30"
+        );
         assert!(
             min_dist < 5.0,
             "homing missile should intercept target (min_dist = {min_dist})"
@@ -6291,7 +6393,10 @@ mod tests {
         assert_eq!(lb350.fx.bullet, 4104);
         assert_eq!(lb350.shoot, 6);
         let spec350 = lb350.blade.expect("laser blade spec");
-        assert!(!spec350.physical, "TE laser blade does not use speedxweight scaling (0x8247f170)");
+        assert!(
+            !spec350.physical,
+            "TE laser blade does not use speedxweight scaling (0x8247f170)"
+        );
         assert!(spec350.infinite_ammo);
         assert_eq!(spec350.hit_radius, 25.0);
         assert_eq!(spec350.blade_radius, 2.0);
@@ -6312,7 +6417,10 @@ mod tests {
         assert!(pile150.damage_recoil > 2000.0);
         assert_eq!(pile150.shoot, 3);
         let spec150 = pile150.blade.expect("heat pile spec");
-        assert!(spec150.physical, "CE heat pile uses physical speedxweight scaling (0x8247f170)");
+        assert!(
+            spec150.physical,
+            "CE heat pile uses physical speedxweight scaling (0x8247f170)"
+        );
         assert!(!spec150.infinite_ammo);
         assert_eq!(spec150.hit_radius, 10.0);
         assert_eq!(spec150.blade_radius, 3.0);
@@ -6335,7 +6443,13 @@ mod tests {
         assert_eq!(kfx.hit_hi, 135);
         assert_eq!(kse.hi, 9202);
         assert_eq!(kse.low, 9027);
-        assert_eq!(find(BULLET_BULLETEXPLOSION_BIN, 4100).unwrap().data.init_radius, 7.0);
+        assert_eq!(
+            find(BULLET_BULLETEXPLOSION_BIN, 4100)
+                .unwrap()
+                .data
+                .init_radius,
+            7.0
+        );
     }
 
     #[test]
@@ -6348,16 +6462,26 @@ mod tests {
         .unwrap()
         .data;
         let ctrl = acvd_data::generated::ctrl::AcCtrlParam::calculate(&design5001);
-        let (k_pwr, k_rec) =
-            SpeedWeightScale::kick().scale(ctrl.kick_power, ctrl.kick_recoil, 120.0, ctrl.total_weight);
+        let (k_pwr, k_rec) = SpeedWeightScale::kick().scale(
+            ctrl.kick_power,
+            ctrl.kick_recoil,
+            120.0,
+            ctrl.total_weight,
+        );
 
         let mut tank = TargetHealth::from_enemy("e1020");
         let (res, lethal) = tank.apply_hit(DamageType::Ke, k_pwr, k_rec);
-        assert!(res.effective && lethal && tank.destroyed, "120 km/h kick must one-shot tank");
+        assert!(
+            res.effective && lethal && tank.destroyed,
+            "120 km/h kick must one-shot tank"
+        );
 
         let mut mt = TargetHealth::from_enemy("e0210");
         let (res_mt, _) = mt.apply_hit(DamageType::Ke, k_pwr, k_rec);
-        assert!(res_mt.effective && mt.is_staggered(), "kick recoil must stagger DEF-MT");
+        assert!(
+            res_mt.effective && mt.is_staggered(),
+            "kick recoil must stagger DEF-MT"
+        );
 
         // Test Heat Pile 150 at 130 km/h against DEF-MT e0210 -> one-shot destruction.
         let pile = gun(150);
@@ -6369,13 +6493,19 @@ mod tests {
         );
         let mut mt2 = TargetHealth::from_enemy("e0210");
         let (res_p, lethal_p) = mt2.apply_hit(pile.damage_type, p_pwr, p_rec);
-        assert!(res_p.effective && lethal_p && mt2.destroyed, "Heat Pile must destroy DEF-MT");
+        assert!(
+            res_p.effective && lethal_p && mt2.destroyed,
+            "Heat Pile must destroy DEF-MT"
+        );
 
         // Test Laser Blade 350 fixed TE damage against tank e1020 -> one-shot destruction.
         let lb = gun(350);
         let mut tank2 = TargetHealth::from_enemy("e1020");
         let (res_l, lethal_l) = tank2.apply_hit(lb.damage_type, lb.damage_power, lb.damage_recoil);
-        assert!(res_l.effective && lethal_l && tank2.destroyed, "Laser Blade must destroy tank");
+        assert!(
+            res_l.effective && lethal_l && tank2.destroyed,
+            "Laser Blade must destroy tank"
+        );
     }
 
     #[test]
@@ -6446,8 +6576,8 @@ mod tests {
         let arm_hi = Armament::from_design(&high_stab);
         let arm_lo = Armament::from_design(&low_stab);
         let raw_r = gun(base.armwep_r as i64);
-        let expected_base =
-            raw_r.reload_time * reload_multiplier(&ctrl_base, raw_r.reload_stab_factor, raw_r.stance);
+        let expected_base = raw_r.reload_time
+            * reload_multiplier(&ctrl_base, raw_r.reload_stab_factor, raw_r.stance);
         assert!(
             (arms_base.hands[0].reload_time - expected_base).abs() < 1e-4,
             "expected {expected_base}, got {}",
@@ -6486,7 +6616,9 @@ mod tests {
         let sh1010 = shoulder_gun(1010, 1);
         assert_eq!(sh1010.kind, Kind::Missile);
         let mf = sh1010.missile_flight.expect("missile flight");
-        let split = mf.split.expect("51010 must have MissileSplit (close_act_id == 8)");
+        let split = mf
+            .split
+            .expect("51010 must have MissileSplit (close_act_id == 8)");
         assert_eq!(split.arise_id, 51010);
         assert_eq!(split.count, 3);
         assert_eq!(split.start_frame, 45.0);
@@ -6506,7 +6638,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(split_tick, Some(45), "Spread missile 51010 splits at frame 45");
+        assert_eq!(
+            split_tick,
+            Some(45),
+            "Spread missile 51010 splits at frame 45"
+        );
 
         let burst = parent.build_split_burst(pos, Some(target), split);
         assert_eq!(burst.children.len(), 3, "must spawn 3 child missiles");
@@ -6518,7 +6654,10 @@ mod tests {
             assert_eq!(cm.damage_power, 652.0);
             assert_eq!(cm.damage_recoil, 1523.0);
             assert_eq!(cm.split_depth, 1);
-            assert!(cm.flight.split.is_none(), "child 61010 does not split again");
+            assert!(
+                cm.flight.split.is_none(),
+                "child 61010 does not split again"
+            );
             dirs.push(cm.velocity.normalize());
             // Confirm each child homes toward target.
             let mut p = cpos;
@@ -6530,7 +6669,10 @@ mod tests {
                 p += d;
                 min_d = min_d.min(p.distance(target));
             }
-            assert!(min_d < 8.0, "child missile should home to target (min_d = {min_d})");
+            assert!(
+                min_d < 8.0,
+                "child missile should home to target (min_d = {min_d})"
+            );
         }
         // Children fan out in distinct directions.
         assert!(dirs[0].dot(dirs[1]) < 0.99);
@@ -6554,8 +6696,12 @@ mod tests {
             None,
             Owner::Enemy,
         );
-        assert!(em.should_split(Vec3::ZERO, Some(Vec3::new(0.0, 0.0, -200.0))).is_none());
-        assert!(em.should_split(Vec3::ZERO, Some(Vec3::new(0.0, 0.0, -100.0))).is_some());
+        assert!(em
+            .should_split(Vec3::ZERO, Some(Vec3::new(0.0, 0.0, -200.0)))
+            .is_none());
+        assert!(em
+            .should_split(Vec3::ZERO, Some(Vec3::new(0.0, 0.0, -100.0)))
+            .is_some());
         let eburst = em.build_split_burst(Vec3::ZERO, Some(Vec3::new(0.0, 0.0, -100.0)), esplit);
         assert_eq!(eburst.children.len(), 4);
     }
@@ -6777,7 +6923,10 @@ mod tests {
             for _ in 0..200 {
                 dmg_total += ow2.step(0.1, false, false).overload_damage;
             }
-            assert!(dmg_total > 0.0, "armed OW must deal periodic overload AP self-damage");
+            assert!(
+                dmg_total > 0.0,
+                "armed OW must deal periodic overload AP self-damage"
+            );
         }
     }
 
@@ -6837,19 +6986,37 @@ mod tests {
         assert_eq!(gun(2110).fire_mode, FireMode::Charge);
 
         // Hold to start charge, charge halfway, release -> partial power (0.5..1.0).
-        assert_eq!(laser.step_trigger(true, true, true, 1.0), TriggerAction::StartCharge);
-        assert_eq!(laser.step_trigger(true, true, true, 53.5), TriggerAction::None);
+        assert_eq!(
+            laser.step_trigger(true, true, true, 1.0),
+            TriggerAction::StartCharge
+        );
+        assert_eq!(
+            laser.step_trigger(true, true, true, 53.5),
+            TriggerAction::None
+        );
         match laser.step_trigger(false, true, true, 1.0) {
-            TriggerAction::Fire { power_scale, pellets } => {
+            TriggerAction::Fire {
+                power_scale,
+                pellets,
+            } => {
                 assert_eq!(pellets, 1);
-                assert!(power_scale > 0.7 && power_scale < 0.8, "half charge scale {power_scale}");
+                assert!(
+                    power_scale > 0.7 && power_scale < 0.8,
+                    "half charge scale {power_scale}"
+                );
             }
             other => panic!("expected partial-charge fire on release, got {other:?}"),
         }
 
         // Full charge -> release fires at full 1.0 power.
-        assert_eq!(laser.step_trigger(true, true, true, 1.0), TriggerAction::StartCharge);
-        assert_eq!(laser.step_trigger(true, true, true, 120.0), TriggerAction::None);
+        assert_eq!(
+            laser.step_trigger(true, true, true, 1.0),
+            TriggerAction::StartCharge
+        );
+        assert_eq!(
+            laser.step_trigger(true, true, true, 120.0),
+            TriggerAction::None
+        );
         assert_eq!(laser.charge_fraction(), 1.0);
         assert_eq!(
             laser.step_trigger(false, true, true, 1.0),
@@ -6915,17 +7082,26 @@ mod tests {
             .iter()
             .find(|p| p.column == "arms")
             .expect("arms placement");
-        let (_, rig) =
-            acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| assemble::place_of(&[], None))
-                .expect("rigged_model");
+        let (_, rig) = acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| {
+            assemble::place_of(&[], None)
+        })
+        .expect("rigged_model");
         let mut world = World::new();
-        let joints: Vec<Entity> = (0..rig.bones.len()).map(|_| world.spawn_empty().id()).collect();
+        let joints: Vec<Entity> = (0..rig.bones.len())
+            .map(|_| world.spawn_empty().id())
+            .collect();
         let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
 
         let mut anims = WeaponAnims::default();
         anims.load(&disc, arms_pl, &rig, &joints, leg_type);
-        assert!(anims.arms.is_empty(), "weapon arm must not load normal-arm rigs");
-        assert!(anims.recoil_bones.is_empty(), "weapon arm must not hook normal-arm recoil");
+        assert!(
+            anims.arms.is_empty(),
+            "weapon arm must not load normal-arm rigs"
+        );
+        assert!(
+            anims.recoil_bones.is_empty(),
+            "weapon arm must not hook normal-arm recoil"
+        );
         let wa = anims.weapon_arm.as_ref().expect("weapon_arm rig loaded");
         assert_eq!(wa.phase, WeaponArmPhase::Stowed);
         let joint_count = wa.joints.len();
@@ -6984,11 +7160,14 @@ mod tests {
             .iter()
             .find(|p| p.column == "arms")
             .expect("arms placement");
-        let (_, rig) =
-            acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| assemble::place_of(&[], None))
-                .expect("rigged_model");
+        let (_, rig) = acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| {
+            assemble::place_of(&[], None)
+        })
+        .expect("rigged_model");
         let mut world = World::new();
-        let joints: Vec<Entity> = (0..rig.bones.len()).map(|_| world.spawn_empty().id()).collect();
+        let joints: Vec<Entity> = (0..rig.bones.len())
+            .map(|_| world.spawn_empty().id())
+            .collect();
         let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
         let mut anims = WeaponAnims::default();
         anims.load(&disc, arms_pl, &rig, &joints, leg_type);
@@ -7015,6 +7194,198 @@ mod tests {
                     .any(|b| b.entity == shoulder && b.hand == hand && !b.sniper),
                 "{hand:?} shoulder must also be a gun recoil bone, or the turn is never written"
             );
+        }
+    }
+}
+
+/// Network visual projectile driven only by a server `FireEvent`; damage is authoritative on the
+/// server and arrives as `DamageEvent`/`ProjectileHit`/`ProjectileExpire`.
+#[derive(Component)]
+pub(crate) struct NetProjectile {
+    pub id: u32,
+    pub flight: NetFlight,
+    /// Impact / delete FFX and hit cue ids from the firing row (server hit/expire placement).
+    pub hit_fx: i32,
+    pub hit_low_fx: i32,
+    pub hit_hi_fx: i32,
+    pub hit_se: i16,
+    pub delete_fx: i32,
+    /// Sub-tick accumulator so visuals step at exactly 60 Hz regardless of render rate.
+    pub acc: f32,
+}
+
+pub(crate) enum NetFlight {
+    Projectile(simw::Projectile),
+    Missile(simw::Missile),
+}
+
+impl NetFlight {
+    pub fn position(&self) -> Vec3 {
+        match self {
+            Self::Projectile(p) => p.position,
+            Self::Missile(m) => m.position,
+        }
+    }
+
+    pub fn velocity(&self) -> Vec3 {
+        match self {
+            Self::Projectile(p) => p.velocity,
+            Self::Missile(m) => m.velocity,
+        }
+    }
+
+    pub fn set_state(&mut self, position: Vec3, velocity: Vec3) {
+        match self {
+            Self::Projectile(p) => {
+                p.position = position;
+                p.velocity = velocity;
+            }
+            Self::Missile(m) => {
+                m.position = position;
+                m.velocity = velocity;
+            }
+        }
+    }
+
+    fn step(&mut self) -> bool {
+        match self {
+            Self::Projectile(p) => p.step_tick().is_some(),
+            Self::Missile(m) => m.step_tick(None).is_some(),
+        }
+    }
+}
+
+/// Spawns the deterministic visual round for one `FireEvent` using the shooter's gun row:
+/// muzzle FFX + cartridge + sound, a glowing tracer, and the bullet follow FFX.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_net_projectile(
+    commands: &mut Commands,
+    assets: &Tracers,
+    cues: &mut Cues,
+    sources: &mut Assets<AudioSource>,
+    event: &acvd_proto::FireEvent,
+    gun: &simw::Gun,
+) {
+    if gun.kind == simw::Kind::Skip {
+        return;
+    }
+    let origin = Vec3::new(
+        acvd_proto::dequantize_coord(event.muzzle_pos[0]),
+        acvd_proto::dequantize_coord(event.muzzle_pos[1]),
+        acvd_proto::dequantize_coord(event.muzzle_pos[2]),
+    );
+    let dir = acvd_proto::dequantize_dir3(event.aim_dir).normalize_or_zero();
+    if dir == Vec3::ZERO {
+        return;
+    }
+    if gun.shoot > 0 {
+        sound::shot(commands, cues, sources, gun.shoot, origin);
+    }
+    if gun.fx.muzzle > 0 {
+        commands.spawn((
+            Sfx::new(gun.fx.muzzle),
+            Transform::from_translation(origin)
+                .looking_to(-dir, Vec3::Y)
+                .with_scale(Vec3::splat(MUZZLE_SCALE)),
+        ));
+    }
+    if gun.fx.cartridge > 0 {
+        commands.spawn((
+            Sfx::new(gun.fx.cartridge),
+            Transform::from_translation(origin).looking_to(-dir, Vec3::Y),
+        ));
+    }
+    let shot = simw::Shot {
+        id: acvd_sim::ids::ProjectileId(event.projectile_id),
+        slot: acvd_sim::world::weapon_slot_of(event.weapon_slot),
+        position: origin,
+        dir,
+        target: None,
+        gun: *gun,
+        seed: event.seed,
+    };
+    let owner = acvd_sim::ids::NetId(event.shooter.get());
+    let (flight, material) = if gun.kind == simw::Kind::Missile {
+        (
+            NetFlight::Missile(simw::Missile::from_shot(&shot, owner)),
+            assets.enemy_missile.clone(),
+        )
+    } else {
+        let material = match gun.kind {
+            simw::Kind::Energy => assets.enemy_energy.clone(),
+            _ => assets.enemy_rigid.clone(),
+        };
+        (
+            NetFlight::Projectile(simw::Projectile::from_shot(&shot, owner, event.fire_tick)),
+            material,
+        )
+    };
+    let tf = Transform::from_translation(origin).looking_to(dir, Vec3::Y);
+    if gun.fx.bullet > 0 {
+        commands
+            .spawn((
+                NetProjectile {
+                    id: event.projectile_id,
+                    flight,
+                    hit_fx: gun.fx.hit,
+                    hit_low_fx: gun.fx.hit_low,
+                    hit_hi_fx: gun.fx.hit_hi,
+                    hit_se: gun.hit_se.hi.max(gun.hit_se.low),
+                    delete_fx: gun.fx.delete_fx,
+                    acc: 0.0,
+                },
+                Mesh3d(assets.mesh.clone()),
+                MeshMaterial3d(material),
+                tf,
+                Visibility::default(),
+            ))
+            .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+    } else {
+        commands.spawn((
+            NetProjectile {
+                id: event.projectile_id,
+                flight,
+                hit_fx: gun.fx.hit,
+                hit_low_fx: gun.fx.hit_low,
+                hit_hi_fx: gun.fx.hit_hi,
+                hit_se: gun.hit_se.hi.max(gun.hit_se.low),
+                delete_fx: gun.fx.delete_fx,
+                acc: 0.0,
+            },
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(material),
+            tf,
+            Visibility::default(),
+        ));
+    }
+}
+
+/// Steps visual network projectiles at 60 Hz and despawns them when their own flight ends.
+pub(crate) fn step_net_projectiles(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut rounds: Query<(Entity, &mut NetProjectile, &mut Transform)>,
+) {
+    let dt = time.delta_secs().min(0.25);
+    for (entity, mut round, mut tf) in &mut rounds {
+        round.acc = (round.acc + dt).min(1.0);
+        let mut alive = true;
+        while round.acc >= acvd_sim::tick::TICK_DT {
+            round.acc -= acvd_sim::tick::TICK_DT;
+            if !round.flight.step() {
+                alive = false;
+                break;
+            }
+        }
+        if !alive {
+            commands.entity(entity).despawn();
+            continue;
+        }
+        let position = round.flight.position();
+        let velocity = round.flight.velocity();
+        tf.translation = position;
+        if velocity.length_squared() > 1.0e-6 {
+            tf.look_to(velocity.normalize(), Vec3::Y);
         }
     }
 }

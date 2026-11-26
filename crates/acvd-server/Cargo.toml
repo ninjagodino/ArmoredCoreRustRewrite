@@ -1,0 +1,25 @@
+[package]
+name = "acvd-server"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "acvd_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "acvd-server"
+path = "src/main.rs"
+
+[dependencies]
+acvd-sim = { path = "../acvd-sim" }
+acvd-formats = { path = "../acvd-formats" }
+acvd-proto = { path = "../acvd-proto" }
+acvd-net = { path = "../acvd-net" }
+anyhow.workspace = true
+bytes.workspace = true
+log.workspace = true
+env_logger = "0.11"
+ctrlc = "3"
+glam.workspace = true

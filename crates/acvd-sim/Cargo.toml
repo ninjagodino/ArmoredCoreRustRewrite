@@ -1,0 +1,12 @@
+[package]
+name = "acvd-sim"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+acvd-formats = { path = "../acvd-formats" }
+acvd-data = { path = "../acvd-data" }
+acvd-proto = { path = "../acvd-proto" }
+anyhow.workspace = true
+glam = { workspace = true }

@@ -84,6 +84,7 @@ mod input;
 mod lens_flare;
 mod map;
 mod movie;
+mod net;
 mod paint;
 mod pause;
 mod pose;
@@ -249,6 +250,34 @@ fn mark_world_spawned(mut spawned: ResMut<WorldSpawned>) {
     spawned.0 = true;
 }
 
+/// `host:port`, `ip:port`, or a bare port on localhost.
+fn parse_socket_addr(raw: String) -> Option<std::net::SocketAddr> {
+    if let Ok(addr) = raw.parse() {
+        return Some(addr);
+    }
+    if let Ok(port) = raw.parse::<u16>() {
+        return Some(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    use std::net::ToSocketAddrs;
+    raw.to_socket_addrs().ok().and_then(|mut it| it.next())
+}
+
+/// `rtt_ms,jitter_ms,loss_pct,reorder_pct,seed`.
+fn parse_netem(raw: &str) -> Option<acvd_net::netem::NetemConfig> {
+    let parts: Vec<&str> = raw.split(',').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    Some(acvd_net::netem::NetemConfig::new(
+        parts[0].trim().parse().ok()?,
+        parts[1].trim().parse().ok()?,
+        parts[2].trim().parse().ok()?,
+        0.0,
+        parts[3].trim().parse().ok()?,
+        parts[4].trim().parse().ok()?,
+    ))
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut wanted, mut disc, mut shot, mut flat, mut yaw, mut pitch, mut pos_override) =
@@ -296,6 +325,10 @@ fn main() {
     let mut boot_auto: Option<f32> = None;
     let mut movies_dir: Option<PathBuf> = None;
     let mut world_args = false;
+    let mut net_listen = false;
+    let mut net_listen_port = 0u16;
+    let mut net_connect: Option<std::net::SocketAddr> = None;
+    let mut net_netem: Option<acvd_net::netem::NetemConfig> = None;
     while let Some(a) = args.next() {
         if matches!(
             a.as_str(),
@@ -323,6 +356,9 @@ fn main() {
                 | "--decal"
                 | "--emblem"
                 | "--shadow-dist"
+                | "--listen"
+                | "--connect"
+                | "--netem"
         ) {
             world_args = true;
         }
@@ -353,6 +389,19 @@ fn main() {
             "--boot-auto" => boot_auto = args.next().and_then(|s| s.parse().ok()),
             "--movies-dir" => movies_dir = args.next().map(PathBuf::from),
             "--disc" => disc = args.next().map(PathBuf::from),
+            "--listen" => net_listen = true,
+            "--listen-port" => {
+                net_listen_port = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
+            "--connect" => net_connect = args.next().and_then(parse_socket_addr),
+            "--netem" => {
+                if let Some(raw) = args.next() {
+                    net_netem = parse_netem(&raw);
+                    if net_netem.is_none() {
+                        eprintln!("--netem expects rtt,jitter,loss,reorder,seed");
+                    }
+                }
+            }
             "--shot" => shot = args.next().map(|p| Shot::new(PathBuf::from(p))),
             "--flat" => flat = true,
             "--yaw" => {
@@ -546,8 +595,8 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let disc =
-        Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
+    let disc_path = disc.unwrap_or_else(|| vfs::default_disc(&root));
+    let disc = Disc::open(&disc_path).expect("opening the disc");
     let (collision, mut start, area_bounds, map_nav, water_return) =
         if initial_mode == garage::Mode::Sortie {
             load_sortie_data(&disc, map.as_deref(), layout.as_deref(), plane, water)
@@ -653,6 +702,32 @@ fn main() {
     if let Some(sd) = shadow_dist_override {
         game_settings.shadow_distance = sd;
     }
+    let net_config = net::NetConfig {
+        listen: net_listen,
+        listen_port: net_listen_port,
+        connect: net_connect,
+        netem: net_netem,
+        max_clients: 8,
+        disc: Some(disc_path.clone()),
+        map: map.clone().unwrap_or_else(|| "m4000".into()),
+        loadout: acvd_sim::stats::loadout_from_design(&initial_design),
+    };
+    let net_runtime = if net_config.enabled() {
+        if net_config.listen && !disc_path.is_file() {
+            eprintln!("--listen needs the 360 disc (ACV2.pe); pass --disc <path>");
+            None
+        } else {
+            match net::NetRuntime::start(net_config) {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("net start failed: {err:#}");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -674,6 +749,7 @@ fn main() {
         paint::PaintPlugin,
         acvd_render::menu::MenuPlugin,
         frontend::FrontendPlugin,
+        net::NetPlugin,
     ))
     .add_plugins(sfx::SfxPlugin { disc: disc.clone() })
     .add_plugins(sound::SoundPlugin {
@@ -828,20 +904,34 @@ fn main() {
                 tick_pending_hold.run_if(in_active_sortie),
                 bay::shift.run_if(in_active_sortie),
                 bay::probe_shot.run_if(in_active_sortie),
-                weapons::fire.run_if(in_active_sortie),
-                weapons::probe_shot.run_if(in_active_sortie),
-                weapons::step_overed_weapon.run_if(in_active_sortie),
-                weapons::step_melee.run_if(in_active_sortie),
-                (ai::update, map::step_aircraft)
+                weapons::fire
+                    .run_if(in_active_sortie)
+                    .run_if(net::solo_play),
+                weapons::probe_shot
+                    .run_if(in_active_sortie)
+                    .run_if(net::solo_play),
+                weapons::step_overed_weapon
+                    .run_if(in_active_sortie)
+                    .run_if(net::solo_play),
+                weapons::step_melee
+                    .run_if(in_active_sortie)
+                    .run_if(net::solo_play),
+                (ai::update.run_if(net::solo_play), map::step_aircraft)
                     .chain()
                     .run_if(in_active_sortie),
                 (targets::animate_enemies, engine_trail::step_plumes)
                     .chain()
                     .run_if(in_active_sortie),
                 pose::animate_npcs.run_if(in_active_sortie),
-                weapons::step_projectiles.run_if(in_active_sortie),
-                weapons::step_missiles.run_if(in_active_sortie),
-                weapons::tick_player_health.run_if(in_active_sortie),
+                weapons::step_projectiles
+                    .run_if(in_active_sortie)
+                    .run_if(net::solo_play),
+                weapons::step_missiles
+                    .run_if(in_active_sortie)
+                    .run_if(net::solo_play),
+                weapons::tick_player_health
+                    .run_if(in_active_sortie)
+                    .run_if(net::solo_play),
                 targets::tick.run_if(in_active_sortie),
                 map::step_destructibles.run_if(in_active_sortie),
                 debris::step.run_if(in_active_sortie),
@@ -896,6 +986,9 @@ fn main() {
     }
     if let Some(o) = cam_override {
         app.insert_resource(o);
+    }
+    if let Some(runtime) = net_runtime {
+        app.insert_resource(runtime);
     }
     app.run();
 }

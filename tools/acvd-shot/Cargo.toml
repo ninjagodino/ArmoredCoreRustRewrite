@@ -1,0 +1,10 @@
+[package]
+name = "acvd-shot"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde_json.workspace = true

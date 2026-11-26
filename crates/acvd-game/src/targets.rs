@@ -1038,12 +1038,7 @@ pub fn spawn(
 
         let mut anim = EnemyAnim::new(cached.bank.clone(), joint_entities, init_yaw);
         if showcase {
-            anim.play(
-                crate::engine_trail::BOMBER_CLIP,
-                true,
-                1.0,
-                0.0,
-            );
+            anim.play(crate::engine_trail::BOMBER_CLIP, true, 1.0, 0.0);
         }
         commands.entity(root).insert(anim);
         if showcase {
@@ -1063,8 +1058,18 @@ pub fn spawn(
     Ok(spawned)
 }
 
+/// One assembled AC rig spawned from a full design: root entity plus its locomotion driver.
+pub struct SpawnedAcRig {
+    pub root: Entity,
+    pub npc: Option<pose::NpcMotion>,
+    /// Every spawned part-mesh entity with its assembly column (`armwep_r`, `hanger_l`, ...).
+    pub parts: Vec<(&'static str, Entity)>,
+}
+
+/// Spawns a real assembled AC rig (all part meshes, NPC skeleton, booster nozzles) from a full
+/// `AcAssemblyDesignSt`. Shared by map-placed AC targets and multiplayer `NetView`.
 #[allow(clippy::too_many_arguments)]
-fn spawn_ac_target(
+pub fn spawn_ac_rig(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
@@ -1074,19 +1079,11 @@ fn spawn_ac_target(
     disc: &Disc,
     packs: &mut Packs,
     missing: &mut usize,
-    part: &msb::Part,
-    layer: &str,
-    design_id: u16,
+    design: &AcAssemblyDesignSt,
+    label: &str,
     xf: Transform,
     flat: bool,
-) -> bool {
-    let Some(design) = find_design(design_id) else {
-        warn!(
-            "target {} ({}): design {design_id} not found",
-            part.name, part.model
-        );
-        return false;
-    };
+) -> Option<SpawnedAcRig> {
     let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
     let accolor = (!flat)
         .then(|| paint::load_accolor(disc, design.coloring_id))
@@ -1110,42 +1107,21 @@ fn spawn_ac_target(
                     rig,
                 });
             }
-            Err(e) => warn!("target {} part {}: {e:#}", part.name, p.model.path),
+            Err(e) => warn!("{label} part {}: {e:#}", p.model.path),
         }
     }
     let rig = match pose::build(disc, &loaded) {
         Ok(r) => r,
         Err(e) => {
-            warn!("target {} rig: {e:#}", part.name);
-            return false;
+            warn!("{label} rig: {e:#}");
+            return None;
         }
     };
-    let health = TargetHealth::from_ac(design);
-    let enemy_ai = ai::EnemyAi::for_ac(
-        design_id,
-        design,
-        xf.translation,
-        ai::yaw_from_quat(xf.rotation),
-    );
     let root = commands
-        .spawn((
-            Target {
-                name: part.name.clone(),
-                model: part.model.clone(),
-                layer: layer.to_string(),
-                ac_design_id: Some(design_id),
-            },
-            health,
-            enemy_ai,
-            Name::new(part.name.clone()),
-            xf,
-            Visibility::default(),
-        ))
+        .spawn((Name::new(label.to_string()), xf, Visibility::default()))
         .id();
     let (npc_motion, _, skins) = pose::spawn_npc(commands, root, rig, &loaded);
-    if let Some(npc) = npc_motion {
-        commands.entity(root).insert(npc);
-    }
+    let mut parts = Vec::new();
     for (part_loaded, (joints, binds)) in loaded.into_iter().zip(skins) {
         boost::fold(commands, part_loaded.placement, &part_loaded.rig, &joints);
         let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
@@ -1173,6 +1149,7 @@ fn spawn_ac_target(
                 Transform::default(),
                 ChildOf(root),
             ));
+            parts.push((part_loaded.placement.column, e.id()));
             match painted {
                 Some(mat) => {
                     e.insert(MeshMaterial3d(paint_materials.add(mat)));
@@ -1182,6 +1159,74 @@ fn spawn_ac_target(
                 }
             }
         }
+    }
+    Some(SpawnedAcRig {
+        root,
+        npc: npc_motion,
+        parts,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_ac_target(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    paint_materials: &mut Assets<paint::AcPaintMaterial>,
+    images: &mut Assets<Image>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    disc: &Disc,
+    packs: &mut Packs,
+    missing: &mut usize,
+    part: &msb::Part,
+    layer: &str,
+    design_id: u16,
+    xf: Transform,
+    flat: bool,
+) -> bool {
+    let Some(design) = find_design(design_id) else {
+        warn!(
+            "target {} ({}): design {design_id} not found",
+            part.name, part.model
+        );
+        return false;
+    };
+    let Some(rig) = spawn_ac_rig(
+        commands,
+        meshes,
+        materials,
+        paint_materials,
+        images,
+        bindposes,
+        disc,
+        packs,
+        missing,
+        design,
+        &part.name,
+        xf,
+        flat,
+    ) else {
+        return false;
+    };
+    let health = TargetHealth::from_ac(design);
+    let enemy_ai = ai::EnemyAi::for_ac(
+        design_id,
+        design,
+        xf.translation,
+        ai::yaw_from_quat(xf.rotation),
+    );
+    commands.entity(rig.root).insert((
+        Target {
+            name: part.name.clone(),
+            model: part.model.clone(),
+            layer: layer.to_string(),
+            ac_design_id: Some(design_id),
+        },
+        health,
+        enemy_ai,
+    ));
+    if let Some(npc) = rig.npc {
+        commands.entity(rig.root).insert(npc);
     }
     true
 }
