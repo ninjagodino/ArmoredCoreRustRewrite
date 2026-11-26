@@ -2,22 +2,22 @@
 //!
 //! A map folder `model/map/{map}` holds `{map}_map.msb` (terrain and objects), optional layout
 //! MSBs such as `{map}_actest.msb` (the garage AC test: start points, areas, test enemies, no
-//! terrain). Verdict Day packs map pieces in `{map}_m.dcx.bnd` and textures in
-//! `{map}_htdcx.bnd`; Armored Core V stores pieces loose as `{model}.flv` / `_l1.flv` / `_h.hmd`
-//! and shares `{map}_l.tpf.dcx`. Objects (part kind 1) load from `model/obj/{o}/{o}_m.bnd.dcx`
-//! on both games.
+//! terrain), and the map-piece assets. Verdict Day stores those pieces in
+//! `{map}_m.dcx.bnd` (`m####.flv` / `_h.hmd`) and their textures as `{name}.tpf.dcx` members
+//! of `{map}_htdcx.bnd` (`{map}_l.tpf.dcx` is the low-resolution copy). ACV stores each piece
+//! as a loose top-level `{model}.flv` (+ `_l1.flv`), with one shared `{map}_l.tpf.dcx` texture
+//! pack and no `_htdcx.bnd`. Objects (part kind 1) load from
+//! `model/obj/{o}/{o}_m.bnd.dcx` on both games.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use acvd_data::find;
-use acvd_data::generated::ac_unit::PARAM_ACOBJECTPARAM_BIN;
-use acvd_data::generated::enemy::PARAM_DESTROYAP_PARAM;
 use acvd_data::generated::map::PARAM_MAPOBJBEHAVIORPARAM_BIN;
 use acvd_data::generated::sfx::PARAM_SFXSESETPARAM_BIN;
 use acvd_data::generated::sound::PARAM_ACSOUNDPARAM_BIN;
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{bnd3, env as fmt_env, flver, mlb, msb, nav, tae};
+use acvd_formats::{bnd3, flver, msb, nav, tae};
 use acvd_render::{LoadedMesh, Packs};
 use anyhow::Result;
 use bevy::camera::visibility::NoFrustumCulling;
@@ -31,45 +31,13 @@ use crate::sfx;
 use crate::sound;
 use crate::targets::{self, EnemyAnim, EnemyAnimBank};
 
-/// Map part kinds that have a visual model and a hit model.
-const KIND_PIECE: u32 = 0;
-pub(crate) const KIND_OBJECT: u32 = 1;
+// Pure map geometry helpers and sim data come from `acvd-sim`.
+pub use acvd_sim::map::{
+    folder, model_asset, terrain_msb, xform, AreaZone, KIND_OBJECT, KIND_PIECE,
+};
 
-pub fn folder(map: &str) -> String {
-    format!("model/map/{map}")
-}
-
-/// `{map}_map.msb`, else `{map}.msb`.
-pub fn terrain_msb(disc: &Disc, map: &str) -> String {
-    let named = format!("{}/{map}_map.msb", folder(map));
-    if disc.exists(&named) {
-        named
-    } else {
-        format!("{}/{map}.msb", folder(map))
-    }
-}
-
-/// Asset path holding `part`'s file, or `None` for kinds without map geometry.
-///
-/// Verdict Day pieces live in `{map}_m.dcx.bnd` entries; Armored Core V keeps the same files
-/// loose under `model/map/{map}`. Objects use their `_m.bnd.dcx` entry on both games.
-pub fn model_asset(disc: &Disc, map: &str, part: &msb::Part, file: &str) -> Option<String> {
-    match part.kind {
-        KIND_PIECE => {
-            let binder = format!("{}/{map}_m.dcx.bnd", folder(map));
-            if disc.exists(&binder) {
-                Some(format!("{binder}|{file}"))
-            } else {
-                Some(format!("{}/{file}", folder(map)))
-            }
-        }
-        KIND_OBJECT => Some(format!("model/obj/{0}/{0}_m.bnd.dcx|{file}", part.model)),
-        _ => None,
-    }
-}
-
-/// TPF shared by an Armored Core V map's loose pieces (`{map}_l.tpf.dcx`). `None` when the map
-/// has a Verdict Day `_m` binder (its textures are per-name `{map}_htdcx.bnd` members).
+/// ACV's shared map-piece texture pack, or `None` on Verdict Day (piece textures are
+/// `{name}.tpf.dcx` entries of `{map}_htdcx.bnd` instead).
 pub fn map_texture_pack(disc: &Disc, map: &str) -> Option<String> {
     if disc.exists(&format!("{}/{map}_m.dcx.bnd", folder(map))) {
         return None;
@@ -79,9 +47,7 @@ pub fn map_texture_pack(disc: &Disc, map: &str) -> Option<String> {
 }
 
 /// TPF holding `part`'s textures, or `None` for map pieces whose textures live as
-/// `{name}.tpf.dcx` members of `{map}_htdcx.bnd`. Object models keep their textures in their own
-/// `model/obj/{model}/{model}.tpf.dcx`; many objects share texture names (`net`, `o2036`, ...) with
-/// other maps, so a name-only global lookup picks an unrelated, brighter pack.
+/// `{name}.tpf.dcx` members of `{map}_htdcx.bnd`.
 pub fn texture_pack(disc: &Disc, part: &msb::Part) -> Option<String> {
     if part.kind != KIND_OBJECT {
         return None;
@@ -90,158 +56,110 @@ pub fn texture_pack(disc: &Disc, part: &msb::Part) -> Option<String> {
     disc.exists(&pack).then_some(pack)
 }
 
-/// The part's placement in FLVER (game) axes.
-pub fn xform(part: &msb::Part) -> flver::Xform {
-    flver::Xform::local(
-        part.translation,
-        part.rotation_deg.map(f32::to_radians),
-        part.scale,
-    )
-}
-
-/// Where the player AC starts: Bevy position and yaw (radians, as `control::Pilot::yaw`).
+/// Bevy resource wrapper for the sim start point.
 #[derive(Resource, Clone, Copy, Debug)]
-pub struct Start {
-    pub position: Vec3,
-    pub yaw: f32,
+pub struct Start(pub acvd_sim::map::Start);
+
+impl Start {
+    pub fn new(position: Vec3, yaw: f32) -> Self {
+        Self(acvd_sim::map::Start { position, yaw })
+    }
 }
 
-/// Water-return respawn points (`POINT_PARAM_ST` kind `50`, `msb::POINT_WATER_RETURN`) and
-/// water surface height (`env::Scene.water_height` from `model/map/ch_env/{map}_env.msb`
-/// type-101 sub-block 0 `+0x08`, 360 `0x827ffa80`, overridden by `--water <y>`).
-#[derive(Resource, Clone, Debug, Default)]
-pub struct WaterReturnPoints {
-    pub points: Vec<Start>,
-    pub water_height: Option<f32>,
+impl std::ops::Deref for Start {
+    type Target = acvd_sim::map::Start;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
+
+impl std::ops::DerefMut for Start {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Bevy resource wrapper for the sim water-return points.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct WaterReturnPoints(pub acvd_sim::map::WaterReturnPoints);
 
 impl WaterReturnPoints {
-    pub fn from_points(points: &[msb::Point], water_height: Option<f32>) -> Self {
-        let pts = points
-            .iter()
-            .filter(|p| p.kind == msb::POINT_WATER_RETURN)
-            .map(|p| {
-                let [x, y, z] = p.translation;
-                Start {
-                    position: Vec3::new(-x, y, z),
-                    yaw: -p.rotation_deg[1].to_radians(),
-                }
-            })
-            .collect();
-        Self {
-            points: pts,
+    pub fn from_parts(points: Vec<Start>, water_height: Option<f32>) -> Self {
+        Self(acvd_sim::map::WaterReturnPoints {
+            points: points.into_iter().map(|s| s.0).collect(),
             water_height,
-        }
+        })
     }
 
-    /// Loads kind-50 water-return points from `{map}_{layout}.msb` and `{map}_map.msb`, plus
-    /// `water_height` from `model/map/ch_env/{map}_env.msb` (or `water_override` if set).
+    pub fn from_points(points: &[msb::Point], water_height: Option<f32>) -> Self {
+        Self(acvd_sim::map::WaterReturnPoints::from_points(
+            points,
+            water_height,
+        ))
+    }
+
     pub fn load(
         disc: &Disc,
         map: &str,
         layout: Option<&str>,
         water_override: Option<f32>,
     ) -> Result<Self> {
-        let mut sources = Vec::new();
-        if let Some(l) = layout {
-            sources.push(format!("{}/{map}_{l}.msb", folder(map)));
-        }
-        sources.push(terrain_msb(disc, map));
-        let mut all_points = Vec::new();
-        for path in sources.into_iter().filter(|p| disc.exists(p)) {
-            let pts = msb::points(&vfs::open(disc, &path)?)?;
-            all_points.extend(
-                pts.into_iter()
-                    .filter(|p| p.kind == msb::POINT_WATER_RETURN),
-            );
-        }
-        let water_height = water_override.or_else(|| {
-            let env_path = format!("model/map/ch_env/{map}_env.msb");
-            vfs::open(disc, &env_path)
-                .ok()
-                .and_then(|d| fmt_env::read(&d).ok())
-                .and_then(|e| e.scene)
-                .map(|s| s.water_height)
-        });
-        Ok(Self::from_points(&all_points, water_height))
+        acvd_sim::map::WaterReturnPoints::load(disc, map, layout, water_override).map(Self)
     }
 
-    /// Returns the water-return point closest to `pos` in XZ, or `fallback` if none exist.
     pub fn nearest(&self, pos: Vec3, fallback: Start) -> Start {
-        self.points
-            .iter()
-            .copied()
-            .min_by(|a, b| {
-                let da = Vec2::new(a.position.x - pos.x, a.position.z - pos.z).length_squared();
-                let db = Vec2::new(b.position.x - pos.x, b.position.z - pos.z).length_squared();
-                da.total_cmp(&db)
-            })
-            .unwrap_or(fallback)
+        Start(self.0.nearest(pos, fallback.0))
     }
 }
 
-/// Destructible map object (`KIND_OBJECT` whose binder ships `{model}_b.flv`, 360 `0x82c02498`,
-/// `DestroyModel` `0x82c84a60`, durability from `{model}_m.mlb` -> `PARAM_DESTROYAP_PARAM`
-/// `0x82c01de8` / `0x82c01bd8`).
+impl std::ops::Deref for WaterReturnPoints {
+    type Target = acvd_sim::map::WaterReturnPoints;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WaterReturnPoints {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+/// Bevy component for a destructible map object. The simulation state (`prop_id`, HP, break
+/// flags) lives in `acvd_sim::map::Destructible`; the mesh entities and debris stay here.
 #[derive(Component, Debug)]
 pub struct DestructibleProp {
-    /// Matches `collision::Hit::prop_id` (`part_idx + 1`).
-    pub prop_id: u32,
-    pub model: String,
-    /// World-space bounding sphere center and radius (for AOE / melee / kick hits).
-    pub center: Vec3,
-    pub radius: f32,
-    /// Remaining HP before breaking into `_b.flv` / `_b_h.hmd`.
-    pub hp: f32,
-    pub max_hp: f32,
-    /// Minimum damage threshold (`DestroyApSt.cutoff_damage`, 360 `0x829ad0f8`; `65535` = indestructible).
-    pub cutoff_damage: f32,
-    /// AC-body collision damage multiplier (`0x82c01bd8`: `(100 - collision_defensibility) * 0.01 * collision_damage_coef`).
-    /// `0.0` = immune to AC walking/sliding/boosting collision (`collision_defensibility == 100`).
-    pub collision_damage_mult: f32,
-    /// Nonzero `AcObjectParam.damage_id` (e.g. explosive fuel tanks `89110..89113`).
-    pub damage_id: i32,
+    pub sim: acvd_sim::map::Destructible,
     pub full: Entity,
     pub low: Option<Entity>,
     pub broken_mesh: Entity,
-    pub broken: bool,
-    /// Set on the lethal hit; consumed by [`step_destructibles`].
-    pub just_broken: bool,
+}
+
+impl std::ops::Deref for DestructibleProp {
+    type Target = acvd_sim::map::Destructible;
+    fn deref(&self) -> &Self::Target {
+        &self.sim
+    }
+}
+
+impl std::ops::DerefMut for DestructibleProp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sim
+    }
 }
 
 impl DestructibleProp {
-    /// Whether this prop can be broken by AC body collision (`0x829aabe8`: `mult >= 0.001`).
     pub fn is_collision_destructible(&self) -> bool {
-        !self.broken && self.collision_damage_mult >= 0.001 && self.cutoff_damage < 65535.0
+        self.sim.is_collision_destructible()
     }
 
-    /// Applies weapon/explosion `damage` to this prop (`0x829ad0f8`); returns `true` on the hit
-    /// that breaks it.
     pub fn apply_damage(&mut self, damage: f32) -> bool {
-        if self.broken || damage <= 0.0 || damage <= self.cutoff_damage {
-            return false;
-        }
-        self.hp = (self.hp - damage).max(0.0);
-        if self.hp <= 0.0 {
-            self.broken = true;
-            self.just_broken = true;
-            true
-        } else {
-            false
-        }
+        self.sim.apply_damage(damage)
     }
 
-    /// Applies AC body collision damage (`damage_type == 2`, 360 `0x82865470` -> `0x829ad0f8`),
-    /// scaling `raw_damage` by `collision_damage_mult` (`0x82c01bd8`). Returns `true` if this
-    /// contact breaks the prop.
     pub fn apply_collision_damage(&mut self, raw_damage: f32) -> bool {
-        if !self.is_collision_destructible() || raw_damage <= 0.0 {
-            return false;
-        }
-        self.apply_damage(raw_damage * self.collision_damage_mult)
+        self.sim.apply_collision_damage(raw_damage)
     }
 }
-
 /// One MSB `POINT_PARAM_ST` area box (kinds `100` operation / `101` warning / `102` caution,
 /// `shape == 5`, `m4000_actest.msb`), already mirrored on X into Bevy coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -358,21 +276,6 @@ impl AreaBox {
         }
         clamped
     }
-}
-
-/// Which map area band the AC currently occupies (`POINT_PARAM_ST` kinds `100`–`102`,
-/// `manual.fmg` 20500 `LIMIT OF AREA` / `OUTSIDE OF AREA`, `AreaOverLine` `0x825b3678`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AreaZone {
-    /// Inside the inner caution area (`kind == 102`) or no area bounds defined.
-    #[default]
-    Inside,
-    /// Outside caution area (`102`), inside warning area (`101`): `LIMIT OF AREA`.
-    Caution,
-    /// Outside warning area (`101`), inside operation area (`100`): `LIMIT OF AREA` (urgent).
-    Warning,
-    /// At or outside the operation area (`100`): `OUTSIDE OF AREA` (clamped).
-    Outside,
 }
 
 /// Map operation / warning / caution area boxes from `{map}_{layout}.msb` (`POINT_PARAM_ST`
@@ -512,10 +415,10 @@ pub fn start(disc: &Disc, map: &str, layout: Option<&str>) -> Result<Option<Star
             .find(|p| p.kind == msb::POINT_START && p.kind_index == 0)
         {
             let [x, y, z] = p.translation;
-            return Ok(Some(Start {
-                position: Vec3::new(-x, y, z),
-                yaw: -p.rotation_deg[1].to_radians(),
-            }));
+            return Ok(Some(Start::new(
+                Vec3::new(-x, y, z),
+                -p.rotation_deg[1].to_radians(),
+            )));
         }
     }
     Ok(None)
@@ -681,7 +584,6 @@ pub fn spawn(
     let mut destructible_parts = 0;
     let mut animated_parts = 0;
     let mut animated_fx_parts = 0;
-    let mut destroy_ap_cache: HashMap<String, Option<u16>> = HashMap::new();
     let mut object_fx: HashMap<String, Vec<(i32, [f32; 3], [f32; 3])>> = HashMap::new();
     let mut object_fx_spawned = 0usize;
     for (part_idx, part) in parts.iter().enumerate() {
@@ -822,53 +724,29 @@ pub fn spawn(
         });
         if let Some(broken_mesh) = broken_entity {
             destructible_parts += 1;
-            let obj_id = part
-                .model
-                .strip_prefix('o')
-                .or_else(|| part.model.strip_prefix('O'))
-                .and_then(|s| s.parse::<u32>().ok());
-            let damage_id = obj_id
-                .and_then(|id| find(PARAM_ACOBJECTPARAM_BIN, id))
-                .map_or(0, |r| r.data.damage_id);
-            let destroy_ap_id = *destroy_ap_cache
-                .entry(part.model.clone())
-                .or_insert_with(|| {
-                    let mlb_path = model_asset(disc, map, part, &format!("{}_m.mlb", part.model))
-                        .unwrap_or_default();
-                    vfs::open(disc, &mlb_path)
-                        .ok()
-                        .and_then(|b| mlb::read_destroy_ap_ids(&b).ok())
-                        .and_then(|ids| ids.primary_id())
-                });
-            let (max_hp, cutoff_damage, collision_damage_mult) = destroy_ap_id
-                .and_then(|id| find(PARAM_DESTROYAP_PARAM, u32::from(id)))
-                .map(|r| {
-                    let d = &r.data;
-                    // 360 `0x82c01bd8`: (100 - collision_defensibility) * 0.01 * collision_damage_coef
-                    let mult = f32::from(100u8.saturating_sub(d.collision_defensibility))
-                        * 0.01
-                        * d.collision_damage_coef;
-                    (d.ap.max(1) as f32, d.cutoff_damage as f32, mult.max(0.0))
-                })
-                .unwrap_or_else(|| {
-                    let hp = if damage_id > 0 { 800.0 } else { 500.0 };
-                    (hp, 0.0, 1.0)
-                });
+            let meta = acvd_sim::map::load_destructible_meta(
+                disc,
+                map,
+                &part.model,
+                part.kind == KIND_OBJECT,
+            );
             commands.entity(parent).insert(DestructibleProp {
-                prop_id: (part_idx + 1) as u32,
-                model: part.model.clone(),
-                center,
-                radius: radius.max(2.0),
-                hp: max_hp,
-                max_hp,
-                cutoff_damage,
-                collision_damage_mult,
-                damage_id,
+                sim: acvd_sim::map::Destructible {
+                    prop_id: acvd_sim::ids::PropId((part_idx + 1) as u32),
+                    model: part.model.clone(),
+                    center,
+                    radius: radius.max(2.0),
+                    hp: meta.max_hp,
+                    max_hp: meta.max_hp,
+                    cutoff_damage: meta.cutoff_damage,
+                    collision_damage_mult: meta.collision_damage_mult,
+                    damage_id: meta.damage_id,
+                    broken: false,
+                    just_broken: false,
+                },
                 full,
                 low: low_entity,
                 broken_mesh,
-                broken: false,
-                just_broken: false,
             });
         }
     }
@@ -1382,7 +1260,7 @@ pub fn step_destructibles(
             continue;
         }
         prop.just_broken = false;
-        collision.break_prop(prop.prop_id);
+        collision.break_prop(prop.prop_id.0);
         set_vis(&mut vis, prop.full, false);
         if let Some(low) = prop.low {
             set_vis(&mut vis, low, false);
@@ -1437,7 +1315,7 @@ pub fn step_destructibles(
         }
         info!(
             "destructible prop {} (id {}) broken at ({:.1}, {:.1}, {:.1}) (debris={})",
-            prop.model, prop.prop_id, prop.center.x, prop.center.y, prop.center.z, spawned_debris
+            prop.model, prop.prop_id.0, prop.center.x, prop.center.y, prop.center.z, spawned_debris
         );
     }
 }
@@ -1662,7 +1540,23 @@ impl Textures {
         materials: &mut Assets<StandardMaterial>,
         images: &mut Assets<Image>,
     ) -> Handle<StandardMaterial> {
-        let (alpha_mode, alpha_kind) = mtd_alpha_mode(&mesh.mtd);
+        let mtd_low = mesh
+            .mtd
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&mesh.mtd)
+            .trim_end_matches(".mtd")
+            .to_ascii_lowercase();
+        let glow = mtd_low.contains("glow");
+        let (mut alpha_mode, mut alpha_kind) = mtd_alpha_mode(&mesh.mtd);
+        if glow {
+            // `Ene_Diffuse_Glow` uses `Phong_ColDifEmi.spx`: `g_EmissionColor` white,
+            // `g_EmissionCoef` 3.5 (`material/mtd.bnd`), with the Glow atlas as both the
+            // diffuse and emission map. The authored quads are black outside the glow, so
+            // the pass is additive (the 360 bloom then turns the HDR core into the glow halo).
+            alpha_mode = AlphaMode::Add;
+            alpha_kind = 3;
+        }
         let key = (
             pack.map(str::to_string),
             mesh.diffuse.clone(),
@@ -1681,7 +1575,10 @@ impl Textures {
             .as_deref()
             .and_then(|name| self.image_handle(disc, pack, name, true, images));
         let handle = materials.add(StandardMaterial {
-            base_color: if image.is_some() {
+            base_color: if glow {
+                // `g_EmissionColor` (1,1,1) times `g_EmissionCoef` 3.5.
+                Color::linear_rgb(3.5, 3.5, 3.5)
+            } else if image.is_some() {
                 Color::WHITE
             } else {
                 Color::srgb(0.55, 0.56, 0.58)
@@ -1690,6 +1587,7 @@ impl Textures {
             normal_map_texture: normal_map,
             flip_normal_map_y: false,
             perceptual_roughness: 0.9,
+            unlit: glow,
             alpha_mode,
             cull_mode: if alpha_kind != 0 {
                 None
@@ -2175,10 +2073,7 @@ mod tests {
             !wr.points.is_empty(),
             "m4000 should expose POINT_WATER_RETURN (kind 50) points"
         );
-        let fallback = Start {
-            position: Vec3::ZERO,
-            yaw: 0.0,
-        };
+        let fallback = Start::new(Vec3::ZERO, 0.0);
         let first = wr.points[0];
         let picked = wr.nearest(first.position + Vec3::new(0.5, -10.0, 0.5), fallback);
         assert!((picked.position - first.position).length() < 1e-3);
@@ -2187,20 +2082,22 @@ mod tests {
     #[test]
     fn destructible_prop_apply_damage_breaks_once() {
         let mut prop = DestructibleProp {
-            prop_id: 42,
-            model: "o2022".into(),
-            center: Vec3::new(10.0, 5.0, 20.0),
-            radius: 4.0,
-            hp: 500.0,
-            max_hp: 500.0,
-            cutoff_damage: 0.0,
-            collision_damage_mult: 0.0,
-            damage_id: 89112,
+            sim: acvd_sim::map::Destructible {
+                prop_id: acvd_sim::ids::PropId(42),
+                model: "o2022".into(),
+                center: Vec3::new(10.0, 5.0, 20.0),
+                radius: 4.0,
+                hp: 500.0,
+                max_hp: 500.0,
+                cutoff_damage: 0.0,
+                collision_damage_mult: 0.0,
+                damage_id: 89112,
+                broken: false,
+                just_broken: false,
+            },
             full: Entity::PLACEHOLDER,
             low: None,
             broken_mesh: Entity::PLACEHOLDER,
-            broken: false,
-            just_broken: false,
         };
         assert_eq!(prop.max_hp, 500.0);
         assert_eq!(prop.damage_id, 89112);
@@ -2241,6 +2138,75 @@ mod tests {
         assert!(
             a.distance(b) > 1.0,
             "o9341 root must follow the body route ({a:?} -> {b:?})"
+        );
+    }
+
+    #[test]
+    fn m3120_o9341_part_clip_moves_the_root() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let map = "m3120";
+        let msb_path = terrain_msb(&disc, map);
+        let parts = msb::parts(&vfs::open(&disc, &msb_path).unwrap()).unwrap();
+        let part = parts
+            .iter()
+            .find(|p| p.model == "o9341")
+            .expect("m3120 o9341 part");
+        let (list, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9341/o9341_m.bnd.dcx|o9341.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
+        let route = root_mesh_route(&rig, &list).expect("o9341 root route");
+        let mut bank = EnemyAnimBank::load_object(&disc, "o9341", &rig);
+        Arc::get_mut(&mut bank).unwrap().root_route = Some(route);
+        let tae = tae::read(&vfs::open(&disc, "tae/obj/o9341/own000100.tae").unwrap()).unwrap();
+        let (clip, speed, looping) =
+            aircraft_clip(&bank, Some(&tae), part).expect("m3120 o9341 clip");
+        let mut anim = EnemyAnim::new(bank, Vec::new(), 0.0);
+        anim.play(clip, looping, speed, 0.0);
+        let a = anim.sample_bone(0).translation;
+        for _ in 0..60 {
+            anim.step(1.0 / 60.0, None);
+        }
+        let b = anim.sample_bone(0).translation;
+        assert!(
+            a.distance(b) > 1.0,
+            "m3120 o9341 clip {clip} must fly the root, got {a:?} -> {b:?}"
+        );
+    }
+
+    #[test]
+    fn o9341_map_bomber_has_no_authored_ffx() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let bytes = vfs::open(&disc, "tae/obj/o9341/own000100.tae").unwrap();
+        let tae = tae::read(&bytes).unwrap();
+        assert_eq!(
+            tae.animations
+                .iter()
+                .flat_map(|a| &a.events)
+                .filter(|e| e.kind == tae::KIND_FFX)
+                .count(),
+            0,
+            "o9341's map TAE has no KIND_FFX; its plumes are not authored"
+        );
+        assert_eq!(
+            tae.animations
+                .iter()
+                .flat_map(|a| &a.events)
+                .filter(|e| e.kind == tae::KIND_ANI)
+                .count(),
+            4,
+            "o9341's behavior timelines select four ANI clips"
         );
     }
 

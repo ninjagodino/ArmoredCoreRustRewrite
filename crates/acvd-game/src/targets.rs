@@ -52,6 +52,9 @@ pub enum TestMode {
     Layer(String),
     /// Every kind-2 part in the layout MSB.
     All,
+    /// Test-only flying-wing showcase: the `e6010` online bomber with its authored TAE
+    /// engine plumes. Not placed in any map.
+    Bomber,
 }
 
 impl Default for TestMode {
@@ -75,6 +78,7 @@ impl TestMode {
             "5" | "snp" | "actest6" => Self::Layer("actest6".into()),
             "6" | "unac" | "actest7" => Self::Layer("actest7".into()),
             "7" | "eirik" | "erik" | "actest8" => Self::Layer("actest8".into()),
+            "bomber" | "e6010" | "flying_wing" | "flying-wing" => Self::Bomber,
             "all" => Self::All,
             other => Self::Layer(other.to_string()),
         }
@@ -266,12 +270,35 @@ pub fn select<'a>(parts: &'a [msb::Part], mode: &TestMode) -> Vec<&'a msb::Part>
         .filter(|p| match mode {
             TestMode::None => false,
             TestMode::All => true,
+            TestMode::Bomber => false,
             TestMode::Layer(wanted) => p
                 .layer
                 .as_deref()
                 .is_some_and(|l| l.eq_ignore_ascii_case(wanted)),
         })
         .collect()
+}
+
+/// Test-only `e6010` placement: the online flying-wing bomber, 300 m up and ahead of the
+/// m4000 start, facing away so its eight engine effect points face the camera. This is a
+/// showcase target, not map traffic; no map MSB contains `e6010`.
+fn showcase_bomber_part() -> msb::Part {
+    msb::Part {
+        name: "e6010_showcase".to_string(),
+        model: crate::engine_trail::BOMBER_MODEL.to_string(),
+        kind: KIND_TARGET,
+        param_index: 0,
+        behavior: None,
+        translation: [0.0, 300.0, -500.0],
+        rotation_deg: [0.0, 0.0, 0.0],
+        scale: [1.0, 1.0, 1.0],
+        light_set: 0,
+        follow_camera_xz: false,
+        is_sky: false,
+        layer_index: None,
+        layer: Some("showcase".to_string()),
+        ac_design_id: None,
+    }
 }
 
 /// Asset path of an enemy's main FLVER (`model/ene/{m}/{m}_m.bnd.dcx|{m}.flv`).
@@ -833,12 +860,25 @@ pub fn spawn(
     if matches!(mode, TestMode::None) {
         return Ok(0);
     }
-    let path = format!("{}/{map_id}_{layout}.msb", map::folder(map_id));
-    if !disc.exists(&path) {
-        return Ok(0);
-    }
-    let parts = msb::parts(&vfs::open(disc, &path)?)?;
-    let chosen = select(&parts, mode);
+    let showcase = matches!(mode, TestMode::Bomber);
+    let path = if showcase {
+        "showcase:e6010".to_string()
+    } else {
+        format!("{}/{map_id}_{layout}.msb", map::folder(map_id))
+    };
+    let parts = if showcase {
+        vec![showcase_bomber_part()]
+    } else {
+        if !disc.exists(&path) {
+            return Ok(0);
+        }
+        msb::parts(&vfs::open(disc, &path)?)?
+    };
+    let chosen: Vec<&msb::Part> = if showcase {
+        parts.iter().collect()
+    } else {
+        select(&parts, mode)
+    };
     if chosen.is_empty() {
         info!("targets ({path}, {mode:?}): 0 parts");
         return Ok(0);
@@ -848,6 +888,8 @@ pub fn spawn(
         meshes: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
         inv_bindposes: Handle<SkinnedMeshInverseBindposes>,
         bank: Arc<EnemyAnimBank>,
+        /// Authored engine TAE (`e6010` only among enemies).
+        fx: Option<crate::engine_trail::EnginePlumeFx>,
     }
 
     let mut packs = Packs::default();
@@ -910,10 +952,22 @@ pub fn spawn(
                                 (meshes.add(m.mesh), materials.add(mat))
                             })
                             .collect();
+                        let fx = (part.model == crate::engine_trail::BOMBER_MODEL)
+                            .then(|| {
+                                crate::engine_trail::EnginePlumeFx::load(
+                                    disc,
+                                    &part.model,
+                                    &rig,
+                                    crate::engine_trail::BOMBER_TIMELINE,
+                                    crate::engine_trail::BOMBER_CLIP_FRAMES,
+                                )
+                            })
+                            .flatten();
                         Some(CachedEnemy {
                             meshes: meshes_mats,
                             inv_bindposes,
                             bank,
+                            fx,
                         })
                     }
                     Ok(_) => None,
@@ -938,12 +992,14 @@ pub fn spawn(
                     ac_design_id: None,
                 },
                 health,
-                enemy_ai,
                 Name::new(part.name.clone()),
                 xf,
                 Visibility::default(),
             ))
             .id();
+        if !showcase {
+            commands.entity(root).insert(enemy_ai);
+        }
 
         // Spawn skeletal joint hierarchy for this enemy instance.
         let mut joint_entities: Vec<Entity> = Vec::with_capacity(cached.bank.rest_locals.len());
@@ -980,11 +1036,23 @@ pub fn spawn(
             ));
         }
 
-        commands.entity(root).insert(EnemyAnim::new(
-            cached.bank.clone(),
-            joint_entities,
-            init_yaw,
-        ));
+        let mut anim = EnemyAnim::new(cached.bank.clone(), joint_entities, init_yaw);
+        if showcase {
+            anim.play(
+                crate::engine_trail::BOMBER_CLIP,
+                true,
+                1.0,
+                0.0,
+            );
+        }
+        commands.entity(root).insert(anim);
+        if showcase {
+            if let Some(fx) = cached.fx.clone() {
+                commands.entity(root).insert(fx);
+            } else {
+                warn!("{}: e6010 TAE plumes did not load", part.model);
+            }
+        }
         spawned += 1;
     }
 

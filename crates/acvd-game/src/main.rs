@@ -42,7 +42,7 @@
 //! `{map}_{name}.msb` start point (`none`: the terrain MSB's), `--test <mode>` picks which
 //! `LAYER_PARAM_ST` target set to spawn from `{map}_{layout}.msb` (`0`/`none`/`actest1` empty,
 //! `1`/`light`/`actest2` tanks & helis [default], `2`/`mt`/`actest3` MTs, `3`..`5`/`7` test ACs
-//! `a0000`..`a0003`, `all`), `--hits` draws the hit meshes
+//! `a0000`..`a0003`, `bomber`/`e6010` the flying-wing showcase, `all`), `--hits` draws the hit meshes
 //! instead of the map models, `--plane` is the old infinite floor, `--water` adds a test water
 //! plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
 //! `--no-hud` leaves that HUD and the part-name overlay out, for looking at effects.
@@ -69,6 +69,7 @@ mod control;
 mod damage;
 mod debris;
 mod decal;
+mod engine_trail;
 mod env;
 mod fcs;
 mod frontend;
@@ -559,16 +560,10 @@ fn main() {
                     }],
                     Vec::new(),
                 ),
-                map::Start {
-                    position: Vec3::ZERO,
-                    yaw: 0.0,
-                },
+                map::Start::new(Vec3::ZERO, 0.0),
                 map::AreaBounds::default(),
                 map::MapNav::default(),
-                map::WaterReturnPoints {
-                    points: Vec::new(),
-                    water_height: water,
-                },
+                map::WaterReturnPoints::from_parts(Vec::new(), water),
             )
         };
     if let Some(p) = pos_override {
@@ -840,7 +835,9 @@ fn main() {
                 (ai::update, map::step_aircraft)
                     .chain()
                     .run_if(in_active_sortie),
-                targets::animate_enemies.run_if(in_active_sortie),
+                (targets::animate_enemies, engine_trail::step_plumes)
+                    .chain()
+                    .run_if(in_active_sortie),
                 pose::animate_npcs.run_if(in_active_sortie),
                 weapons::step_projectiles.run_if(in_active_sortie),
                 weapons::step_missiles.run_if(in_active_sortie),
@@ -1096,10 +1093,7 @@ fn load_sortie_data(
         }),
         None => None,
     }
-    .unwrap_or(map::Start {
-        position: Vec3::ZERO,
-        yaw: 0.0,
-    });
+    .unwrap_or(map::Start::new(Vec3::ZERO, 0.0));
     let area_bounds = match map.filter(|_| !plane) {
         Some(id) => map::AreaBounds::load(disc, id, layout).unwrap_or_else(|e| {
             eprintln!("map {id} area bounds: {e:#}");
@@ -1134,16 +1128,10 @@ fn load_sortie_data(
             }
             Err(e) => {
                 eprintln!("{id} water return: {e:#}");
-                map::WaterReturnPoints {
-                    points: Vec::new(),
-                    water_height: water,
-                }
+                map::WaterReturnPoints::from_parts(Vec::new(), water)
             }
         },
-        None => map::WaterReturnPoints {
-            points: Vec::new(),
-            water_height: water,
-        },
+        None => map::WaterReturnPoints::from_parts(Vec::new(), water),
     };
     if let Some(y) = water {
         collision.planes.push(Plane {
