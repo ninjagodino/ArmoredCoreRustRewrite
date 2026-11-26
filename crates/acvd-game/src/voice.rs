@@ -272,6 +272,31 @@ impl VoiceLibrary {
     }
 }
 
+/// One spoken COM line, emitted after its audio starts so the HUD can show the retail subtitle
+/// box. `seconds` is the decoded voice-clip length when known (custom packs return `None`).
+#[derive(Message, Debug, Clone, Copy)]
+pub struct ComLine {
+    pub offset: u32,
+    pub seconds: Option<f32>,
+}
+
+/// The `aisys.fmg` line id for an `AI_MESSAGE_SOUND_MAP` voice offset, from the generated
+/// English table (`sheets/voice.csv`). Offsets 34..40 share the "Enemy AC sighted." row with
+/// their weight/leg rows, so both the prefix (33) and the type voice resolve to the full line.
+pub fn text_id(offset: u32) -> Option<i32> {
+    use acvd_data::generated::ai::LANG_EN_TEXT_AI_AISYS_TSMAP as ROWS;
+    if offset == 0 {
+        return None;
+    }
+    ROWS.iter()
+        .find(|row| {
+            [row.data.voice_offset0, row.data.voice_offset1, row.data.voice_offset2].contains(&offset)
+        })
+        .map(|row| row.data.text_id)
+        .filter(|id| *id > 0)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
 /// Resolves an `AI_MESSAGE_SOUND_MAP` voice offset to the FEV event id that
 /// `Sound_formatCue` (`0x82b47758`, format 8 `%08d`) formats. The five on-disc packs all contain
 /// the same event ids: `10001..10037`, then `10101`, `10201`, `10202`, `10203`, `20101`,
@@ -315,6 +340,7 @@ pub fn trigger_messages(
     mut state: ResMut<ComVoiceState>,
     library: Res<VoiceLibrary>,
     players: Query<(&Pilot, &Status, &PlayerHealth)>,
+    mut lines: MessageWriter<ComLine>,
 ) {
     if !piloting.0 {
         *state = ComVoiceState::default();
@@ -399,6 +425,12 @@ pub fn trigger_messages(
         };
         if !played.is_empty() {
             state.cooldown = 2.0;
+            let seconds = if custom {
+                None
+            } else {
+                cues.com_voice_seconds(voice, offset)
+            };
+            lines.write(ComLine { offset, seconds });
         }
     }
 }
@@ -409,6 +441,7 @@ impl Plugin for ComVoicePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(VoiceLibrary::load())
             .init_resource::<ComVoiceState>()
+            .add_message::<ComLine>()
             .add_systems(Update, trigger_messages);
     }
 }

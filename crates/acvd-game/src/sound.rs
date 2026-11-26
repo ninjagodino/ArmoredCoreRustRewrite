@@ -172,6 +172,20 @@ impl Cues {
         self.play_waves(commands, assets, waves, AudioBus::Sfx, false)
     }
 
+    /// Decoded length of one COM / operator voice clip in seconds, from the FSB sample metadata
+    /// (`frames / frequency`). The subtitle window uses it to match the spoken line.
+    pub fn com_voice_seconds(&mut self, voice: u8, offset: u32) -> Option<f32> {
+        let id = crate::voice::event_id(offset)?;
+        let cue = format!("{id:08}");
+        let wave = {
+            let project = self.voice_project(voice)?;
+            project.waves(&cue).into_iter().next().cloned()?
+        };
+        let bank = self.bank(&wave.bank)?;
+        let sample = bank.samples.get(wave.index as usize)?;
+        (sample.frequency > 0).then(|| sample.length as f32 / sample.frequency as f32)
+    }
+
     /// Plays a user-supplied COM voice line from disk (`.mp3`/`.wav`/`.ogg`/`.flac`, decoded by
     /// Bevy's audio loaders). Missing files log once and stay silent; the line rides the SFX bus.
     pub fn custom_voice(

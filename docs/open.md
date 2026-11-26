@@ -473,4 +473,7 @@ in order:
   path (`0x82449518` / `0x824493d0`) in the Xenia probe (`private/xenia/voice_en.jsonl`); a
   real mission run would confirm the offset->event table live. Voice currently rides the SFX
   bus; a dedicated Voice Volume slider (the 360 `@VoiceVolumeSl`/`@VoiceVolumeValue` strings,
-  `0x8204c8c4`/`0x8204c8d4`) is not exposed yet.
+  `0x8204c8c4`/`0x8204c8d4`) is not exposed yet. Fired callouts now draw the retail
+  `MissionText` subtitle window (`acvd-game::subtitle`, `sortie.drb` dialog 44 at
+  `0x82519228`): every `ComLine` resolves its offset through `voice::text_id` to
+  `lang/en/text/ai/aisys.fmg` and shows the line for the FSB clip length (`Cues::com_voice_seconds`).
