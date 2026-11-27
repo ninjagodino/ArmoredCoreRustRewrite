@@ -1,0 +1,10 @@
+name,param,unit,value,evidence
+blade_charge_frames,NewAcBehavior+0x??,ticks,5,"0x828ae9e0 Phase 0 compares +0xc timer against 5/60 s (0x828af660 returns 5.0/60); blade phase table 0x83714024 [0x828ae9e0,0x828af000,0x828af1c8]; action boundary every 2 60 Hz ticks (0x828ad124..0x828ad14c), so charge ends on the 4th action step (8 ticks)"
+phys_blade_charge_frames,NewAcBehavior,ticks,5,"same 5/60 Phase 0 timer for physical blades; tuning row newacbehavior.phys_blade_charge_frames"
+blade_swing_frames,NewAcBehavior,ticks,12,"0x828af1c8 Phase 2 first window 12/60 s; Phase 2 timer is shared with recovery, so swing ends on its 7th action step (14 ticks)"
+blade_recovery_frames,NewAcBehavior,ticks,30,"0x828af1c8 Phase 2 full timer 30/60 s; recovery ends on Phase 2 action step 16 (32 ticks)"
+blade_dash_max,NewAcBehavior+0x??,seconds,"entry_kmh * 0.1 * 0.01 + blade_dash_max_frames / 60","0x828ad328 computes the entry-speed ratio, then AcMove_bladeDash 0x828248f8 caps the dash at entry_kmh*0.001 + +0x0a0/60 s; NewAcBehavior blade_dash_max_frames is 0.0, so 100 km/h = 0.1 s = 6 ticks"
+blade_instant_swing_dist,NewAcBehavior,metres,12,"0x828af000 Phase 1 checks the 12 m instant-swing distance (0x82000fc4 = 1.0 / distance scale) before entering dash; target inside 12 m and within 1.2 m vertical goes directly to swing"
+blade_instant_swing_vertical,NewAcBehavior,metres,1.2,"0x828af000 target vertical gate; same 12 m gate"
+blade_pitch_limit_deg,NewAcBehavior+0x5b4,degrees,2,"0x828ad710 reads u16 +0x5b4 directly (2) and converts to radians with 0x8371c0e8"
+blade_pitch_speed_deg,NewAcBehavior+0x5b6,degrees/frame,1,"0x828ad710/0x828ad298 pitch homing step; NewAcBehavior +0x5b6 = 1 deg per 60 Hz frame"

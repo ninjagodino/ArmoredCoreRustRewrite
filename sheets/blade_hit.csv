@@ -1,0 +1,7 @@
+name,param,unit,value,evidence
+hit_radius,BulletBladeSt+0x8,metres,"per bullet row","BulletBladeSt +0x8; 0x828a3138 copies it to runtime bullet +0x50 via 0x82475cd8 (0x828a318c..0x828a3190) and uses it as the broad target-search sphere (0x8246c8d0/0x828a1f48). Not the capsule thickness."
+blade_radius,BulletBladeSt+0x24,metres,"per bullet row","BulletBladeSt +0x24; 0x828a1fc0/0x828a1f48 read +0x24 into the shape constructors 0x82456a10/0x82456ae0, then 0x828a3988 -> 0x828a4518 builds the 4-point blade capsule. Capsule thickness, not broad phase."
+b_near_hit_only,BulletBladeSt+0x21,bool,"per bullet row","0x828a3138 copies +0x21 to runtime +0x21 (0x828a323c/0x828a3258); 0x82885940 reads record+0x40 bit 0x10000000 and calls 0x82885630, which admits a query only when the dot scalar is < 2.0 (0x83713e40) and 0x828855c0 runs the shape query"
+damage_hit_count_chara,BulletBladeSt+0x1c,u8,"per bullet row","Distinct-character hit cap per swing; 0x828a4518 target loop + 0x828852b8 6-slot records; sim caps distinct targets, never re-hits the same target in one swing"
+decay_power,BulletBladeSt+0x14,rate,"per bullet row","Applied to every distinct target after the first in the same swing (0x828a4518 hit records + damage scaling)"
+decay_recoil,BulletBladeSt+0x18,rate,"per bullet row","Applied to every distinct target after the first in the same swing"

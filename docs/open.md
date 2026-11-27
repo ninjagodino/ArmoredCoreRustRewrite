@@ -665,6 +665,30 @@ in order:
       Kind 1 `10:50`/`11:50` is a part-animation selector, not a sound. `am7020`'s
       `a00_006` 40-frame attack clip is wired and the body reaches `BladePhase::Swing`, but
       `own007020.tae` anim 6 has no FFX and the canonical 360 base+6 selector is unproven.
+  - **Melee Overhaul Milestone A (Phases 0-3) done 2026-11-27, left uncommitted for the
+    Milestone B checkpoint:** (1) Gate 1 hand-part clips: `0x8284b198` (weapon-controller
+    vtable `0x82044fc0+0x28`) selects the blade action array
+    `[0,0xc2,0xc4,0xc6,0xc8,0xca,0xcc,0xce,0xd0]` while `0x82848690` is in body blade state
+    `0xc8`/`0xce`; `0x82883370 -> 0x828832f8 -> 0x82882ff0` resolves the action entry to the
+    part animation list. Dumped binders: `hr0150_a.bnd.dcx` ids 0/1/2/3 =
+    `a00_000/010/011/100`, `hr2810_a.bnd.dcx` ids 0/1/2/3/4 = `a00_000/020/021/022/100`;
+    so charge/swing = id 1/2 and hr2810 recovery = id 3 (`sheets/weapon_arm_actions.csv`).
+    (2) Gate 2: `0x828852b8` is only the 6-slot 4-point hit-record writer; the consumer is
+    `0x82885940 -> 0x82885630 -> 0x828855c0`. `BulletBladeSt +0x8 hit_radius` is the
+    target-search sphere (`0x828a3138` copies it to runtime `+0x50` via `0x82475cd8`), while
+    `+0x24 blade_radius` is the swept capsule (`0x828a1fc0`/`0x828a1f48` ->
+    `0x82456a10`/`0x82456ae0` -> `0x828a3988`). `+0x21 b_near_hit_only` is copied to runtime
+    `+0x21` and `0x82885630` applies the 2.0 m near gate (`0x83713e40`); record bit
+    `0x10000000` is the per-target near-only flag (`sheets/blade_hit.csv`). (3) Kick units:
+    `0x828590f8` converts params 128/129 by `1/60` (`0x82004408`) before storing action_ctrl
+    `+0x98/+0x9c`; `0x8283fdb0` copies them to KickState `+0x30/+0x34`, so 3+35 =
+    **38 60 Hz ticks**, not 76 30 Hz action steps (`sheets/kick.csv`).
+    `acvd-sim` now has `tick::ActionClock` (30 Hz boundaries, clip advances 2 frames/step),
+    the exact `motion::step_blade` phase formulas, `BladeSweep` capsule broad/narrow rule, and
+    per-swing distinct-target dedup/cap/decay. Cargo workspace tests, `check-headless`,
+    `acvd-sheets preflight` (0 errors) and `acvd-index audit` (0 mismatches, 0 PS3 citations)
+    pass. Still open for Milestone B (Phases 4-8): exact blade entry/hit sound & trail FFX
+    placement, hand-part action table runtime entry dump, and the remaining archetypes.
   - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
     arm clip request is `AimArm` `0x8284a570` -> `0x8289e808` -> `0x82882ad0` (clip 1) for a held
     hand weapon, and the shoulder-slot branch of the part shoot handler `0x8289de30`

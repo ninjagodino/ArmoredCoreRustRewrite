@@ -1,0 +1,7 @@
+category,part_id,model,kind,action,clip,bnd_id,evidence
+hand,150,hr0150,13,charge,0xc2,a00_010.ani,1,"Hand action dispatcher 0x8284b198 (weapon-controller vtable 0x82044fc0+0x28) selects array [0,0xc2,0xc4,0xc6,0xc8,0xca,0xcc,0xce,0xd0] when 0x82848690 is true (blade body states 0xc8/0xce). 0x82883370 -> 0x828832f8 category 11 entry; 0x82882ff0 resolves entry[+2] against the part animation binder. hr0150_a.bnd.dcx entry ids: 0 a00_000, 1 a00_010, 2 a00_011, 3 a00_100."
+hand,150,hr0150,13,swing,0xc4,a00_011.ani,2,"Same dispatcher/action table; hr0150 binder id 2 is a00_011. No third blade clip exists, so 0xc6 is not used by this part."
+hand,2810,hr2810,12,charge,0xc2,a00_020.ani,1,"Hand action dispatcher 0x8284b198 action array 0xc2..; hr2810_a.bnd.dcx ids: 0 a00_000, 1 a00_020, 2 a00_021, 3 a00_022, 4 a00_100."
+hand,2810,hr2810,12,swing,0xc4,a00_021.ani,2,"Same dispatcher/action table; hr2810 binder id 2 is a00_021."
+hand,2810,hr2810,12,recovery,0xc6,a00_022.ani,3,"Same dispatcher/action table; hr2810 binder id 3 is a00_022."
+weapon_arm,7020,am7020,2,attack,0xdd,a00_006.ani,5,"0x8284aaf8/0x82883370 with action 221 (0xdd); am7020_a.bnd.dcx ids: 0 a00_000, 1 a00_001, 2 a00_003, 3 a00_004, 4 a00_005, 5 a00_006."

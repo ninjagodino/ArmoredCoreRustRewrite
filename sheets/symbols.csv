@@ -100,3 +100,37 @@ addr,name,summary,evidence
 0x8289d908,WeaponArm_enterReady,"Weapon-arm ready/aim entry: starts the base+3 ready clip when it is not already active.","x360dis 0x8289d908 -> 0x82882b18/0x828832b8, active test 0x82889480, start 0x82889b38"
 0x8289da68,WeaponArm_enterDeployClip,"Starts the weapon arm base+4 unfold clip.","x360dis 0x8289da68 -> 0x82883198 -> 0x82889b38"
 0x8289dab8,WeaponArm_enterStowClip,"Starts the weapon arm base+5 fold clip.","x360dis 0x8289dab8 -> 0x82883228 -> 0x82889b38"
+0x8283e1f0,KickState_phase0,KickState Phase 0: compares kick_charge_frames x 1/60 against the seconds timer; reads NewAcBehavior +0x528.,x360dis 0x8283e1f0; 0x82844570 phase table
+0x8283f8a8,KickState_ctor,KickState constructor: copies the two action-controller kick duration floats into +0x30/+0x34.,x360dis 0x8283f8a8; caller 0x82845698
+0x828433a0,KickState_phase1,KickState Phase 1: ends when timer +0x8 exceeds accel+after durations +0x30/+0x34 (seconds).,x360dis 0x828433a0; 0x82844570 phase table
+0x828590f8,ActionCtrl_buildKickTimes,Action-controller builder: converts the raw kick accel/after frame counts (params 128/129) to seconds by 1/60 and stores action_ctrl +0x98/+0x9c.,x360dis 0x828590f8 0x82859344/0x8285934c; 0x82004408 = 1/60
+0x8286ac40,Kick_damage,Applies the boost-charge-kick hit: base kick power/recoil and single damage_hit_count.,x360dis 0x8286ac40; sheets/ac_ctrl_calc kick_power/kick_recoil
+0x82823740,AcMove_boostChargeKick,Boost Charge Kick movement: kick_max_tick/kick_accel_tick and downward kick_down_accel.,x360dis 0x82823740; docs/open.md Boost Charge Kick
+0x8284aaf8,WeaponArm_startAttack,Weapon-arm attack entry: selects part action 221 (0xdd) through 0x82883370.,x360dis 0x8284aaf8; am7020 a00_006 binder id 5
+0x8284ada0,WeaponArm_update,Weapon-arm controller update (vtable 0x82044fc0+0x8): deploy/ready/fire state machine.,x360dis 0x8284ada0; docs/open.md Weapon-arm flow
+0x8284b198,WeaponHand_actionDispatch,"Hand-weapon action dispatch (vtable 0x82044fc0+0x28): ranged set [0,9,0x10,10,0xf,11,0xd,0xe,0xc] or blade set [0,0xc2,0xc4,0xc6,0xc8,0xca,0xcc,0xce,0xd0].",x360dis 0x8284b198; 0x82883648/0x82883778 action arrays
+0x82848690,WeaponHand_bladeActionActive,"True while the body is in a blade action state 0xc8/0xce (or weapon controller +0x1c8), selecting the hand blade action array.",x360dis 0x82848690; body blade states 200/206
+0x82882d80,PartAnim_buildCommand,"Builds a part-animation request from an action-entry pointer, clip resource and blend speeds.",x360dis 0x82882d80; 0x82883370 caller
+0x82882ff0,PartAnim_clipResource,Resolves action-entry byte +2 to the part animation clip list (asset category 12).,x360dis 0x82882ff0; 0x82883370
+0x828832f8,PartAnim_actionEntry,Looks up a part-animation action entry by action id in the category-11 action table.,x360dis 0x828832f8; 0x82883370
+0x82883370,PartAnim_playAction,"Plays a part animation action: action entry lookup, clip resolve, command build.",x360dis 0x82883370; callers 0x8284aaf8/0x8284b198
+0x82883648,PartAnim_rangedActionSet,"Ranged hand action set [0,9,0x10,10,0xf,11,0xd,0xe,0xc].",x360dis 0x82883648
+0x82883778,PartAnim_bladeActionSet,"Blade hand action set [0,0xc2,0xc4,0xc6,0xc8,0xca,0xcc,0xce,0xd0].",x360dis 0x82883778; 0x8284b198
+0x828852b8,Blade_hitRecordSet,Writes one 4-point blade hit record (3 vectors + armed/near flag) into the 6-slot transform table.,x360dis 0x828852b8; consumer 0x828a4518
+0x828855c0,Blade_shapeQuery,Generic collision shape query wrapper used by 0x82885630.,x360dis 0x828855c0
+0x82885630,Blade_hitQuery,"Blade hit query: decomposes a hit record, applies the 2.0 m near gate (0x83713e40) and calls 0x828855c0.",x360dis 0x82885630
+0x82885940,Blade_hitRecordProcess,Iterates the 6 blade hit records and dispatches armed/near records to 0x82885630.,x360dis 0x82885940
+0x828a1f48,Blade_shapeFromBladeRadius,Builds a shape from BulletBladeSt +0x24 (BladeRadius).,x360dis 0x828a1f48; 0x82456ae0
+0x828a1fc0,Blade_shapeFromHitRadius,Builds a shape from BulletBladeSt +0x24 (BladeRadius) for a target index.,x360dis 0x828a1fc0; 0x82456a10
+0x828a30e0,Blade_targetTransform,Builds the blade transform for one target from the weapon shape and blade radius.,x360dis 0x828a30e0; 0x828a3988 caller
+0x828a3988,Blade_buildTransform,Builds the 4-point blade transform (hilt/tip/capsule) from the animated weapon and target.,x360dis 0x828a3988; docs/open.md melee
+0x828a4518,Blade_applyHits,"Iterates valid targets, builds blade transforms, writes 6 hit records via 0x828852b8 and applies damage.",x360dis 0x828a4518; 0x828852b8
+0x828ad010,BladeState_ctor,BladeState constructor/initialiser.,x360dis 0x828ad010
+0x828ad0b0,BladeState_dtor,BladeState teardown.,x360dis 0x828ad0b0
+0x828ad328,Blade_entryRatio,Computes the entry-speed ratio for the blade dash from the horizontal speed.,x360dis 0x828ad328; 0x828ae9e0 caller
+0x828ad510,Blade_dashMax,Returns the blade dash max duration term used by Phase 0/1.,x360dis 0x828ad510; 0x828ae9e0
+0x828ad710,Blade_pitchClamp,Blade homing pitch clamp: reads NewAcBehavior +0x5b4 (2 deg) and converts to radians.,x360dis 0x828ad710; +0x5b4/+0x5b6
+0x828ad7b8,Blade_setPhase,Blade phase setter used by Phase 0/1/2 transitions.,x360dis 0x828ad7b8
+0x828ae9e0,Blade_phase0,Blade Phase 0 (charge): wind-up timer and entry-speed/dash-max check.,x360dis 0x828ae9e0; phase table 0x83714024
+0x828af000,Blade_phase1,"Blade Phase 1 (dash): target validity, 12 m + 1.2 m instant swing gate, homing dash.",x360dis 0x828af000; phase table 0x83714024
+0x828af1c8,Blade_phase2,Blade Phase 2 (swing/recovery): 12/60 s swing then 30/60 s recovery.,x360dis 0x828af1c8; phase table 0x83714024

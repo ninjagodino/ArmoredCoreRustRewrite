@@ -1,0 +1,6 @@
+name,param,unit,value,evidence
+laser_blade_trail_fx,acweaponsfxparam.bullet_sfx_id,ffx id,4104,"BladeLaunch trail_fx comes from acweaponsfxparam.bullet_sfx_id; generated sheets bullet/acweaponsfxparam rows"
+blade_hit_low_fx,bullethitsfxparam.dry_ac_low_damage,ffx id,746,"BladeLaunch hit_low_fx; bullethitsfxparam.dry_ac_low_damage"
+blade_hit_hi_fx,bullethitsfxparam.ac_hi_damage,ffx id,746,"BladeLaunch hit_hi_fx; bullethitsfxparam.ac_hi_damage"
+blade_hit_low_se,bullethitseparam.dry_ac_low_damage,sound id,9501,"BladeLaunch hit_low_se; bullethitseparam.dry_ac_low_damage"
+blade_hit_hi_se,bullethitseparam.ac_hi_damage,sound id,9501,"BladeLaunch hit_hi_se; bullethitseparam.ac_hi_damage"

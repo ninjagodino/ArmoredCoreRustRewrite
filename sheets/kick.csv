@@ -1,0 +1,5 @@
+name,param,unit,value,evidence
+kick_accel_frames,128,"ticks (60 Hz frames)",3,"0x828590f8 +0x18 converts raw 3 by 1/60 (0x82004408) and stores action_ctrl +0x98; 0x8283fdb0 copies it to KickState +0x30; 0x828433a0 compares +0x30 + +0x34 against seconds timer +0x8"
+kick_after_frames,129,"ticks (60 Hz frames)",35,"0x828590f8 +0x1c converts raw 35 by 1/60 and stores action_ctrl +0x9c; KickState +0x34; total 38 ticks, not 76"
+kick_charge_frames,350,"ticks (60 Hz frames)",0,"NewAcBehavior +0x528; 0x8283e1f0 Phase 0 reads +0x528 x 1/60 (0x82004408) and compares the seconds timer"
+kick_down_accel,538,"m/frame per second",3,"0x82823740 reads NewAcBehavior +0x538 (3.0) x 1/60 at 0x82823938 when pitching down"

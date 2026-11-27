@@ -14,6 +14,7 @@ use glam::{Quat, Vec2, Vec3};
 use crate::collision::{Collision, Layer, RAY_HALF};
 use crate::input::InputFrame;
 use crate::map::AreaZone;
+use crate::tick::{ActionClock, ACTION_DT};
 
 /// Movement ticks per second; `AcCtrlParam`'s `_tick` values are per tick.
 const TICK_RATE: f32 = 60.0;
@@ -118,6 +119,63 @@ pub enum BladePhase {
     Recovery,
 }
 
+/// Swept blade hurtbox. `hit_radius` is the broad-phase target-search sphere
+/// (`BulletBladeSt.hit_radius`, `acvd-data` `bullet.rs`, runtime bullet `+0x50` via
+/// `0x828a3138` at `0x828a318c`), and `blade_radius` is the capsule thickness
+/// (`BulletBladeSt.blade_radius` `+0x24`, consumed by `0x828a1fc0`/`0x828a1f48` ->
+/// `0x82456a10`/`0x82456ae0`, then `0x828a3988` -> `0x828a4518`). `b_near_hit_only`
+/// (`+0x21`, copied to runtime `+0x21` by `0x828a3138` at `0x828a323c`/`0x828a3258`)
+/// adds the 2.0 m near gate proved in `0x82885630` (`0x83713e40` = 2.0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BladeSweep {
+    pub hilt: Vec3,
+    pub tip: Vec3,
+    pub blade_radius: f32,
+    pub hit_radius: f32,
+    pub near_hit_only: bool,
+}
+
+/// Distance from `p` to segment `a..b` and the normalised segment parameter.
+fn segment_closest(a: Vec3, b: Vec3, p: Vec3) -> (f32, f32) {
+    let ab = b - a;
+    let len2 = ab.length_squared();
+    if len2 <= 1e-9 {
+        return ((p - a).length(), 0.0);
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    ((p - (a + ab * t)).length(), t)
+}
+
+impl BladeSweep {
+    pub fn new(hilt: Vec3, tip: Vec3, blade_radius: f32, hit_radius: f32, near_hit_only: bool) -> Self {
+        Self {
+            hilt,
+            tip,
+            blade_radius: blade_radius.max(0.0),
+            hit_radius: hit_radius.max(0.0),
+            near_hit_only,
+        }
+    }
+
+    /// Closest approach of the target sphere centre to the blade segment, returning the
+    /// normalised segment parameter when the capsule overlaps. Broad phase uses the blade
+    /// `hit_radius`; the narrow phase uses the swept `blade_radius` capsule. A near-hit-only
+    /// record additionally requires the closest approach within the 360 2.0 m gate.
+    pub fn hits_sphere(&self, center: Vec3, target_radius: f32) -> Option<f32> {
+        let (dist, t) = segment_closest(self.hilt, self.tip, center);
+        if dist > self.hit_radius + target_radius {
+            return None;
+        }
+        if dist > self.blade_radius + target_radius {
+            return None;
+        }
+        if self.near_hit_only && dist > 2.0 + target_radius {
+            return None;
+        }
+        Some(t)
+    }
+}
+
 /// Parameters passed to `AcMotion::start_blade` when triggering a melee blade weapon.
 #[derive(Clone, Copy, Debug)]
 pub struct BladeLaunch {
@@ -127,12 +185,17 @@ pub struct BladeLaunch {
     pub physical: bool,
     /// FCS-locked target entity & world position (if any).
     pub target: Option<(u64, Vec3)>,
+    /// True when the FCS target passed the 360 validity gate (`+0x44` bit 26 clear, `+0x4d` == 0,
+    /// not the owner). Invalid targets are treated as no target.
+    pub target_valid: bool,
     /// Weapon hit reach (`BulletBladeSt.hit_radius`, m).
     pub hit_radius: f32,
     /// Weapon blade capsule thickness (`BulletBladeSt.blade_radius`, m).
     pub blade_radius: f32,
     /// Max targets damaged per swing (`BulletBladeSt.damage_hit_count_chara`).
     pub max_hits: u8,
+    /// `BulletBladeSt.b_near_hit_only`: require the 2.0 m near gate for each target.
+    pub near_hit_only: bool,
     /// Multi-hit power decay (`BulletBladeSt.decay_power`).
     pub decay_power: f32,
     /// Multi-hit recoil decay (`BulletBladeSt.decay_recoil`).
@@ -164,6 +227,9 @@ pub struct BladeAction {
     pub max_dash_ticks: f32,
     /// Entry horizontal speed in m/tick (`0x828ad328`).
     pub entry_speed_tick: f32,
+    /// Homing pitch in radians, clamped to `blade_pitch_limit_deg` (2 deg) and stepped at most
+    /// `blade_pitch_speed_deg` (1 deg) per 60 Hz frame (`0x828ad710`).
+    pub pitch: f32,
     /// Live target position (updated each frame while target lives).
     pub target_pos: Option<Vec3>,
     /// Whether the attack started airborne (picks air vs ground `acmotion` rows).
@@ -292,6 +358,9 @@ pub struct AcMotion {
     pub kick: Option<KickState>,
     /// Active melee blade state (`BladeState` `0x83714024`).
     pub blade: Option<BladeAction>,
+    /// 30 Hz boundary clock for the active body action (`BladeState`/`KickState`). Reset by
+    /// every action start; an action boundary occurs on every second 60 Hz tick.
+    pub action_clock: ActionClock,
     /// World position before the last movement frame (for swept melee collision).
     pub prev_position: Vec3,
     /// The body-relative eighth of a high boost whose clip starts on the next state pick.
@@ -380,18 +449,20 @@ impl AcMotion {
         self.qb = None;
         self.glide = false;
         let entry_speed_tick = Vec2::new(self.velocity.x, self.velocity.z).length();
-        let speed_bonus_ticks = NEW_AC_BEHAVIOR.blade_homing_time_speed_coef
-            * (entry_speed_tick * TICK_TO_KMH)
-            * 0.01
-            * TICK_RATE;
-        let max_dash_ticks = if launch.target.is_some() {
-            (NEW_AC_BEHAVIOR.blade_dash_max_frames + speed_bonus_ticks).clamp(18.0, 45.0)
-        } else {
-            NEW_AC_BEHAVIOR.blade_dash_max_frames
-        };
-        let target_pos = launch.target.map(|(_, pos)| pos);
+        let entry_kmh = entry_speed_tick * TICK_TO_KMH;
+        // `0x828ad328` -> `AcMove_bladeDash` `0x828248f8`: the dash duration is
+        // `entry_kmh * 0.1 * 0.01 + NewAcBehavior.blade_dash_max_frames / 60` seconds.
+        // `blade_dash_max_frames` is authored 0.0, so only the entry-speed term remains.
+        let max_dash_secs = entry_kmh * 0.1 * 0.01
+            + NEW_AC_BEHAVIOR.blade_dash_max_frames.max(0.0) / 60.0;
+        let max_dash_ticks = max_dash_secs * TICK_RATE;
+        let target_pos = launch
+            .target
+            .filter(|_| launch.target_valid)
+            .map(|(_, pos)| pos);
         let downward = self.airborne
             && self.aim_pitch.to_degrees() <= -f32::from(NEW_AC_BEHAVIOR.blade_down_angle_deg);
+        self.action_clock.reset();
         self.blade_swings += 1;
         self.blade = Some(BladeAction {
             launch,
@@ -399,6 +470,7 @@ impl AcMotion {
             timer: 0.0,
             max_dash_ticks,
             entry_speed_tick,
+            pitch: 0.0,
             target_pos,
             air_start: self.airborne,
             downward,
@@ -476,6 +548,7 @@ impl AcMotion {
             wall_jump_queued: false,
             kick: None,
             blade: None,
+            action_clock: ActionClock::new(),
             prev_position: Vec3::ZERO,
             quick_pending: None,
             takeoff: 0.0,
@@ -1036,8 +1109,23 @@ fn step_kick(p: &mut AcMotion, horizontal: Vec2) -> Option<(Vec2, bool)> {
     Some((next_h, true))
 }
 
+/// Clamp a homing pitch to `blade_pitch_limit_deg` (2 deg) and step it at most
+/// `blade_pitch_speed_deg` (1 deg) per 60 Hz frame (`0x828ad710`, `NewAcBehavior +0x5b4/+0x5b6`).
+fn blade_pitch_step(current: f32, desired: f32) -> f32 {
+    let limit = f32::from(NEW_AC_BEHAVIOR.blade_pitch_limit_deg).to_radians();
+    let speed = f32::from(NEW_AC_BEHAVIOR.blade_pitch_speed_deg).to_radians();
+    let desired = desired.clamp(-limit, limit);
+    let delta = (desired - current).clamp(-speed, speed);
+    (current + delta).clamp(-limit, limit)
+}
+
 /// Steps `BladeState` (`360 0x83714024`: Phase 0 `0x828ae9e0`, Phase 1 `0x828af000`,
 /// Phase 2 `0x828af1c8`, `AcMove_bladeDash` `0x828248f8`) by one 60 Hz tick.
+///
+/// The action phase function runs only on 30 Hz boundaries (`ActionClock`); on the intervening
+/// 60 Hz tick the dash velocity still integrates, but the phase timer does not advance. This is
+/// the 360 update order at `0x828ad124..0x828ad14c`: phase function first, then the owner's
+/// action dt is added only when the phase did not change.
 /// Returns `(horizontal, skip_gravity)` when active.
 fn step_blade(
     p: &mut AcMotion,
@@ -1048,12 +1136,25 @@ fn step_blade(
 ) -> Option<(Vec2, bool)> {
     let mut b = p.blade.take()?;
     let c = p.ctrl;
-    b.timer += 1.0;
+    let action_step = p.action_clock.tick();
+
+    let charge_secs = if b.launch.physical {
+        NEW_AC_BEHAVIOR.phys_blade_charge_frames
+    } else {
+        NEW_AC_BEHAVIOR.blade_charge_frames
+    } / 60.0;
+    let swing_secs = f32::from(NEW_AC_BEHAVIOR.blade_swing_frames) / 60.0;
+    let recovery_secs = f32::from(NEW_AC_BEHAVIOR.blade_recovery_frames) / 60.0;
+    let instant_dist = NEW_AC_BEHAVIOR.blade_instant_swing_dist;
+    let instant_vert = 1.2;
 
     // Steer AC facing toward the FCS-locked target during Charge, Dash, and Swing (`0x828ad710`).
-    if !matches!(b.phase, BladePhase::Recovery) {
-        if let Some(tpos) = b.target_pos {
-            let to = Vec2::new(tpos.x - position.x, tpos.z - position.z);
+    let target_delta = b.target_pos.map(|t| t - position);
+    let dist2d = target_delta.map(|d| Vec2::new(d.x, d.z).length());
+    let dy = target_delta.map(|d| d.y - 4.0);
+    if action_step && !matches!(b.phase, BladePhase::Recovery) {
+        if let Some(to) = target_delta {
+            let to = Vec2::new(to.x, to.z);
             if to.length_squared() > 1e-4 {
                 // FORWARD is -Z (`sin(-yaw) = x`, `-cos(-yaw) = z` -> `yaw = atan2(-dx, -dz)`).
                 let target_yaw = (-to.x).atan2(-to.y);
@@ -1069,60 +1170,90 @@ fn step_blade(
 
     let forward = Quat::from_rotation_y(p.yaw) * FORWARD;
     let forward_h = Vec2::new(forward.x, forward.z).normalize_or(Vec2::NEG_Y);
-    let dist_to_target = b.target_pos.map(|t| (t - position).with_y(0.0).length());
 
-    let (next_h, skip_gravity) = match b.phase {
-        BladePhase::Charge => {
-            let charge_ticks = if b.launch.physical {
-                NEW_AC_BEHAVIOR.phys_blade_charge_frames
-            } else {
-                NEW_AC_BEHAVIOR.blade_charge_frames
-            };
-            let h = if p.airborne {
-                horizontal * (1.0 - drag).clamp(0.0, 1.0)
-            } else {
-                approach(horizontal, Vec2::ZERO, brake)
-            };
-            if b.timer >= charge_ticks {
-                b.timer = 0.0;
-                let instant_dist = NEW_AC_BEHAVIOR.blade_instant_swing_dist;
-                if b.max_dash_ticks > 0.0 && dist_to_target.is_some_and(|d| d > instant_dist) {
-                    b.phase = BladePhase::Dash;
+    if action_step {
+        match b.phase {
+            BladePhase::Charge => {
+                if b.timer + 1e-6 >= charge_secs {
+                    let instant = dist2d.is_some_and(|d| d <= instant_dist)
+                        && dy.is_some_and(|d| d.abs() <= instant_vert);
+                    if b.target_pos.is_some() && b.max_dash_ticks > 0.0 && !instant {
+                        b.phase = BladePhase::Dash;
+                    } else {
+                        b.phase = BladePhase::Swing;
+                    }
+                    b.timer = 0.0;
                 } else {
-                    b.phase = BladePhase::Swing;
+                    b.timer += ACTION_DT;
                 }
             }
-            (h, false)
+            BladePhase::Dash => {
+                let arrived = b.target_pos.is_none()
+                    || (dist2d.is_some_and(|d| d <= instant_dist)
+                        && dy.is_some_and(|d| d.abs() <= instant_vert));
+                let dash_elapsed_ticks = b.timer * TICK_RATE;
+                if arrived || dash_elapsed_ticks + 1e-3 >= b.max_dash_ticks {
+                    b.phase = BladePhase::Swing;
+                    b.timer = 0.0;
+                } else {
+                    b.timer += ACTION_DT;
+                }
+            }
+            BladePhase::Swing => {
+                // Phase 2 is one timer: the swing window is the first `blade_swing_frames`
+                // (12/60 s), then recovery continues in the same timer until
+                // `blade_recovery_frames` (30/60 s).
+                if b.timer + 1e-6 >= recovery_secs {
+                    return Some((blade_brake(p.airborne, horizontal, brake, drag), false));
+                }
+                if b.timer + 1e-6 >= swing_secs {
+                    b.phase = BladePhase::Recovery;
+                }
+                b.timer += ACTION_DT;
+            }
+            BladePhase::Recovery => {
+                if b.timer + 1e-6 >= recovery_secs {
+                    return Some((blade_brake(p.airborne, horizontal, brake, drag), false));
+                }
+                b.timer += ACTION_DT;
+            }
         }
-        BladePhase::Dash | BladePhase::Swing => {
-            let dir_h = b
-                .target_pos
-                .map(|t| Vec2::new(t.x - position.x, t.z - position.z).normalize_or(forward_h))
+    }
+
+    let braking = blade_brake(p.airborne, horizontal, brake, drag);
+    let (next_h, skip_gravity) = match b.phase {
+        BladePhase::Charge => (braking, false),
+        BladePhase::Dash => {
+            let dir_h = target_delta
+                .map(|d| Vec2::new(d.x, d.z).normalize_or(forward_h))
                 .unwrap_or(forward_h);
-            // `0x828ad328`: entry speed ratio between `blade_min_speed_kmh` (20) and `blade_max_speed_kmh` (150),
-            // combined with `0x828aeb68` distance scale (`min(1, dist / 50 m)`).
+            // `0x828ad328`: entry speed ratio between `blade_min_speed_kmh` (20) and
+            // `blade_max_speed_kmh` (150), combined with `0x828aeb68` distance scale
+            // (`min(1, dist / 50 m)`).
             let entry_kmh = b.entry_speed_tick * TICK_TO_KMH;
             let min_s = f32::from(NEW_AC_BEHAVIOR.blade_min_speed_kmh);
             let max_s = f32::from(NEW_AC_BEHAVIOR.blade_max_speed_kmh).max(min_s + 1.0);
             let spd_rate = ((entry_kmh - min_s) / (max_s - min_s))
                 .clamp(NEW_AC_BEHAVIOR.blade_min_accel_rate, 1.0)
                 .max(0.4);
-            let dist_rate = dist_to_target
+            let dist_rate = dist2d
                 .map(|d| (d / NEW_AC_BEHAVIOR.blade_homing_full_dist.max(1.0)).clamp(0.4, 1.0))
                 .unwrap_or(1.0);
             let accel = dir_h * (c.blade_accel_tick * spd_rate * dist_rate);
             let h = integrate(horizontal, accel, c.blade_max_tick, c.over_max_decel_tick);
 
-            // Vertical homing toward locked target (`AcMove_bladeDash` `0x82824a04..0x82824a24`).
             let mut hover = false;
             if let Some(tpos) = b.target_pos {
-                let dy = tpos.y - (position.y + 4.0);
-                if dy > 1.0 {
+                let d2 = Vec2::new(tpos.x - position.x, tpos.z - position.z).length();
+                let desired_pitch = (tpos.y - (position.y + 4.0)).atan2(d2.max(1e-3));
+                b.pitch = blade_pitch_step(b.pitch, desired_pitch);
+                let target_dy = tpos.y - (position.y + 4.0);
+                if target_dy > 1.0 {
                     p.airborne = true;
                     p.velocity.y =
                         (p.velocity.y + c.quick_boost_v_acc_tick).min(c.blade_rise_max_tick);
                     hover = true;
-                } else if dy < -1.0 && p.airborne {
+                } else if target_dy < -1.0 && p.airborne {
                     p.velocity.y =
                         (p.velocity.y - c.quick_boost_v_acc_tick).max(-c.blade_rise_max_tick);
                     hover = true;
@@ -1131,42 +1262,22 @@ fn step_blade(
                     hover = true;
                 }
             }
-
-            if b.phase == BladePhase::Dash {
-                let instant_dist = NEW_AC_BEHAVIOR.blade_instant_swing_dist;
-                if b.timer >= NEW_AC_BEHAVIOR.blade_dash_min_frames
-                    && (dist_to_target.is_none_or(|d| d <= instant_dist)
-                        || b.timer >= b.max_dash_ticks)
-                {
-                    b.phase = BladePhase::Swing;
-                    b.timer = 0.0;
-                }
-            } else {
-                let swing_ticks = f32::from(NEW_AC_BEHAVIOR.blade_swing_frames).max(1.0);
-                if b.timer >= swing_ticks {
-                    b.phase = BladePhase::Recovery;
-                }
-            }
             (h, hover)
         }
-        BladePhase::Recovery => {
-            // `0x828af30c..0x828af350`: brake until `blade_recovery_frames` (30 ticks) elapse.
-            let h = if p.airborne {
-                horizontal * (1.0 - drag).clamp(0.0, 1.0)
-            } else {
-                approach(horizontal, Vec2::ZERO, brake)
-            };
-            let total_ticks = f32::from(NEW_AC_BEHAVIOR.blade_recovery_frames)
-                .max(f32::from(NEW_AC_BEHAVIOR.blade_swing_frames));
-            if b.timer >= total_ticks {
-                return Some((h, false));
-            }
-            (h, false)
-        }
+        BladePhase::Swing | BladePhase::Recovery => (braking, false),
     };
 
     p.blade = Some(b);
     Some((next_h, skip_gravity))
+}
+
+/// Ground braking or air drag shared by the non-dash blade phases.
+fn blade_brake(airborne: bool, horizontal: Vec2, brake: f32, drag: f32) -> Vec2 {
+    if airborne {
+        horizontal * (1.0 - drag).clamp(0.0, 1.0)
+    } else {
+        approach(horizontal, Vec2::ZERO, brake)
+    }
 }
 
 /// One 60 Hz tick of generator output minus passive part EN drain (`360 0x828bef18` at
@@ -2742,6 +2853,7 @@ mod tests {
             Vec::new(),
         );
         let mut p = AcMotion::new(ctrl);
+        p.velocity = Vec3::new(0.0, 0.0, -100.0 / TICK_TO_KMH);
         let mut pos = Vec3::ZERO;
         // Locked target 25 m ahead along -Z (beyond 12 m instant-swing distance).
         let target_pos = Vec3::new(0.0, 3.0, -25.0);
@@ -2749,9 +2861,11 @@ mod tests {
             hand_idx: 1,
             physical: false,
             target: Some((0, target_pos)),
+            target_valid: true,
             hit_radius: 22.0,
             blade_radius: 2.0,
             max_hits: 3,
+            near_hit_only: false,
             decay_power: 0.5,
             decay_recoil: 0.5,
             damage_type: crate::damage::DamageType::Te,
@@ -3328,5 +3442,184 @@ mod tests {
             pos.z > 0.0,
             "a 60 degree ramp must stay a wall, got {pos:?}"
         );
+    }
+
+    fn blade_test_motion() -> AcMotion {
+        use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
+        let ctrl = AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .find(|r| r.id == 5001)
+            .map(|r| AcCtrlParam::calculate(&r.data))
+            .expect("design 5001");
+        AcMotion::new(ctrl)
+    }
+
+    fn blade_test_launch(target: Option<Vec3>, target_valid: bool) -> BladeLaunch {
+        BladeLaunch {
+            hand_idx: 0,
+            physical: false,
+            target: target.map(|p| (0, p)),
+            target_valid,
+            hit_radius: 22.0,
+            blade_radius: 2.0,
+            max_hits: 3,
+            near_hit_only: false,
+            decay_power: 0.5,
+            decay_recoil: 0.5,
+            damage_type: crate::damage::DamageType::Te,
+            damage_power: 8107.0,
+            damage_recoil: 0.0,
+            trail_fx: 4104,
+            hit_low_fx: 746,
+            hit_hi_fx: 746,
+            hit_low_se: 9501,
+            hit_hi_se: 9501,
+        }
+    }
+
+    fn drive_blade(p: &mut AcMotion, position: Vec3, calls: usize) {
+        for _ in 0..calls {
+            let _ = step_blade(p, position, Vec2::ZERO, 0.0, 0.0);
+        }
+    }
+
+    #[test]
+    fn charge_ends_on_4th_action_step() {
+        let mut p = blade_test_motion();
+        p.velocity = Vec3::new(0.0, 0.0, -100.0 / TICK_TO_KMH);
+        assert!(p.start_blade(blade_test_launch(Some(Vec3::new(0.0, 4.0, -25.0)), true)));
+        let pos = Vec3::ZERO;
+        drive_blade(&mut p, pos, 6);
+        assert_eq!(p.blade.as_ref().unwrap().phase, BladePhase::Charge);
+        drive_blade(&mut p, pos, 1);
+        assert_eq!(p.blade.as_ref().unwrap().phase, BladePhase::Dash);
+    }
+
+    #[test]
+    fn swing_ends_on_7th_action_step() {
+        let mut p = blade_test_motion();
+        assert!(p.start_blade(blade_test_launch(None, true)));
+        let pos = Vec3::ZERO;
+        let mut boundary = 0;
+        let mut swing_at = 0;
+        let mut recovery_at = 0;
+        for _ in 0..80 {
+            if p.action_clock.ticks() % 2 == 0 {
+                boundary += 1;
+            }
+            let before = p.blade.as_ref().map(|b| b.phase);
+            let _ = step_blade(&mut p, pos, Vec2::ZERO, 0.0, 0.0);
+            let after = p.blade.as_ref().map(|b| b.phase);
+            if before != Some(BladePhase::Swing) && after == Some(BladePhase::Swing) {
+                swing_at = boundary;
+            }
+            if before != Some(BladePhase::Recovery) && after == Some(BladePhase::Recovery) {
+                recovery_at = boundary;
+                break;
+            }
+        }
+        assert_eq!(swing_at, 4, "charge must hand off to swing on action step 4");
+        assert_eq!(
+            recovery_at,
+            swing_at + 7,
+            "swing must hand off to recovery on its 7th action step"
+        );
+    }
+
+    #[test]
+    fn recovery_ends_on_16th_action_step() {
+        let mut p = blade_test_motion();
+        assert!(p.start_blade(blade_test_launch(None, true)));
+        let pos = Vec3::ZERO;
+        let mut boundary = 0;
+        let mut swing_at = 0;
+        let mut end_at = 0;
+        for _ in 0..120 {
+            if p.action_clock.ticks() % 2 == 0 {
+                boundary += 1;
+            }
+            let before = p.blade.as_ref().map(|b| b.phase);
+            let active = step_blade(&mut p, pos, Vec2::ZERO, 0.0, 0.0).is_some();
+            let after = p.blade.as_ref().map(|b| b.phase);
+            if before != Some(BladePhase::Swing) && after == Some(BladePhase::Swing) {
+                swing_at = boundary;
+            }
+            if !active {
+                end_at = boundary;
+                break;
+            }
+        }
+        assert_eq!(swing_at, 4);
+        assert_eq!(
+            end_at,
+            swing_at + 16,
+            "Phase 2 must end on its 16th action step (30/60 s)"
+        );
+        assert!(p.blade.is_none());
+    }
+
+    #[test]
+    fn clip_frame_equals_two_per_action_step() {
+        let mut clock = ActionClock::new();
+        assert!(clock.tick());
+        assert_eq!(clock.clip_frame(), 0);
+        assert!(!clock.tick());
+        assert_eq!(clock.clip_frame(), 2);
+        clock.tick();
+        clock.tick();
+        assert_eq!(clock.action_steps(), 2);
+        assert_eq!(clock.clip_frame(), 4);
+    }
+
+    #[test]
+    fn dash_max_is_entry_speed_times_0_001() {
+        let mut p = blade_test_motion();
+        p.velocity = Vec3::new(0.0, 0.0, -100.0 / TICK_TO_KMH);
+        assert!(p.start_blade(blade_test_launch(Some(Vec3::new(0.0, 4.0, -25.0)), true)));
+        let b = p.blade.as_ref().unwrap();
+        assert!((b.max_dash_ticks - 6.0).abs() < 1e-3, "{}", b.max_dash_ticks);
+    }
+
+    #[test]
+    fn instant_swing_at_12m_and_vertical_1_2m() {
+        let mut p = blade_test_motion();
+        p.velocity = Vec3::new(0.0, 0.0, -100.0 / TICK_TO_KMH);
+        assert!(p.start_blade(blade_test_launch(Some(Vec3::new(0.0, 4.0, -10.0)), true)));
+        drive_blade(&mut p, Vec3::ZERO, 7);
+        assert_eq!(p.blade.as_ref().unwrap().phase, BladePhase::Swing);
+
+        let mut p = blade_test_motion();
+        p.velocity = Vec3::new(0.0, 0.0, -100.0 / TICK_TO_KMH);
+        assert!(p.start_blade(blade_test_launch(Some(Vec3::new(0.0, 6.0, -10.0)), true)));
+        drive_blade(&mut p, Vec3::ZERO, 7);
+        assert_eq!(p.blade.as_ref().unwrap().phase, BladePhase::Dash);
+    }
+
+    #[test]
+    fn no_target_skips_dash() {
+        let mut p = blade_test_motion();
+        assert!(p.start_blade(blade_test_launch(None, true)));
+        drive_blade(&mut p, Vec3::ZERO, 7);
+        assert_eq!(p.blade.as_ref().unwrap().phase, BladePhase::Swing);
+
+        let mut p = blade_test_motion();
+        assert!(p.start_blade(blade_test_launch(Some(Vec3::new(0.0, 4.0, -25.0)), false)));
+        drive_blade(&mut p, Vec3::ZERO, 7);
+        assert_eq!(p.blade.as_ref().unwrap().phase, BladePhase::Swing);
+    }
+
+    #[test]
+    fn homing_pitch_clamped_to_2_deg_at_1_deg_per_frame() {
+        let up = 10.0_f32.to_radians();
+        let first = blade_pitch_step(0.0, up);
+        assert!((first.to_degrees() - 1.0).abs() < 1e-4);
+        let mut pitch = first;
+        for _ in 0..10 {
+            pitch = blade_pitch_step(pitch, up);
+        }
+        assert!((pitch.to_degrees() - 2.0).abs() < 1e-4);
+        let down = blade_pitch_step(0.0, -up);
+        assert!((down.to_degrees() + 1.0).abs() < 1e-4);
     }
 }

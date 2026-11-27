@@ -20,7 +20,7 @@ use crate::ids::{NetId, ProjectileId, PropId};
 use crate::input::InputFrame;
 use crate::map::{AreaZone, DestructibleSet, Start, WaterReturnPoints};
 use crate::motion::{
-    self, AcMotion, BladeAction, BladeLaunch, BladePhase, GlidePhase, KickState, QbPhase,
+    self, AcMotion, BladeAction, BladeLaunch, BladePhase, BladeSweep, GlidePhase, KickState, QbPhase,
     WallJumpPhase,
 };
 use crate::stats::{self, AcStats};
@@ -489,11 +489,10 @@ impl SimWorld {
         struct Attack {
             attacker: NetId,
             blade: Option<BladeLaunch>,
-            blade_first: bool,
-            kick: bool,
             from: Vec3,
             to: Vec3,
             dir: Vec3,
+            hit_entities: Vec<u64>,
         }
         let mut attacks = Vec::new();
         for ac in self.acs.values() {
@@ -505,12 +504,11 @@ impl SimWorld {
                     attacks.push(Attack {
                         attacker: ac.id,
                         blade: Some(blade.launch),
-                        blade_first: blade.hit_entities.is_empty(),
-                        kick: false,
                         from: ac.motion.prev_position,
                         to: ac.position,
                         dir: (glam::Quat::from_rotation_y(ac.motion.yaw) * Vec3::NEG_Z)
                             .normalize_or(Vec3::NEG_Z),
+                        hit_entities: blade.hit_entities.clone(),
                     });
                 }
             }
@@ -519,11 +517,10 @@ impl SimWorld {
                     attacks.push(Attack {
                         attacker: ac.id,
                         blade: None,
-                        blade_first: false,
-                        kick: true,
                         from: ac.motion.prev_position,
                         to: ac.position,
                         dir: kick.dir,
+                        hit_entities: Vec::new(),
                     });
                 }
             }
@@ -533,44 +530,113 @@ impl SimWorld {
                 Some(ac) if ac.alive => ac,
                 _ => continue,
             };
-            let (power, recoil, attr) = if let Some(blade) = attack.blade {
-                let (p, r) = weapons::blade_scaled(
+
+            if let Some(blade) = attack.blade {
+                let (base_power, base_recoil) = weapons::blade_scaled(
                     attacker,
                     blade.damage_power,
                     blade.damage_recoil,
                     blade.physical,
                 );
-                let (p, r) = if attack.blade_first {
-                    (p, r)
+                let max_hits = blade.max_hits.max(1) as usize;
+                let remaining_slots = max_hits.saturating_sub(attack.hit_entities.len());
+                let origin = attack.to + Vec3::Y * 4.5 + attack.dir * 2.0;
+                let tip = origin + attack.dir * blade.hit_radius.max(0.0);
+                let sweep = BladeSweep::new(
+                    origin,
+                    tip,
+                    blade.blade_radius,
+                    blade.hit_radius,
+                    blade.near_hit_only,
+                );
+
+                let mut any_hit = !attack.hit_entities.is_empty();
+                if remaining_slots > 0 {
+                    let mut candidates: Vec<(f32, NetId)> = Vec::new();
+                    for (id, target) in &self.acs {
+                        if *id == attack.attacker
+                            || !target.alive
+                            || (!self.friendly_fire && target.team == attacker.team)
+                            || attack.hit_entities.contains(&u64::from(id.0))
+                        {
+                            continue;
+                        }
+                        let mut best_t = f32::INFINITY;
+                        for sphere in damage::ac_hit_spheres() {
+                            let center = target.position + Vec3::Y * sphere.offset_y;
+                            if let Some(t) = sweep.hits_sphere(center, sphere.radius) {
+                                best_t = best_t.min(t);
+                            }
+                        }
+                        if best_t.is_finite() {
+                            candidates.push((best_t, *id));
+                        }
+                    }
+                    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    candidates.truncate(remaining_slots);
+
+                    let mut first = !any_hit;
+                    for (_, target) in &candidates {
+                        let (power, recoil) = if first {
+                            first = false;
+                            any_hit = true;
+                            (base_power, base_recoil)
+                        } else {
+                            (
+                                base_power * blade.decay_power.clamp(0.0, 1.0),
+                                base_recoil * blade.decay_recoil.clamp(0.0, 1.0),
+                            )
+                        };
+                        let pos = self
+                            .acs
+                            .get(target)
+                            .map(|ac| ac.position + Vec3::Y * 4.0)
+                            .unwrap_or(origin);
+                        let _ = self.apply_hit(
+                            *target,
+                            attack.attacker,
+                            blade.damage_type,
+                            power,
+                            recoil,
+                            pos,
+                            tick,
+                            events,
+                        );
+                        if let Some(ac) = self.acs.get_mut(&attack.attacker) {
+                            if let Some(live) = ac.motion.blade.as_mut() {
+                                live.hit_entities.push(u64::from(target.0));
+                            }
+                        }
+                    }
+                }
+
+                // Destructible props swept by the same capsule. Props do not consume the
+                // distinct-character hit count; they use the current decayed power.
+                let (prop_power, _) = if !any_hit {
+                    (base_power, base_recoil)
                 } else {
                     (
-                        p * blade.decay_power.clamp(0.0, 1.0),
-                        r * blade.decay_recoil.clamp(0.0, 1.0),
+                        base_power * blade.decay_power.clamp(0.0, 1.0),
+                        base_recoil * blade.decay_recoil.clamp(0.0, 1.0),
                     )
                 };
-                (p, r, blade.damage_type)
-            } else {
-                let (p, r) = weapons::kick_scaled(attacker);
-                (p, r, DamageType::Ke)
-            };
+                for prop in self.destructibles.props_mut() {
+                    if !prop.broken
+                        && sweep.hits_sphere(prop.center, prop.radius).is_some()
+                        && prop.apply_damage(prop_power.max(1.0))
+                    {
+                        events.push(SimEvent::PropBroken {
+                            prop: prop.prop_id,
+                            tick: tick.0,
+                        });
+                    }
+                }
+                continue;
+            }
 
-            let reach = attack.blade.map_or(7.0, |b| b.hit_radius.clamp(6.0, 35.0));
-            let sweep_r = attack.blade.map_or(7.0, |b| b.blade_radius.max(2.0));
-            let origin = if attack.blade.is_some() {
-                attack.to + Vec3::Y * 4.5 + attack.dir * 2.0
-            } else {
-                attack.to + Vec3::Y * 4.0 + attack.dir * 2.5
-            };
-            let tip = origin + attack.dir * reach;
-            let from = if attack.kick {
-                attack.from + Vec3::Y * 4.0 + attack.dir * 2.5
-            } else {
-                attack.from + Vec3::Y * 4.5 + attack.dir * 2.0
-            };
-            let segment_end = if attack.kick { origin } else { tip };
-
-            let mut hit_targets: Vec<NetId> = Vec::new();
-            let max_hits = attack.blade.map_or(1, |b| b.max_hits.max(1) as usize);
+            let (power, recoil) = weapons::kick_scaled(attacker);
+            let origin = attack.to + Vec3::Y * 4.0 + attack.dir * 2.5;
+            let from = attack.from + Vec3::Y * 4.0 + attack.dir * 2.5;
             let mut best: Option<(f32, NetId, Vec3)> = None;
             for (id, target) in &self.acs {
                 if *id == attack.attacker
@@ -583,8 +649,8 @@ impl SimWorld {
                     let center = target.position + Vec3::Y * sphere.offset_y;
                     if let Some((t, p, _)) = damage::swept_sphere_hits_sphere(
                         from,
-                        segment_end,
-                        sweep_r,
+                        origin,
+                        7.0,
                         center,
                         sphere.radius,
                     ) {
@@ -594,84 +660,38 @@ impl SimWorld {
                     }
                 }
             }
-            // A blade swing can cleave several targets; process nearest-first up to `max_hits`.
-            let mut remaining: Vec<(f32, NetId, Vec3)> = Vec::new();
-            if attack.blade.is_some() {
-                for (id, target) in &self.acs {
-                    if *id == attack.attacker
-                        || !target.alive
-                        || (!self.friendly_fire && target.team == attacker.team)
-                        || remaining.iter().any(|(_, rid, _)| rid == id)
-                    {
-                        continue;
-                    }
-                    for sphere in damage::ac_hit_spheres() {
-                        let center = target.position + Vec3::Y * sphere.offset_y;
-                        if let Some((t, p, _)) = damage::swept_sphere_hits_sphere(
-                            from,
-                            segment_end,
-                            sweep_r,
-                            center,
-                            sphere.radius,
-                        ) {
-                            remaining.push((t, *id, p));
-                            break;
-                        }
-                    }
-                }
-                remaining.sort_by(|a, b| a.0.total_cmp(&b.0));
-                remaining.truncate(max_hits);
-                hit_targets.extend(remaining.iter().map(|(_, id, _)| *id));
-            } else if let Some(b) = best {
-                hit_targets.push(b.1);
-            }
-
-            for target in &hit_targets {
-                let pos = remaining
-                    .iter()
-                    .find(|(_, id, _)| id == target)
-                    .map_or(origin, |(_, _, p)| *p);
+            if let Some((_, target, pos)) = best {
                 let _ = self.apply_hit(
-                    *target,
+                    target,
                     attack.attacker,
-                    attr,
+                    DamageType::Ke,
                     power,
                     recoil,
                     pos,
                     tick,
                     events,
                 );
-            }
-
-            // Destructible props swept by the same blade/kick volume.
-            for prop in self.destructibles.props_mut() {
-                if !prop.broken
-                    && damage::swept_sphere_hits_sphere(
-                        from,
-                        segment_end,
-                        sweep_r,
-                        prop.center,
-                        prop.radius,
-                    )
-                    .is_some()
-                {
-                    if prop.apply_damage(power.max(1.0)) {
+                for prop in self.destructibles.props_mut() {
+                    if !prop.broken
+                        && damage::swept_sphere_hits_sphere(
+                            from,
+                            origin,
+                            7.0,
+                            prop.center,
+                            prop.radius,
+                        )
+                        .is_some()
+                        && prop.apply_damage(power.max(1.0))
+                    {
                         events.push(SimEvent::PropBroken {
                             prop: prop.prop_id,
                             tick: tick.0,
                         });
                     }
                 }
-            }
-
-            if let Some(ac) = self.acs.get_mut(&attack.attacker) {
-                if attack.kick {
+                if let Some(ac) = self.acs.get_mut(&attack.attacker) {
                     if let Some(kick) = ac.motion.kick.as_mut() {
                         kick.hit_applied = true;
-                    }
-                } else if let Some(blade) = ac.motion.blade.as_mut() {
-                    for target in hit_targets {
-                        blade.hit_entities.push(u64::from(target.0));
                     }
                 }
             }
@@ -1266,9 +1286,11 @@ pub fn apply_local_state(ac: &mut SimAc, state: &LocalPlayerState) {
                 hand_idx: 0,
                 physical: false,
                 target: has_target.then_some((0, target)),
+                target_valid: has_target,
                 hit_radius: 0.0,
                 blade_radius: 0.0,
                 max_hits: 0,
+                near_hit_only: false,
                 decay_power: 0.0,
                 decay_recoil: 0.0,
                 damage_type: crate::damage::DamageType::Ke,
@@ -1289,6 +1311,7 @@ pub fn apply_local_state(ac: &mut SimAc, state: &LocalPlayerState) {
             timer: state.blade_timer,
             max_dash_ticks: state.blade_max_dash_ticks,
             entry_speed_tick: state.blade_entry_speed,
+            pitch: 0.0,
             target_pos: has_target.then_some(target),
             air_start: state.blade_flags & 1 != 0,
             downward: state.blade_flags & 2 != 0,
@@ -1518,4 +1541,178 @@ mod tests {
         apply_world_state(&mut late, &state);
         assert_eq!(late.broken_bits(), world.destructibles.broken_bits());
     }
+    fn test_blade_action(
+        hit_radius: f32,
+        blade_radius: f32,
+        max_hits: u8,
+        decay_power: f32,
+        decay_recoil: f32,
+        near_hit_only: bool,
+    ) -> BladeAction {
+        BladeAction {
+            launch: BladeLaunch {
+                hand_idx: 0,
+                physical: true,
+                target: None,
+                target_valid: true,
+                hit_radius,
+                blade_radius,
+                max_hits,
+                near_hit_only,
+                decay_power,
+                decay_recoil,
+                damage_type: DamageType::Ke,
+                damage_power: 1000.0,
+                damage_recoil: 100.0,
+                trail_fx: 0,
+                hit_low_fx: 0,
+                hit_hi_fx: 0,
+                hit_low_se: 0,
+                hit_hi_se: 0,
+            },
+            phase: BladePhase::Swing,
+            timer: 0.0,
+            max_dash_ticks: 0.0,
+            entry_speed_tick: 0.0,
+            pitch: 0.0,
+            target_pos: None,
+            air_start: false,
+            downward: false,
+            trail_spawned: false,
+            hit_entities: Vec::new(),
+        }
+    }
+
+    fn blade_world(max_hits: u8, decay_power: f32, decay_recoil: f32) -> SimWorld {
+        let mut world = SimWorld::new();
+        let mut attacker = SimAc::new(NetId(1), loadout(), Vec3::ZERO, 0.0, 0);
+        attacker.motion.prev_position = Vec3::ZERO;
+        attacker.motion.blade = Some(test_blade_action(20.0, 3.0, max_hits, decay_power, decay_recoil, false));
+        world.insert(attacker);
+        for (i, z) in [-6.0, -8.0, -10.0, -12.0].iter().enumerate() {
+            world.insert(SimAc::new(
+                NetId(2 + i as u8),
+                loadout(),
+                Vec3::new(0.0, 0.0, *z),
+                0.0,
+                1,
+            ));
+        }
+        world
+    }
+
+    #[test]
+    fn blade_radius_is_capsule_hit_radius_is_broad_phase() {
+        let sweep = BladeSweep::new(
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -10.0),
+            1.0,
+            10.0,
+            false,
+        );
+        assert!(sweep.hits_sphere(Vec3::new(0.0, 0.0, -5.0), 0.0).is_some());
+        assert!(
+            sweep.hits_sphere(Vec3::new(0.0, 3.0, -5.0), 0.5).is_none(),
+            "inside HitRadius broad phase but outside BladeRadius capsule"
+        );
+        assert!(sweep.hits_sphere(Vec3::new(0.0, 1.4, -5.0), 0.5).is_some());
+
+        let near = BladeSweep::new(
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -10.0),
+            5.0,
+            10.0,
+            true,
+        );
+        assert!(near.hits_sphere(Vec3::new(0.0, 3.0, -5.0), 0.5).is_none());
+        assert!(near.hits_sphere(Vec3::new(0.0, 2.0, -5.0), 0.5).is_some());
+    }
+
+    #[test]
+    fn swing_hits_each_target_once() {
+        let mut world = blade_world(3, 0.5, 0.5);
+        let mut events = Vec::new();
+        world.step_melee(Tick(0), &mut events);
+        let damaged: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SimEvent::Damaged { target, .. } => Some(*target),
+                _ => None,
+            })
+            .collect();
+        assert!(damaged.contains(&NetId(2)));
+        let ap_after_first = world.acs[&NetId(2)].ap;
+        let hits_after_first = world.acs[&NetId(1)]
+            .motion
+            .blade
+            .as_ref()
+            .unwrap()
+            .hit_entities
+            .len();
+        assert!(hits_after_first >= 1);
+
+        events.clear();
+        world.step_melee(Tick(1), &mut events);
+        assert!(
+            !events.iter().any(|e| matches!(e, SimEvent::Damaged { target, .. } if *target == NetId(2))),
+            "a target already struck this swing must not be hit again"
+        );
+        assert_eq!(world.acs[&NetId(2)].ap, ap_after_first);
+    }
+
+    #[test]
+    fn damage_hit_count_caps_distinct_targets() {
+        let mut world = blade_world(2, 0.5, 0.5);
+        let mut events = Vec::new();
+        world.step_melee(Tick(0), &mut events);
+        let damaged: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SimEvent::Damaged { target, .. } => Some(*target),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(damaged.len(), 2, "damage_hit_count_chara = 2");
+        assert_eq!(
+            world.acs[&NetId(1)]
+                .motion
+                .blade
+                .as_ref()
+                .unwrap()
+                .hit_entities
+                .len(),
+            2
+        );
+        events.clear();
+        world.step_melee(Tick(1), &mut events);
+        assert!(
+            !events.iter().any(|e| matches!(e, SimEvent::Damaged { .. })),
+            "the per-swing distinct-target cap must stop further hits"
+        );
+    }
+
+    #[test]
+    fn decay_power_and_recoil_after_first_target() {
+        let mut world = blade_world(2, 0.5, 0.5);
+        let mut events = Vec::new();
+        world.step_melee(Tick(0), &mut events);
+        let mut hits: Vec<(f32, f32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                SimEvent::Damaged { amount, recoil, .. } => Some((*amount, *recoil)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 2);
+        hits.sort_by(|a, b| b.0.total_cmp(&a.0));
+        assert!(
+            hits[0].0 > hits[1].0,
+            "second distinct target must take decayed power: {hits:?}"
+        );
+        assert!(
+            hits[0].1 > hits[1].1,
+            "second distinct target must take decayed recoil: {hits:?}"
+        );
+    }
+
 }
