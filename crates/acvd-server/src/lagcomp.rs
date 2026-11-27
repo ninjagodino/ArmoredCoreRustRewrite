@@ -121,6 +121,11 @@ impl HitboxHistory {
     pub fn remove(&mut self, id: NetId) {
         self.per_ac.remove(&id);
     }
+
+    /// Number of ACs with retained hitbox history (leak check).
+    pub fn tracked(&self) -> usize {
+        self.per_ac.len()
+    }
 }
 
 /// `clamp(rtt_ticks/2 + INTERP_DELAY_TICKS + jitter_ticks, 0, MAX_REWIND_TICKS)`.

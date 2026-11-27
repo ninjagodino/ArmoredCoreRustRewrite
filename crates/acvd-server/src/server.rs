@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use acvd_formats::vfs::Disc;
 use acvd_net::{
@@ -32,12 +32,52 @@ use acvd_sim::weapons::HITSCAN_MAX_RANGE;
 use acvd_sim::world::{wire_id, SimAc, SimWorld};
 use anyhow::{Context, Result};
 use glam::Vec3;
+use serde::Serialize;
 
 use crate::config::ServerConfig;
 use crate::input_queue::{self, InputQueue};
 use crate::interest::{self, InterestManager};
 use crate::lagcomp::{self, HitboxHistory, HitscanOutcome};
 use crate::snapshot::{self, RecordSet};
+
+/// Microsecond breakdown of one fixed tick (Phase 4 soak instrumentation).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct StepTimings {
+    pub sim_us: u64,
+    pub snapshot_us: u64,
+    pub encode_us: u64,
+    pub net_us: u64,
+    pub total_us: u64,
+}
+
+/// Payload egress accumulated for one client. Bots are counted exactly like UDP clients, but
+/// their encoded datagrams are discarded instead of being handed to the socket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ClientEgress {
+    pub bytes: u64,
+    pub snapshot_bytes: u64,
+    pub snapshot_ticks: u64,
+    pub snapshot_packets: u64,
+    pub max_snapshot_packet: u16,
+    pub max_packets_per_tick: u8,
+    pub missing_local: u64,
+}
+
+/// Live entity/message counts used by the soak leak checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct EntityCounts {
+    pub acs: usize,
+    pub clients: usize,
+    pub projectiles: usize,
+    pub missiles: usize,
+    pub pending_fires: usize,
+    pub combat_pending: usize,
+    pub history_entries: usize,
+}
+
+/// Synthetic `ClientId` tag for bots. Renet client ids are random 64-bit values; the tag keeps
+/// bot ids far from the small test ids and is never used on the socket.
+pub const BOT_CLIENT_TAG: ClientId = 0xB07_0000_0000_0000;
 
 /// One joined player's server-side state.
 struct ClientState {
@@ -56,6 +96,9 @@ struct ClientState {
     /// Smoothed transport quality used by the lag-compensation rewind.
     rtt_ms: f64,
     jitter_ms: f64,
+    /// A local load generator fed through the same input queue/snapshot path as UDP clients.
+    is_bot: bool,
+    egress: ClientEgress,
 }
 
 /// The running server, split from the clock loop so tests can step it deterministically.
@@ -83,6 +126,7 @@ pub struct Server {
     combat_packets: u64,
     kills: u64,
     respawns: u64,
+    timings: StepTimings,
 }
 
 impl Server {
@@ -130,7 +174,170 @@ impl Server {
             combat_packets: 0,
             kills: 0,
             respawns: 0,
+            timings: StepTimings::default(),
         })
+    }
+
+    /// Timing breakdown of the most recent [`Self::step`].
+    pub fn last_timings(&self) -> StepTimings {
+        self.timings
+    }
+
+    pub fn start(&self) -> Start {
+        self.start
+    }
+
+    pub fn client_egress(&self, net_id: NetId) -> Option<ClientEgress> {
+        self.clients
+            .values()
+            .find(|state| state.net_id == net_id)
+            .map(|state| state.egress)
+    }
+
+    /// Total encoded payload bytes queued for every client since the server started.
+    pub fn egress_bytes(&self) -> u64 {
+        self.clients.values().map(|state| state.egress.bytes).sum()
+    }
+
+    pub fn entity_counts(&self) -> EntityCounts {
+        EntityCounts {
+            acs: self.world.acs.len(),
+            clients: self.clients.len(),
+            projectiles: self.world.projectiles.len(),
+            missiles: self.world.missiles.len(),
+            pending_fires: self.pending_fires.len(),
+            combat_pending: self.combat_damages.len()
+                + self.combat_hits.len()
+                + self.combat_expires.len(),
+            history_entries: self.history.tracked(),
+        }
+    }
+
+    /// ACs in the world that no client owns (must stay zero across churn).
+    pub fn orphan_acs(&self) -> usize {
+        self.world
+            .acs
+            .keys()
+            .filter(|id| {
+                self.clients
+                    .values()
+                    .all(|state| sim_id(state.net_id) != **id)
+            })
+            .count()
+    }
+
+    /// Pending input frames for one client (bot queue leak check).
+    pub fn queued_inputs(&self, net_id: NetId) -> Option<usize> {
+        self.clients
+            .values()
+            .find(|state| state.net_id == net_id)
+            .map(|state| state.queue.queued())
+    }
+
+    /// Largest pending input queue across all clients.
+    pub fn max_queued_inputs(&self) -> usize {
+        self.clients
+            .values()
+            .map(|state| state.queue.queued())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Summed queue counters for the current clients.
+    pub fn queue_totals(&self) -> input_queue::QueueStats {
+        let mut totals = input_queue::QueueStats::default();
+        for state in self.clients.values() {
+            let stats = state.queue.stats();
+            totals.accepted = totals.accepted.saturating_add(stats.accepted);
+            totals.duplicates = totals.duplicates.saturating_add(stats.duplicates);
+            totals.stale = totals.stale.saturating_add(stats.stale);
+            totals.too_far = totals.too_far.saturating_add(stats.too_far);
+            totals.starved_ticks = totals.starved_ticks.saturating_add(stats.starved_ticks);
+            totals.idle_ticks = totals.idle_ticks.saturating_add(stats.idle_ticks);
+        }
+        totals
+    }
+
+    /// Joins a local bot with the same spawn/world/queue/snapshot path as a UDP client.
+    pub fn add_bot(&mut self, loadout: Loadout, team: u8) -> Option<NetId> {
+        let net_id = self.allocate_net_id()?;
+        let position = self.spawn_position(net_id, team);
+        let mut ac = SimAc::new(sim_id(net_id), loadout, position, self.start.yaw, team);
+        ac.motion.wall_jumps = 0;
+        self.world.insert(ac);
+        let client = BOT_CLIENT_TAG | u64::from(net_id.get());
+        self.clients.insert(
+            client,
+            ClientState {
+                net_id,
+                team,
+                loadout,
+                queue: InputQueue::new(),
+                full_snapshot: true,
+                last_lock_target: SimNetId::NONE,
+                joined_tick: self.tick,
+                respawn_at: None,
+                died_tick: self.tick,
+                rtt_ms: 0.0,
+                jitter_ms: 0.0,
+                is_bot: true,
+                egress: ClientEgress::default(),
+            },
+        );
+        let update = ReliableMessage::LoadoutUpdate(LoadoutUpdate {
+            net_id,
+            loadout: loadout.to_blob(),
+        })
+        .to_bytes();
+        self.broadcast(RELIABLE, update);
+        let joined = ReliableMessage::PlayerJoined(PlayerJoined { net_id, team }).to_bytes();
+        self.broadcast(RELIABLE, joined);
+        Some(net_id)
+    }
+
+    /// Removes a bot and its world/history/input state (the same teardown as a disconnect).
+    pub fn remove_bot(&mut self, net_id: NetId) -> bool {
+        let Some(client) = self
+            .clients
+            .iter()
+            .find(|(_, state)| state.is_bot && state.net_id == net_id)
+            .map(|(client, _)| *client)
+        else {
+            return false;
+        };
+        self.despawn_client(client);
+        true
+    }
+
+    /// Places a bot at an exact ground position (distribution setup and churn respawns).
+    pub fn place_bot(&mut self, net_id: NetId, x: f32, z: f32, yaw: f32) -> bool {
+        let probe = self.start.position + Vec3::new(0.0, 100.0, 0.0);
+        let ground = self
+            .collision
+            .ground_below(Vec3::new(x, probe.y.max(self.start.position.y) + 100.0, z))
+            .unwrap_or(self.start.position.y);
+        let Some(ac) = self.world.acs.get_mut(&sim_id(net_id)) else {
+            return false;
+        };
+        ac.respawn(Vec3::new(x, ground, z), yaw);
+        true
+    }
+
+    /// Queues one bot input frame through the authoritative client [`InputQueue`].
+    pub fn enqueue_bot_input(
+        &mut self,
+        net_id: NetId,
+        seq: u16,
+        frame: acvd_proto::InputFrame,
+    ) -> bool {
+        let Some(state) = self
+            .clients
+            .values_mut()
+            .find(|state| state.is_bot && state.net_id == net_id)
+        else {
+            return false;
+        };
+        state.queue.accept(seq, &[frame]) == 1
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -233,6 +440,10 @@ impl Server {
     /// One fixed 60 Hz iteration: transport/events, commands, inputs, `SimWorld::step`, events,
     /// snapshots.
     pub fn step(&mut self, dt: Duration) -> Result<()> {
+        let started = Instant::now();
+        self.timings = StepTimings::default();
+
+        let t = Instant::now();
         let events = self.net.poll(dt)?;
         for event in events {
             match event {
@@ -245,17 +456,26 @@ impl Server {
                 }
             }
         }
+        self.timings.net_us += t.elapsed().as_micros() as u64;
 
         self.update_network_quality();
         self.receive_commands();
         self.receive_inputs();
         self.resend_fires();
+
+        let t = Instant::now();
         self.step_world();
+        self.timings.sim_us += t.elapsed().as_micros() as u64;
+
         self.flush_combat();
         if self.config.snapshot_every > 0 && self.tick % self.config.snapshot_every == 0 {
             self.send_snapshots(false);
         }
+
+        let t = Instant::now();
         self.net.send_packets();
+        self.timings.net_us += t.elapsed().as_micros() as u64;
+        self.timings.total_us = started.elapsed().as_micros() as u64;
         Ok(())
     }
 
@@ -741,12 +961,14 @@ impl Server {
             died_tick: self.tick,
             rtt_ms: 0.0,
             jitter_ms: 0.0,
+            is_bot: false,
+            egress: ClientEgress::default(),
         };
         self.clients.insert(client, state);
 
         self.send_join_accepted(client, net_id, &loadout);
         self.send_bulk_state(client);
-        self.net.send(
+        self.send_to(
             client,
             RELIABLE,
             ReliableMessage::MatchState(MatchState {
@@ -791,7 +1013,7 @@ impl Server {
             pos_max: self.config.quantizer.max.to_array(),
             loadout: loadout.to_blob(),
         };
-        self.net.send(client, BULK, join.to_bytes());
+        self.send_to(client, BULK, join.to_bytes());
     }
 
     /// Every loadout and the destructible state for a late joiner (and on re-join).
@@ -807,10 +1029,10 @@ impl Server {
                 net_id,
                 loadout: loadout.to_blob(),
             });
-            self.net.send(client, BULK, update.to_bytes());
+            self.send_to(client, BULK, update.to_bytes());
         }
         let world = ReliableMessage::WorldState(self.world.world_state());
-        self.net.send(client, BULK, world.to_bytes());
+        self.send_to(client, BULK, world.to_bytes());
     }
 
     fn handle_loadout(&mut self, client: ClientId, blob: Vec<u8>) {
@@ -895,8 +1117,10 @@ impl Server {
     }
 
     fn send_snapshots(&mut self, force_full: bool) {
+        let t = Instant::now();
         self.interest.rebuild(&self.world);
         let records = RecordSet::build(&self.world, &self.config.quantizer);
+        self.timings.snapshot_us += t.elapsed().as_micros() as u64;
         let mut recipients: Vec<ClientId> = self.clients.keys().copied().collect();
         recipients.sort_unstable();
         for client in recipients {
@@ -923,21 +1147,49 @@ impl Server {
         let Some(state) = self.clients.get(&client) else {
             return;
         };
+        let is_bot = state.is_bot;
+        let net_id = state.net_id;
+        let t = Instant::now();
         let packet = snapshot::build(
             &self.world,
             &self.interest,
             records,
-            sim_id(state.net_id),
+            sim_id(net_id),
             state.last_lock_target,
             state.queue.last_acked(),
             self.snapshot_seq,
             force_full,
         );
         let split = snapshot::split(&packet);
+        self.timings.snapshot_us += t.elapsed().as_micros() as u64;
         self.dropped_records += split.dropped_records as u64;
         self.dropped_corrections += split.dropped_corrections as u64;
-        for packet in split.packets {
-            self.net.send(client, HOT, packet.to_bytes());
+        let packets = split.packets.len() as u8;
+        let local_first = split.packets.first().is_some_and(|p| p.local.is_some());
+        let t = Instant::now();
+        let mut encoded = Vec::with_capacity(split.packets.len());
+        for packet in &split.packets {
+            encoded.push(packet.to_bytes());
+        }
+        self.timings.encode_us += t.elapsed().as_micros() as u64;
+        if let Some(state) = self.clients.get_mut(&client) {
+            state.egress.snapshot_ticks += 1;
+            state.egress.snapshot_packets += u64::from(packets);
+            state.egress.max_packets_per_tick = state.egress.max_packets_per_tick.max(packets);
+            if !local_first {
+                state.egress.missing_local += 1;
+            }
+            for bytes in &encoded {
+                state.egress.bytes += bytes.len() as u64;
+                state.egress.snapshot_bytes += bytes.len() as u64;
+                state.egress.max_snapshot_packet =
+                    state.egress.max_snapshot_packet.max(bytes.len() as u16);
+            }
+        }
+        if !is_bot {
+            for bytes in encoded {
+                self.net.send(client, HOT, bytes);
+            }
         }
     }
 
@@ -984,13 +1236,33 @@ impl Server {
         None
     }
 
+    /// Sends to one UDP client, counting the payload for soak metrics.
+    fn send_to(&mut self, client: ClientId, channel: u8, bytes: bytes::Bytes) {
+        if let Some(state) = self.clients.get_mut(&client) {
+            state.egress.bytes += bytes.len() as u64;
+        }
+        self.net.send(client, channel, bytes);
+    }
+
+    /// Broadcasts to UDP clients and counts the same payload for every bot recipient. Bots have
+    /// no socket; their encoded snapshot datagrams are counted in `send_snapshot_to_with`.
     fn broadcast(&mut self, channel: u8, bytes: bytes::Bytes) {
+        let len = bytes.len() as u64;
+        for state in self.clients.values_mut() {
+            state.egress.bytes += len;
+        }
         for client in self.net.clients() {
             self.net.send(client, channel, bytes.clone());
         }
     }
 
     fn broadcast_except(&mut self, except: ClientId, channel: u8, bytes: bytes::Bytes) {
+        let len = bytes.len() as u64;
+        for (client, state) in self.clients.iter_mut() {
+            if *client != except {
+                state.egress.bytes += len;
+            }
+        }
         for client in self.net.clients() {
             if client != except {
                 self.net.send(client, channel, bytes.clone());

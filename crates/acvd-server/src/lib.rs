@@ -3,6 +3,7 @@
 //! `run` owns the fixed 60 Hz loop and graceful shutdown; [`Server`] is the stepped core used by
 //! tests and later by the listen-server thread.
 
+pub mod bots;
 pub mod config;
 pub mod input_queue;
 pub mod interest;
