@@ -164,3 +164,20 @@ Sheets rebuild (after editing `sheets/*.csv`):
 ```
 cargo run --release -p acvd-sheets -- all
 ```
+
+### Anti-Loop & Local Verification Discipline (Hard Rule)
+
+1. **Deterministic `cargo test` FIRST, `--shot` LAST:**
+   - **NEVER** use repeated `acvd-game --shot --wait <secs>` trial-and-error runs to debug state machines, animation frame counts, TAE/ANI event timing, or FFX spawning.
+   - Always test and debug tick progression, phase transitions, and event triggers in a fast deterministic `cargo test` unit test first (<1 s).
+   - Reserve `--shot` strictly for **final visual confirmation** (hard cap: **max 2 `--shot` captures per task**; no `--wait` sweeps).
+
+2. **Read Definitions Before Guessing Logs:**
+   - Never guess what a printed enum discriminant, phase index, or bitflag means across runs — read its exact `enum`/`struct` definition in source first.
+
+3. **No Throwaway CLI Hacks or Cache-Busting Rebuilds:**
+   - Do not add temporary timing/reset CLI flags (`--*-reset`, etc.) to `main.rs` just to catch a screenshot frame.
+   - **NEVER** add `bevy/debug` (or alter `bevy` features in `Cargo.toml`) to debug a panic — that invalidates the Cargo cache and triggers a 6-minute full Bevy rebuild. Inspect the source directly, run with `RUST_BACKTRACE=1`, and use `.try_despawn()` / `commands.get_entity()` on shared/networked entities.
+
+4. **2-Attempt Circuit-Breaker:**
+   - If the same bug, timing mismatch, or probe failure is not solved after **2 focused attempts**, **STOP immediately** and report the exact blocker and next hypothesis in <5 lines instead of looping for 20+ minutes.
