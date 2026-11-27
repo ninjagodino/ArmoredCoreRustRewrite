@@ -20,9 +20,12 @@
 //! Key AC event kinds (`0x8289acd0`):
 //! - `0`: Spawn FFX (`params[0]` = `ffx_id`, `params[1]` = `dummy_id`)
 //! - `1`, `2`: Play sound cue (`params[0]` = sound category, `params[1]` = cue ID; formatted via
-//!   360 table `0x8371c688`)
+//!   360 table `0x8371c688`). Kind `1` part-animation events (`params[0]` = 10/11/17/18) are
+//!   not sound cues.
 //! - `103`: Footstep (`params[0]` = foot side `0`/`1`, `params[1]` = step type)
 //! - `104`: Play a model ANI clip (`params[0]` = clip id, `params[4]` = speed; map objects)
+//! - `204`: Weapon-arm sound variant (`params[0]` = category, `params[1]` = cue ID; e.g.
+//!   `am7420` deploy/stow `[1,56]`/`[1,57]` -> `c00000056`/`c00000057`)
 //! - `602`: Play AC sound (`params[0]` = cue ID in category 1 `c%08d`)
 //!
 //! All integers and floats are big-endian.
@@ -45,6 +48,10 @@ pub const KIND_FOOTSTEP: u32 = 103;
 /// Play a skeletal ANI clip from the model's `_a` binder: `params[0]` = clip id,
 /// `params[4]` = speed (`f32`). 360 TAE dispatcher `0x8289acd0` case `0x68`.
 pub const KIND_ANI: u32 = 104;
+/// Weapon-arm TAE deploy/stow/ready sound variant. `params[0]` = sound category (1),
+/// `params[1]` = cue ID. `0x8284b690` dispatches kind `0xcc`; `own007020` uses
+/// `[1,36]`/`[1,37]`, `own007420` uses `[1,56]`/`[1,57]`.
+pub const KIND_SOUND_VARIANT: u32 = 204;
 pub const KIND_AC_SOUND: u32 = 602;
 
 /// Parsed `.tae` timeline file.
@@ -123,14 +130,26 @@ impl Event {
         Some((ffx_id, dummy_id as u8))
     }
 
-    /// Decodes a sound event (`KIND_SOUND_EXT` 1, `KIND_SOUND` 2, or `KIND_AC_SOUND` 602) as
-    /// `(category, sound_id)`.
+    /// Decodes a sound event (`KIND_SOUND_EXT` 1, `KIND_SOUND` 2, `KIND_SOUND_VARIANT`
+    /// 204, or `KIND_AC_SOUND` 602) as `(category, sound_id)`.
+    ///
+    /// Kind 1 is dual-use: weapon-arm/part-animation events use category 10/11 (and part
+    /// slots 17/18), which are not loaded FEV sound categories. Excluding them prevents a
+    /// bogus `c050`/`c051` lookup. The real weapon-arm deploy/stow cues are kind 204.
     pub fn as_sound(&self) -> Option<(u32, u32)> {
         match self.kind {
             KIND_SOUND_EXT | KIND_SOUND => {
                 let cat = self.param_u32(0)?;
                 let id = self.param_u32(4)?;
-                (id > 0).then_some((cat, id))
+                if id == 0 || (self.kind == KIND_SOUND_EXT && matches!(cat, 10 | 11 | 17 | 18)) {
+                    return None;
+                }
+                Some((cat, id))
+            }
+            KIND_SOUND_VARIANT => {
+                let cat = self.param_u32(0)?;
+                let id = self.param_u32(4)?;
+                (cat == 1 && id > 0).then_some((cat, id))
             }
             KIND_AC_SOUND => {
                 let id = self.param_u32(0)?;
@@ -154,13 +173,17 @@ impl Event {
     /// `acattachinfo` row ID (e.g. `13`/`14`/`9`/`10` seat on rack at frame 40;
     /// `11`/`12`/`2`/`3` grab to hand at frame 150 in `own*.tae` anims `2000..2003`).
     pub fn as_reattach(&self) -> Option<u32> {
-        (self.kind == KIND_REATTACH).then(|| self.param_u32(0)).flatten()
+        (self.kind == KIND_REATTACH)
+            .then(|| self.param_u32(0))
+            .flatten()
     }
 
     /// Decodes a `KIND_PURGE` (102, 360 `0x8289acd0` case `0x66`) event as the purge slot ID
     /// (e.g. `2`/`3`/`11`/`12` at frame 10 in `own*.tae` anims `2010..2013`).
     pub fn as_purge(&self) -> Option<u32> {
-        (self.kind == KIND_PURGE).then(|| self.param_u32(0)).flatten()
+        (self.kind == KIND_PURGE)
+            .then(|| self.param_u32(0))
+            .flatten()
     }
 
     /// Decodes a part-animation event (`kind == 1` with part slot `17` = `rack_r` or `18` = `rack_l`,
@@ -182,6 +205,15 @@ impl Event {
     pub fn format_cue(category: u32, id: u32) -> Option<String> {
         if id == 0 {
             return None;
+        }
+        // `0x8371c688` entries: 1 `c%08d`, 2 `a%08d`, 3 `b%08d`, 4 `w%08d`, 5 `m%08d`,
+        // 6 `d%08d`, 11 `c%03d`, 12 `r%03d`. Category 11 is the 360 table entry but
+        // weapon-arm deploy/stow sound events are kind 204 category 1.
+        if category == 11 {
+            return Some(format!("c{id:03}"));
+        }
+        if category == 12 {
+            return Some(format!("r{id:03}"));
         }
         let prefix = match category {
             1 | 14 | 15 => 'c',
@@ -342,6 +374,31 @@ mod tests {
         assert_eq!(Event::format_cue(1, 89).as_deref(), Some("c00000089"));
         assert_eq!(Event::format_cue(4, 34).as_deref(), Some("w00000034"));
 
+        let arm_sound = Event {
+            start_frame: 0,
+            end_frame: 3,
+            kind: KIND_SOUND_VARIANT,
+            params: [1u32.to_be_bytes(), 56u32.to_be_bytes()].concat(),
+        };
+        assert_eq!(arm_sound.as_sound(), Some((1, 56)));
+        assert_eq!(
+            Event::format_cue(1, 56).as_deref(),
+            Some("c00000056"),
+            "am7420 deploy Arm_HShot_Open"
+        );
+
+        // Kind 1 10/11 is a part animation, not a sound; it must not become c050.
+        let part_anim = Event {
+            start_frame: 80,
+            end_frame: 83,
+            kind: KIND_SOUND_EXT,
+            params: [11u32.to_be_bytes(), 50u32.to_be_bytes()].concat(),
+        };
+        assert_eq!(part_anim.as_sound(), None);
+        assert_eq!(part_anim.as_part_anim(), None);
+        assert_eq!(Event::format_cue(11, 50).as_deref(), Some("c050"));
+        assert_eq!(Event::format_cue(12, 51).as_deref(), Some("r051"));
+
         let step = Event {
             start_frame: 19,
             end_frame: 22,
@@ -365,13 +422,13 @@ mod tests {
         buf[0x50..0x54].copy_from_slice(&100u32.to_be_bytes()); // file_id
         buf[0x54..0x58].copy_from_slice(&1u32.to_be_bytes()); // anim_count
         buf[0x58..0x5c].copy_from_slice(&0x70u32.to_be_bytes()); // anim_ids_off
-        // Anim ID entry at 0x70
+                                                                 // Anim ID entry at 0x70
         buf[0x70..0x74].copy_from_slice(&2u32.to_be_bytes()); // id = 2
         buf[0x74..0x78].copy_from_slice(&0x80u32.to_be_bytes()); // anim_off
-        // Anim data at 0x80 (0x30 bytes)
+                                                                 // Anim data at 0x80 (0x30 bytes)
         buf[0x80..0x84].copy_from_slice(&1u32.to_be_bytes()); // ev_count
         buf[0x84..0x88].copy_from_slice(&0xb8u32.to_be_bytes()); // ev_off
-        // Times at 0xb0
+                                                                 // Times at 0xb0
         buf[0xb0..0xb4].copy_from_slice(&19u32.to_be_bytes());
         buf[0xb4..0xb8].copy_from_slice(&22u32.to_be_bytes());
         // Event header at 0xb8 (16 bytes)
@@ -412,16 +469,17 @@ mod tests {
         let mut total_anims = 0usize;
         let mut total_events = 0usize;
         for path in &paths {
-            let bytes = crate::vfs::open(&disc, path)
-                .unwrap_or_else(|e| panic!("open {path}: {e:#}"));
+            let bytes =
+                crate::vfs::open(&disc, path).unwrap_or_else(|e| panic!("open {path}: {e:#}"));
             let tae = read(&bytes).unwrap_or_else(|e| panic!("parse {path}: {e:#}"));
             total_anims += tae.animations.len();
             total_events += tae.animations.iter().map(|a| a.events.len()).sum::<usize>();
         }
         assert!(total_anims > 0 && total_events > 0);
         // Verify own000100 walk-forward (anim 2) has the two footstep events (frames 19 & 44).
-        let own100 = read(&crate::vfs::open(&disc, "tae/ac/motion_ow_disarm/own000100.tae").unwrap())
-            .unwrap();
+        let own100 =
+            read(&crate::vfs::open(&disc, "tae/ac/motion_ow_disarm/own000100.tae").unwrap())
+                .unwrap();
         let walk = own100.animation(2).expect("walk anim 2");
         let steps: Vec<_> = walk
             .events
@@ -436,10 +494,9 @@ mod tests {
         let Some(disc) = crate::vfs::test_disc() else {
             return;
         };
-        let own100 = read(
-            &crate::vfs::open(&disc, "tae/ac/motion_ow_disarm/own000100.tae").unwrap(),
-        )
-        .unwrap();
+        let own100 =
+            read(&crate::vfs::open(&disc, "tae/ac/motion_ow_disarm/own000100.tae").unwrap())
+                .unwrap();
 
         // Bay shift timelines 2000..2003 (360 0x82849440 / 0x82849450 -> 0x828487b8).
         for (anim_id, dummy, part_slot, rack_anim, seat_id, grab_id) in [
@@ -448,30 +505,53 @@ mod tests {
             (2002, 1, 18, 20, 9, 2),
             (2003, 2, 17, 20, 10, 3),
         ] {
-            let a = own100.animation(anim_id).unwrap_or_else(|| panic!("missing anim {anim_id}"));
+            let a = own100
+                .animation(anim_id)
+                .unwrap_or_else(|| panic!("missing anim {anim_id}"));
             assert!(a.events.iter().any(|e| {
                 e.start_frame == 0
-                    && e.as_sound().and_then(|(c, i)| Event::format_cue(c, i)).as_deref()
+                    && e.as_sound()
+                        .and_then(|(c, i)| Event::format_cue(c, i))
+                        .as_deref()
                         == Some("c00000047")
             }));
-            assert!(a.events.iter().any(|e| e.start_frame == 0 && e.as_ffx() == Some((4109, dummy))));
+            assert!(a
+                .events
+                .iter()
+                .any(|e| e.start_frame == 0 && e.as_ffx() == Some((4109, dummy))));
             assert!(a.events.iter().any(|e| {
                 e.start_frame == 0 && e.as_part_anim() == Some((part_slot, rack_anim))
             }));
-            assert!(a.events.iter().any(|e| e.start_frame == 15 && e.as_ffx() == Some((98, dummy))));
-            assert!(a.events.iter().any(|e| e.start_frame == 40 && e.as_reattach() == Some(seat_id)));
-            assert!(a.events.iter().any(|e| e.start_frame == 150 && e.as_reattach() == Some(grab_id)));
+            assert!(a
+                .events
+                .iter()
+                .any(|e| e.start_frame == 15 && e.as_ffx() == Some((98, dummy))));
+            assert!(a
+                .events
+                .iter()
+                .any(|e| e.start_frame == 40 && e.as_reattach() == Some(seat_id)));
+            assert!(a
+                .events
+                .iter()
+                .any(|e| e.start_frame == 150 && e.as_reattach() == Some(grab_id)));
         }
 
         // Bay purge timelines 2010..2013 (360 0x82848548 -> 0x82848cc8).
         for (anim_id, purge_slot) in [(2010u32, 2u32), (2011, 3), (2012, 11), (2013, 12)] {
-            let a = own100.animation(anim_id).unwrap_or_else(|| panic!("missing anim {anim_id}"));
+            let a = own100
+                .animation(anim_id)
+                .unwrap_or_else(|| panic!("missing anim {anim_id}"));
             assert!(a.events.iter().any(|e| {
                 e.start_frame == 10
-                    && e.as_sound().and_then(|(c, i)| Event::format_cue(c, i)).as_deref()
+                    && e.as_sound()
+                        .and_then(|(c, i)| Event::format_cue(c, i))
+                        .as_deref()
                         == Some("c00000045")
             }));
-            assert!(a.events.iter().any(|e| e.start_frame == 10 && e.as_purge() == Some(purge_slot)));
+            assert!(a
+                .events
+                .iter()
+                .any(|e| e.start_frame == 10 && e.as_purge() == Some(purge_slot)));
         }
     }
 }

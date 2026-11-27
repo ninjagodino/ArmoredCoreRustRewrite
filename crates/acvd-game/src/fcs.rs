@@ -391,13 +391,7 @@ pub fn in_lock_cone(
     datum_back: f32,
 ) -> Option<f32> {
     lock_sight_ellipse(
-        ac_pos,
-        aim_dir,
-        target_pos,
-        range,
-        half_x_rad,
-        half_y_rad,
-        datum_back,
+        ac_pos, aim_dir, target_pos, range, half_x_rad, half_y_rad, datum_back,
     )
     .filter(|ell| *ell <= 1.0)
 }
@@ -558,8 +552,10 @@ pub fn update(
 
     // Multi-target missile lock accumulation (`0x82858638` + `0x82857688`):
     // supports shoulder missiles as well as missile weapon arms (`am7210`/`am7220`).
-    let (sh, salvo_empty) = if arms.weapon_arm && arms.hands[0].is_missile {
-        (&arms.hands[0], arms.arm_salvo.is_empty())
+    let arm_deployed =
+        arms.weapon_arm && arms.weapon_arm_state.phase != acvd_sim::weapons::WeaponArmPhase::Stowed;
+    let (sh, salvo_empty) = if arm_deployed && arms.weapon_arm_gun.is_missile {
+        (&arms.weapon_arm_gun, arms.arm_salvo.is_empty())
     } else {
         (&arms.shoulder, arms.salvo.is_empty())
     };
@@ -781,28 +777,11 @@ mod tests {
         let z = 120.0;
         let target = Vec3::new(z * 14.5_f32.to_radians().tan(), 0.0, -100.0);
         assert!(
-            in_lock_cone(
-                ac,
-                aim,
-                target,
-                160.0,
-                half,
-                half,
-                datum_back
-            )
-            .is_none(),
+            in_lock_cone(ac, aim, target, 160.0, half, half, datum_back).is_none(),
             "14.5 deg is outside the 14 deg inner sight"
         );
-        let ell = lock_sight_ellipse(
-            ac,
-            aim,
-            target,
-            160.0,
-            outer,
-            outer,
-            datum_back,
-        )
-        .expect("14.5 deg is inside the 16 deg outer cone");
+        let ell = lock_sight_ellipse(ac, aim, target, 160.0, outer, outer, datum_back)
+            .expect("14.5 deg is inside the 16 deg outer cone");
         assert!(ell > 0.0 && ell <= 1.0);
     }
 

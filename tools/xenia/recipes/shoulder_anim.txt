@@ -1,0 +1,13 @@
+# AC TEST, then fire the shoulder unit (R1 / RB) and hold it, to trace the
+# shoulder-piece arm animation (arm clip a00_001 / a00_003).
+run ac_test.txt
+wait 2
+shot private/xenia/shots/shoulder_before.png
+hold RB 3
+wait 0.5
+shot private/xenia/shots/shoulder_open.png
+wait 1.2
+shot private/xenia/shots/shoulder_closing.png
+release
+wait 2
+shot private/xenia/shots/shoulder_closed.png

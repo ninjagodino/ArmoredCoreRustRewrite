@@ -79,11 +79,15 @@ pub fn run(img: &Image, out_dir: &Path) -> Result<()> {
         cases: w("switch_cases.csv")?,
         vcalls: w("vcalls.csv")?,
     };
-    out.calls.write_record(["caller", "site", "callee", "kind"])?;
-    out.consts.write_record(["func", "site", "op", "target", "value"])?;
+    out.calls
+        .write_record(["caller", "site", "callee", "kind"])?;
+    out.consts
+        .write_record(["func", "site", "op", "target", "value"])?;
     out.imms.write_record(["func", "site", "op", "value"])?;
-    out.fields.write_record(["func", "site", "op", "offset", "width", "access", "base"])?;
-    out.switches.write_record(["func", "site", "table", "cases"])?;
+    out.fields
+        .write_record(["func", "site", "op", "offset", "width", "access", "base"])?;
+    out.switches
+        .write_record(["func", "site", "table", "cases"])?;
     out.cases.write_record(["site", "case", "target"])?;
     out.vcalls.write_record(["func", "site", "slot"])?;
 
@@ -91,7 +95,15 @@ pub fn run(img: &Image, out_dir: &Path) -> Result<()> {
     for &(s, e, _) in &funcs {
         n_switch += scan(img, s, e, &starts, &ranges, &mut out)?;
     }
-    for wr in [&mut out.calls, &mut out.consts, &mut out.imms, &mut out.fields, &mut out.switches, &mut out.cases, &mut out.vcalls] {
+    for wr in [
+        &mut out.calls,
+        &mut out.consts,
+        &mut out.imms,
+        &mut out.fields,
+        &mut out.switches,
+        &mut out.cases,
+        &mut out.vcalls,
+    ] {
         wr.flush()?;
     }
 
@@ -163,11 +175,18 @@ pub fn functions(img: &Image) -> Vec<(u32, u32, &'static str)> {
             }
         }
     }
-    let mut funcs: Vec<(u32, u32, &'static str)> = pdata.iter().map(|&(s, e)| (s, e, "pdata")).collect();
-    let next_pdata = |a: u32| pdata.get(pdata.partition_point(|f| f.0 <= a)).map_or(u32::MAX, |f| f.0);
+    let mut funcs: Vec<(u32, u32, &'static str)> =
+        pdata.iter().map(|&(s, e)| (s, e, "pdata")).collect();
+    let next_pdata = |a: u32| {
+        pdata
+            .get(pdata.partition_point(|f| f.0 <= a))
+            .map_or(u32::MAX, |f| f.0)
+    };
     let leaf: Vec<u32> = leaf.into_iter().collect();
     for (i, &s) in leaf.iter().enumerate() {
-        let limit = next_pdata(s).min(leaf.get(i + 1).copied().unwrap_or(u32::MAX)).min(s + 0x1000);
+        let limit = next_pdata(s)
+            .min(leaf.get(i + 1).copied().unwrap_or(u32::MAX))
+            .min(s + 0x1000);
         let mut e = s;
         while e < limit {
             let w = img.word(e);
@@ -184,10 +203,21 @@ pub fn functions(img: &Image) -> Vec<(u32, u32, &'static str)> {
 
 fn branch_target(a: u32, w: u32) -> u32 {
     let li = ((w & 0x03ff_fffc) << 6) as i32 >> 6;
-    if w & 2 != 0 { li as u32 } else { a.wrapping_add(li as u32) }
+    if w & 2 != 0 {
+        li as u32
+    } else {
+        a.wrapping_add(li as u32)
+    }
 }
 
-fn scan(img: &Image, s: u32, e: u32, starts: &HashSet<u32>, ranges: &[(u32, u32)], out: &mut Out) -> Result<usize> {
+fn scan(
+    img: &Image,
+    s: u32,
+    e: u32,
+    starts: &HashSet<u32>,
+    ranges: &[(u32, u32)],
+    out: &mut Out,
+) -> Result<usize> {
     let mut reg: [Option<u32>; 32] = [None; 32];
     // Register -> vtable slot it was loaded from (`lwz rX,SLOT(rY)` with rY itself a `lwz` result).
     let mut slot_of: [Option<u32>; 32] = [None; 32];
@@ -207,7 +237,11 @@ fn scan(img: &Image, s: u32, e: u32, starts: &HashSet<u32>, ranges: &[(u32, u32)
         let mut slot: Option<u32> = None;
         match op {
             14 | 15 => {
-                let v = if op == 15 { ((w & 0xffff) << 16) as i32 } else { simm(w) };
+                let v = if op == 15 {
+                    ((w & 0xffff) << 16) as i32
+                } else {
+                    simm(w)
+                };
                 if ra == 0 {
                     known = Some(v as u32);
                     if op == 14 {
@@ -224,7 +258,11 @@ fn scan(img: &Image, s: u32, e: u32, starts: &HashSet<u32>, ranges: &[(u32, u32)
             }
             24 | 25 => {
                 // ori / oris rA,rS,UIMM
-                let v = if op == 24 { w & 0xffff } else { (w & 0xffff) << 16 };
+                let v = if op == 24 {
+                    w & 0xffff
+                } else {
+                    (w & 0xffff) << 16
+                };
                 if let Some(base) = reg[rd] {
                     known = Some(base | v);
                     if op == 24 && w & 0xffff != 0 {
@@ -235,7 +273,11 @@ fn scan(img: &Image, s: u32, e: u32, starts: &HashSet<u32>, ranges: &[(u32, u32)
             }
             10 | 11 => {
                 let name = if op == 10 { "cmplwi" } else { "cmpwi" };
-                let v = if op == 10 { (w & 0xffff) as i32 } else { simm(w) };
+                let v = if op == 10 {
+                    (w & 0xffff) as i32
+                } else {
+                    simm(w)
+                };
                 out.imms.write_record([&f, &site, name, &v.to_string()])?;
             }
             7 | 8 | 12 | 13 => wrote = Some(rd),
@@ -270,12 +312,25 @@ fn scan(img: &Image, s: u32, e: u32, starts: &HashSet<u32>, ranges: &[(u32, u32)
                     467 if (w >> 11) & 0x3ff == 0x120 => {
                         // mtctr rS: a virtual call when rS came from a vtable slot.
                         if let Some(sl) = slot_of[rd] {
-                            if (a + 4..(a + 0x14).min(e)).step_by(4).any(|b| img.word(b) == BCTRL) {
+                            if (a + 4..(a + 0x14).min(e))
+                                .step_by(4)
+                                .any(|b| img.word(b) == BCTRL)
+                            {
                                 out.vcalls.write_record([&f, &site, &hex(sl)])?;
                             }
                         }
                         if img.word(a + 4) == BCTR || img.word(a + 8) == BCTR {
-                            switches += switch_at(img, &f, a, s, e, rd, &reg_lwzx(img, a, s, &reg_snapshot(img, s, a)), ranges, out)?;
+                            switches += switch_at(
+                                img,
+                                &f,
+                                a,
+                                s,
+                                e,
+                                rd,
+                                &reg_lwzx(img, a, s, &reg_snapshot(img, s, a)),
+                                ranges,
+                                out,
+                            )?;
                         }
                         continue;
                     }
@@ -290,13 +345,34 @@ fn scan(img: &Image, s: u32, e: u32, starts: &HashSet<u32>, ranges: &[(u32, u32)
             _ => {}
         }
         if let Some((name, width, store)) = mem_op(op) {
-            let d = if op == 58 || op == 62 { simm(w) & !3 } else { simm(w) };
-            let update = matches!(op, 33 | 35 | 37 | 39 | 41 | 43 | 45 | 49 | 51 | 53 | 55) || ((op == 58 || op == 62) && w & 3 == 1);
+            let d = if op == 58 || op == 62 {
+                simm(w) & !3
+            } else {
+                simm(w)
+            };
+            let update = matches!(op, 33 | 35 | 37 | 39 | 41 | 43 | 45 | 49 | 51 | 53 | 55)
+                || ((op == 58 || op == 62) && w & 3 == 1);
             if let Some(base) = reg[ra].filter(|_| ra != 0) {
-                const_ref(img, &f, &site, name, base.wrapping_add(d as u32), starts, out)?;
+                const_ref(
+                    img,
+                    &f,
+                    &site,
+                    name,
+                    base.wrapping_add(d as u32),
+                    starts,
+                    out,
+                )?;
             } else if ra != 0 && ra != 1 {
                 let access = if store { "w" } else { "r" };
-                out.fields.write_record([&f, &site, name, &format!("{:#x}", d), &width.to_string(), access, &format!("r{ra}")])?;
+                out.fields.write_record([
+                    &f,
+                    &site,
+                    name,
+                    &format!("{:#x}", d),
+                    &width.to_string(),
+                    access,
+                    &format!("r{ra}"),
+                ])?;
                 if name == "lwz" {
                     if vptr[ra] {
                         slot = Some(d as u32);
@@ -344,10 +420,22 @@ fn reg_snapshot(img: &Image, s: u32, upto: u32) -> [Option<u32>; 32] {
     let lo = upto.saturating_sub(0x80).max(s);
     for a in (lo..upto).step_by(4) {
         let w = img.word(a);
-        let (op, rd, ra) = (w >> 26, ((w >> 21) & 31) as usize, ((w >> 16) & 31) as usize);
+        let (op, rd, ra) = (
+            w >> 26,
+            ((w >> 21) & 31) as usize,
+            ((w >> 16) & 31) as usize,
+        );
         match op {
             15 if ra == 0 => reg[rd] = Some((w & 0xffff) << 16),
-            14 | 15 => reg[rd] = reg[ra].filter(|_| ra != 0).map(|b| b.wrapping_add(if op == 15 { (w & 0xffff) << 16 } else { simm(w) as u32 })),
+            14 | 15 => {
+                reg[rd] = reg[ra].filter(|_| ra != 0).map(|b| {
+                    b.wrapping_add(if op == 15 {
+                        (w & 0xffff) << 16
+                    } else {
+                        simm(w) as u32
+                    })
+                })
+            }
             24 => reg[ra] = reg[rd].map(|b| b | (w & 0xffff)),
             18 if w & 1 == 1 => reg = [None; 32],
             _ => {}
@@ -369,8 +457,20 @@ fn reg_lwzx(img: &Image, mt: u32, s: u32, reg: &[Option<u32>; 32]) -> Option<(u3
 }
 
 #[allow(clippy::too_many_arguments)]
-fn switch_at(img: &Image, f: &str, mt: u32, s: u32, e: u32, _rd: usize, table: &Option<(u32, u32)>, ranges: &[(u32, u32)], out: &mut Out) -> Result<usize> {
-    let Some((table, lwzx)) = *table else { return Ok(0) };
+fn switch_at(
+    img: &Image,
+    f: &str,
+    mt: u32,
+    s: u32,
+    e: u32,
+    _rd: usize,
+    table: &Option<(u32, u32)>,
+    ranges: &[(u32, u32)],
+    out: &mut Out,
+) -> Result<usize> {
+    let Some((table, lwzx)) = *table else {
+        return Ok(0);
+    };
     let mut cases = None;
     for a in (lwzx.saturating_sub(0x40).max(s)..lwzx).step_by(4).rev() {
         let w = img.word(a);
@@ -390,11 +490,20 @@ fn switch_at(img: &Image, f: &str, mt: u32, s: u32, e: u32, _rd: usize, table: &
         out.cases.write_record([hex(mt), i.to_string(), hex(t)])?;
         written += 1;
     }
-    out.switches.write_record([f.to_string(), hex(mt), hex(table), written.to_string()])?;
+    out.switches
+        .write_record([f.to_string(), hex(mt), hex(table), written.to_string()])?;
     Ok(1)
 }
 
-fn const_ref(img: &Image, f: &str, site: &str, op: &str, t: u32, starts: &HashSet<u32>, out: &mut Out) -> Result<()> {
+fn const_ref(
+    img: &Image,
+    f: &str,
+    site: &str,
+    op: &str,
+    t: u32,
+    starts: &HashSet<u32>,
+    out: &mut Out,
+) -> Result<()> {
     if img.section(t).is_none() {
         return Ok(());
     }
@@ -403,7 +512,10 @@ fn const_ref(img: &Image, f: &str, site: &str, op: &str, t: u32, starts: &HashSe
     } else {
         match op {
             "lfs" => format!("{}", f32::from_bits(img.word(t))),
-            "lfd" => format!("{}", f64::from_bits((img.word(t) as u64) << 32 | img.word(t + 4) as u64)),
+            "lfd" => format!(
+                "{}",
+                f64::from_bits((img.word(t) as u64) << 32 | img.word(t + 4) as u64)
+            ),
             "lwz" => hex(img.word(t)),
             _ => img.cstr(t).map(|s| format!("str:{s}")).unwrap_or_default(),
         }

@@ -297,7 +297,12 @@ mod tests {
             let (_, sh_r) = eval_ani_world(&skel, &shift_r, f, "r_kata");
             let mut q = [Quat::IDENTITY; 6];
             for i in 0..6 {
-                q[i] = bevy_quat(c01.bones[i].track.rotation(f).unwrap_or([0.0, 0.0, 0.0, 1.0]));
+                q[i] = bevy_quat(
+                    c01.bones[i]
+                        .track
+                        .rotation(f)
+                        .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                );
             }
             let prong_r = if is_front {
                 sh_r * q[0] * q[1] * q[2] * q[3]
@@ -354,15 +359,23 @@ mod tests {
         // Run exact Bevy World propagation (`pose::spawn_static` + `GlobalTransform`) to measure
         // the true world-space barrel direction of `r_hg_b` and `l_hg_b` across pitch angles!
         let mut world = World::new();
-        let ac = world.spawn((Transform::IDENTITY, GlobalTransform::IDENTITY)).id();
+        let ac = world
+            .spawn((Transform::IDENTITY, GlobalTransform::IDENTITY))
+            .id();
         let (_joints, skins) = {
             let mut cmd = world.commands();
             let res = crate::pose::spawn_static(&mut cmd, ac, &rig, &loaded);
             world.flush();
             res
         };
-        let r_idx = loaded.iter().position(|p| p.placement.column == "rack_r").unwrap();
-        let l_idx = loaded.iter().position(|p| p.placement.column == "rack_l").unwrap();
+        let r_idx = loaded
+            .iter()
+            .position(|p| p.placement.column == "rack_r")
+            .unwrap();
+        let l_idx = loaded
+            .iter()
+            .position(|p| p.placement.column == "rack_l")
+            .unwrap();
         let r_joints = skins[r_idx].0.clone();
         let l_joints = skins[l_idx].0.clone();
         let r_base0 = world.get::<Transform>(r_joints[0]).unwrap().rotation;
@@ -388,8 +401,16 @@ mod tests {
         };
 
         // AC FRONT reference from `r_armhand` (-Z is muzzle/forward in Bevy space).
-        let arm_idx = loaded.iter().position(|p| p.placement.column == "arms").unwrap();
-        let hand_bi = loaded[arm_idx].rig.bones.iter().position(|b| b.name == "r_armhand").unwrap();
+        let arm_idx = loaded
+            .iter()
+            .position(|p| p.placement.column == "arms")
+            .unwrap();
+        let hand_bi = loaded[arm_idx]
+            .rig
+            .bones
+            .iter()
+            .position(|b| b.name == "r_armhand")
+            .unwrap();
         let hand_fwd = world_of(&world, skins[arm_idx].0[hand_bi]).rotation() * (-Vec3::Z);
         assert!(hand_fwd.z < -0.5, "AC front should face -Z, got {hand_fwd}");
 
@@ -412,11 +433,7 @@ mod tests {
                 for i in 0..6 {
                     let q = sample_quat(clip, i, 0.0);
                     let mut tf = world.get_mut::<Transform>(jts[i]).unwrap();
-                    tf.rotation = if i == 0 {
-                        (base0 * q).normalize()
-                    } else {
-                        q
-                    };
+                    tf.rotation = if i == 0 { (base0 * q).normalize() } else { q };
                 }
                 let g = world_of(&world, jts[prong_bone]).rotation() * q4;
                 let muzzle = g * (-Vec3::Z);

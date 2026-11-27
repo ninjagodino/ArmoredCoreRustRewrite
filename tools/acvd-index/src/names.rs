@@ -16,14 +16,22 @@ pub fn run(root: &Path, out_dir: &Path) -> Result<usize> {
     if let Ok(dir) = std::fs::read_dir(&schema) {
         for entry in dir.flatten() {
             let path = entry.path();
-            let Some(st) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(st) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let mut rd = csv::ReaderBuilder::new().flexible(true).from_path(&path)?;
             let head = rd.headers()?.clone();
             let col = |name: &str| head.iter().position(|h| h == name);
-            let (Some(ni), Some(oi)) = (col("name"), col("offset")) else { continue };
+            let (Some(ni), Some(oi)) = (col("name"), col("offset")) else {
+                continue;
+            };
             for row in rd.records().flatten() {
-                let (Some(name), Some(off)) = (row.get(ni), row.get(oi)) else { continue };
-                let Ok(off) = off.parse::<u32>() else { continue };
+                let (Some(name), Some(off)) = (row.get(ni), row.get(oi)) else {
+                    continue;
+                };
+                let Ok(off) = off.parse::<u32>() else {
+                    continue;
+                };
                 out.write_record(["paramdef", st, &format!("{off:#x}"), name])?;
                 n += 1;
             }

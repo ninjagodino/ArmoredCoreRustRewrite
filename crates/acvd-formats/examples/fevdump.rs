@@ -29,7 +29,13 @@ fn main() -> anyhow::Result<()> {
                 None => format!("def {i}?"),
             })
             .collect();
-        println!("{}\t{}", event.name, layers.join(" | "));
+        let playback = event
+            .mix
+            .first()
+            .and_then(|l| l.sounds.first())
+            .map(|s| format!(" flags={:#x} loop={}", s.flags, s.loop_count))
+            .unwrap_or_default();
+        println!("{}\t{}{}", event.name, layers.join(" | "), playback);
     }
     Ok(())
 }

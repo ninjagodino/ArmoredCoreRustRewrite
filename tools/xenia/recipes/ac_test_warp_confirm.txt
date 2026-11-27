@@ -1,0 +1,14 @@
+# AC Test with a warped map.  The warped map's sortie preload starts while
+# ac_test.txt sends its final confirm, so that confirm can be lost before the
+# AC Test menu is interactive.  Repeat the same A press after the preload;
+# this is timing only, not a new menu path.  The two shots bracket the
+# warped sortie's load/entry window.
+run ac_test.txt
+wait 5
+press A
+wait 5
+press A
+wait 8
+shot private/xenia/shots/m3120_mission_a.png
+wait 8
+shot private/xenia/shots/m3120_mission_b.png

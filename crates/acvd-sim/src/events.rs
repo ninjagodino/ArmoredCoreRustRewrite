@@ -17,6 +17,8 @@ pub enum SimEvent {
         muzzle: Vec3,
         dir: Vec3,
         tick: u32,
+        /// Weapon-arm barrel/muzzle index (0/1 alternating L/R; 0 for hand/shoulder guns).
+        barrel: u8,
         /// High-velocity rounds are validated through hitbox-history rewind by the server.
         hitscan: bool,
     },

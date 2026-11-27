@@ -276,6 +276,7 @@ mod tests {
             flags: ac_flags::TEAM_B,
             pose_state: 2,
             combat_flags: 0,
+            weapon_arm_ticks: 0,
             ap: 0,
             en: 0,
             reload: [0, 0],

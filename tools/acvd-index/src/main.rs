@@ -36,11 +36,18 @@ fn run() -> Result<ExitCode> {
         args.drain(i..(i + 2).min(args.len()));
         v
     };
-    let root = take("--root").unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(".."));
+    let root = take("--root").unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    });
     let root = root.canonicalize()?;
-    let pe = take("--pe").unwrap_or_else(|| root.join("private").join("x360").join("vd").join("ACV2.pe"));
+    let pe = take("--pe")
+        .unwrap_or_else(|| root.join("private").join("x360").join("vd").join("ACV2.pe"));
     let dir = root.join("private").join("index");
-    let Some(cmd) = args.first().cloned() else { bail!(USAGE) };
+    let Some(cmd) = args.first().cloned() else {
+        bail!(USAGE)
+    };
     match cmd.as_str() {
         "build" => {
             let img = image::Image::open(&pe)?;

@@ -163,7 +163,11 @@ pub enum TaeFired {
     Sound { cue: String },
     /// TAE kind `0`: spawn FFX effect `ffx_id` on part dummy socket `dummy_id` at `scale`
     /// (`1.5` for bay-shift arm-overlay TAE `2000..2003`, verified in Xenia `bay_switch.jsonl`).
-    Ffx { ffx_id: i32, dummy_id: u8, scale: f32 },
+    Ffx {
+        ffx_id: i32,
+        dummy_id: u8,
+        scale: f32,
+    },
     /// TAE kind `101` (`0x65`): reattach weapon (`acattachinfo` row ID; frame 40 seat, frame 150 grab).
     Reattach { id: u32 },
     /// TAE kind `102` (`0x66`): purge weapon (`2`/`3`/`11`/`12` at frame 10 of `2010..2013`).
@@ -496,15 +500,9 @@ impl Motion {
         if let Some(c) = self.ow_cache.get(&anim_id) {
             return Ok(Arc::clone(c));
         }
-        let asset = self
-            .ow_clip_by_id
-            .get(&anim_id)
-            .copied()
-            .with_context(|| {
-                format!(
-                    "motion_ow_equip has no {}_{anim_id:03}.ani",
-                    self.prefix
-                )
+        let asset =
+            self.ow_clip_by_id.get(&anim_id).copied().with_context(|| {
+                format!("motion_ow_equip has no {}_{anim_id:03}.ani", self.prefix)
             })?;
         let clip = Arc::new(ani::read(&vfs::open(disc, &asset.path())?)?);
         anyhow::ensure!(
@@ -540,10 +538,7 @@ impl Motion {
         let clip = self.load_clip(disc, index)?;
         self.clip = clip;
         self.playing_ow_clip = false;
-        self.current_anim_id = self
-            .clips
-            .get(index)
-            .map_or(0, |a| parse_anim_id(a.entry));
+        self.current_anim_id = self.clips.get(index).map_or(0, |a| parse_anim_id(a.entry));
         (self.index, self.frame, self.looping, self.speed, self.wheel) =
             (index, 0.0, true, 1.0, None);
         self.center_ready = false;
@@ -860,7 +855,8 @@ impl Built {
             let inv_bind = Mat4::from(mirror(self.joints[first + b].bind).inverse());
             skins.push(w * inv_bind);
         }
-        let extra_w = to_transform(unboned.translation.into(), Quat::IDENTITY, Vec3::ONE).to_matrix();
+        let extra_w =
+            to_transform(unboned.translation.into(), Quat::IDENTITY, Vec3::ONE).to_matrix();
         skins.push(extra_w * Mat4::from(mirror(unboned).inverse()));
 
         let mut bmin = Vec3::splat(f32::INFINITY);
@@ -893,7 +889,11 @@ impl Built {
                             }
                         }
                     }
-                    if wsum > 1e-4 { acc / wsum } else { p }
+                    if wsum > 1e-4 {
+                        acc / wsum
+                    } else {
+                        p
+                    }
                 } else {
                     skins.last().map_or(p, |m| m.transform_point3(p))
                 };
@@ -943,9 +943,8 @@ impl Built {
                 Vec3::from(p.t),
             )
         };
-        let deployed_world = place_affine(deployed_place)
-            * place_affine(stowed_place).inverse()
-            * child.bind;
+        let deployed_world =
+            place_affine(deployed_place) * place_affine(stowed_place).inverse() * child.bind;
         let local = parent.bind.inverse() * deployed_world;
         let (s, r, t) = local.to_scale_rotation_translation();
         Some(to_transform(t, r, s))
@@ -982,8 +981,7 @@ pub(crate) fn to_transform(t: Vec3, r: Quat, s: Vec3) -> Transform {
 /// `param/jcondata.bin`.
 fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
     let Some((leg_part, m)) = parts.iter().find_map(|p| {
-        acvd_data::ac_motion(p.placement.category, p.placement.part)
-            .map(|m| (p.placement.part, m))
+        acvd_data::ac_motion(p.placement.category, p.placement.part).map(|m| (p.placement.part, m))
     }) else {
         return Ok(None);
     };
@@ -1061,7 +1059,10 @@ fn motion(disc: &Disc, parts: &[Loaded]) -> Result<Option<Motion>> {
                 .filter(|a| a.ext == ".ani")
                 .collect();
             ow_clips.sort_by_key(|a| a.entry);
-            let ow_tae_path = format!("tae/ac/motion_ow_equip/own{:06}.tae", r.data.motion_ow_equip);
+            let ow_tae_path = format!(
+                "tae/ac/motion_ow_equip/own{:06}.tae",
+                r.data.motion_ow_equip
+            );
             let ow_tae = vfs::open(disc, &ow_tae_path)
                 .and_then(|b| tae::read(&b))
                 .ok();
@@ -1150,27 +1151,30 @@ pub fn build(disc: &Disc, parts: &[Loaded]) -> Result<Built> {
         let pi = first.iter().rposition(|&f| f <= j).unwrap_or(0);
         &parts[pi].rig.bones[j - first[pi]].name
     };
-    // Weapon arms (`acvparts` cat-2 `+0x13c == 1`, 360 `0x824793c8`) animate all of their
-    // non-root bones (`*_armwepunit_*`, `*_armroot`, `*_arm01..*_armhand`) via their own
-    // `am*_a.bnd.dcx` clips (`0x8284cecc`, `0x82882d28`). Only their shoulder roots (`l_kata`,
-    // `r_kata`, `parent.is_none()`) follow the AC body clip; letting the body clip overwrite
-    // `*_arm01..*_armhand` twists them against `*_armwepunit_*` / `*_armroot` (e.g. `am7420`'s
-    // 180-degree `r_armroot` bind rotation).
-    let is_weapon_arm_child = |j: usize| -> bool {
+    // Weapon arms (`acvparts` cat-2 `+0x13c == 1`, 360 `0x824793c8`) animate their folded
+    // weapon-unit bones (`*_armwepunit_*` / `*_armwepunitp_*`) from `am*_a.bnd.dcx`
+    // (`0x8284cecc`, `0x82882d28`). Those bones have no body-clip counterpart. The main arm
+    // chain (`*_armroot`, `*_arm01..*_armhand`) must stay on the AC body clip while the weapon
+    // arm is stowed, so normal arm raise and aim-pitch IK work; the weapon-arm rig overwrites
+    // that chain only while deploying/deployed/firing/stowing.
+    let is_weapon_unit = |j: usize| -> bool {
         let pi = first.iter().rposition(|&f| f <= j).unwrap_or(0);
         let p = &parts[pi];
         p.placement.column == "arms"
             && acvd_data::part_field(p.placement.part as i64, 2, "is_weapon_arm") != 0.0
             && p.rig.bones[j - first[pi]].parent.is_some()
+            && p.rig.bones[j - first[pi]]
+                .name
+                .contains("_armwepunit")
     };
 
     // Each clip bone claims the first part bone of its name, or becomes a joint of its own.
     let part_joints = joints.len();
     let mut of_bone: Vec<usize> = Vec::with_capacity(rest.len());
     for (i, r) in rest.iter().enumerate() {
-        match (0..part_joints).find(|&j| {
-            joints[j].bone.is_none() && !is_weapon_arm_child(j) && name(j) == r.name
-        }) {
+        match (0..part_joints)
+            .find(|&j| joints[j].bone.is_none() && !is_weapon_unit(j) && name(j) == r.name)
+        {
             Some(j) => {
                 joints[j].bone = Some(i);
                 of_bone.push(j);
@@ -1391,7 +1395,11 @@ impl NpcMotion {
             // Dash / boost strafe (`ac_states.csv` row 17 -> 360-frame wheel `anim_id 55`).
             let deg = right.atan2(fwd).to_degrees().rem_euclid(360.0);
             let dash_id = find(PARAM_ACMOTION_BIN, 17).map_or(55, |r| r.data.anim_id);
-            if self.motion.play(disc, dash_id, false, 1.0, [0.12; 8]).is_ok() {
+            if self
+                .motion
+                .play(disc, dash_id, false, 1.0, [0.12; 8])
+                .is_ok()
+            {
                 self.motion.wheel = Some(deg);
                 self.motion.lean = 1.0;
             } else {
@@ -1407,9 +1415,15 @@ impl NpcMotion {
             let row_id = 9 + octant;
             let anim_id = find(PARAM_ACMOTION_BIN, row_id).map_or(10, |r| r.data.anim_id);
             let play_speed = (speed / walk_speed.max(6.0)).clamp(0.7, 1.4);
-            if self.motion.play(disc, anim_id, true, play_speed, [0.12; 8]).is_err() {
+            if self
+                .motion
+                .play(disc, anim_id, true, play_speed, [0.12; 8])
+                .is_err()
+            {
                 let fallback = find(PARAM_ACMOTION_BIN, 9).map_or(10, |r| r.data.anim_id);
-                let _ = self.motion.play(disc, fallback, true, play_speed, [0.12; 8]);
+                let _ = self
+                    .motion
+                    .play(disc, fallback, true, play_speed, [0.12; 8]);
             }
         }
 
@@ -1452,7 +1466,11 @@ pub fn spawn_npc(
     ac: Entity,
     built: Built,
     parts: &[Loaded],
-) -> (Option<NpcMotion>, Vec<Entity>, Vec<(Vec<Entity>, Vec<Mat4>)>) {
+) -> (
+    Option<NpcMotion>,
+    Vec<Entity>,
+    Vec<(Vec<Entity>, Vec<Mat4>)>,
+) {
     let entities: Vec<Entity> = built
         .joints
         .iter()
@@ -1528,14 +1546,18 @@ pub fn spawn_npc(
 /// Steps all [`NpcMotion`] test-AC skeletons and writes their posed joint transforms.
 pub fn animate_npcs(
     time: Res<Time>,
-    mut npcs: Query<&mut NpcMotion>,
+    mut npcs: Query<(&mut NpcMotion, Option<&crate::net::view::RemoteLod>)>,
     mut transforms: Query<&mut Transform>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
-    for mut npc in &mut npcs {
+    for (mut npc, lod) in &mut npcs {
+        // Far/off-screen remote rigs are hidden by `net::view`; skip their 60 Hz bone solve.
+        if lod.is_some_and(|lod| !lod.active) {
+            continue;
+        }
         npc.step_clock(dt);
         let NpcMotion { motion: m, joints } = &mut *npc;
         let (f, scale, fade) = (m.frame, m.scale, m.fade);
@@ -1918,7 +1940,8 @@ pub fn animate(
             if d.generation != fade.generation {
                 (d.from, d.generation) = (d.base, fade.generation);
             }
-            let returning_upper = d.upper && return_fade.generation != 0 && d.upper_gen != return_fade.generation;
+            let returning_upper =
+                d.upper && return_fade.generation != 0 && d.upper_gen != return_fade.generation;
             if returning_upper {
                 (d.upper_from, d.upper_gen) = (d.base, return_fade.generation);
             }
@@ -1966,7 +1989,11 @@ pub fn animate(
             };
             // Smooth crossfade back from a recently cleared upper-body clip.
             let ret_secs = return_fade.secs[d.group];
-            d.base = if d.upper && return_fade.generation != 0 && ret_secs > 0.0 && return_fade.t < ret_secs {
+            d.base = if d.upper
+                && return_fade.generation != 0
+                && ret_secs > 0.0
+                && return_fade.t < ret_secs
+            {
                 let rw = (return_fade.t / ret_secs).clamp(0.0, 1.0);
                 Transform {
                     translation: d.upper_from.translation.lerp(base.translation, rw),
@@ -2214,8 +2241,14 @@ mod tests {
             motion.ow_equip_set
         );
         assert!(motion.has_ow_clip(200), "should have OW arm clip 200");
-        assert!(motion.has_ow_clip(201), "should have OW armed idle clip 201");
-        assert!(motion.ow_equip_tae.is_some(), "should load motion_ow_equip TAE");
+        assert!(
+            motion.has_ow_clip(201),
+            "should have OW armed idle clip 201"
+        );
+        assert!(
+            motion.ow_equip_tae.is_some(),
+            "should load motion_ow_equip TAE"
+        );
 
         // Switch bank and play OW armed idle clip 201.
         motion.set_ow_bank(true);
@@ -2266,7 +2299,7 @@ mod tests {
     }
 
     #[test]
-    fn weapon_arm_child_bones_are_not_driven_by_body_clip() {
+    fn weapon_arm_unit_bones_stay_out_of_body_clip_but_main_arm_chain_does_not() {
         use crate::assemble;
         use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
         use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
@@ -2276,8 +2309,9 @@ mod tests {
         let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
             return;
         };
-        // Design 6009 uses weapon arms 7420 (`am7420.flv`), whose `r_armroot` has a 180-deg bind
-        // rotation and whose `*_arm01..*_armhand` are driven by `am7420_a.bnd.dcx`, not `a01_000`.
+        // Design 6009 uses weapon arms 7420 (`am7420.flv`): the folded weapon unit has no
+        // body-clip bones, while `*_arm01..*_armhand` must stay on `a01_000` for hand-weapon
+        // raise/aim while the weapon arm is stowed.
         let design = AC_ASSEMBLY_DESIGN_ST_FILES
             .iter()
             .flat_map(|(_, rows)| rows.iter())
@@ -2310,6 +2344,7 @@ mod tests {
             .expect("arms");
         let first = rig.parts[arms_li].0;
         let mut roots_driven = 0usize;
+        let mut main_chain_driven = 0usize;
         for (b, bone) in loaded[arms_li].rig.bones.iter().enumerate() {
             let spec = &rig.joints[first + b];
             if bone.parent.is_none() && (bone.name == "l_kata" || bone.name == "r_kata") {
@@ -2319,15 +2354,32 @@ mod tests {
                     bone.name
                 );
                 roots_driven += 1;
-            } else if bone.parent.is_some() {
+            } else if bone.name.contains("_armwepunit") {
                 assert!(
                     spec.bone.is_none(),
-                    "weapon arm child bone {} must not be claimed by body clip",
+                    "folded weapon unit bone {} must not be claimed by body clip",
                     bone.name
                 );
+            } else if ["_arm01", "_arm02", "_arm03", "_arm04", "_arm05", "_armhand"]
+                .iter()
+                .any(|suffix| bone.name.ends_with(suffix))
+            {
+                assert!(
+                    spec.bone.is_some(),
+                    "main arm bone {} must be driven by the body clip while stowed",
+                    bone.name
+                );
+                main_chain_driven += 1;
             }
         }
-        assert_eq!(roots_driven, 2, "expected both l_kata and r_kata roots driven");
+        assert_eq!(
+            roots_driven, 2,
+            "expected both l_kata and r_kata roots driven"
+        );
+        assert_eq!(
+            main_chain_driven, 12,
+            "expected both hands' arm01..armhand driven by the body clip"
+        );
     }
 
     #[test]

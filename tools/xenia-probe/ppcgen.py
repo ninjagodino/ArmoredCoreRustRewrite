@@ -201,9 +201,20 @@ class Cave:
                          | ((me & 0x1F) << 1))
 
     # -- memory ---------------------------------------------------------
+    def extsb(self, ra: int, rs: int) -> int:
+        return self.emit(0x7C000774 | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16))
+
     def stwu(self, rs: int, ra: int, d: int) -> int:
         return self.emit(0x94000000 | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16)
                          | _check_s16(d, "stwu"))
+
+    def lhz(self, rd: int, ra: int, d: int) -> int:
+        return self.emit(0xA0000000 | ((rd & 0x1F) << 21) | ((ra & 0x1F) << 16)
+                         | _check_s16(d, "lhz"))
+
+    def sth(self, rs: int, ra: int, d: int) -> int:
+        return self.emit(0xB0000000 | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16)
+                         | _check_s16(d, "sth"))
 
     def lwz(self, rd: int, ra: int, d: int) -> int:
         return self.emit(0x80000000 | ((rd & 0x1F) << 21) | ((ra & 0x1F) << 16)
@@ -212,6 +223,10 @@ class Cave:
     def stw(self, rs: int, ra: int, d: int) -> int:
         return self.emit(0x90000000 | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16)
                          | _check_s16(d, "stw"))
+
+    def stfs(self, frs: int, ra: int, d: int) -> int:
+        return self.emit(0xD0000000 | ((frs & 0x1F) << 21) | ((ra & 0x1F) << 16)
+                         | _check_s16(d, "stfs"))
 
     def lbz(self, rd: int, ra: int, d: int) -> int:
         return self.emit(0x88000000 | ((rd & 0x1F) << 21) | ((ra & 0x1F) << 16)

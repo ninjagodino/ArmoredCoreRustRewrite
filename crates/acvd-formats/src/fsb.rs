@@ -121,7 +121,10 @@ pub fn read_sample(disc: &crate::vfs::Disc, file: &str, index: usize) -> Result<
     );
     let big_endian_pcm = lu32(&head, 20)? & BANK_BIG_ENDIAN_PCM != 0;
     let table = disc.read_range(file, HEADER as u64, header_bytes)?;
-    ensure!(table.len() == header_bytes, "{file}: truncated sample table");
+    ensure!(
+        table.len() == header_bytes,
+        "{file}: truncated sample table"
+    );
 
     let data_at = HEADER + header_bytes;
     let mut at = 0usize;

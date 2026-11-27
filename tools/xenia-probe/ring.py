@@ -105,6 +105,9 @@ def parse_header(data: bytes, offsets: dict) -> dict:
         "warp_calls": u32(int(offsets["warp_calls"])),
         "warp_map": u32(int(offsets["warp_map"])),
         "warp_msb": u32(int(offsets["warp_msb"])),
+        "root_ptr": u32(int(offsets["root_ptr"])),
+        "root_seq": u32(int(offsets["root_seq"])),
+        "root": vec(int(offsets["root_x"])),
     }
 
 
@@ -254,6 +257,55 @@ def apply_camera(mem: ProcessMemory, drainer: RingDrainer, profile: dict,
     }
 
 
+def build_root_cave(base: int, ring_base: int, offsets: dict,
+                    next_addr: int = 0x829ABF30) -> list[int]:
+    """Live map-actor world-root writer, hooked at the actor-update join.
+
+    ``FUN_829ABC38`` is the per-frame map-actor update and ``r31`` is the actor
+    (``mr r31, r3``).  All three position paths -- model +0xF8, model +0xFC and
+    the matrix fallback -- converge at 0x829ABF2C after storing the animated
+    world root to +0xB4/+0xB8/+0xBC (360 evidence: stfs at 0x829ABDD8/0x829ABE1C/
+    0x829ABF20 and 0x829ABF2C).  ``FUN_829AB5E8`` is only the one-shot ANI-player
+    constructor (vtable 0x820BF578, copies actor+0xE4/0xEC handles), so hooking
+    it never sees a refreshed root.  The replaced instruction is
+    ``stfs f0,0xC0(r31)`` and is replayed before branching back.  r10/r11/r12
+    and CR0 are dead at the join (the next instructions only store f0 and call
+    0x829907F8), so no stack frame is needed and the cave stays inside the
+    0x7C slot before the indexed call at 0x8260E980.  Only airborne actors
+    (800 < y < 2000, positive-float bits compared as integers) are published,
+    so ground pieces never overwrite the bomber root.
+    """
+    c = Cave(base)
+    c.lis(11, ring_base >> 16)
+    c.ori(11, 11, ring_base & 0xFFFF)
+    c.lwz(12, 11, int(offsets["magic"]))
+    c.lis(10, 0x4158)
+    c.ori(10, 10, 0x5052)
+    c.cmpw(12, 10)
+    c.bne("skip")
+    c.lwz(12, 31, 0xB8)
+    c.lis(10, 0x4448)        # 800.0f
+    c.cmplw(12, 10)
+    c.blt("skip")
+    c.lis(10, 0x44FA)        # 2000.0f
+    c.cmplw(12, 10)
+    c.bgt("skip")
+    c.lwz(12, 31, 0xB4)
+    c.stw(12, 11, int(offsets["root_x"]))
+    c.lwz(12, 31, 0xB8)
+    c.stw(12, 11, int(offsets["root_y"]))
+    c.lwz(12, 31, 0xBC)
+    c.stw(12, 11, int(offsets["root_z"]))
+    c.stw(31, 11, int(offsets["root_ptr"]))
+    c.lwz(12, 11, int(offsets["root_seq"]))
+    c.addi(12, 12, 1)
+    c.stw(12, 11, int(offsets["root_seq"]))
+    c.mark("skip")
+    c.stfs(0, 31, 0xC0)      # replay the replaced stfs
+    c.b(next_addr)
+    return c.finish()
+
+
 def build_camera_cave(base: int, ring_base: int, offsets: dict,
                       next_addr: int = 0x82BFB33C) -> list[int]:
     """Camera readback/override cave hooked at 0x82BFB338.
@@ -328,6 +380,53 @@ def build_camera_cave(base: int, ring_base: int, offsets: dict,
     c.addi(6, 31, shown_eye)   # original hooked instruction
     c.b(next_addr)
     return c.finish()
+
+
+def update_camera(mem: ProcessMemory, profile: dict,
+                  eye: tuple[float, float, float],
+                  target: tuple[float, float, float]) -> int:
+    """Publish a camera pose without the disable/wait handshake (cave already live)."""
+    offsets = profile["ring"]["offsets"]
+    base = int(profile["ring"]["base"])
+    mem.write(base + int(offsets["cam_eye"]), struct.pack(">3f", *eye))
+    mem.write(base + int(offsets["cam_target"]), struct.pack(">3f", *target))
+    seq = (mem.u32(base + int(offsets["cam_seq"])) or 0) + 1
+    mem.write_u32(base + int(offsets["cam_seq"]), seq & 0xFFFFFFFF)
+    mem.write_u32(base + int(offsets["cam_enable"]), 1)
+    return seq & 0xFFFFFFFF
+
+
+def root_follow_pose(drainer: "RingDrainer", dist: float):
+    """Read two live actor-root samples and build a rear/underside follow pose.
+
+    Returns ``(eye, target, direction, root, seq)`` or ``None`` when the root
+    cave has not published an airborne actor yet.  ``target`` is 15 m above the
+    root origin (the bomber's body centre) and ``eye`` sits ``dist`` behind the
+    flight direction and 12% of ``dist`` below it, so the engines are seen from
+    the trailing underside.  The route direction comes from the live samples,
+    with the m3120 clip-221 heading as fallback when the actor is stationary.
+    """
+    header = drainer.header() or {}
+    if not header.get("root_ptr") or not header.get("root_seq"):
+        return None
+    first = header["root"]
+    seq = header["root_seq"]
+    second = first
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        header = drainer.header() or {}
+        if header.get("root_seq") != seq:
+            second = header["root"]
+            seq = header["root_seq"]
+            break
+        time.sleep(0.02)
+    direction = vec_norm(vec_sub(second, first)) or (0.887, 0.0, 0.462)
+    target = (second[0], second[1] + 15.0, second[2])
+    below = max(10.0, dist * 0.12)
+    eye = (target[0] - direction[0] * dist,
+           second[1] - below,
+           target[2] - direction[2] * dist)
+    return eye, target, direction, second, seq
 
 
 def vec_sub(a, b):

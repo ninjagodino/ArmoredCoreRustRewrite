@@ -12,7 +12,9 @@ use std::sync::{mpsc, Mutex};
 use acvd_render::menu::MenuRoot;
 use anyhow::{bail, Context, Result};
 use bevy::asset::RenderAssetUsages;
-use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings, Volume};
+use bevy::audio::{
+    AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings, Volume,
+};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::ui::widget::NodeImageMode;
@@ -93,7 +95,9 @@ pub fn start(
     let audio = match (&manifest.audio, seek) {
         (Some(file), None) => {
             let bytes = std::fs::read(dir.join(file)).with_context(|| format!("reading {file}"))?;
-            let handle = audio_assets.add(AudioSource { bytes: bytes.into() });
+            let handle = audio_assets.add(AudioSource {
+                bytes: bytes.into(),
+            });
             Some(
                 commands
                     .spawn((
@@ -113,13 +117,21 @@ pub fn start(
     std::thread::spawn(move || {
         for idx in first..count {
             let path = frames_dir.join(format!("{idx:05}.jpg"));
-            let Ok(bytes) = std::fs::read(&path) else { break };
-            let Ok(decoded) = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg) else {
+            let Ok(bytes) = std::fs::read(&path) else {
+                break;
+            };
+            let Ok(decoded) = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+            else {
                 break;
             };
             let rgba = decoded.to_rgba8();
             let (width, height) = rgba.dimensions();
-            let frame = Frame { idx, rgba: rgba.into_raw(), width, height };
+            let frame = Frame {
+                idx,
+                rgba: rgba.into_raw(),
+                width,
+                height,
+            };
             if tx.send(frame).is_err() {
                 break;
             }
@@ -142,7 +154,12 @@ pub fn start(
     if let Some(idx) = seek {
         // Pose the seek immediately so a `--shot` never catches an empty frame.
         while player.pending.len() < 2 {
-            match player.rx.get_mut().expect("movie rx").recv_timeout(std::time::Duration::from_millis(5000)) {
+            match player
+                .rx
+                .get_mut()
+                .expect("movie rx")
+                .recv_timeout(std::time::Duration::from_millis(5000))
+            {
                 Ok(f) => {
                     player.pending.insert(f.idx, f);
                 }
@@ -157,9 +174,15 @@ pub fn start(
 
 impl Player {
     fn show(&mut self, idx: u32, commands: &mut Commands, images: &mut Assets<Image>) {
-        let Some(frame) = self.pending.remove(&idx) else { return };
+        let Some(frame) = self.pending.remove(&idx) else {
+            return;
+        };
         let image = Image::new(
-            Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
+            Extent3d {
+                width: frame.width,
+                height: frame.height,
+                depth_or_array_layers: 1,
+            },
             TextureDimension::D2,
             frame.rgba,
             TextureFormat::Rgba8UnormSrgb,
@@ -215,7 +238,9 @@ pub fn update(
     sinks: Query<&AudioSink, With<MovieAudio>>,
     mut player: Option<ResMut<Player>>,
 ) {
-    let Some(player) = player.as_deref_mut() else { return };
+    let Some(player) = player.as_deref_mut() else {
+        return;
+    };
     if player.finished {
         return;
     }
@@ -263,11 +288,18 @@ pub fn despawn(commands: &mut Commands, player: &Player) {
 
 /// Names of the movies present in a cache directory (for the boot fallback message).
 pub fn cached_movies(cache: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(cache) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(cache) else {
+        return Vec::new();
+    };
     entries
         .flatten()
         .filter(|e| e.path().join("manifest.json").is_file())
-        .map(|e| e.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        .map(|e| {
+            e.path()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
         .filter(|n| !n.is_empty())
         .map(PathBuf::from)
         .collect()

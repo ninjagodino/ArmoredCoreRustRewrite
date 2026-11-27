@@ -59,7 +59,11 @@ pub struct Boot {
 
 impl Default for Boot {
     fn default() -> Self {
-        Self { stage: None, timer: 0.0, timestamp_timer: 0.0 }
+        Self {
+            stage: None,
+            timer: 0.0,
+            timestamp_timer: 0.0,
+        }
     }
 }
 
@@ -67,11 +71,12 @@ pub struct FrontendPlugin;
 
 impl Plugin for FrontendPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Boot>().add_systems(
-            Startup,
-            spawn_frontend.run_if(boot_on),
-        )
-        .add_systems(Update, (movie::update, tick, finish).chain().run_if(boot_on));
+        app.init_resource::<Boot>()
+            .add_systems(Startup, spawn_frontend.run_if(boot_on))
+            .add_systems(
+                Update,
+                (movie::update, tick, finish).chain().run_if(boot_on),
+            );
     }
 }
 
@@ -96,7 +101,11 @@ fn spawn_frontend(
             ..default()
         },
     ));
-    let stage = if cfg.frame.is_some() { BootStage::Movie } else { cfg.start };
+    let stage = if cfg.frame.is_some() {
+        BootStage::Movie
+    } else {
+        cfg.start
+    };
     boot.stage = Some(stage);
     match stage {
         BootStage::Movie => start_movie(&mut commands, &cfg, &mut boot, &mut images, &mut audio),
@@ -124,8 +133,12 @@ fn show_title(
         boot.stage = Some(BootStage::Done);
         return;
     };
-    let scale = (window.width() / 1280.0).min(window.height() / 720.0).max(0.1);
-    let origin = ((Vec2::new(window.width(), window.height()) - Vec2::new(1280.0, 720.0) * scale) / 2.0).max(Vec2::ZERO);
+    let scale = (window.width() / 1280.0)
+        .min(window.height() / 720.0)
+        .max(0.1);
+    let origin = ((Vec2::new(window.width(), window.height()) - Vec2::new(1280.0, 720.0) * scale)
+        / 2.0)
+        .max(Vec2::ZERO);
     for name in ["@BackImage", "@PressStart"] {
         match layout.drb.dialogs.iter().position(|d| d.name == name) {
             Some(i) => {
@@ -145,7 +158,14 @@ fn start_movie(
     images: &mut Assets<Image>,
     audio: &mut Assets<AudioSource>,
 ) {
-    match movie::start(commands, images, audio, &cfg.movies_dir, &cfg.movie, cfg.frame) {
+    match movie::start(
+        commands,
+        images,
+        audio,
+        &cfg.movies_dir,
+        &cfg.movie,
+        cfg.frame,
+    ) {
         Ok(player) => commands.insert_resource(player),
         Err(e) => {
             eprintln!("boot: {e:#}");
@@ -265,7 +285,9 @@ fn finish(
 }
 
 fn timestamp() -> String {
-    let Some((y, mo, d, h, mi, s)) = local_now() else { return "00:00:00 00/00/0000".into() };
+    let Some((y, mo, d, h, mi, s)) = local_now() else {
+        return "00:00:00 00/00/0000".into();
+    };
     format!("{h:02}:{mi:02}:{s:02} {mo:02}/{d:02}/{y:04}")
 }
 
@@ -285,7 +307,16 @@ fn local_now() -> Option<(u16, u16, u16, u16, u16, u16)> {
     extern "system" {
         fn GetLocalTime(time: *mut SystemTime);
     }
-    let mut t = SystemTime { year: 0, month: 0, day_of_week: 0, day: 0, hour: 0, minute: 0, second: 0, milliseconds: 0 };
+    let mut t = SystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
     // SAFETY: `GetLocalTime` writes a `SYSTEMTIME` into the storage we pass.
     unsafe { GetLocalTime(&mut t) };
     Some((t.year, t.month, t.day, t.hour, t.minute, t.second))
@@ -293,7 +324,10 @@ fn local_now() -> Option<(u16, u16, u16, u16, u16, u16)> {
 
 #[cfg(not(windows))]
 fn local_now() -> Option<(u16, u16, u16, u16, u16, u16)> {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
     let (days, rem) = (secs / 86400, secs % 86400);
     let (mut year, mut day) = (1970i64, days as i64);
     loop {
@@ -306,11 +340,31 @@ fn local_now() -> Option<(u16, u16, u16, u16, u16, u16)> {
         year += 1;
     }
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 0usize;
     while day >= months[month] {
         day -= months[month];
         month += 1;
     }
-    Some((year as u16, month as u16 + 1, day as u16 + 1, (rem / 3600) as u16, ((rem % 3600) / 60) as u16, (rem % 60) as u16))
+    Some((
+        year as u16,
+        month as u16 + 1,
+        day as u16 + 1,
+        (rem / 3600) as u16,
+        ((rem % 3600) / 60) as u16,
+        (rem % 60) as u16,
+    ))
 }

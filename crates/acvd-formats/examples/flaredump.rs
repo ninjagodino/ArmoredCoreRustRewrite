@@ -41,7 +41,10 @@ fn main() -> anyhow::Result<()> {
         let lin = tex.linear(hdr.platform, &data, 8)?;
         let rgba = tpf::decode_bc1(&lin, tex.width, tex.height)?;
         let out_path = format!("{out}/{}.bmp", tex.name.to_ascii_lowercase());
-        std::fs::write(&out_path, bmp(tex.width as usize, tex.height as usize, &rgba))?;
+        std::fs::write(
+            &out_path,
+            bmp(tex.width as usize, tex.height as usize, &rgba),
+        )?;
         println!("{} {}x{} -> {out_path}", tex.name, tex.width, tex.height);
     }
     Ok(())

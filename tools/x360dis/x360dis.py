@@ -180,6 +180,23 @@ def line(addr, word, text, comment=None, raw=False):
     return prefix + text
 
 
+def disasm_words(words, base=0, raw=True, out=sys.stdout):
+    """Decode a list of raw 32-bit words at `base` (cave self-test, no PE)."""
+    md = make_capstone()
+    for i, word in enumerate(words):
+        addr = (base + i * 4) & 0xFFFFFFFF
+        hit = ppc_vmx128.disasm(word)
+        if hit:
+            text = hit[1]
+        else:
+            insns = list(md.disasm(struct.pack(">I", word & 0xFFFFFFFF), addr))
+            if insns:
+                text = ("%-8s %s" % (insns[0].mnemonic, insns[0].op_str)).strip()
+            else:
+                text = ".word 0x%08x" % (word & 0xFFFFFFFF)
+        out.write(line(addr, word & 0xFFFFFFFF, text, None, raw) + "\n")
+
+
 def disasm_body(disc, md, lo, hi, refs=False, raw=False, out=sys.stdout):
     known = {}
     addr = lo
@@ -310,7 +327,15 @@ def main():
                     help="resolve vector constant addresses (lis/addi tracking)")
     ap.add_argument("--raw", action="store_true", help="show the raw word")
     ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--words", nargs="+", type=lambda x: int(x, 0),
+                    help="decode raw 32-bit words (hex, e.g. 0x7d8802a6)")
+    ap.add_argument("--base", type=lambda x: int(x, 0), default=0,
+                    help="address of the first --words word (default 0)")
     args = ap.parse_args()
+
+    if args.words:
+        disasm_words(args.words, args.base, True)
+        return
 
     disc = Disc(args.disc)
     md = make_capstone()

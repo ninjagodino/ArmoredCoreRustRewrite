@@ -3,7 +3,8 @@
 //!
 //! `acvd-game [design id] [--disc <360 ISO>] [--shot <png>] [--flat] [--yaw <degrees>]
 //! [--clip <entry>] [--frame <n>] [--hold <keys>] [--wait <seconds>] [--map <id>] [--plane]
-//! [--water <y>] [--cam <x,y,z> --look <x,y,z>]`
+//! [--water <y>] [--cam <x,y,z> --look <x,y,z>] [--listen [--listen-port <p>] [--bots <n>] |
+//! --connect <addr>]`
 //! Piloting (see `control`): WASD move, Q/E turn, Up/Down pitch, V boost mode, Space jump,
 //! Shift high boost (quick boost) / hold Shift (or K, gamepad □ + HOLD) Boost Charge Kick, Ctrl glide boost while boosting on the ground
 //! (air clips once it leaves the ground);
@@ -317,6 +318,8 @@ fn main() {
     let mut hanger_r_override: Option<i16> = None;
     let mut hanger_l_override: Option<i16> = None;
     let mut start_view_action: Option<garage::GarageViewAction> = None;
+    let mut test_weapon_switch = false;
+    let mut test_weapon_switch_stow = false;
     let mut boot_flag: Option<bool> = None;
     let mut boot_movie = "prologue".to_string();
     let mut boot_lang = "en".to_string();
@@ -328,6 +331,7 @@ fn main() {
     let mut world_args = false;
     let mut net_listen = false;
     let mut net_listen_port = 0u16;
+    let mut net_bots = 0usize;
     let mut net_connect: Option<std::net::SocketAddr> = None;
     let mut net_netem: Option<acvd_net::netem::NetemConfig> = None;
     while let Some(a) = args.next() {
@@ -358,8 +362,12 @@ fn main() {
                 | "--emblem"
                 | "--shadow-dist"
                 | "--listen"
+                | "--listen-port"
+                | "--bots"
                 | "--connect"
                 | "--netem"
+                | "--test-weapon-switch"
+                | "--test-weapon-switch-stow"
         ) {
             world_args = true;
         }
@@ -394,6 +402,7 @@ fn main() {
             "--listen-port" => {
                 net_listen_port = args.next().and_then(|v| v.parse().ok()).unwrap_or(0)
             }
+            "--bots" => net_bots = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--connect" => net_connect = args.next().and_then(parse_socket_addr),
             "--netem" => {
                 if let Some(raw) = args.next() {
@@ -471,6 +480,11 @@ fn main() {
             "--sfx" => preview = args.next().and_then(|s| s.parse::<i32>().ok()),
             "--burst" => burst = args.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1),
             "--no-hud" => no_hud = true,
+            "--test-weapon-switch" => test_weapon_switch = true,
+            "--test-weapon-switch-stow" => {
+                test_weapon_switch = true;
+                test_weapon_switch_stow = true;
+            }
             "--input" => {
                 if let Some(raw) = args.next() {
                     start_input = if raw.eq_ignore_ascii_case("gamepad")
@@ -703,11 +717,16 @@ fn main() {
     if let Some(sd) = shadow_dist_override {
         game_settings.shadow_distance = sd;
     }
+    if net_bots > 0 && !net_listen {
+        eprintln!("--bots only applies to --listen; ignoring it");
+        net_bots = 0;
+    }
     let net_config = net::NetConfig {
         listen: net_listen,
         listen_port: net_listen_port,
         connect: net_connect,
         netem: net_netem,
+        bots: net_bots,
         max_clients: 8,
         disc: Some(disc_path.clone()),
         map: map.clone().unwrap_or_else(|| "m4000".into()),
@@ -790,6 +809,7 @@ fn main() {
     })
     .insert_resource(pause_state)
     .init_resource::<AcTexturePacks>()
+    .init_resource::<targets::AcRigCache>()
     .init_resource::<garage_assemble::AssembleUiAssets>()
     .init_resource::<garage::PaintPickerAssets>()
     .init_resource::<paint::CustomCamoLibrary>()
@@ -826,6 +846,10 @@ fn main() {
     })
     .insert_resource(collision)
     .insert_resource(control::Piloting(piloting))
+    .insert_resource(weapons::TestWeaponSwitch {
+        deploy: test_weapon_switch,
+        stow_after_deploy: test_weapon_switch_stow,
+    })
     .insert_resource(control::Held(if hold_delay > 0.0 {
         Vec::new()
     } else {
@@ -902,12 +926,13 @@ fn main() {
                 .chain()
                 .after(hanger::pose),
             (
-                tick_pending_hold.run_if(in_active_sortie),
+                tick_pending_hold,
                 bay::shift.run_if(in_active_sortie),
                 bay::probe_shot.run_if(in_active_sortie),
                 weapons::fire
                     .run_if(in_active_sortie)
-                    .run_if(net::solo_play),
+                    .run_if(net::solo_play)
+                    .after(pose::animate),
                 weapons::probe_shot
                     .run_if(in_active_sortie)
                     .run_if(net::solo_play),
@@ -1246,6 +1271,7 @@ fn spawn_sortie_world(
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
     garage: &Garage,
     enemy_parts: &weapons::EnemyParts,
+    rig_cache: &mut targets::AcRigCache,
     collision: &Collision,
     start: &map::Start,
     scene: &Scene,
@@ -1280,6 +1306,7 @@ fn spawn_sortie_world(
             bindposes,
             &garage.disc,
             enemy_parts,
+            rig_cache,
             map_id,
             layout,
             start,
@@ -1380,6 +1407,7 @@ struct RenderAssets<'w> {
     paint_materials: ResMut<'w, Assets<paint::AcPaintMaterial>>,
     images: ResMut<'w, Assets<Image>>,
     bindposes: ResMut<'w, Assets<SkinnedMeshInverseBindposes>>,
+    rigs: ResMut<'w, targets::AcRigCache>,
     ac_packs: ResMut<'w, AcTexturePacks>,
     custom_camos: Res<'w, paint::CustomCamoLibrary>,
 }
@@ -1534,6 +1562,7 @@ fn process_mode_switch(
                 &mut assets.bindposes,
                 &garage,
                 &sortie.enemy_parts,
+                &mut assets.rigs,
                 &sortie.collision,
                 &sortie.start,
                 &sortie.scene,
@@ -1573,11 +1602,7 @@ fn process_mode_switch(
 #[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut paint_materials: ResMut<Assets<paint::AcPaintMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mut assets: RenderAssets,
     mut decals: ResMut<decal::DecalState>,
     mode: Res<garage::Mode>,
     garage: Res<Garage>,
@@ -1620,26 +1645,27 @@ fn setup(
     if *mode == garage::Mode::Sortie {
         spawn_sortie_world(
             &mut commands,
-            &mut meshes,
-            &mut materials,
-            &mut paint_materials,
-            &mut images,
-            &mut bindposes,
+            &mut assets.meshes,
+            &mut assets.materials,
+            &mut assets.paint_materials,
+            &mut assets.images,
+            &mut assets.bindposes,
             &garage,
             &enemy_parts,
+            &mut assets.rigs,
             &collision,
             &start,
             &scene,
         );
     }
     let show_hud_flag = show_hud.0;
-    decals.init_assets(&mut images);
+    decals.init_assets(&mut assets.images);
     if show_hud_flag {
-        match load_hud(&garage.disc, &mut images) {
+        match load_hud(&garage.disc, &mut assets.images) {
             Ok(hud) => commands.insert_resource(hud),
             Err(e) => warn!("hud: {e:#}"),
         }
-        match hud::load(&garage.disc, &mut images) {
+        match hud::load(&garage.disc, &mut assets.images) {
             Ok(sortie) => commands.insert_resource(sortie),
             Err(e) => warn!("sortie hud: {e:#}"),
         }
@@ -2033,6 +2059,11 @@ fn show(
         }
         let leg_type = acvd_data::part_field(design_data.legs as i64, 3, "leg_type") as u8;
         weapon_anims.load(&garage.disc, part.placement, &part.rig, &joints, leg_type);
+        if part.placement.column == "arms" {
+            let mut transition_cues = weapon_anims.transition_cues();
+            transition_cues.extend(["c00000047".to_string(), "c00000045".to_string()]);
+            commands.insert_resource(sound::PreloadCues(transition_cues));
+        }
         sfx::effect_points(&mut commands, &part.rig, &joints, part.placement.column);
         if part.placement.column == "arms" {
             l_kata_rest = part

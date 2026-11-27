@@ -256,6 +256,10 @@ fn mtd_add_gain(mtd_low: &str) -> Vec3 {
         "map_diffuse_add" => Vec3::new(4.0, 4.0, 1.0),
         "map_nolight_add" => Vec3::new(3.5, 5.0, 5.0),
         "ene_diffuse_add" => Vec3::splat(1.8),
+        // `Ene_Diffuse_Glow` (`o9341`/`o9344` engine cards, MTD `Phong_ColDifEmi.spx`): the
+        // diffuse map is also `g_EmissionTexture`, added as `g_EmissionColor` (1,1,1) times
+        // `g_EmissionCoef` 3.5 (`private/tmp/mtd/Ene_Diffuse_Glow.mtd`).
+        "ene_diffuse_glow" => Vec3::splat(3.5),
         "map_nolightnofog_add" => Vec3::new(0.16, 0.16, 0.22),
         _ => Vec3::ONE,
     }
@@ -1093,8 +1097,8 @@ mod tests {
                 luma_tint: 0.5,
                 rising: true,
                 height_range: 0.0,
-                height_base: 0.0,
-                height_color: [0.0; 4],
+                height_base: 50.0,
+                height_color: [0.6, 0.7, 0.8, 0.14],
                 acv: None,
             },
         };
@@ -1165,6 +1169,8 @@ mod tests {
         assert_eq!(mtd_add_gain("map_diffuse_add"), Vec3::new(4.0, 4.0, 1.0));
         assert_eq!(mtd_add_gain("map_nolight_add"), Vec3::new(3.5, 5.0, 5.0));
         assert_eq!(mtd_add_gain("ene_diffuse_add"), Vec3::splat(1.8));
+        // `Ene_Diffuse_Glow` has no additive diffuse gain; its energy is `g_EmissionCoef` 3.5.
+        assert_eq!(mtd_add_gain("ene_diffuse_glow"), Vec3::splat(3.5));
         assert_eq!(
             mtd_add_gain("map_nolightnofog_add"),
             Vec3::new(0.16, 0.16, 0.22)

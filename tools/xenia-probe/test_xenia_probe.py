@@ -119,6 +119,23 @@ class TestCaves(unittest.TestCase):
         self.assertIn("82bfb33c", text)
         self.assertNotIn(".word 0x", text)
 
+    def test_root_cave_fits_and_decodes(self):
+        words = ring.build_root_cave(0x8260E900, 0x83803400,
+                                     PROFILE["ring"]["offsets"])
+        self.assertLessEqual(len(words) * 4, int(PROFILE["caves"]["root"]["size"]))
+        text = decode(words, 0x8260E900)
+        for field in ("0xb4(r31)", "0xb8(r31)", "0xbc(r31)", "0xc0(r31)"):
+            self.assertIn(field, text)
+        self.assertIn("829abf30", text)   # branch back after the replayed stfs
+        self.assertNotIn(".word 0x", text)
+
+    def test_ring_root_offsets_are_inside_the_header(self):
+        offsets = PROFILE["ring"]["offsets"]
+        self.assertEqual(offsets["root_ptr"], 0x6C)
+        self.assertLessEqual(offsets["root_z"] + 4, PROFILE["ring"]["header_size"])
+        self.assertLess(PROFILE["ring"]["header_size"],
+                        PROFILE["ring"]["data_offset"])
+
     def test_mapwarp_cave_fits_and_decodes(self):
         words = mapwarp.build_cave(0x8260E700, 0x83803400, "m3120", 1)
         self.assertLessEqual(len(words) * 4, 0x200)
@@ -151,8 +168,8 @@ class TestPatch(unittest.TestCase):
         self.assertEqual(len(data["patch"]), 1)
         patch = data["patch"][0]
         self.assertTrue(patch["is_enabled"])
-        self.assertEqual(len(patch["be32"]), 31)
-        self.assertEqual(len(patch["array"]), 3)
+        self.assertEqual(len(patch["be32"]), 37)
+        self.assertEqual(len(patch["array"]), 4)
         self.assertLessEqual(info["cave_sizes"]["mapwarp"], 0x200)
         self.assertGreater(info["cave_sizes"]["mapwarp"], 0)
         addresses = {entry["address"] for entry in patch["be32"]}
@@ -241,7 +258,7 @@ class TestRing(unittest.TestCase):
     def test_header_roundtrip(self):
         offsets = PROFILE["ring"]["offsets"]
         base = 0x83803400
-        buf = bytearray(0x70)
+        buf = bytearray(int(PROFILE["ring"]["header_size"]))
         struct.pack_into(">I", buf, offsets["magic"], PROFILE["ring"]["magic"])
         struct.pack_into(">I", buf, offsets["write_index"], 7)
         struct.pack_into(">I", buf, offsets["cam_frame"], 42)
@@ -249,6 +266,9 @@ class TestRing(unittest.TestCase):
         struct.pack_into(">I", buf, offsets["warp_calls"], 9)
         struct.pack_into(">I", buf, offsets["warp_map"], 3)
         struct.pack_into(">I", buf, offsets["warp_msb"], 2)
+        struct.pack_into(">I", buf, offsets["root_ptr"], 0x41A2B000)
+        struct.pack_into(">I", buf, offsets["root_seq"], 12)
+        struct.pack_into(">3f", buf, offsets["root_x"], 4.0, 5.0, 6.0)
         header = ring.parse_header(bytes(buf), offsets)
         self.assertEqual(header["write_index"], 7)
         self.assertEqual(header["cam_frame"], 42)
@@ -256,6 +276,9 @@ class TestRing(unittest.TestCase):
         self.assertEqual(header["warp_calls"], 9)
         self.assertEqual(header["warp_map"], 3)
         self.assertEqual(header["warp_msb"], 2)
+        self.assertEqual(header["root_ptr"], 0x41A2B000)
+        self.assertEqual(header["root_seq"], 12)
+        self.assertEqual(header["root"], (4.0, 5.0, 6.0))
 
     def test_drain_and_drop(self):
         mem = self.FakeMem()

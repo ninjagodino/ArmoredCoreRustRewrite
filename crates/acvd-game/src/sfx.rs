@@ -381,12 +381,18 @@ impl Library {
                 };
                 match read() {
                     Ok(e) => {
-                        let roots = e
-                            .states
-                            .first()
+                        // Action-95 muzzle effects keep their visual nodes in the effect-level
+                        // params1 list; action 95 itself is an empty 64-slot container. Other
+                        // effects (action 14/79) keep them in the first state's actions.
+                        let roots = nodes(&e.params1)
                             .into_iter()
-                            .flat_map(|s| &s.actions)
-                            .flat_map(|a| nodes(&a.params))
+                            .chain(
+                                e.states
+                                    .first()
+                                    .into_iter()
+                                    .flat_map(|s| &s.actions)
+                                    .flat_map(|a| nodes(&a.params)),
+                            )
                             .collect();
                         Some(Arc::new(roots))
                     }
@@ -1225,6 +1231,8 @@ struct NodeDef {
     look: Option<Look>,
     motion: Motion,
     children: Vec<Arc<NodeDef>>,
+    /// Node 2117/2118 camera-distance LOD thresholds; empty for ordinary nodes.
+    lod_distances: Vec<f32>,
     kind: Kind,
 }
 
@@ -1259,6 +1267,7 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
         look: None,
         motion: Motion::default(),
         children: Vec::new(),
+        lod_distances: Vec::new(),
         kind: Kind::Static,
     };
     match id {
@@ -1273,6 +1282,22 @@ fn node(id: i32, l: &ParamList) -> Option<NodeDef> {
             n.xf = Xf::read(action(l, 5));
             n.motion = Motion::read(action(l, 6));
             n.children = children(l, 8);
+        }
+        2117 | 2118 => {
+            // Five LOD slots with four camera-distance thresholds. Node 2117 is the
+            // action-95 muzzle root (params1); 2118 is the 1269 cartridge root (state 0).
+            for i in 0..5 {
+                if let (Some(37), Some(Value::Node(id, list))) =
+                    (param(l, i).map(|p| p.kind), l.get(i))
+                {
+                    if *id != 0 {
+                        if let Some(child) = node(*id, list) {
+                            n.children.push(Arc::new(child));
+                        }
+                    }
+                }
+            }
+            n.lod_distances = (5..9).map(|i| int(l, i).max(0) as f32).collect();
         }
         2020 | 2024 => {
             (n.life, n.delay) = (tick(l, 0), tick(l, 4));
@@ -1516,6 +1541,8 @@ struct NodeRt {
     /// World matrix of the spawner at birth. A 2020/2024 copy keeps that frame, so a
     /// glide flame stays where the nozzle was instead of riding it onto the last colour key.
     anchor: Option<Affine3A>,
+    /// Camera distance captured when the node was born, used by 2117/2118 LOD roots.
+    view_dist: f32,
     visual: Option<Visual>,
     children: Vec<NodeRt>,
     /// Seconds to the next emission or spawn.
@@ -1694,7 +1721,18 @@ fn look_span(def: &NodeDef) -> f32 {
 }
 
 impl NodeRt {
-    fn new(def: Arc<NodeDef>, rng: &mut Rng, turn: Quat) -> Self {
+    fn new(def: Arc<NodeDef>, rng: &mut Rng, turn: Quat, view_dist: f32) -> Self {
+        if !def.lod_distances.is_empty() {
+            let idx = def
+                .lod_distances
+                .iter()
+                .position(|d| view_dist < *d)
+                .unwrap_or(def.children.len().saturating_sub(1))
+                .min(def.children.len().saturating_sub(1));
+            if let Some(child) = def.children.get(idx) {
+                return NodeRt::new(child.clone(), rng, turn, view_dist);
+            }
+        }
         let base = Affine3A::from_quat(turn) * def.xf.sample(rng);
         let speed = rng.range(def.motion.speed);
         let spin = Vec3::from_array([0, 1, 2].map(|i| {
@@ -1710,7 +1748,7 @@ impl NodeRt {
             _ => def
                 .children
                 .iter()
-                .map(|c| NodeRt::new(c.clone(), rng, Quat::IDENTITY))
+                .map(|c| NodeRt::new(c.clone(), rng, Quat::IDENTITY, view_dist))
                 .collect(),
         };
         let life = def.life;
@@ -1724,6 +1762,7 @@ impl NodeRt {
             spin,
             roll,
             anchor: None,
+            view_dist,
             visual: None,
             children,
             emit: 0.0,
@@ -1793,7 +1832,7 @@ impl NodeRt {
                         for _ in 0..*count {
                             for c in child {
                                 let turn = Quat::from_rotation_arc(Vec3::Z, rng.cone(*angle));
-                                let mut born = NodeRt::new(c.clone(), rng, turn);
+                                let mut born = NodeRt::new(c.clone(), rng, turn, self.view_dist);
                                 if born.life < 0.0 {
                                     born.life = look_span(&born.def).max(1.0 / 60.0);
                                 }
@@ -2473,9 +2512,10 @@ fn simulate(
                 .wrapping_mul(747_796_405)
                 .wrapping_add(2_891_336_453);
             let mut rng = Rng(lib.seed | 1);
+            let view_dist = camera.distance(at.translation());
             let nodes = roots
                 .iter()
-                .map(|d| NodeRt::new(d.clone(), &mut rng, Quat::IDENTITY))
+                .map(|d| NodeRt::new(d.clone(), &mut rng, Quat::IDENTITY, view_dist))
                 .collect();
             sfx.run = Some(Run { nodes, rng });
         }
@@ -3457,11 +3497,15 @@ mod tests {
             let bytes = acvd_formats::vfs::open(&disc, &format!("{}|f{id:07}.ffx", super::EFFECTS))
                 .expect("ffx entry");
             let eff = acvd_formats::ffx::read(&bytes).expect("parse ffx");
-            eff.states
-                .first()
+            super::nodes(&eff.params1)
                 .into_iter()
-                .flat_map(|s| &s.actions)
-                .flat_map(|a| super::nodes(&a.params))
+                .chain(
+                    eff.states
+                        .first()
+                        .into_iter()
+                        .flat_map(|s| &s.actions)
+                        .flat_map(|a| super::nodes(&a.params)),
+                )
                 .collect::<Vec<_>>()
         };
         fn find_any(
@@ -3514,11 +3558,15 @@ mod tests {
             let bytes = acvd_formats::vfs::open(&disc, &format!("{}|f{id:07}.ffx", super::EFFECTS))
                 .expect("ffx entry");
             let eff = acvd_formats::ffx::read(&bytes).expect("parse ffx");
-            eff.states
-                .first()
+            super::nodes(&eff.params1)
                 .into_iter()
-                .flat_map(|s| &s.actions)
-                .flat_map(|a| super::nodes(&a.params))
+                .chain(
+                    eff.states
+                        .first()
+                        .into_iter()
+                        .flat_map(|s| &s.actions)
+                        .flat_map(|a| super::nodes(&a.params)),
+                )
                 .collect::<Vec<_>>()
         };
 
@@ -3549,7 +3597,14 @@ mod tests {
             let mut rng = super::Rng(0x1234_5679);
             let mut nodes: Vec<_> = roots
                 .iter()
-                .map(|d| super::NodeRt::new(d.clone(), &mut rng, bevy::prelude::Quat::IDENTITY))
+                .map(|d| {
+                    super::NodeRt::new(
+                        d.clone(),
+                        &mut rng,
+                        bevy::prelude::Quat::IDENTITY,
+                        f32::INFINITY,
+                    )
+                })
                 .collect();
             let owner = world.spawn_empty().id();
             let steps = (secs * 60.0).round() as u32;
@@ -3764,5 +3819,35 @@ mod tests {
         assert_eq!(b.uv[1], [1.0, 1.0]);
         assert_eq!(b.uv[4], [0.0, 0.0]);
         assert_eq!(b.uv[5], [1.0, 0.0]);
+    }
+
+    #[test]
+    fn action_95_muzzle_uses_params1_and_selects_lod() {
+        let disc = acvd_formats::vfs::Disc::open(
+            &acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO),
+        )
+        .expect("disc");
+        let bytes = acvd_formats::vfs::open(&disc, &format!("{}|f0000722.ffx", super::EFFECTS))
+            .expect("f0000722");
+        let effect = acvd_formats::ffx::read(&bytes).expect("parse f0000722");
+        let roots = super::nodes(&effect.params1);
+        assert_eq!(roots.len(), 1, "f722 visual root lives in params1");
+        assert_eq!(roots[0].lod_distances, vec![3.0, 100.0, 1000.0, 10000.0]);
+
+        let mut rng = super::Rng(1);
+        let near = super::NodeRt::new(
+            roots[0].clone(),
+            &mut rng,
+            bevy::prelude::Quat::IDENTITY,
+            1.0,
+        );
+        let far = super::NodeRt::new(
+            roots[0].clone(),
+            &mut rng,
+            bevy::prelude::Quat::IDENTITY,
+            20.0,
+        );
+        assert!((near.life - 0.5).abs() < 1e-6, "near LOD child life");
+        assert!((far.life - 3.0).abs() < 1e-6, "far LOD child life");
     }
 }

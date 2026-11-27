@@ -32,7 +32,11 @@ impl<'a> Cursor<'a> {
         }
     }
     fn seek(&mut self, at: usize) -> Result<()> {
-        ensure!(at <= self.be.len(), "seek {at:#x} past end {:#x}", self.be.len());
+        ensure!(
+            at <= self.be.len(),
+            "seek {at:#x} past end {:#x}",
+            self.be.len()
+        );
         self.pos = at;
         Ok(())
     }
@@ -122,11 +126,7 @@ impl MacroRegion {
     /// World-space center of this region's floor (`y = min_y`) in FLVER/game axes.
     pub fn world_center(&self, g2w: &Mat4) -> [f32; 3] {
         let (min, max) = self.world_bounds(g2w);
-        [
-            0.5 * (min[0] + max[0]),
-            min[1],
-            0.5 * (min[2] + max[2]),
-        ]
+        [0.5 * (min[0] + max[0]), min[1], 0.5 * (min[2] + max[2])]
     }
 }
 
@@ -475,10 +475,7 @@ impl NavMesh {
     }
 
     pub fn region_count(&self) -> usize {
-        self.hnav
-            .macro_nodes
-            .first()
-            .map_or(0, |m| m.regions.len())
+        self.hnav.macro_nodes.first().map_or(0, |m| m.regions.len())
     }
 
     pub fn region_bounds(&self, idx: usize) -> Option<([f32; 3], [f32; 3])> {
@@ -600,7 +597,8 @@ impl NavMesh {
 
         // Build portal waypoints clamped to the shared overlap of consecutive region AABBs,
         // pulling each waypoint toward the line between its neighbors (iterative string-pulling).
-        let mut portals: Vec<([f32; 3], [f32; 3])> = Vec::with_capacity(chain.len().saturating_sub(1));
+        let mut portals: Vec<([f32; 3], [f32; 3])> =
+            Vec::with_capacity(chain.len().saturating_sub(1));
         for w in chain.windows(2) {
             let (a_min, a_max) = self.bounds[w[0]];
             let (b_min, b_max) = self.bounds[w[1]];
@@ -688,7 +686,10 @@ impl Eq for AStarNode {}
 
 impl Ord for AStarNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.f.total_cmp(&self.f).then_with(|| self.idx.cmp(&other.idx))
+        other
+            .f
+            .total_cmp(&self.f)
+            .then_with(|| self.idx.cmp(&other.idx))
     }
 }
 
@@ -763,12 +764,11 @@ mod tests {
         assert_eq!(htrs.len(), 59, "expected 59 .htr files on 360 ISO");
 
         for path in &hnavs {
-            let bytes = disc.read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let bytes = disc
+                .read(path)
+                .unwrap_or_else(|e| panic!("read {path}: {e}"));
             let hnav = read_hnav(&bytes).unwrap_or_else(|e| panic!("parse {path}: {e}"));
-            assert!(
-                !hnav.macro_nodes.is_empty(),
-                "{path} has no macro node"
-            );
+            assert!(!hnav.macro_nodes.is_empty(), "{path} has no macro node");
             assert_eq!(
                 hnav.macro_nodes[0].regions.len(),
                 hnav.micro_nodes.len(),
@@ -777,7 +777,9 @@ mod tests {
         }
 
         for path in &htrs {
-            let bytes = disc.read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let bytes = disc
+                .read(path)
+                .unwrap_or_else(|e| panic!("read {path}: {e}"));
             let htr = read_htr(&bytes).unwrap_or_else(|e| panic!("parse {path}: {e}"));
             assert!(!htr.nodes.is_empty(), "{path} has 0 HTR nodes");
             // Verify every internal node index is in bounds.
@@ -811,7 +813,10 @@ mod tests {
         let goal = [-620.0, 29.0, 520.0];
         let r_start = nav.find_region(start).expect("start region");
         let r_goal = nav.find_region(goal).expect("goal region");
-        assert_ne!(r_start, r_goal, "start and goal should be in distinct regions");
+        assert_ne!(
+            r_start, r_goal,
+            "start and goal should be in distinct regions"
+        );
 
         let path = nav.find_path(start, goal);
         assert!(
@@ -823,7 +828,10 @@ mod tests {
         // Every consecutive step should be finite and reasonable.
         for w in path.windows(2) {
             let d = dist_3d(w[0], w[1]);
-            assert!(d.is_finite() && d < 300.0, "unreasonable segment length {d}");
+            assert!(
+                d.is_finite() && d < 300.0,
+                "unreasonable segment length {d}"
+            );
         }
     }
 }

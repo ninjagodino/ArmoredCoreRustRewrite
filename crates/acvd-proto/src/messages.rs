@@ -1,4 +1,4 @@
-//! Wire messages.
+﻿//! Wire messages.
 //!
 //! Field order and widths are part of the protocol; the golden tests in `tests/golden.rs` pin the
 //! sizes the server and client budget against.
@@ -10,7 +10,7 @@ use crate::error::ProtoError;
 use crate::ids::NetId;
 
 /// Bumped whenever a field changes meaning or order.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 /// One UDP datagram, with room under a 1200-byte path MTU.
 pub const MAX_SNAPSHOT_BYTES: usize = 1100;
 /// Input frames sent per packet (current + last two unacked).
@@ -21,7 +21,7 @@ pub const MAX_LOADOUT_BYTES: usize = 512;
 /// Encoded length of one [`InputFrame`] in bytes.
 pub const INPUT_FRAME_BYTES: usize = 9;
 /// Encoded length of one [`AcRecord`] in bytes.
-pub const AC_RECORD_BYTES: usize = 27;
+pub const AC_RECORD_BYTES: usize = 28;
 
 /// `InputFrame::buttons` bits (movement + combat inputs).
 pub mod input_buttons {
@@ -49,6 +49,9 @@ pub mod combat_flags {
     pub const RIGHT_SWAPPING: u8 = 1 << 3;
     /// Network glide quick-boost replay flag carried next to the bay bits.
     pub const GLIDE_QB: u8 = 1 << 4;
+    /// Bits 5..=7 carry the authoritative weapon-arm phase (`WeaponArmPhase::code`).
+    pub const WEAPON_ARM_PHASE_SHIFT: u8 = 5;
+    pub const WEAPON_ARM_PHASE_MASK: u8 = 0xE0;
 }
 
 /// Tag byte at the start of every `HOT` payload. `HOT` carries snapshots, `FireEvent`s, and the
@@ -282,7 +285,7 @@ impl Wire for Loadout {
     }
 }
 
-/// One remote AC in a snapshot (26 B).
+/// One remote AC in a snapshot (28 B, still under the 32 B cap).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AcRecord {
     pub net_id: NetId,
@@ -292,8 +295,11 @@ pub struct AcRecord {
     pub pitch: i8,
     pub flags: u16,
     pub pose_state: u8,
-    /// Bay/rack active + swap state and `glide_qb` ([`combat_flags`]).
+    /// Bay/rack active + swap state, `glide_qb`, and the weapon-arm phase bits
+    /// ([`combat_flags`]).
     pub combat_flags: u8,
+    /// Remaining 30 Hz wire ticks of an active weapon-arm deploy/stow/fire transition (expanded to 60 Hz clip frames by the sim).
+    pub weapon_arm_ticks: u8,
     pub ap: u16,
     pub en: u8,
     pub reload: [u8; 2],
@@ -321,6 +327,7 @@ impl Wire for AcRecord {
         w.write_u16(self.flags);
         w.write_u8(self.pose_state);
         w.write_u8(self.combat_flags);
+        w.write_u8(self.weapon_arm_ticks);
         w.write_u16(self.ap);
         w.write_u8(self.en);
         w.write_u8(self.reload[0]);
@@ -339,6 +346,7 @@ impl Wire for AcRecord {
             flags: r.read_u16()?,
             pose_state: r.read_u8()?,
             combat_flags: r.read_u8()?,
+            weapon_arm_ticks: r.read_u8()?,
             ap: r.read_u16()?,
             en: r.read_u8()?,
             reload: [r.read_u8()?, r.read_u8()?],
@@ -347,7 +355,7 @@ impl Wire for AcRecord {
     }
 }
 
-/// Full authoritative state of the recording client (154 B), always in snapshot packet 1.
+/// Full authoritative state of the recording client (229 B), always in snapshot packet 1.
 ///
 /// This is the state reconciliation replays from. It carries every movement phase and cooldown
 /// timer `AcMotion` owns, plus the phase parameters that a bare timer cannot rebuild (Quick Boost
@@ -369,8 +377,14 @@ pub struct LocalPlayerState {
     pub last_acked_seq: u16,
     /// Server tick this state was recorded at; prediction replays forward from here.
     pub server_tick: u32,
-    /// Same compact bay/swap/glide-qb bits as [`AcRecord::combat_flags`].
+    /// Same compact bay/swap/glide-qb + weapon-arm phase bits as [`AcRecord::combat_flags`].
     pub combat_flags: u8,
+    /// Remaining 30 Hz wire ticks of the active weapon-arm transition (expanded to 60 Hz clip frames by the sim).
+    pub weapon_arm_ticks: u8,
+    /// Alternating weapon-arm barrel/muzzle index.
+    pub weapon_arm_barrel: u8,
+    /// Continue the weapon-arm clip from the exact local frame (reconciliation only).
+    pub weapon_arm_frame: f32,
     /// Remaining ticks of each hand's bay swap (`0` when idle).
     pub swap_ticks: [u16; 2],
     /// Magazine counters for the hand, bay, and shoulder weapons.
@@ -430,7 +444,7 @@ pub struct LocalPlayerState {
 }
 
 impl LocalPlayerState {
-    pub const WIRE_BYTES: usize = 223;
+    pub const WIRE_BYTES: usize = 229;
 }
 
 impl Wire for LocalPlayerState {
@@ -451,6 +465,9 @@ impl Wire for LocalPlayerState {
         w.write_u16(self.last_acked_seq);
         w.write_u32(self.server_tick);
         w.write_u8(self.combat_flags);
+        w.write_u8(self.weapon_arm_ticks);
+        w.write_u8(self.weapon_arm_barrel);
+        w.write_f32(self.weapon_arm_frame);
         for v in self.swap_ticks {
             w.write_u16(v);
         }
@@ -543,6 +560,9 @@ impl Wire for LocalPlayerState {
             last_acked_seq: r.read_u16()?,
             server_tick: r.read_u32()?,
             combat_flags: r.read_u8()?,
+            weapon_arm_ticks: r.read_u8()?,
+            weapon_arm_barrel: r.read_u8()?,
+            weapon_arm_frame: r.read_f32()?,
             swap_ticks: [r.read_u16()?, r.read_u16()?],
             hand_ammo: [r.read_u16()?, r.read_u16()?],
             bay_ammo: [r.read_u16()?, r.read_u16()?],
@@ -636,10 +656,12 @@ pub struct FireEvent {
     pub aim_dir: [i8; 3],
     pub fire_tick: u32,
     pub seed: u8,
+    /// Weapon-arm barrel/muzzle index (0/1 alternating L/R; 0 for hand/shoulder guns).
+    pub barrel: u8,
 }
 
 impl FireEvent {
-    pub const WIRE_BYTES: usize = 20;
+    pub const WIRE_BYTES: usize = 21;
 }
 
 impl Wire for FireEvent {
@@ -655,6 +677,7 @@ impl Wire for FireEvent {
         }
         w.write_u32(self.fire_tick);
         w.write_u8(self.seed);
+        w.write_u8(self.barrel);
     }
 
     fn decode(r: &mut BitReader<'_>) -> Result<Self, ProtoError> {
@@ -666,6 +689,7 @@ impl Wire for FireEvent {
             aim_dir: [r.read_i8()?, r.read_i8()?, r.read_i8()?],
             fire_tick: r.read_u32()?,
             seed: r.read_u8()?,
+            barrel: r.read_u8()?,
         })
     }
 }

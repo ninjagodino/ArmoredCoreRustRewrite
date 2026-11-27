@@ -38,7 +38,8 @@ pub const BUDGET_SERVER_MBPS: f64 = 35.0;
 /// Ten-minute churn memory ceiling (RSS growth).
 pub const BUDGET_MEMORY_GROWTH_KB: u64 = 128 * 1024;
 
-const BOT_COUNT_MAX: usize = 64;
+/// Hard cap for local bots; `NetId` supports more, but the budget gates are 64.
+pub const BOT_COUNT_MAX: usize = 64;
 const CHURN_REMOVE_EVERY: u64 = 120;
 const CHURN_WAVE_EVERY: u64 = 1_800;
 const CHURN_GAP_TICKS: u64 = 20;

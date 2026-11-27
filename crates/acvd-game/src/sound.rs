@@ -300,6 +300,11 @@ fn mix_gain(curves: &[Vec<(f32, f32)>], x: f32) -> f32 {
         .fold(1.0, |gain, points| gain * envelope_at(points, x))
 }
 
+/// Cues to decode on the next Update, queued when the AC build knows which transition
+/// sounds it will need. Keeps XMA decoding off the first switch frame.
+#[derive(Resource, Default)]
+pub struct PreloadCues(pub Vec<String>);
+
 /// Projects and the banks a cue has already pulled in.
 #[derive(Resource)]
 pub struct Cues {
@@ -682,6 +687,49 @@ impl Cues {
         self.play_waves(commands, assets, waves, AudioBus::Sfx, false, volume)
     }
 
+    /// Decodes the first-use samples for cues that will be triggered by a state transition.
+    /// Without this the deploy/stow/bay-shift voices synchronously XMA-decode on the switch
+    /// frame, so the first transition starts late (the animation is already moving).
+    pub fn preload<'a>(
+        &mut self,
+        cues: impl IntoIterator<Item = &'a str>,
+        assets: &mut Assets<AudioSource>,
+    ) {
+        for cue in cues {
+            let waves: Vec<fev::Wave> = self
+                .projects
+                .iter()
+                .find_map(|(project, _)| {
+                    project
+                        .event(cue)
+                        .map(|_| project.waves(cue).into_iter().cloned().collect())
+                })
+                .unwrap_or_default();
+            for wave in waves {
+                let _ = self.source(assets, &wave);
+            }
+        }
+    }
+
+    /// Authored duration of a cue's first sound, from the FSB sample count and frequency.
+    /// TAE sound events are one-shots (`SoundRef::loop_count == 1`), so this is how long a
+    /// deploy/stow/bay-shift voice stays active; the TAE `end_frame` is only the trigger span.
+    #[allow(dead_code)] // active-duration audit in sound::tests
+    pub fn cue_seconds(&mut self, cue: &str) -> Option<f32> {
+        let wave = self
+            .projects
+            .iter()
+            .find_map(|(project, _)| project.waves(cue).into_iter().next().cloned())?;
+        let (length, frequency) = {
+            let sample = self
+                .bank(&wave.bank)?
+                .samples
+                .get(wave.index as usize)?;
+            (sample.length, sample.frequency)
+        };
+        (frequency > 0).then(|| length as f32 / frequency as f32)
+    }
+
     /// Length in seconds of one COM voice event, from the FSB sample count and frequency. The
     /// mission subtitle stays up for this long (`0x825196a8` writes its timer at window +0x170).
     pub fn com_voice_seconds(&mut self, voice: u8, offset: u32) -> Option<f32> {
@@ -906,6 +954,7 @@ impl Plugin for SoundPlugin {
         };
         app.insert_resource(Cues::load(&self.disc))
             .insert_resource(bgm)
+            .init_resource::<PreloadCues>()
             .init_resource::<ListenerDistance>()
             .init_resource::<AmbientState>()
             .add_audio_source::<BoostVoice>()
@@ -913,6 +962,7 @@ impl Plugin for SoundPlugin {
             .add_systems(
                 Update,
                 (
+                    preload_cues.before(crate::weapons::fire),
                     update_listener.before(crate::weapons::fire),
                     motion.after(crate::weapons::fire),
                     bgm_update,
@@ -922,6 +972,23 @@ impl Plugin for SoundPlugin {
                 ),
             );
     }
+}
+
+/// Decodes transition sounds queued by the AC build so their first play has no synchronous
+/// XMA-decode delay. Empty queues are a no-op.
+fn preload_cues(
+    queued: Option<ResMut<PreloadCues>>,
+    mut cues: ResMut<Cues>,
+    mut assets: ResMut<Assets<AudioSource>>,
+) {
+    let Some(mut queued) = queued else {
+        return;
+    };
+    if queued.0.is_empty() {
+        return;
+    }
+    let cues_to_preload = std::mem::take(&mut queued.0);
+    cues.preload(cues_to_preload.iter().map(String::as_str), &mut assets);
 }
 
 /// Refreshes the emitter-relative listener used by `Cues::play_at_position`. Runs before
@@ -1250,13 +1317,20 @@ fn motion(
                     }
                 }
                 crate::pose::TaeFired::Sound { cue } => {
-                    cues.play_at_position(
-                        &mut commands,
-                        &mut assets,
-                        cue,
-                        false,
-                        pilot_tf.translation,
-                    );
+                    // Bay-shift/purge cues come from the same position-less TAE sound
+                    // handler as the weapon-arm kind-204 cues; play them 2D so the
+                    // mechanical shift does not fade as the camera moves off the pilot.
+                    if matches!(cue.as_str(), "c00000047" | "c00000045") {
+                        cues.play(&mut commands, &mut assets, cue, false);
+                    } else {
+                        cues.play_at_position(
+                            &mut commands,
+                            &mut assets,
+                            cue,
+                            false,
+                            pilot_tf.translation,
+                        );
+                    }
                 }
                 crate::pose::TaeFired::Ffx { .. }
                 | crate::pose::TaeFired::Reattach { .. }
@@ -1662,6 +1736,79 @@ mod tests {
             assert!(
                 pcm.to_i16().iter().any(|&s| s.unsigned_abs() > 1000),
                 "{cue} decoded to silence"
+            );
+        }
+    }
+
+    /// Deploy/stow/bay-shift TAE sound events are one-shot FEV events. Their audible span is
+    /// the FSB sample duration, not the TAE 0..3 trigger window: `c00000056` is 3.024 s,
+    /// `c00000057` 1.988 s, `c00000047` 2.873 s and `c00000045` 0.737 s. This pins the full
+    /// durations so a phase transition cannot despawn the voice at the 3-frame TAE end.
+    #[test]
+    fn weapon_arm_and_bay_shift_transition_voices_play_full_samples() {
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        let Ok(disc) = Disc::open(&iso) else { return };
+        let mut cues = Cues::load(&disc);
+        for (cue, seconds) in [
+            ("c00000056", 3.0244),
+            ("c00000057", 1.9882),
+            ("c00000047", 2.8735),
+            ("c00000045", 0.7372),
+        ] {
+            let got = cues.cue_seconds(cue).unwrap_or_else(|| panic!("{cue} sample"));
+            assert!(
+                (got - seconds).abs() < 0.01,
+                "{cue}: expected {seconds:.3}s of authored one-shot, got {got:.3}s"
+            );
+            let event = cues
+                .projects
+                .iter()
+                .find_map(|(project, _)| project.event(cue))
+                .unwrap_or_else(|| panic!("{cue} FEV event"));
+            let sounds: Vec<_> = event.mix.iter().flat_map(|layer| &layer.sounds).collect();
+            assert!(!sounds.is_empty(), "{cue} has no sound refs");
+            for sound in sounds {
+                assert_eq!(
+                    (sound.flags, sound.loop_count),
+                    (0, 1),
+                    "{cue} must be a non-looping one-shot"
+                );
+            }
+        }
+    }
+
+    /// The weapon-arm TAE kind-204 events and the bay-shift TAE kind-2 event must resolve
+    /// to real FEV events and decoded FMOD samples, not silently fall through `missing`.
+    /// IDs are from `own007020`/`own007420` deploy/stow and `own000100` bay shift.
+    #[test]
+    fn weapon_arm_and_bay_shift_sfx_resolve_real_samples() {
+        let iso = acvd_formats::vfs::repo_root().join(acvd_formats::vfs::X360_ISO);
+        let Ok(disc) = Disc::open(&iso) else { return };
+        let mut cues = Cues::load(&disc);
+        let mut assets = Assets::<AudioSource>::default();
+        for (cue, what) in [
+            ("c00000036", "am7020 deploy Arm_Blade_Open"),
+            ("c00000037", "am7020 stow Arm_Blade_Return"),
+            ("c00000038", "am7110 deploy Arm_Snipe_Open"),
+            ("c00000039", "am7110 stow Arm_Snipe_Return"),
+            ("c00000056", "am7420 deploy Arm_HShot_Open"),
+            ("c00000057", "am7420 stow Arm_HShot_close"),
+            ("c00000047", "bay shift change_weapon02"),
+            ("c00000045", "bay purge purge00"),
+        ] {
+            let waves: Vec<fev::Wave> = cues
+                .projects
+                .iter()
+                .find_map(|(p, _)| {
+                    p.event(cue)
+                        .map(|_| p.waves(cue).into_iter().cloned().collect())
+                })
+                .unwrap_or_else(|| panic!("{what}: missing FEV event {cue}"));
+            assert!(!waves.is_empty(), "{what}: no waves");
+            let wave = &waves[0];
+            assert!(
+                cues.source(&mut assets, wave).is_some(),
+                "{what}: {cue} did not decode to an AudioSource"
             );
         }
     }

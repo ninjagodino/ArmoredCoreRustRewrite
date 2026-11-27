@@ -56,8 +56,16 @@ fn run() -> Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--out" => out = PathBuf::from(args.next().context("--out needs a directory")?),
-            "--disc" => disc_path = Some(PathBuf::from(args.next().context("--disc needs a path")?)),
-            "--quality" => quality = args.next().context("--quality needs 1..31")?.parse().context("--quality")?,
+            "--disc" => {
+                disc_path = Some(PathBuf::from(args.next().context("--disc needs a path")?))
+            }
+            "--quality" => {
+                quality = args
+                    .next()
+                    .context("--quality needs 1..31")?
+                    .parse()
+                    .context("--quality")?
+            }
             "--no-audio" => audio = false,
             "--force" => force = true,
             "-h" | "--help" => {
@@ -74,18 +82,25 @@ fn run() -> Result<()> {
     if !out.starts_with(root.join("private")) {
         bail!("--out must stay under private/ (got {})", out.display());
     }
-    let disc = Disc::open(&disc_path.clone().unwrap_or_else(|| vfs::default_disc(&root)))?;
+    let disc = Disc::open(
+        &disc_path
+            .clone()
+            .unwrap_or_else(|| vfs::default_disc(&root)),
+    )?;
     match command {
         "list" => list(&disc, &out),
         "cache" => {
-            let name = positional.get(1).context("cache needs a movie name (see `acvd-movies list`)")?;
+            let name = positional
+                .get(1)
+                .context("cache needs a movie name (see `acvd-movies list`)")?;
             cache(&disc, &root, &out, name, quality, audio, force)
         }
         "clean" => {
             let name = positional.get(1).context("clean needs a movie name")?;
             let dir = out.join(asset_stem(name)?.0);
             if dir.exists() {
-                std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+                std::fs::remove_dir_all(&dir)
+                    .with_context(|| format!("removing {}", dir.display()))?;
                 println!("removed {}", dir.display());
             }
             Ok(())
@@ -105,7 +120,14 @@ fn asset_stem(name: &str) -> Result<(String, String)> {
         let path = name.replace('\\', "/");
         let file = path.rsplit('/').next().unwrap_or(&path);
         let stem = file.strip_suffix(".wmv").unwrap_or(file);
-        return Ok((stem.to_string(), if path.ends_with(".wmv") { path } else { format!("{path}.wmv") }));
+        return Ok((
+            stem.to_string(),
+            if path.ends_with(".wmv") {
+                path
+            } else {
+                format!("{path}.wmv")
+            },
+        ));
     }
     let stem = name.strip_suffix(".wmv").unwrap_or(name);
     Ok((stem.to_string(), format!("movie/jp/{stem}.wmv")))
@@ -122,12 +144,21 @@ fn list(disc: &Disc, out: &Path) -> Result<()> {
         let file = asset.rsplit('/').next().unwrap_or(&asset);
         let stem = file.trim_end_matches(".wmv");
         let manifest = out.join(stem).join("manifest.json");
-        let state = match std::fs::read(&manifest).ok().and_then(|b| serde_json::from_slice::<Manifest>(&b).ok()) {
-            Some(m) => format!("cached {} frames, {:.2}s ({}x{} @ {:.3})", m.frames, m.duration, m.width, m.height, m.fps),
+        let state = match std::fs::read(&manifest)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Manifest>(&b).ok())
+        {
+            Some(m) => format!(
+                "cached {} frames, {:.2}s ({}x{} @ {:.3})",
+                m.frames, m.duration, m.width, m.height, m.fps
+            ),
             None => "not cached".to_string(),
         };
         let size = disc.size(&asset).unwrap_or(0);
-        println!("{stem:<24} {:>10.1} MiB  {state}", size as f64 / (1024.0 * 1024.0));
+        println!(
+            "{stem:<24} {:>10.1} MiB  {state}",
+            size as f64 / (1024.0 * 1024.0)
+        );
     }
     Ok(())
 }
@@ -143,19 +174,34 @@ fn cache(
 ) -> Result<()> {
     ensure!((1..=31).contains(&quality), "--quality must be 1..31");
     let (stem, asset) = asset_stem(name)?;
-    ensure!(disc.exists(&asset), "no `{asset}` on the 360 disc (see `acvd-movies list`)");
+    ensure!(
+        disc.exists(&asset),
+        "no `{asset}` on the 360 disc (see `acvd-movies list`)"
+    );
     let dir = out.join(&stem);
     let manifest_path = dir.join("manifest.json");
     if manifest_path.exists() && !force {
-        println!("{} is already cached; pass --force to rebuild", dir.display());
+        println!(
+            "{} is already cached; pass --force to rebuild",
+            dir.display()
+        );
         return Ok(());
     }
-    let wmv = root.join("private/tmp").join(format!("acvd-movies-{stem}.wmv"));
+    let wmv = root
+        .join("private/tmp")
+        .join(format!("acvd-movies-{stem}.wmv"));
     std::fs::create_dir_all(wmv.parent().unwrap()).context("creating private/tmp")?;
-    std::fs::create_dir_all(dir.join("frames")).with_context(|| format!("creating {}", dir.display()))?;
-    let data = disc.read(&asset).with_context(|| format!("reading {asset}"))?;
+    std::fs::create_dir_all(dir.join("frames"))
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let data = disc
+        .read(&asset)
+        .with_context(|| format!("reading {asset}"))?;
     std::fs::write(&wmv, &data).with_context(|| format!("writing {}", wmv.display()))?;
-    println!("{asset}: {:.1} MiB -> {}", data.len() as f64 / 1048576.0, dir.display());
+    println!(
+        "{asset}: {:.1} MiB -> {}",
+        data.len() as f64 / 1048576.0,
+        dir.display()
+    );
 
     let probe = probe(&wmv)?;
     let fps = probe.fps.unwrap_or(30.0);
@@ -165,11 +211,22 @@ fn cache(
     let status = Command::new(ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&wmv)
-        .args(["-an", "-vsync", "0", "-start_number", "0", "-q:v", &quality.to_string()])
+        .args([
+            "-an",
+            "-vsync",
+            "0",
+            "-start_number",
+            "0",
+            "-q:v",
+            &quality.to_string(),
+        ])
         .arg(&frames_pattern)
         .status()
         .context("running ffmpeg (is it on PATH?)")?;
-    ensure!(status.success(), "ffmpeg frame extraction failed ({status})");
+    ensure!(
+        status.success(),
+        "ffmpeg frame extraction failed ({status})"
+    );
 
     let audio_name = if audio {
         let wav = dir.join("audio.wav");
@@ -180,7 +237,10 @@ fn cache(
             .arg(&wav)
             .status()
             .context("running ffmpeg (is it on PATH?)")?;
-        ensure!(status.success(), "ffmpeg audio extraction failed ({status})");
+        ensure!(
+            status.success(),
+            "ffmpeg audio extraction failed ({status})"
+        );
         Some("audio.wav".to_string())
     } else {
         None
@@ -204,10 +264,15 @@ fn cache(
         audio_seconds: probe.audio_seconds,
         generated_by: format!(
             "acvd-movies ffmpeg {frames} frames q{quality}{}; source {asset}",
-            if audio_name.is_some() { " + stereo 48k PCM" } else { "" }
+            if audio_name.is_some() {
+                " + stereo 48k PCM"
+            } else {
+                ""
+            }
         ),
     };
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?).with_context(|| format!("writing {}", manifest_path.display()))?;
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
     let _ = std::fs::remove_file(&wmv);
     println!(
         "cached {stem}: {} frames, {:.2}s, {}x{} @ {:.3} fps{} -> {}",
@@ -216,7 +281,11 @@ fn cache(
         probe.width,
         probe.height,
         fps,
-        if audio_name.is_some() { ", stereo WAV" } else { "" },
+        if audio_name.is_some() {
+            ", stereo WAV"
+        } else {
+            ""
+        },
         dir.display()
     );
     Ok(())
@@ -232,20 +301,37 @@ struct Probe {
 
 fn probe(wmv: &Path) -> Result<Probe> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_streams", "-show_format", "-of", "json"])
+        .args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+        ])
         .arg(wmv)
         .output()
         .context("running ffprobe (is it on PATH?)")?;
-    ensure!(output.status.success(), "ffprobe failed: {}", String::from_utf8_lossy(&output.stderr));
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).context("parsing ffprobe JSON")?;
+    ensure!(
+        output.status.success(),
+        "ffprobe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parsing ffprobe JSON")?;
     let streams = json["streams"].as_array().context("ffprobe streams")?;
-    let video = streams.iter().find(|s| s["codec_type"] == "video").context("no video stream")?;
+    let video = streams
+        .iter()
+        .find(|s| s["codec_type"] == "video")
+        .context("no video stream")?;
     let audio = streams.iter().find(|s| s["codec_type"] == "audio");
     let fps = video["r_frame_rate"]
         .as_str()
         .and_then(parse_ratio)
         .or_else(|| video["avg_frame_rate"].as_str().and_then(parse_ratio));
-    let duration = json["format"]["duration"].as_str().and_then(|d| d.parse().ok());
+    let duration = json["format"]["duration"]
+        .as_str()
+        .and_then(|d| d.parse().ok());
     Ok(Probe {
         width: video["width"].as_u64().unwrap_or(0) as u32,
         height: video["height"].as_u64().unwrap_or(0) as u32,

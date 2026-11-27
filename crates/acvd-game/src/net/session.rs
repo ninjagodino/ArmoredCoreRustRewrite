@@ -33,6 +33,8 @@ pub struct NetConfig {
     pub listen_port: u16,
     pub connect: Option<SocketAddr>,
     pub netem: Option<NetemConfig>,
+    /// Live bots hosted by `--listen` (they fight through the authoritative server).
+    pub bots: usize,
     pub max_clients: usize,
     pub disc: Option<std::path::PathBuf>,
     pub map: String,
@@ -526,7 +528,7 @@ impl NetRuntime {
             };
             let server_config = ServerConfig {
                 bind: SocketAddr::from(([127, 0, 0, 1], port)),
-                max_clients: config.max_clients.max(1),
+                max_clients: config.max_clients.max(config.bots + 1).max(1),
                 protocol_id: NETCODE_PROTOCOL_ID,
                 map: config.map.clone(),
                 disc: config.disc.clone(),
@@ -536,10 +538,18 @@ impl NetRuntime {
             };
             let shutdown = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&shutdown);
+            let bots = config.bots;
             let thread = std::thread::Builder::new()
                 .name("acvd-listen-server".into())
                 .spawn(move || {
-                    if let Err(err) = acvd_server::run(server_config, flag) {
+                    let result = acvd_server::run_with_bots(
+                        server_config,
+                        bots,
+                        acvd_server::bots::Distribution::Cluster,
+                        acvd_sim::world::DEFAULT_MATCH_SEED,
+                        flag,
+                    );
+                    if let Err(err) = result {
                         log::error!("listen server: {err:#}");
                     }
                 })
@@ -607,9 +617,12 @@ pub fn apply_world_deltas(
         collision.break_prop(prop_id);
         for mut prop in &mut props {
             if prop.prop_id.0 == prop_id {
+                // A local prediction may already have broken this prop; only the first break
+                // transition may spawn debris/sfx.
+                let was_broken = prop.sim.broken;
                 prop.sim.hp = 0.0;
                 prop.sim.broken = true;
-                prop.sim.just_broken = true;
+                prop.sim.just_broken = !was_broken;
             }
         }
     }
@@ -652,35 +665,20 @@ pub fn step_prediction(
     mut runtime: ResMut<NetRuntime>,
     mut collision: ResMut<crate::collision::Collision>,
     mut pilots: Query<(&mut crate::control::Pilot, &mut Transform)>,
-    mut props: Query<&mut crate::map::DestructibleProp>,
 ) {
-    // The first authoritative local state is what creates the prediction, so reconcile even
-    // while `prediction` is still `None`.
+    // The server owns prop HP online. Local prediction therefore never applies collision damage
+    // to props (a local break followed by `DestructibleBreak` would double-spawn debris/sfx).
     if runtime.session.joined {
         let _ = runtime
             .session
-            .reconcile_pending(&mut collision.0, |prop_id, raw| {
-                for mut prop in &mut props {
-                    if prop.prop_id.0 == prop_id {
-                        return prop.apply_collision_damage(raw);
-                    }
-                }
-                false
-            });
+            .reconcile_pending(&mut collision.0, |_prop_id, _raw| false);
     }
     let steps = runtime.session.steps_due(time.delta_secs());
     if steps > 0 {
         let input = runtime.input;
         runtime
             .session
-            .step_ticks(steps, &input, &mut collision.0, |prop_id, raw| {
-                for mut prop in &mut props {
-                    if prop.prop_id.0 == prop_id {
-                        return prop.apply_collision_damage(raw);
-                    }
-                }
-                false
-            });
+            .step_ticks(steps, &input, &mut collision.0, |_prop_id, _raw| false);
     }
     runtime.last_aim = (runtime.input.aim_yaw, runtime.input.aim_pitch);
     let Some(pred) = runtime.session.prediction.as_mut() else {

@@ -278,7 +278,6 @@ fn texture_pack(disc: &Disc, asset: &str) -> Option<String> {
 /// fall back to static rendering when appropriate.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
-
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
@@ -433,11 +432,7 @@ pub fn spawn(
             // Radial outward direction from explosion center + deterministic jitter.
             let mut dir = world_center - explosion_origin;
             if dir.length_squared() < 1e-4 {
-                dir = Vec3::new(
-                    hash01(s + 1) * 2.0 - 1.0,
-                    0.5,
-                    hash01(s + 2) * 2.0 - 1.0,
-                );
+                dir = Vec3::new(hash01(s + 1) * 2.0 - 1.0, 0.5, hash01(s + 2) * 2.0 - 1.0);
             }
             dir.x += (hash01(s + 3) - 0.5) * 0.45;
             dir.z += (hash01(s + 4) - 0.5) * 0.45;
@@ -447,8 +442,7 @@ pub fn spawn(
             // Heavier hull/body pieces of an enemy get gentler spread & slower tumble than
             // small `break*` shrapnel so the wreckage reads as a heavy machine coming apart.
             let heavy = kind == DebrisKind::Enemy
-                && ((has_explicit_break_bones && !is_gib_bone_name(bone_name))
-                    || radii[i] > 2.2);
+                && ((has_explicit_break_bones && !is_gib_bone_name(bone_name)) || radii[i] > 2.2);
             let speed_scale = if heavy { 0.48 } else { 1.0 };
             let spin_scale = if heavy { 0.42 } else { 1.0 };
 
@@ -609,8 +603,8 @@ pub fn probe_shot(mark: Option<Res<acvd_render::app::ShotMark>>, rigs: Query<&De
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acvd_formats::vfs;
     use crate::collision::{Collision, Layer, Plane};
+    use acvd_formats::vfs;
 
     #[test]
     fn gib_piece_falls_bounces_settles_and_shrinks() {
@@ -662,10 +656,16 @@ mod tests {
             }
         }
 
-        assert!(gib.pos.distance(init_pos) > 3.0, "gib must travel away from spawn");
+        assert!(
+            gib.pos.distance(init_pos) > 3.0,
+            "gib must travel away from spawn"
+        );
         assert!(max_angle > 0.5, "gib must tumble (max_angle={max_angle})");
         assert!(bounced, "gib must bounce on ground collision");
-        assert!(gib.done, "gib must finish shrinking after settling on ground");
+        assert!(
+            gib.done,
+            "gib must finish shrinking after settling on ground"
+        );
         assert_eq!(last_tf.scale, Vec3::ZERO);
     }
 
@@ -694,7 +694,10 @@ mod tests {
         ];
         for (asset, expected, diffuse, bump) in cases {
             let pack = texture_pack(&disc, asset).expect("gib model TPF exists on disc");
-            assert_eq!(pack, expected, "{asset} should resolve to its own model TPF");
+            assert_eq!(
+                pack, expected,
+                "{asset} should resolve to its own model TPF"
+            );
             assert!(
                 packs.find(&disc, &pack, diffuse).unwrap().is_some(),
                 "diffuse `{diffuse}` missing from {pack}"
@@ -738,12 +741,42 @@ mod tests {
 
         let mut packs = Packs::default();
         let cases = [
-            ("e0010", "model/ene/e0010/e0010_m.bnd.dcx|e0010_b.flv", DebrisKind::Enemy, false),
-            ("e1020", "model/ene/e1020/e1020_m.bnd.dcx|e1020_b.flv", DebrisKind::Enemy, false),
-            ("e2030", "model/ene/e2030/e2030_m.bnd.dcx|e2030_b.flv", DebrisKind::Enemy, false),
-            ("o2070", "model/obj/o2070/o2070_m.bnd.dcx|o2070_b.flv", DebrisKind::Prop, false),
-            ("o2108", "model/obj/o2108/o2108_m.bnd.dcx|o2108_b.flv", DebrisKind::Prop, true),
-            ("o4235", "model/obj/o4235/o4235_m.bnd.dcx|o4235_b.flv", DebrisKind::Prop, true),
+            (
+                "e0010",
+                "model/ene/e0010/e0010_m.bnd.dcx|e0010_b.flv",
+                DebrisKind::Enemy,
+                false,
+            ),
+            (
+                "e1020",
+                "model/ene/e1020/e1020_m.bnd.dcx|e1020_b.flv",
+                DebrisKind::Enemy,
+                false,
+            ),
+            (
+                "e2030",
+                "model/ene/e2030/e2030_m.bnd.dcx|e2030_b.flv",
+                DebrisKind::Enemy,
+                false,
+            ),
+            (
+                "o2070",
+                "model/obj/o2070/o2070_m.bnd.dcx|o2070_b.flv",
+                DebrisKind::Prop,
+                false,
+            ),
+            (
+                "o2108",
+                "model/obj/o2108/o2108_m.bnd.dcx|o2108_b.flv",
+                DebrisKind::Prop,
+                true,
+            ),
+            (
+                "o4235",
+                "model/obj/o4235/o4235_m.bnd.dcx|o4235_b.flv",
+                DebrisKind::Prop,
+                true,
+            ),
         ];
 
         for (label, asset, kind, expect_static_base) in cases {
@@ -787,7 +820,10 @@ mod tests {
                 "{label} static base mismatch"
             );
             let dyn_count = rig.pieces.iter().filter(|p| p.dynamic).count();
-            assert!(dyn_count >= 5, "{label} should have >=5 dynamic gibs, got {dyn_count}");
+            assert!(
+                dyn_count >= 5,
+                "{label} should have >=5 dynamic gibs, got {dyn_count}"
+            );
 
             // Step 30 frames (0.5 s) and verify dynamic gibs actually move & rotate (never freeze).
             let init_positions: Vec<Vec3> = rig
@@ -868,7 +904,10 @@ mod tests {
         app.add_systems(Update, step);
 
         // 1. Enemy-style rig (no static base): should move joints then despawn when finished.
-        let enemy_joint = app.world_mut().spawn(Transform::from_xyz(0.0, 2.0, 0.0)).id();
+        let enemy_joint = app
+            .world_mut()
+            .spawn(Transform::from_xyz(0.0, 2.0, 0.0))
+            .id();
         let enemy_root = app
             .world_mut()
             .spawn((
@@ -902,8 +941,14 @@ mod tests {
             .id();
 
         // 2. Prop-style rig with static base: dynamic gib moves and shrinks, static base stays.
-        let base_joint = app.world_mut().spawn(Transform::from_xyz(10.0, 0.0, 0.0)).id();
-        let gib_joint = app.world_mut().spawn(Transform::from_xyz(10.0, 3.0, 0.0)).id();
+        let base_joint = app
+            .world_mut()
+            .spawn(Transform::from_xyz(10.0, 0.0, 0.0))
+            .id();
+        let gib_joint = app
+            .world_mut()
+            .spawn(Transform::from_xyz(10.0, 3.0, 0.0))
+            .id();
         let prop_root = app
             .world_mut()
             .spawn((

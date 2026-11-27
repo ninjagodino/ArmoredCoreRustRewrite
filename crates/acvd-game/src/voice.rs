@@ -152,7 +152,10 @@ impl VoiceLibrary {
             version: 1,
             packs: self.packs.clone(),
         };
-        std::fs::write(CUSTOM_VOICE_MANIFEST, serde_json::to_string_pretty(&manifest)?)?;
+        std::fs::write(
+            CUSTOM_VOICE_MANIFEST,
+            serde_json::to_string_pretty(&manifest)?,
+        )?;
         Ok(())
     }
 
@@ -262,12 +265,7 @@ impl VoiceLibrary {
     pub fn next_name(&self) -> String {
         (1..)
             .map(|n| format!("CUSTOM {n}"))
-            .find(|name| {
-                !self
-                    .packs
-                    .iter()
-                    .any(|p| p.name.eq_ignore_ascii_case(name))
-            })
+            .find(|name| !self.packs.iter().any(|p| p.name.eq_ignore_ascii_case(name)))
             .unwrap_or_else(|| "CUSTOM".to_string())
     }
 }
@@ -290,7 +288,12 @@ pub fn text_id(offset: u32) -> Option<i32> {
     }
     ROWS.iter()
         .find(|row| {
-            [row.data.voice_offset0, row.data.voice_offset1, row.data.voice_offset2].contains(&offset)
+            [
+                row.data.voice_offset0,
+                row.data.voice_offset1,
+                row.data.voice_offset2,
+            ]
+            .contains(&offset)
         })
         .map(|row| row.data.text_id)
         .filter(|id| *id > 0)

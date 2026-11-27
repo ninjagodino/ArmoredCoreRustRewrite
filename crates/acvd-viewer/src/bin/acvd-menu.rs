@@ -36,7 +36,8 @@ struct Viewer {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut positional, mut lang, mut disc, mut shot, mut placeholders, mut atlas, mut kit_mode) = (Vec::new(), "en".to_string(), None, None, false, None, false);
+    let (mut positional, mut lang, mut disc, mut shot, mut placeholders, mut atlas, mut kit_mode) =
+        (Vec::new(), "en".to_string(), None, None, false, None, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--lang" => lang = args.next().unwrap_or(lang),
@@ -48,37 +49,72 @@ fn main() {
             _ => positional.push(a),
         }
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let disc = Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let disc =
+        Disc::open(&disc.unwrap_or_else(|| vfs::default_disc(&root))).expect("opening the disc");
     let folder = format!("lang/{lang}/menu");
-    let mut layouts: Vec<String> = disc.list(&folder).into_iter().filter(|n| n.ends_with(".drb.dcx")).collect();
-    let wanted = positional.first().cloned().unwrap_or_else(|| "staffroll".into());
-    let path = if wanted.ends_with(".drb.dcx") { wanted.clone() } else { format!("{folder}/{wanted}.drb.dcx") };
-    let current = layouts.iter().position(|l| l.eq_ignore_ascii_case(&path)).unwrap_or_else(|| {
-        layouts.insert(0, path);
-        0
-    });
+    let mut layouts: Vec<String> = disc
+        .list(&folder)
+        .into_iter()
+        .filter(|n| n.ends_with(".drb.dcx"))
+        .collect();
+    let wanted = positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "staffroll".into());
+    let path = if wanted.ends_with(".drb.dcx") {
+        wanted.clone()
+    } else {
+        format!("{folder}/{wanted}.drb.dcx")
+    };
+    let current = layouts
+        .iter()
+        .position(|l| l.eq_ignore_ascii_case(&path))
+        .unwrap_or_else(|| {
+            layouts.insert(0, path);
+            0
+        });
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window { title: "acvd-menu".into(), resolution: WindowResolution::new(1280, 720), ..default() }),
+        primary_window: Some(Window {
+            title: "acvd-menu".into(),
+            resolution: WindowResolution::new(1280, 720),
+            ..default()
+        }),
         ..default()
     }))
     .add_plugins(menu::MenuPlugin)
     .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.07)))
-    .insert_resource(Viewer { disc, layouts, current, dialog: 0, wanted_dialog: positional.get(1).cloned(), shown: None, layout: None, placeholders, atlas, kit_mode, kit: None })
+    .insert_resource(Viewer {
+        disc,
+        layouts,
+        current,
+        dialog: 0,
+        wanted_dialog: positional.get(1).cloned(),
+        shown: None,
+        layout: None,
+        placeholders,
+        atlas,
+        kit_mode,
+        kit: None,
+    })
     .add_systems(Startup, |mut commands: Commands| {
         commands.spawn(Camera2d);
     })
     .add_systems(Update, (browse, show).chain());
     if let Some(shot) = shot {
-        app.insert_resource(shot).add_systems(Update, take_shot.after(show));
+        app.insert_resource(shot)
+            .add_systems(Update, take_shot.after(show));
     }
     app.run();
 }
 
 fn browse(keys: Res<ButtonInput<KeyCode>>, mut viewer: ResMut<Viewer>) {
-    let step = |a: KeyCode, b: KeyCode| keys.just_pressed(b) as isize - keys.just_pressed(a) as isize;
+    let step =
+        |a: KeyCode, b: KeyCode| keys.just_pressed(b) as isize - keys.just_pressed(a) as isize;
     let layout_step = step(KeyCode::ArrowUp, KeyCode::ArrowDown);
     if layout_step != 0 {
         let n = viewer.layouts.len() as isize;
@@ -88,7 +124,10 @@ fn browse(keys: Res<ButtonInput<KeyCode>>, mut viewer: ResMut<Viewer>) {
     }
     let dialog_step = step(KeyCode::ArrowLeft, KeyCode::ArrowRight);
     if dialog_step != 0 {
-        let n = viewer.layout.as_ref().map_or(1, |l| l.drb.dialogs.len().max(1)) as isize;
+        let n = viewer
+            .layout
+            .as_ref()
+            .map_or(1, |l| l.drb.dialogs.len().max(1)) as isize;
         viewer.dialog = (viewer.dialog as isize + dialog_step).rem_euclid(n) as usize;
     }
 }
@@ -101,7 +140,9 @@ fn show(
     mut window: Query<&mut Window, With<PrimaryWindow>>,
     shot: Option<ResMut<Shot>>,
 ) {
-    let Ok(mut window) = window.single_mut() else { return };
+    let Ok(mut window) = window.single_mut() else {
+        return;
+    };
     let size = Vec2::new(window.width(), window.height());
     if viewer.kit_mode {
         let key = Some((usize::MAX, 0, [size.x as u32, size.y as u32]));
@@ -144,7 +185,11 @@ fn show(
             }
         }
     }
-    let key = Some((viewer.current, viewer.dialog, [size.x as u32, size.y as u32]));
+    let key = Some((
+        viewer.current,
+        viewer.dialog,
+        [size.x as u32, size.y as u32],
+    ));
     if viewer.shown == key {
         return;
     }
@@ -154,23 +199,60 @@ fn show(
     }
     let layout = viewer.layout.as_ref().unwrap();
     if let Some(name) = &viewer.atlas {
-        let found = layout.drb.textures.iter().position(|t| &t.name == name).and_then(|i| layout.textures[i].clone());
+        let found = layout
+            .drb
+            .textures
+            .iter()
+            .position(|t| &t.name == name)
+            .and_then(|i| layout.textures[i].clone());
         let Some(image) = found else {
-            eprintln!("no texture `{name}`; layout has {:?}", layout.drb.textures.iter().map(|t| &t.name).collect::<Vec<_>>());
+            eprintln!(
+                "no texture `{name}`; layout has {:?}",
+                layout
+                    .drb
+                    .textures
+                    .iter()
+                    .map(|t| &t.name)
+                    .collect::<Vec<_>>()
+            );
             return;
         };
-        commands.spawn((MenuRoot, Node { position_type: PositionType::Absolute, ..default() }, ImageNode::new(image)));
+        commands.spawn((
+            MenuRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                ..default()
+            },
+            ImageNode::new(image),
+        ));
         window.title = format!("{} - texture {name}", viewer.layouts[viewer.current]);
         if let Some(mut shot) = shot {
             shot.ready = true;
         }
         return;
     }
-    let Some(dialog) = layout.drb.dialogs.get(viewer.dialog) else { return };
+    let Some(dialog) = layout.drb.dialogs.get(viewer.dialog) else {
+        return;
+    };
     let scale = (size.x / 1280.0).min(size.y / 720.0);
     let dsize = Vec2::new(dialog.size[0] as f32, dialog.size[1] as f32) * scale;
-    menu::spawn(&mut commands, layout, viewer.dialog, ((size - dsize) / 2.0).max(Vec2::ZERO), scale);
-    window.title = format!("{} - [{}/{}] {} ({}x{}, {} objects)", viewer.layouts[viewer.current], viewer.dialog + 1, layout.drb.dialogs.len(), dialog.name, dialog.size[0], dialog.size[1], dialog.objects.len());
+    menu::spawn(
+        &mut commands,
+        layout,
+        viewer.dialog,
+        ((size - dsize) / 2.0).max(Vec2::ZERO),
+        scale,
+    );
+    window.title = format!(
+        "{} - [{}/{}] {} ({}x{}, {} objects)",
+        viewer.layouts[viewer.current],
+        viewer.dialog + 1,
+        layout.drb.dialogs.len(),
+        dialog.name,
+        dialog.size[0],
+        dialog.size[1],
+        dialog.objects.len()
+    );
     info!("{}", window.title);
     if let Some(mut shot) = shot {
         shot.ready = true;
@@ -217,7 +299,14 @@ fn spawn_kit_showcase(commands: &mut Commands, kit: &AcvdUiKit, scale: f32) {
         },
         scale,
     );
-    kit.spawn_text(commands, top_bar, FontRole::Header, "ACVD // AC DESIGN PRESETS", scale, palette::TEXT_PRIMARY);
+    kit.spawn_text(
+        commands,
+        top_bar,
+        FontRole::Header,
+        "ACVD // AC DESIGN PRESETS",
+        scale,
+        palette::TEXT_PRIMARY,
+    );
     let top_right = commands
         .spawn((
             Node {
@@ -229,7 +318,14 @@ fn spawn_kit_showcase(commands: &mut Commands, kit: &AcvdUiKit, scale: f32) {
             ChildOf(top_bar),
         ))
         .id();
-    kit.spawn_badge(commands, top_right, "ALL TYPES", palette::ACCENT_TEAL, true, scale);
+    kit.spawn_badge(
+        commands,
+        top_right,
+        "ALL TYPES",
+        palette::ACCENT_TEAL,
+        true,
+        scale,
+    );
     kit.spawn_badge(commands, top_right, "KE", palette::TEXT_MUTED, false, scale);
     kit.spawn_badge(commands, top_right, "CE", palette::TEXT_MUTED, false, scale);
     kit.spawn_badge(commands, top_right, "TE", palette::TEXT_MUTED, false, scale);
@@ -266,7 +362,13 @@ fn spawn_kit_showcase(commands: &mut Commands, kit: &AcvdUiKit, scale: f32) {
         },
         scale,
     );
-    kit.spawn_header(commands, left_panel, "PRESET DESIGNS", Some("67 / 118"), scale);
+    kit.spawn_header(
+        commands,
+        left_panel,
+        "PRESET DESIGNS",
+        Some("67 / 118"),
+        scale,
+    );
 
     let rows = [
         ("6260 NTAC_AC", Some("CLR 6260"), ButtonState::Normal),
@@ -305,9 +407,29 @@ fn spawn_kit_showcase(commands: &mut Commands, kit: &AcvdUiKit, scale: f32) {
             ChildOf(pager),
         ))
         .id();
-    kit.spawn_arrow(commands, prev_box, ArrowDir::Left, scale, palette::TEXT_PRIMARY);
-    kit.spawn_text(commands, prev_box, FontRole::Small, "PREV", scale, palette::TEXT_PRIMARY);
-    kit.spawn_text(commands, pager, FontRole::Small, "55-67 / 118", scale, palette::TEXT_MUTED);
+    kit.spawn_arrow(
+        commands,
+        prev_box,
+        ArrowDir::Left,
+        scale,
+        palette::TEXT_PRIMARY,
+    );
+    kit.spawn_text(
+        commands,
+        prev_box,
+        FontRole::Small,
+        "PREV",
+        scale,
+        palette::TEXT_PRIMARY,
+    );
+    kit.spawn_text(
+        commands,
+        pager,
+        FontRole::Small,
+        "55-67 / 118",
+        scale,
+        palette::TEXT_MUTED,
+    );
     let next_box = commands
         .spawn((
             Node {
@@ -319,8 +441,21 @@ fn spawn_kit_showcase(commands: &mut Commands, kit: &AcvdUiKit, scale: f32) {
             ChildOf(pager),
         ))
         .id();
-    kit.spawn_text(commands, next_box, FontRole::Small, "NEXT", scale, palette::TEXT_PRIMARY);
-    kit.spawn_arrow(commands, next_box, ArrowDir::Right, scale, palette::TEXT_PRIMARY);
+    kit.spawn_text(
+        commands,
+        next_box,
+        FontRole::Small,
+        "NEXT",
+        scale,
+        palette::TEXT_PRIMARY,
+    );
+    kit.spawn_arrow(
+        commands,
+        next_box,
+        ArrowDir::Right,
+        scale,
+        palette::TEXT_PRIMARY,
+    );
 
     // Right: Framed Panel (`Shop_Base1` corner brackets) with StatRows + Gauges
     let right_panel = kit.spawn_panel(
@@ -336,17 +471,79 @@ fn spawn_kit_showcase(commands: &mut Commands, kit: &AcvdUiKit, scale: f32) {
         },
         scale,
     );
-    kit.spawn_header(commands, right_panel, "AC SPECS", Some("AcCtrlParam"), scale);
+    kit.spawn_header(
+        commands,
+        right_panel,
+        "AC SPECS",
+        Some("AcCtrlParam"),
+        scale,
+    );
 
     let stats: [(&str, &str, Option<StatDelta<'_>>); 8] = [
-        ("AP", "35,582", Some(StatDelta { text: "38,140", cmp: 1 })),
-        ("KE Defense", "1,659", Some(StatDelta { text: "1,860", cmp: 1 })),
-        ("CE Defense", "685", Some(StatDelta { text: "505", cmp: -1 })),
-        ("TE Defense", "496", Some(StatDelta { text: "496", cmp: 0 })),
-        ("Boost Speed", "177 km/h", Some(StatDelta { text: "192 km/h", cmp: 1 })),
-        ("HB Speed", "371 km/h", Some(StatDelta { text: "358 km/h", cmp: -1 })),
-        ("EN Recovery", "10,218", Some(StatDelta { text: "12,170", cmp: 1 })),
-        ("Stability", "918", Some(StatDelta { text: "918", cmp: 0 })),
+        (
+            "AP",
+            "35,582",
+            Some(StatDelta {
+                text: "38,140",
+                cmp: 1,
+            }),
+        ),
+        (
+            "KE Defense",
+            "1,659",
+            Some(StatDelta {
+                text: "1,860",
+                cmp: 1,
+            }),
+        ),
+        (
+            "CE Defense",
+            "685",
+            Some(StatDelta {
+                text: "505",
+                cmp: -1,
+            }),
+        ),
+        (
+            "TE Defense",
+            "496",
+            Some(StatDelta {
+                text: "496",
+                cmp: 0,
+            }),
+        ),
+        (
+            "Boost Speed",
+            "177 km/h",
+            Some(StatDelta {
+                text: "192 km/h",
+                cmp: 1,
+            }),
+        ),
+        (
+            "HB Speed",
+            "371 km/h",
+            Some(StatDelta {
+                text: "358 km/h",
+                cmp: -1,
+            }),
+        ),
+        (
+            "EN Recovery",
+            "10,218",
+            Some(StatDelta {
+                text: "12,170",
+                cmp: 1,
+            }),
+        ),
+        (
+            "Stability",
+            "918",
+            Some(StatDelta {
+                text: "918",
+                cmp: 0,
+            }),
+        ),
     ];
     for (i, (label, val, delta)) in stats.into_iter().enumerate() {
         kit.spawn_stat_row(commands, right_panel, label, val, delta, i % 2 == 0, scale);
@@ -369,7 +566,15 @@ fn spawn_kit_showcase(commands: &mut Commands, kit: &AcvdUiKit, scale: f32) {
         scale,
     );
     kit.spawn_gauge(commands, gauge_card, "Load", 0.72, Some(0.85), false, scale);
-    kit.spawn_gauge(commands, gauge_card, "Energy", 0.94, Some(0.80), true, scale);
+    kit.spawn_gauge(
+        commands,
+        gauge_card,
+        "Energy",
+        0.94,
+        Some(0.80),
+        true,
+        scale,
+    );
 
     // Bottom helpline bar
     let bot_bar = kit.spawn_panel(
@@ -394,5 +599,12 @@ fn spawn_kit_showcase(commands: &mut Commands, kit: &AcvdUiKit, scale: f32) {
         scale,
         palette::TEXT_PRIMARY,
     );
-    kit.spawn_badge(commands, bot_bar, "UI KIT PHASE 1", palette::SQUARE_MARK, false, scale);
+    kit.spawn_badge(
+        commands,
+        bot_bar,
+        "UI KIT PHASE 1",
+        palette::SQUARE_MARK,
+        false,
+        scale,
+    );
 }

@@ -163,15 +163,48 @@ impl Track {
     /// Local rotation quaternion (x, y, z, w) at `frame`.
     pub fn rotation(&self, frame: f32) -> Option<[f32; 4]> {
         let (a, b, t, span) = self.bracket(frame)?;
+        if self.euler {
+            let xyz = match (a.rotation_tangents, b.rotation_tangents) {
+                (Some(ta), Some(tb)) => hermite(a.rotation, ta[1], b.rotation, tb[0], t, span),
+                _ => std::array::from_fn(|i| a.rotation[i] + (b.rotation[i] - a.rotation[i]) * t),
+            };
+            return Some(euler_quat(xyz));
+        }
+
+        // The file stores quaternion x,y,z with w >= 0 implied. A 180-degree rotation is
+        // therefore authored as either +1 or -1 on the axis; `am7020` a00_004
+        // l/r_armwepunit_06 flips from -1 to +1 at frames 92/93. Linear interpolation
+        // between those raw values passes through identity at f92.5 and snaps the blade
+        // hinge by 180 degrees. Put the endpoint/tangents in the same hemisphere first.
+        let qa = quat(a.rotation);
+        let mut qb = quat(b.rotation);
+        let dot = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3];
+        if dot < 0.0 {
+            qb = qb.map(|c| -c);
+            if a.rotation_tangents.is_none() && b.rotation_tangents.is_none() {
+                let q = std::array::from_fn(|i| qa[i] + (qb[i] - qa[i]) * t);
+                let n = q
+                    .iter()
+                    .map(|c| c * c)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(f32::EPSILON);
+                return Some(q.map(|c| c / n));
+            }
+            let br = b.rotation.map(|c| -c);
+            let tb = b.rotation_tangents.map(|t| t.map(|v| v.map(|c| -c)));
+            let xyz = match (a.rotation_tangents, tb) {
+                (Some(ta), Some(tb)) => hermite(a.rotation, ta[1], br, tb[0], t, span),
+                _ => std::array::from_fn(|i| a.rotation[i] + (br[i] - a.rotation[i]) * t),
+            };
+            return Some(quat(xyz));
+        }
+
         let xyz = match (a.rotation_tangents, b.rotation_tangents) {
             (Some(ta), Some(tb)) => hermite(a.rotation, ta[1], b.rotation, tb[0], t, span),
             _ => std::array::from_fn(|i| a.rotation[i] + (b.rotation[i] - a.rotation[i]) * t),
         };
-        Some(if self.euler {
-            euler_quat(xyz)
-        } else {
-            quat(xyz)
-        })
+        Some(quat(xyz))
     }
 
     /// Local translation at `frame`, if the track carries one.
@@ -511,6 +544,26 @@ mod tests {
             );
             assert_eq!(tr.scale(5.0), l.scale.then_some([1.0; 3]));
         }
+    }
+
+    #[test]
+    fn quaternion_sign_flip_uses_the_shortest_hemisphere() {
+        let key = |frame, x| Key {
+            frame,
+            translation: None,
+            rotation: [x, 0.0, 0.0],
+            rotation_tangents: None,
+            scale: None,
+        };
+        // `am7020` a00_004 l/r_armwepunit_06 has -1 at f92 and +1 at f93. Both are the same
+        // 180-degree rotation; interpolating the raw components would pass through identity.
+        let track = Track {
+            kind: 9,
+            euler: false,
+            keys: vec![key(0, -1.0), key(1, 1.0)],
+        };
+        let q = track.rotation(0.5).unwrap();
+        assert!(q[0] < -0.99 && q[3].abs() < 1e-5, "{q:?}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ fn record(net_id: u8) -> AcRecord {
         flags: ac_flags::BOOST | ac_flags::TEAM_B,
         pose_state: 2,
         combat_flags: combat_flags::LEFT_BAY_ACTIVE | combat_flags::RIGHT_SWAPPING,
+        weapon_arm_ticks: 7,
         ap: 500,
         en: 200,
         reload: [1, 2],
@@ -36,6 +37,9 @@ fn local_state() -> LocalPlayerState {
         combat_flags: combat_flags::LEFT_BAY_ACTIVE
             | combat_flags::RIGHT_SWAPPING
             | combat_flags::GLIDE_QB,
+        weapon_arm_ticks: 12,
+        weapon_arm_barrel: 1,
+        weapon_arm_frame: 42.0,
         swap_ticks: [150, 40],
         hand_ammo: [24, 30],
         bay_ammo: [8, 0],
@@ -286,6 +290,7 @@ fn local_state_and_hot_messages_roundtrip() {
         aim_dir: [127, -127, 0],
         fire_tick: 99,
         seed: 5,
+        barrel: 1,
     };
     assert_eq!(fire.to_bytes().len(), FireEvent::WIRE_BYTES);
     assert_eq!(FireEvent::from_bytes(&fire.to_bytes()).unwrap(), fire);
@@ -301,6 +306,7 @@ fn hot_messages_are_tagged_and_have_no_bullet_transforms() {
         aim_dir: [0, 0, -127],
         fire_tick: 77,
         seed: 9,
+        barrel: 0,
     };
     let hot = HotMessage::Fire(fire);
     let bytes = hot.to_bytes();

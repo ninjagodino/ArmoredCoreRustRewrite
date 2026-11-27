@@ -58,6 +58,10 @@ pub struct SoundRef {
     pub def: u16,
     pub x: f32,
     pub width: f32,
+    /// Per-sound playback flags (bit 0 is the FEV loop flag).
+    pub flags: u32,
+    /// Authored repeat count (`0` = not looped; `0xffff_ffff` = infinite).
+    pub loop_count: u32,
     pub volume: f32,
     pub fade_in: f32,
     pub fade_out: f32,
@@ -360,7 +364,9 @@ fn sound_ref(r: &mut Le) -> Result<SoundRef> {
     // x, width, flags, loop count, auto pitch, fine tune, volume and fades. See module docs.
     let x = r.f32()?;
     let width = r.f32()?;
-    r.skip(4 + 4 + 4 + 8 + 4 + 4)?;
+    let flags = r.u32()?;
+    let loop_count = r.u32()?;
+    r.skip(4 + 8 + 4 + 4)?;
     let volume = r.f32()?;
     let fade_in = r.f32()?;
     let fade_out = r.f32()?;
@@ -369,6 +375,8 @@ fn sound_ref(r: &mut Le) -> Result<SoundRef> {
         def,
         x,
         width,
+        flags,
+        loop_count,
         volume,
         fade_in,
         fade_out,

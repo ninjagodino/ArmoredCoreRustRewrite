@@ -530,7 +530,12 @@ fn update_lens_flare(
     shot_mark: Option<Res<acvd_render::app::ShotMark>>,
     ac_q: Query<&GlobalTransform, (With<Ac>, Without<FlareSlot>)>,
     mut cam_q: Query<
-        (&Camera, &GlobalTransform, &Projection, Option<&mut ZoomBlur>),
+        (
+            &Camera,
+            &GlobalTransform,
+            &Projection,
+            Option<&mut ZoomBlur>,
+        ),
         (
             With<Camera3d>,
             Without<crate::env::WaterReflectionCamera>,
@@ -772,7 +777,12 @@ fn update_lens_flare(
     }
 
     // 2. Dynamic world-space point flares (`AppFxLensFlareDrawEntity`, 360 `0x82c7b2b0`).
-    for (idx, pf) in point_flares.active.iter().take(MAX_POINT_FLARES).enumerate() {
+    for (idx, pf) in point_flares
+        .active
+        .iter()
+        .take(MAX_POINT_FLARES)
+        .enumerate()
+    {
         let env = pf.envelope();
         if env <= 0.002 {
             continue;
@@ -860,12 +870,8 @@ fn update_lens_flare(
             *gt = GlobalTransform::from(*xform);
             *vis = Visibility::Visible;
             if let Some(mut m) = mats.get_mut(&mat_handle.0) {
-                m.extension.tint = Vec4::new(
-                    cmd.tint.red,
-                    cmd.tint.green,
-                    cmd.tint.blue,
-                    cmd.tint.alpha,
-                );
+                m.extension.tint =
+                    Vec4::new(cmd.tint.red, cmd.tint.green, cmd.tint.blue, cmd.tint.alpha);
                 if m.extension.image != cmd.img {
                     m.extension.image = cmd.img;
                 }
@@ -1038,10 +1044,9 @@ mod tests {
         let Ok(disc) = Disc::default_for(&vfs::repo_root()) else {
             return;
         };
-        let env = acvd_formats::env::read(
-            &vfs::open(&disc, "model/map/ch_env/m4000_env.msb").unwrap(),
-        )
-        .unwrap();
+        let env =
+            acvd_formats::env::read(&vfs::open(&disc, "model/map/ch_env/m4000_env.msb").unwrap())
+                .unwrap();
         let lf = &env.scene.unwrap().lens_flare;
         let g = lf.direction();
         let sun_dir = Vec3::new(-g[0], g[1], g[2]).normalize();

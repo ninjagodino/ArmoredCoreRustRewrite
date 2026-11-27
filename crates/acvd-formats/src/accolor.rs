@@ -85,7 +85,12 @@ impl AcColor {
     /// The 7 `FC_AC_OverlayCol` pixel-shader constants (`c180..c186`) for `group`, in the reversed
     /// order uploaded by 360 `0x82ca9c70` (`0x82bd6588`) and `0x82461ce0`:
     /// `[eye, kojima, joint, optional, aid2, aid, base]`.
-    pub fn overlay_cols(&self, group: usize, color_min: f32, color_max: f32) -> [[f32; 4]; OVERLAY_CHANNELS] {
+    pub fn overlay_cols(
+        &self,
+        group: usize,
+        color_min: f32,
+        color_max: f32,
+    ) -> [[f32; 4]; OVERLAY_CHANNELS] {
         let g = &self.groups[group.min(GROUP_COUNT - 1)];
         [
             rgba_to_float(self.eye, color_min, color_max),

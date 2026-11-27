@@ -37,6 +37,7 @@ import ffx  # noqa: E402
 import mapwarp  # noqa: E402
 import parts  # noqa: E402
 import patchgen  # noqa: E402
+import loadout  # noqa: E402
 import ring  # noqa: E402
 import state_nav  # noqa: E402
 import symbols  # noqa: E402
@@ -105,7 +106,8 @@ def choose_mission(root, profile, map_id: int, args) -> tuple[int, int, str]:
 
 
 def make_patch(root, profile, *, mission_id: int, map_id: int, warp_mode: int,
-               dump_ffx: bool = False) -> tuple[patchgen.PatchSpec, dict]:
+               dump_ffx: bool = False,
+               loadout_arm: int | None = None) -> tuple[patchgen.PatchSpec, dict]:
     hooks = profile["hooks"]
     caves = profile["caves"]
     mission = profile["mission"]
@@ -140,6 +142,15 @@ def make_patch(root, profile, *, mission_id: int, map_id: int, warp_mode: int,
                         int(hooks["camera"]["word"]), int(caves["camera"]["base"]),
                         camera_words, int(hooks["camera"]["next"]))
 
+    root_words = ring.build_root_cave(
+        int(caves["root"]["base"]), int(profile["ring"]["base"]),
+        profile["ring"]["offsets"], int(hooks["root"]["next"]))
+    if len(root_words) * 4 > int(caves["root"]["size"]):
+        raise ProbeError("root cave exceeds its slot", 2)
+    patchgen.cave_patch(spec, int(hooks["root"]["addr"]),
+                        int(hooks["root"]["word"]), int(caves["root"]["base"]),
+                        root_words, int(hooks["root"]["next"]))
+
     warp_info = {"mode": warp_mode, "target": None}
     warp_words = []
     if warp_mode:
@@ -159,19 +170,50 @@ def make_patch(root, profile, *, mission_id: int, map_id: int, warp_mode: int,
 
     patchgen.ring_prearm(spec, profile["ring"], profile["ring"]["offsets"],
                          dump_ffx=dump_ffx, warp_mode=warp_mode)
+
+    loadout_info = {"arm": loadout_arm, "size": 0}
+    loadout_words: list[int] = []
+    if loadout_arm is not None:
+        gate_flag = (int(profile["ring"]["base"])
+                     + loadout.GATE_FLAG_OFFSET)
+        spec.add_be32(gate_flag, 0)
+        loadout_words = loadout.build_cave(
+            int(caves["loadout"]["base"]), loadout_arm,
+            gate_addr=gate_flag)
+        if len(loadout_words) * 4 > int(caves["loadout"]["size"]):
+            raise ProbeError("loadout cave exceeds its slot", 2)
+        patchgen.cave_patch(
+            spec, int(hooks["loadout"]["addr"]),
+            int(hooks["loadout"]["word"]),
+            int(caves["loadout"]["base"]), loadout_words,
+            int(hooks["loadout"]["next"]))
+        loadout_info = {
+            "arm": loadout_arm,
+            "weapon": loadout.weapon_id_for(loadout_arm),
+            "size": len(loadout_words) * 4,
+            "gate": gate_flag,
+        }
+
     sizes = {
         "ffx": len(ffx_words) * 4,
         "camera": len(camera_words) * 4,
+        "root": len(root_words) * 4,
         "mapwarp": warp_info.get("size", 0),
+        "loadout": loadout_info["size"],
     }
     exits = {
         "ffx": int(caves["ffx"]["base"]) + (len(ffx_words) - 1) * 4,
         "camera": int(caves["camera"]["base"]) + (len(camera_words) - 1) * 4,
+        "root": int(caves["root"]["base"]) + (len(root_words) - 1) * 4,
     }
     if warp_words:
         exits["mapwarp"] = (int(caves["mapwarp"]["base"])
                             + (len(warp_words) - 1) * 4)
-    return spec, {"warp": warp_info, "cave_sizes": sizes, "cave_exits": exits}
+    if loadout_words:
+        exits["loadout"] = (int(caves["loadout"]["base"])
+                            + (len(loadout_words) - 1) * 4)
+    return spec, {"warp": warp_info, "cave_sizes": sizes, "cave_exits": exits,
+                  "loadout": loadout_info}
 
 
 def patch_summary(spec: patchgen.PatchSpec) -> dict:
@@ -256,6 +298,15 @@ def probe_lines(profile, build_info: dict) -> list[str]:
     if "camera" in exits:
         lines.append(f"0x{exits['camera']:08X} cam_cave_exit max=4 "
                      f"after=actest_sortie_load r31")
+    if "root" in exits:
+        lines.append(f"0x{exits['root']:08X} root_cave_exit max=200 every=997 "
+                     f"after=env_bgm r11 r31 "
+                     f"[r31+0xb4]:f32 [r31+0xb8]:f32 [r31+0xbc]:f32")
+    if "loadout" in exits:
+        lines.append(f"0x824556F0 loadout_hook max=24 "
+                     f"after=actest_sortie_load r3 r4 lr")
+        lines.append(f"0x{exits['loadout']:08X} loadout_hit max=24 "
+                     f"after=actest_sortie_load r5 r6 r7 r8")
     return lines
 
 
@@ -429,14 +480,30 @@ def apply_look_at(root, profile, map_id: int, spec: str, args,
     status = drainer.camera_status() or {}
     read_eye = status.get("read_eye")
     read_target = status.get("read_target")
+    runtime = None
+    if kind == "part":
+        # Distant map actors can be parked until they enter the mission's
+        # active range; wait for the root cave's first airborne sample.
+        deadline = time.monotonic() + max(0.0, float(args.root_wait))
+        while True:
+            runtime = ring.root_follow_pose(drainer, float(args.dist))
+            if runtime is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
     if kind == "ac":
         target = read_target
         if target is None:
             raise ProbeError("camera readback target unavailable for --look-at ac", 6)
+    if runtime is not None:
+        eye, target, _, root, seq = runtime
+        result["target_source"] = "runtime_root"
+        result["root"] = {"seq": seq, "pos": fmt_vec(root)}
     result["target"] = fmt_vec(target)
     if args.eye:
         eye = parse_xyz(args.eye)
         result["eye_source"] = "explicit"
+    elif runtime is not None:
+        result["eye_source"] = "runtime_root"
     else:
         direction = None
         if read_eye is not None and read_target is not None:
@@ -455,6 +522,17 @@ def apply_look_at(root, profile, map_id: int, spec: str, args,
     result["handshake"] = apply
     time.sleep(int(profile["camera"]["settle_ms"]) / 1000.0)
     drainer.drain(int((time.monotonic() - wait_event.start) * 1000))
+    if runtime is not None:
+        # The bomber moves ~650 m/s along the clip-221 route; refresh the pose
+        # against the live root after the handshake so the shot is on target.
+        refreshed = ring.root_follow_pose(drainer, float(args.dist))
+        if refreshed is not None:
+            eye, target, _, root, seq = refreshed
+            result["eye"] = list(eye)
+            result["target"] = fmt_vec(target)
+            result["root"] = {"seq": seq, "pos": fmt_vec(root)}
+            result["refresh_seq"] = ring.update_camera(mem, profile, eye, target)
+            time.sleep(0.05)
     after = drainer.camera_status() or {}
     result["after"] = {
         "cam_ptr": after.get("cam_ptr"),
@@ -500,9 +578,15 @@ def annotate_records(root, profile, records: list[dict], out_dir: Path,
 def run_probe(root, profile, args) -> int:
     map_id = parse_map(args.map or "m4000")
     mission_id, warp_mode, mission_source = choose_mission(root, profile, map_id, args)
+    if args.loadout_arm is not None and warp_mode:
+        raise ProbeError(
+            "loadout gate uses ring +0x5C (warp mode); do not combine with --warp",
+            2,
+        )
     spec, build_info = make_patch(root, profile, mission_id=mission_id,
                                   map_id=map_id, warp_mode=warp_mode,
-                                  dump_ffx=args.dump_ffx)
+                                  dump_ffx=args.dump_ffx,
+                                  loadout_arm=args.loadout_arm)
     validation = validate.validate(profile, root, scan_index_refs=True)
     if not validation["ok"]:
         raise ProbeError("static validation failed: " + "; ".join(validation["errors"]), 2)
@@ -546,6 +630,7 @@ def run_probe(root, profile, args) -> int:
             "mission_source": mission_source,
             "warp": build_info["warp"],
             "cave_sizes": build_info["cave_sizes"],
+            "loadout": build_info.get("loadout"),
             "patch": patch_summary(spec),
             "validation": validation,
             "preflight": checks,
@@ -605,6 +690,7 @@ def run_probe(root, profile, args) -> int:
         "look_at_kind": look_kind,
         "target": list(target) if target is not None else None,
         "cave_sizes": build_info["cave_sizes"],
+        "loadout": build_info.get("loadout"),
         "patch": {"file": patch_file.name, **patch_summary(spec)},
         "validation": validation,
         "preflight": checks,
@@ -655,6 +741,21 @@ def run_probe(root, profile, args) -> int:
             drainer=drainer, records=records, input_path=input_path,
             debug_shot=debug_shot, driver=driver,
             interval=float(profile["nav"]["drain_interval"]))
+        if args.loadout_arm is not None:
+            # Arm the loadout cave only after the AC Test sortie loader starts, so
+            # title/garage AC previews keep the starter design. The cave checks the
+            # ring header +0x5C word (unused warp-mode word for m4000).
+            wait_event(
+                log,
+                lambda e: event_label(e) == "actest_sortie_load",
+                float(args.mission_timeout), proc, "actest sortie load",
+                drainer=drainer, records=records, input_path=input_path,
+                debug_shot=debug_shot, driver=driver,
+                interval=float(profile["nav"]["drain_interval"]))
+            gate = int(profile["ring"]["base"]) + loadout.GATE_FLAG_OFFSET
+            if not mem.write_u32(gate, 1):
+                raise ProbeError("could not arm the loadout gate", 7)
+            summary["loadout_gate"] = {"addr": gate, "value": 1}
         mission = wait_event(
             log,
             lambda e: event_label(e) == profile["nav"]["mission_label"],
@@ -704,8 +805,41 @@ def run_probe(root, profile, args) -> int:
             if not any(str(e).startswith("camera:") for e in summary["errors"]):
                 summary["errors"].append(f"camera: {err}")
 
-        shot_ok = take_shot(input_path, shot_path, timeout=12.0)
-        summary["shot"] = str(shot_path) if shot_ok else None
+        if args.look_at and summary.get("camera", {}).get("root"):
+            # Re-aim against the newest live root immediately before the shot;
+            # the clip-221 aircraft covers ~650 m/s, so the 200 ms settle pose
+            # would otherwise be hundreds of metres behind.
+            try:
+                refreshed = ring.root_follow_pose(drainer, float(args.dist))
+                if refreshed is not None:
+                    eye, target, _, root, seq = refreshed
+                    ring.update_camera(mem, profile, eye, target)
+                    summary["camera"]["eye"] = list(eye)
+                    summary["camera"]["target"] = fmt_vec(target)
+                    summary["camera"]["root"] = {"seq": seq, "pos": fmt_vec(root)}
+                    summary["camera"]["shot_refresh"] = True
+            except Exception as exc:  # refresh is best effort
+                summary["errors"].append(f"camera refresh: {exc}")
+        shot_ok = False
+        shot_paths = []
+        count = max(1, int(args.shot_count))
+        first_delay = max(0.0, float(args.shot_delay))
+        interval = max(0.0, float(args.shot_interval))
+        for i in range(count):
+            wait_s = first_delay if i == 0 else interval
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline and proc.poll() is None:
+                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+                drainer.drain(int((time.monotonic() - wait_event.start) * 1000))
+            path_i = shot_path
+            if count > 1:
+                path_i = shot_path.with_name(
+                    f"{shot_path.stem}_{i:02d}{shot_path.suffix}")
+            ok = take_shot(input_path, path_i, timeout=12.0)
+            shot_paths.append(str(path_i) if ok else None)
+            shot_ok = shot_ok or ok
+        summary["shots"] = shot_paths
+        summary["shot"] = shot_paths[0] if shot_paths else None
         if not shot_ok:
             summary["errors"].append(f"shot not written: {shot_path}")
 
@@ -825,11 +959,22 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--eye", help="explicit camera eye X,Y,Z")
     ap.add_argument("--dist", type=float, default=None,
                     help="camera distance from target (default profile 20)")
+    ap.add_argument("--root-wait", type=float, default=0.0,
+                    help="seconds to wait for a live airborne actor root before aiming")
     ap.add_argument("--dump-ffx", action="store_true")
     ap.add_argument("--annotate", action="store_true")
     ap.add_argument("--input", help="existing ffx.jsonl for --annotate")
     ap.add_argument("--shot", help="guest PNG path")
+    ap.add_argument("--shot-delay", type=float, default=0.0,
+                    help="seconds between camera apply and the first shot")
+    ap.add_argument("--shot-count", type=int, default=1,
+                    help="number of shots in a timed series")
+    ap.add_argument("--shot-interval", type=float, default=1.0,
+                    help="seconds between shots in a timed series")
     ap.add_argument("--test", default="actest1", help="AC Test layer name")
+    ap.add_argument("--loadout-arm", type=int, default=None,
+                    help="override the starter arms slot (410) with this "
+                         "weapon-arm id, e.g. 7420; suppresses hand/bay slots")
     ap.add_argument("--recipe", help="drive.py recipe override (demo only)")
     ap.add_argument("--title-timeout", type=float, default=None)
     ap.add_argument("--mission-timeout", type=float, default=None)

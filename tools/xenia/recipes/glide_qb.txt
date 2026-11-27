@@ -1,0 +1,22 @@
+# AC TEST -> boost -> the boost_glide.txt turn/forward sequence -> Glide Boost along
+# the bridge, then High Boost (X) while gliding at 1.6 s and 2.3 s.
+run ac_test.txt
+wait 2
+press LB
+wait 0.4
+stick L 0 1 3
+stick R 1 0 1.2
+stick L 0 1 2
+stick L 0 -1 2.5
+stick L 1 0 2
+stick L 0 1
+press LS
+wait 1.6
+press X
+wait 0.7
+shot private/xenia/shots/glide_qb_a.png
+press X
+wait 0.7
+shot private/xenia/shots/glide_qb_b.png
+release
+wait 1

@@ -181,26 +181,25 @@ impl EnemyAi {
             _ => Archetype::Tank,
         };
 
-        let (walk_kmh, dash_kmh, lift_kmh, airborne) =
-            if let Some(h) = find(ENEMY_ENEMYHERIBEHAVIORPARAM_BIN, param_id).map(|r| &r.data) {
-                (
-                    h.horizontal_max_speed,
-                    h.dash_horizontal_max_speed.max(h.horizontal_max_speed),
-                    h.lift_up_max_speed,
-                    matches!(archetype, Archetype::Heli),
-                )
-            } else if let Some(m) =
-                find(ENEMY_ENEMYMECHBEHAVIORPARAM_BIN, param_id).map(|r| &r.data)
-            {
-                (
-                    m.horizontal_max_speed,
-                    m.dash_horizontal_max_speed.max(m.horizontal_max_speed),
-                    0.0,
-                    false,
-                )
-            } else {
-                (40.0, 60.0, 0.0, false)
-            };
+        let (walk_kmh, dash_kmh, lift_kmh, airborne) = if let Some(h) =
+            find(ENEMY_ENEMYHERIBEHAVIORPARAM_BIN, param_id).map(|r| &r.data)
+        {
+            (
+                h.horizontal_max_speed,
+                h.dash_horizontal_max_speed.max(h.horizontal_max_speed),
+                h.lift_up_max_speed,
+                matches!(archetype, Archetype::Heli),
+            )
+        } else if let Some(m) = find(ENEMY_ENEMYMECHBEHAVIORPARAM_BIN, param_id).map(|r| &r.data) {
+            (
+                m.horizontal_max_speed,
+                m.dash_horizontal_max_speed.max(m.horizontal_max_speed),
+                0.0,
+                false,
+            )
+        } else {
+            (40.0, 60.0, 0.0, false)
+        };
 
         let turn_deg_s = basic
             .map(|b| f32::from(b.turn_accel_deg_per_sec).max(20.0))
@@ -372,7 +371,11 @@ impl EnemyAi {
         // Right arm weapon (`WEAPON_ID__ARMWEP_R`)
         if arm.hands[0].kind != Kind::Skip {
             let max_r = arm.hands[0].decay.damp_range.clamp(160.0, 500.0);
-            let burst = if arm.hands[0].reload_time <= 14.0 { 5 } else { 1 };
+            let burst = if arm.hands[0].reload_time <= 14.0 {
+                5
+            } else {
+                1
+            };
             weapons.push(AiWeaponSlot::new(
                 WeaponRole::Main,
                 arm.hands[0],
@@ -386,7 +389,11 @@ impl EnemyAi {
         // Left arm weapon (`WEAPON_ID__ARMWEP_L`)
         if arm.hands[1].kind != Kind::Skip {
             let max_r = arm.hands[1].decay.damp_range.clamp(160.0, 500.0);
-            let burst = if arm.hands[1].reload_time <= 14.0 { 5 } else { 1 };
+            let burst = if arm.hands[1].reload_time <= 14.0 {
+                5
+            } else {
+                1
+            };
             weapons.push(AiWeaponSlot::new(
                 WeaponRole::Sub,
                 arm.hands[1],
@@ -516,8 +523,9 @@ impl EnemyAi {
         let desired_player_yaw = yaw_from_dir(dir_xz).unwrap_or(self.yaw);
 
         // Perception (`Targetting_CatchUpWithConeInSide` + `LockCheckRay` + `IsLastHitRemember`).
-        let in_sight =
-            has_los && dist_3d <= self.visible_dist && angle_to_player <= self.visible_half_angle_rad;
+        let in_sight = has_los
+            && dist_3d <= self.visible_dist
+            && angle_to_player <= self.visible_half_angle_rad;
         let in_hearing = dist_3d <= self.hearing_dist;
         let hit_alert = health.last_hit_timer > 0.0;
         let max_keep_dist = self.visible_dist.max(self.hearing_dist) * 1.35;
@@ -625,8 +633,8 @@ impl EnemyAi {
                     self.state_timer += dt;
                     if self.sub_state == 0 {
                         // Approach & flank sweep.
-                        let move_dir = (dir_xz + right_xz * (0.4 * self.strafe_sign))
-                            .normalize_or_zero();
+                        let move_dir =
+                            (dir_xz + right_xz * (0.4 * self.strafe_sign)).normalize_or_zero();
                         desired_vel = move_dir * self.dash_speed_ms;
                         if dist_xz < 70.0 {
                             self.sub_state = 1;
@@ -792,11 +800,7 @@ impl EnemyAi {
         if self.engaged && has_los {
             let new_forward = Quat::from_rotation_y(self.yaw) * FORWARD;
             let outer_angle_deg = if dir_xz != Vec3::ZERO {
-                new_forward
-                    .dot(dir_xz)
-                    .clamp(-1.0, 1.0)
-                    .acos()
-                    .to_degrees()
+                new_forward.dot(dir_xz).clamp(-1.0, 1.0).acos().to_degrees()
             } else {
                 0.0
             };
@@ -819,8 +823,15 @@ impl EnemyAi {
                 let aimed = outer_angle_deg <= slot.muzzle_cone_deg;
 
                 // Start a new burst when ready.
-                if slot.burst_left == 0 && in_range && aimed && slot.gun.cooldown <= 0.0 && slot.wait_timer <= 0.0 {
-                    slot.burst_left = slot.burst_shots.min(slot.gun.remaining.min(u8::MAX as u16) as u8);
+                if slot.burst_left == 0
+                    && in_range
+                    && aimed
+                    && slot.gun.cooldown <= 0.0
+                    && slot.wait_timer <= 0.0
+                {
+                    slot.burst_left = slot
+                        .burst_shots
+                        .min(slot.gun.remaining.min(u8::MAX as u16) as u8);
                     slot.burst_timer = 0.0;
                 }
 
@@ -906,7 +917,8 @@ impl EnemyAi {
             pos + dir_xz * 45.0
         };
 
-        let goal_moved = Vec2::new(goal.x - self.nav_last_goal.x, goal.z - self.nav_last_goal.z).length() > 12.0;
+        let goal_moved =
+            Vec2::new(goal.x - self.nav_last_goal.x, goal.z - self.nav_last_goal.z).length() > 12.0;
         if self.nav_path.is_empty()
             || self.nav_index >= self.nav_path.len()
             || (self.nav_repath_timer <= 0.0 && goal_moved)
@@ -1292,7 +1304,10 @@ mod tests {
             );
             blocked_shots += out.shots.len();
         }
-        assert_eq!(blocked_shots, 0, "occluded enemy must not fire through walls");
+        assert_eq!(
+            blocked_shots, 0,
+            "occluded enemy must not fire through walls"
+        );
 
         // Stepping out from behind cover (x = 70 m -> crosses z = -60 at x = 35 m > 30 m) restores LOS.
         let exposed_pos = Vec3::new(70.0, 0.0, -120.0);

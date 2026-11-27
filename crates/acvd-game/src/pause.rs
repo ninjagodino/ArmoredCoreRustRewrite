@@ -127,6 +127,7 @@ pub enum PauseAction {
     SelectOptionRow(OptionRow),
     StepUiScale(i8),
     StepHudSway(i8),
+    StepHudOpacity(i8),
     StepDisplayParam(DisplayParam, i8),
     StepShadowDistance(i8),
     StepVolume(AudioChannel, i8),
@@ -154,7 +155,7 @@ pub struct PauseAudioCtx<'w> {
 
 fn option_row_count(tab: OptionsTab) -> usize {
     match tab {
-        OptionsTab::Graphics => 8, // 0: Fullscreen, 1: UI Scale, 2: HUD Sway, 3: Gamma, 4: Brightness, 5: Contrast, 6: Shadow Dist, 7: Back
+        OptionsTab::Graphics => 9, // 0: Fullscreen, 1: UI Scale, 2: HUD Sway, 3: Gamma, 4: Brightness, 5: Contrast, 6: Shadow Dist, 7: HUD Opacity, 8: Back
         OptionsTab::Sound => 5,    // 0: Master, 1: Music, 2: SFX, 3: Menu/UI, 4: Back
     }
 }
@@ -218,6 +219,23 @@ fn step_hud_sway(
     sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_MOVE);
     state.status_banner = Some((
         format!("HUD SWAY: {}%", options.settings.hud_sway_percent()),
+        palette::ACCENT_TEAL,
+    ));
+    state.dirty = true;
+}
+
+fn step_hud_opacity(
+    commands: &mut Commands,
+    options: &mut PauseOptionsCtx,
+    audio: &mut PauseAudioCtx,
+    state: &mut PauseState,
+    delta: i8,
+) {
+    options.settings.step_hud_opacity(delta);
+    options.settings.save();
+    sound::cue(commands, &mut audio.cues, &mut audio.audio_assets, CUE_MOVE);
+    state.status_banner = Some((
+        format!("HUD OPACITY: {}%", options.settings.hud_opacity_percent()),
         palette::ACCENT_TEAL,
     ));
     state.dirty = true;
@@ -428,6 +446,11 @@ pub fn handle_input(
                 step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, delta);
                 return;
             }
+            PauseAction::StepHudOpacity(delta) => {
+                state.cursor = OptionRow::HudOpacity.cursor_index();
+                step_hud_opacity(&mut commands, &mut options, &mut audio, &mut state, delta);
+                return;
+            }
             PauseAction::StepDisplayParam(param, delta) => {
                 state.cursor = OptionRow::DisplayParam(param).cursor_index();
                 step_display_param(
@@ -569,6 +592,12 @@ pub fn handle_input(
                 PauseAction::SelectOptionRow(OptionRow::HudSway) | PauseAction::StepHudSway(_) => {
                     state.cursor = OptionRow::HudSway.cursor_index();
                     step_hud_sway(&mut commands, &mut options, &mut audio, &mut state, delta);
+                    return;
+                }
+                PauseAction::SelectOptionRow(OptionRow::HudOpacity)
+                | PauseAction::StepHudOpacity(_) => {
+                    state.cursor = OptionRow::HudOpacity.cursor_index();
+                    step_hud_opacity(&mut commands, &mut options, &mut audio, &mut state, delta);
                     return;
                 }
                 PauseAction::SelectOptionRow(OptionRow::DisplayParam(param))
@@ -744,6 +773,9 @@ pub fn handle_input(
             (OptionsTab::Graphics, 6) => {
                 step_shadow_distance(&mut commands, &mut options, &mut audio, &mut state, delta)
             }
+            (OptionsTab::Graphics, 7) => {
+                step_hud_opacity(&mut commands, &mut options, &mut audio, &mut state, delta)
+            }
             (OptionsTab::Sound, 0) => step_volume(
                 &mut commands,
                 &mut options,
@@ -831,6 +863,9 @@ pub fn handle_input(
                 (OptionsTab::Graphics, 6) => {
                     step_shadow_distance(&mut commands, &mut options, &mut audio, &mut state, 1)
                 }
+                (OptionsTab::Graphics, 7) => {
+                    step_hud_opacity(&mut commands, &mut options, &mut audio, &mut state, 1)
+                }
                 (OptionsTab::Sound, 0) => step_volume(
                     &mut commands,
                     &mut options,
@@ -863,7 +898,7 @@ pub fn handle_input(
                     AudioChannel::Ui,
                     1,
                 ),
-                (OptionsTab::Graphics, 7) | (OptionsTab::Sound, 4) => {
+                (OptionsTab::Graphics, 8) | (OptionsTab::Sound, 4) => {
                     state.screen = PauseScreen::Main;
                     state.cursor = items
                         .iter()
@@ -1358,7 +1393,36 @@ pub fn sync_ui(
                         scale * 0.88,
                     );
 
-                    7
+                    // Row 7: Combat HUD Transparency slider (0% - 100%)
+                    let ho_row = OptionRow::HudOpacity.cursor_index();
+                    let ho_txt = format!("{}%", settings.hud_opacity_percent());
+                    let ho_slider = kit.spawn_slider_row(
+                        &mut commands,
+                        list,
+                        "HUD OPACITY",
+                        &ho_txt,
+                        settings.hud_opacity.clamp(0.0, 1.0),
+                        None,
+                        state.cursor == ho_row,
+                        132.0,
+                        scale,
+                    );
+                    commands
+                        .entity(ho_slider.row)
+                        .insert((Button, PauseAction::SelectOptionRow(OptionRow::HudOpacity)));
+                    commands
+                        .entity(ho_slider.track)
+                        .insert(crate::garage::SliderTrack(
+                            crate::garage::SliderTrackTarget::HudOpacity,
+                        ));
+                    commands
+                        .entity(ho_slider.dec_btn)
+                        .insert((Button, PauseAction::StepHudOpacity(-1)));
+                    commands
+                        .entity(ho_slider.inc_btn)
+                        .insert((Button, PauseAction::StepHudOpacity(1)));
+
+                    8
                 }
                 OptionsTab::Sound => {
                     // Section: Sound Settings (Master, Music, SFX, Menu / UI)
@@ -1517,7 +1581,7 @@ mod tests {
 
     #[test]
     fn option_row_counts_match_tabs() {
-        assert_eq!(option_row_count(OptionsTab::Graphics), 8);
+        assert_eq!(option_row_count(OptionsTab::Graphics), 9);
         assert_eq!(option_row_count(OptionsTab::Sound), 5);
     }
 }

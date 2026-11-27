@@ -13,7 +13,13 @@ before doing long static hunts:
    - Run `acvd-game` with `--shot private\shots\<name>.png --wait <sec>` (plus scenario flags like
      `--hold w`, `--hold w,shift`, `--garage`, `--water <y>`, `--sfx <id>`) and filter `SHOT `
      output to see exact live entities, states, timers, active `Sfx` nodes/particles, velocities,
-     and transforms on that frame, then read the PNG.
+     and transforms on that frame.
+   - Compare the PNG numerically, not by eye: `cargo run -p acvd-shot -- diff <360.png> <shot.png>`
+     (or `.\tools\shot-check.ps1`, which runs the scene and the comparison) prints tone/gradient/tile
+     deltas, writes `_diff.png` / `_side.png` / `_compare.json`, and exits non-zero on a threshold
+     miss. Use `--crop` for a detail, `--ignore` for HUD regions, and `--align` for a small camera
+     offset. The 360 guest shot is the reference for appearance; disc files remain the source for
+     values and layouts.
    - If the subsystem under investigation does not yet log to `SHOT` on `ShotMark`, add a concise
      `SHOT` probe dump for it (like `sfx::probe_shot`) so the scene reports ground truth directly.
 2. **Headless Bevy `World` / disc-asset probes (`cargo test`)**:
@@ -25,4 +31,4 @@ before doing long static hunts:
    - Use the Rust probe to pinpoint the exact entity/ID/state behaving unexpectedly, then check that
      specific path in `acvd-index` / `ghidra-cli` / Xenia probes.
    - Keep a permanent unit test asserting the traced invariant and verify the fix with a before/after
-     `--shot` probe.
+     `acvd-shot diff` run (and the numeric report, not a visual guess).

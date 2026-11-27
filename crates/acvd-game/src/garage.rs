@@ -190,6 +190,7 @@ pub enum UiAction {
     SelectOptionRow(OptionRow),
     UiScaleStep(i8),
     HudSwayStep(i8),
+    HudOpacityStep(i8),
     DisplayParamStep(DisplayParam, i8),
     ShadowDistanceStep(i8),
     VolumeStep(AudioChannel, i8),
@@ -348,6 +349,7 @@ impl GarageViewAnimState {
 pub enum WheelAdjust {
     UiScale,
     HudSway,
+    HudOpacity,
     DisplayParam(DisplayParam),
     ShadowDistance,
     Volume(AudioChannel),
@@ -371,6 +373,9 @@ impl UiAction {
             }
             Self::SelectOptionRow(OptionRow::HudSway) | Self::HudSwayStep(_) => {
                 Some(WheelAdjust::HudSway)
+            }
+            Self::SelectOptionRow(OptionRow::HudOpacity) | Self::HudOpacityStep(_) => {
+                Some(WheelAdjust::HudOpacity)
             }
             Self::SelectOptionRow(OptionRow::DisplayParam(p)) | Self::DisplayParamStep(p, _) => {
                 Some(WheelAdjust::DisplayParam(p))
@@ -493,6 +498,7 @@ pub struct ColorPickerTrack(pub PaintDragTarget);
 pub enum SliderTrackTarget {
     UiScale,
     HudSway,
+    HudOpacity,
     DisplayParam(DisplayParam),
     ShadowDistance,
     Volume(AudioChannel),
@@ -673,8 +679,9 @@ fn options_row_desc(tab: OptionsTab, cursor: usize) -> &'static str {
             4 => "Adjust overall screen brightness\n(50% - 150%, default 100%).",
             5 => "Adjust light/dark contrast\n(50% - 150%, default 100%).",
             6 => "Set sun shadow draw distance\n(Off to Full Map).",
-            7 => "Return to the Garage main menu.",
-            8 => "Exit the game and return\nto the desktop.",
+            7 => "Adjust combat HUD opacity\n(0% - 100%, default 100%).",
+            8 => "Return to the Garage main menu.",
+            9 => "Exit the game and return\nto the desktop.",
             _ => "",
         },
         OptionsTab::Sound => match cursor {
@@ -893,12 +900,14 @@ impl AssembleSlot {
         )
     }
 
-    /// True when equipping Weapon Arms (`arms.is_weapon_arm != 0`) disables this slot
+    /// True when equipping Weapon Arms (`arms.is_weapon_arm != 0`) disables this slot.
+    /// Weapon arms only replace the hanger bays, shoulder unit, and Overed Weapon; the normal
+    /// L/R hand weapons stay equipped and are active while the arm is stowed
     /// (360 `0x824793c8` / `0x82457400` / `0x8288e218`, matching `assemble::assemble`).
     pub fn blocked_by_weapon_arm(self) -> bool {
         matches!(
             self,
-            Self::ArmUnitR | Self::ArmUnitL | Self::Shoulder | Self::HangerR | Self::HangerL
+            Self::Shoulder | Self::HangerR | Self::HangerL | Self::OveredWeapon
         )
     }
 
@@ -946,6 +955,17 @@ impl AssembleSlot {
 /// True when `design`'s equipped arms are Weapon Arms (`acvparts` cat-2 `+0x13c == 1`).
 pub fn has_weapon_arms(design: &AcAssemblyDesignSt) -> bool {
     acvd_data::part_field(design.arms as i64, 2, "is_weapon_arm") != 0.0
+}
+
+/// ACVD clears only the hanger bays, shoulder unit, and Overed Weapon when weapon arms are
+/// equipped. L/R hand weapons remain valid and become active whenever the arm is stowed.
+pub fn enforce_weapon_arm_loadout(design: &mut AcAssemblyDesignSt) {
+    if has_weapon_arms(design) {
+        design.hanger_r = 0;
+        design.hanger_l = 0;
+        design.shoulder = 0;
+        design.back_r = 0;
+    }
 }
 
 /// Returns all selectable part IDs (`0` = empty when allowed) for `slot`.
@@ -3022,6 +3042,18 @@ pub fn handle_input(
                 );
                 return;
             }
+            UiAction::HudOpacityStep(delta) => {
+                state.cursor = OptionRow::HudOpacity.cursor_index();
+                step_hud_opacity_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
             UiAction::DisplayParamStep(param, delta) => {
                 state.cursor = OptionRow::DisplayParam(param).cursor_index();
                 step_display_param_setting(
@@ -3419,6 +3451,17 @@ pub fn handle_input(
                 WheelAdjust::HudSway => {
                     state.cursor = OptionRow::HudSway.cursor_index();
                     step_hud_sway_setting(
+                        &mut commands,
+                        &mut options,
+                        &mut cues,
+                        &mut audio_assets,
+                        &mut state,
+                        delta,
+                    );
+                }
+                WheelAdjust::HudOpacity => {
+                    state.cursor = OptionRow::HudOpacity.cursor_index();
+                    step_hud_opacity_setting(
                         &mut commands,
                         &mut options,
                         &mut cues,
@@ -3901,6 +3944,17 @@ pub fn handle_input(
                 );
                 return;
             }
+            (OptionsTab::Graphics, 7) => {
+                step_hud_opacity_setting(
+                    &mut commands,
+                    &mut options,
+                    &mut cues,
+                    &mut audio_assets,
+                    &mut state,
+                    delta,
+                );
+                return;
+            }
             (OptionsTab::Sound, 0) => {
                 step_volume_setting(
                     &mut commands,
@@ -4057,7 +4111,7 @@ fn current_list_len(state: &GarageState, garage: &crate::Garage) -> usize {
         GarageScreen::GarageCustom => state.workshops.len(),
         GarageScreen::SortieConfig => 3, // Target Set, Map, Launch
         GarageScreen::Options => match state.options_tab {
-            OptionsTab::Graphics => 9, // Fullscreen, UI Scale, HUD Sway, Gamma, Brightness, Contrast, Shadow Dist, Back, Quit
+            OptionsTab::Graphics => 10, // Fullscreen, UI Scale, HUD Sway, Gamma, Brightness, Contrast, Shadow Dist, HUD Opacity, Back, Quit
             OptionsTab::Sound => 8, // Master, Music, SFX, Menu/UI, COM Voice, Add Custom COM Voice, Back, Quit
         },
         GarageScreen::ViewMode => 0,
@@ -4119,6 +4173,24 @@ fn step_hud_sway_setting(
     sound::cue(commands, cues, audio_assets, CUE_MOVE);
     state.set_banner(
         format!("HUD SWAY: {}%", options.settings.hud_sway_percent()),
+        Color::srgb(0.45, 0.92, 0.62),
+    );
+    state.ui_dirty = true;
+}
+
+fn step_hud_opacity_setting(
+    commands: &mut Commands,
+    options: &mut OptionsCtx,
+    cues: &mut Cues,
+    audio_assets: &mut Assets<AudioSource>,
+    state: &mut GarageState,
+    delta: i8,
+) {
+    options.settings.step_hud_opacity(delta);
+    options.settings.save();
+    sound::cue(commands, cues, audio_assets, CUE_MOVE);
+    state.set_banner(
+        format!("HUD OPACITY: {}%", options.settings.hud_opacity_percent()),
         Color::srgb(0.45, 0.92, 0.62),
     );
     state.ui_dirty = true;
@@ -4231,7 +4303,9 @@ fn preview_com_voice(
     commands: &mut Commands,
     audio_assets: &mut Assets<AudioSource>,
 ) {
-    if let Some(path) = options.voice_lib.line_for(&options.settings, crate::voice::msg::PREVIEW)
+    if let Some(path) = options
+        .voice_lib
+        .line_for(&options.settings, crate::voice::msg::PREVIEW)
     {
         let path = path.to_string();
         cues.custom_voice(commands, audio_assets, &path);
@@ -4355,10 +4429,7 @@ fn save_com_voice_editor(
     }
     if lines.is_empty() {
         sound::cue(commands, cues, audio_assets, CUE_ERROR);
-        state.set_banner(
-            "SET AT LEAST ONE VOICE LINE",
-            Color::srgb(0.96, 0.40, 0.36),
-        );
+        state.set_banner("SET AT LEAST ONE VOICE LINE", Color::srgb(0.96, 0.40, 0.36));
         return false;
     }
     options.voice_lib.upsert(CustomVoicePack {
@@ -4445,9 +4516,7 @@ fn handle_com_voice_editor_input(
             }
             return;
         }
-        if keys.just_pressed(KeyCode::Escape)
-            || keys.just_pressed(KeyCode::Backspace)
-            || gp_cancel
+        if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::Backspace) || gp_cancel
         {
             if let Some(editor) = state.com_voice_editor.as_mut() {
                 editor.confirm_exit = false;
@@ -4497,7 +4566,11 @@ fn handle_com_voice_editor_input(
         return;
     }
 
-    let Some(rows) = state.com_voice_editor.as_ref().map(ComVoiceEditor::row_count) else {
+    let Some(rows) = state
+        .com_voice_editor
+        .as_ref()
+        .map(ComVoiceEditor::row_count)
+    else {
         return;
     };
     if rows == 0 {
@@ -4520,7 +4593,11 @@ fn handle_com_voice_editor_input(
     }
 
     if keys.just_pressed(KeyCode::Delete) {
-        let focused = state.com_voice_editor.as_ref().map(|e| e.cursor).unwrap_or(0);
+        let focused = state
+            .com_voice_editor
+            .as_ref()
+            .map(|e| e.cursor)
+            .unwrap_or(0);
         if (1..=EDITOR_EVENTS.len()).contains(&focused) {
             let offset = EDITOR_EVENTS[focused - 1].offset;
             let removed = state
@@ -4536,7 +4613,11 @@ fn handle_com_voice_editor_input(
     }
 
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) || gp_confirm {
-        let cursor = state.com_voice_editor.as_ref().map(|e| e.cursor).unwrap_or(0);
+        let cursor = state
+            .com_voice_editor
+            .as_ref()
+            .map(|e| e.cursor)
+            .unwrap_or(0);
         if cursor == 0 {
             if let Some(editor) = state.com_voice_editor.as_mut() {
                 editor.name_editing = true;
@@ -4718,6 +4799,7 @@ fn apply_cursor_preview(state: &mut GarageState, garage: &mut crate::Garage) {
                     // Only the isolated `ASSEMBLY VIEW` preview AC updates while browsing parts;
                     // the main garage mech in the blurred background updates on Enter (equip).
                     slot.set(&mut garage.active_design, part_id);
+                    enforce_weapon_arm_loadout(&mut garage.active_design);
                 }
             }
         }
@@ -4992,6 +5074,7 @@ fn trigger_confirm(
             let orig = state.saved_design.unwrap_or(garage.active_design);
             let changed = slot.get(&orig) != part_id;
             slot.set(&mut garage.active_design, part_id);
+            enforce_weapon_arm_loadout(&mut garage.active_design);
             let pending = state.ac_preview_debounce.take().is_some();
             state.ac_preview_rebuilt = false;
             if slot_has_visible_ac_model(slot) && (changed || pending) {
@@ -5131,7 +5214,7 @@ fn trigger_confirm(
                 step_shadow_distance_setting(commands, options, cues, audio_assets, state, 1);
             }
             (OptionsTab::Graphics, 7) => {
-                trigger_cancel(commands, state, garage, cues, audio_assets);
+                step_hud_opacity_setting(commands, options, cues, audio_assets, state, 1);
             }
             (OptionsTab::Graphics, 8) => {
                 trigger_cancel(commands, state, garage, cues, audio_assets);
@@ -5821,6 +5904,21 @@ pub fn handle_slider_track_drag(
                     pause_state.dirty = true;
                 } else {
                     state.cursor = OptionRow::HudSway.cursor_index();
+                    state.ui_dirty = true;
+                }
+                changed = true;
+            }
+        }
+        SliderTrackTarget::HudOpacity => {
+            let prev = options.settings.hud_opacity_percent();
+            options.settings.set_hud_opacity_from_fill(fill);
+            if options.settings.hud_opacity_percent() != prev || just_pressed {
+                options.settings.save();
+                if in_pause_options {
+                    pause_state.cursor = OptionRow::HudOpacity.cursor_index();
+                    pause_state.dirty = true;
+                } else {
+                    state.cursor = OptionRow::HudOpacity.cursor_index();
                     state.ui_dirty = true;
                 }
                 changed = true;
@@ -7765,7 +7863,34 @@ fn spawn_garage_options_menu(
                 scale * 0.88,
             );
 
-            (7, 8)
+            // Combat HUD Transparency slider (0% - 100%)
+            let ho_row = OptionRow::HudOpacity.cursor_index();
+            let ho_txt = format!("{}%", settings.hud_opacity_percent());
+            let ho_slider = kit.spawn_slider_row(
+                commands,
+                list,
+                "HUD OPACITY",
+                &ho_txt,
+                settings.hud_opacity.clamp(0.0, 1.0),
+                None,
+                cursor == ho_row,
+                104.0,
+                scale,
+            );
+            commands
+                .entity(ho_slider.row)
+                .insert((Button, UiAction::SelectOptionRow(OptionRow::HudOpacity)));
+            commands
+                .entity(ho_slider.track)
+                .insert(SliderTrack(SliderTrackTarget::HudOpacity));
+            commands
+                .entity(ho_slider.dec_btn)
+                .insert((Button, UiAction::HudOpacityStep(-1)));
+            commands
+                .entity(ho_slider.inc_btn)
+                .insert((Button, UiAction::HudOpacityStep(1)));
+
+            (8, 9)
         }
         OptionsTab::Sound => {
             kit.spawn_text(
@@ -10646,7 +10771,7 @@ fn spawn_garage_view_mode_bar(
 
     let weapon_arm = arms.is_some_and(|a| a.weapon_arm);
     let has_r_arm = arms.is_some_and(|a| a.weapon_arm || a.hands[0].kind != Kind::Skip);
-    let has_l_arm = arms.is_some_and(|a| a.weapon_arm || a.hands[1].kind != Kind::Skip);
+    let has_l_arm = arms.is_some_and(|a| a.hands[1].kind != Kind::Skip);
     let has_r_bay =
         arms.is_some_and(|a| !a.weapon_arm && a.bays[0].kind != Kind::Skip && !a.hands[0].stance);
     let has_l_bay =
@@ -10932,7 +11057,11 @@ pub fn step_view_actions(
                     Hand::Left
                 };
                 let idx = if arms.weapon_arm { 0 } else { hand as usize };
-                let gun = arms.hands[idx];
+                let gun = if arms.weapon_arm {
+                    arms.weapon_arm_gun
+                } else {
+                    arms.hands[idx]
+                };
                 if gun.kind == Kind::Skip {
                     sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_ERROR);
                 } else if arms.weapon_arm {
@@ -11088,7 +11217,11 @@ pub fn step_view_actions(
             state.view_anim.hand_timers[i] = (state.view_anim.hand_timers[i] - dt).max(0.0);
             want_hand[i] = true;
             let hand = if i == 0 { Hand::Right } else { Hand::Left };
-            let gun = arms.hands[if arms.weapon_arm { 0 } else { i }];
+            let gun = if arms.weapon_arm {
+                arms.weapon_arm_gun
+            } else {
+                arms.hands[i]
+            };
             let is_ready =
                 matches!(state.view_anim.body, GarageViewBody::Ready { hand: h, .. } if h == hand);
             let stance_ok = !is_ready || rig.anims.as_ref().is_none_or(|a| a.sniper_allows(hand));
@@ -11499,7 +11632,9 @@ mod tests {
         assert_eq!(editor.cancel_row(), editor.save_row() + 1);
         assert!(!editor.dirty);
         let offset = EDITOR_EVENTS[1].offset;
-        editor.lines.insert(offset, "C:/voice/energy.mp3".to_string());
+        editor
+            .lines
+            .insert(offset, "C:/voice/energy.mp3".to_string());
         assert_eq!(editor.file_name(offset).as_deref(), Some("energy.mp3"));
         assert_eq!(editor.file_name(EDITOR_EVENTS[0].offset), None);
         assert!(editor.clear_line(offset));
@@ -11918,7 +12053,7 @@ mod tests {
                 sz.x
             );
         }
-        for (tab, count) in [(OptionsTab::Graphics, 9usize), (OptionsTab::Sound, 8usize)] {
+        for (tab, count) in [(OptionsTab::Graphics, 10usize), (OptionsTab::Sound, 8usize)] {
             for i in 0..count {
                 let desc = options_row_desc(tab, i);
                 assert!(!desc.is_empty(), "options_row_desc({tab:?}, {i}) is empty");
@@ -11972,6 +12107,14 @@ mod tests {
         assert_eq!(
             UiAction::HudSwayStep(-1).wheel_adjust(),
             Some(WheelAdjust::HudSway)
+        );
+        assert_eq!(
+            UiAction::SelectOptionRow(OptionRow::HudOpacity).wheel_adjust(),
+            Some(WheelAdjust::HudOpacity)
+        );
+        assert_eq!(
+            UiAction::HudOpacityStep(1).wheel_adjust(),
+            Some(WheelAdjust::HudOpacity)
         );
         assert_eq!(
             UiAction::SelectOptionRow(OptionRow::DisplayParam(DisplayParam::Gamma)).wheel_adjust(),

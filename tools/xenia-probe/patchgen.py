@@ -112,8 +112,11 @@ def ring_prearm(spec: PatchSpec, ring: dict, offsets: dict, *, dump_ffx: bool,
     spec.add_be32(base + int(offsets["ring_cap"]), cap)
     spec.add_be32(base + int(offsets["ring_recsz"]), recsz)
     spec.add_be32(base + int(offsets["warp_mode"]), warp_mode & 0xFFFFFFFF)
-    # Mapwarp evidence counters live in the unused header padding (0x60..0x68).
+    # Mapwarp evidence counters live in the unused header padding (0x60..0x68);
+    # the live animation root uses the field block after them (0x6C..0x80).
     for key in ("warp_calls", "warp_map", "warp_msb"):
+        spec.add_be32(base + int(offsets[key]), 0)
+    for key in ("root_ptr", "root_seq", "root_x", "root_y", "root_z"):
         spec.add_be32(base + int(offsets[key]), 0)
 
 

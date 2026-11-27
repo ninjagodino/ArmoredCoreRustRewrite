@@ -34,7 +34,9 @@ fn run() -> Result<ExitCode> {
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else { bail!(USAGE) };
     let asset = if cmd == "dump" { args.next() } else { None };
-    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
     let mut disc = std::env::var_os("ACVD_DISC").map(PathBuf::from);
     while let Some(flag) = args.next() {
         let value = args.next().map(PathBuf::from);

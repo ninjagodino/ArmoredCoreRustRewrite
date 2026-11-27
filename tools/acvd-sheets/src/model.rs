@@ -26,7 +26,11 @@ impl Paths {
         self.root.join("private").join("preflight")
     }
     pub fn paramdex(&self, game: &str) -> PathBuf {
-        self.root.join("external").join("paramdex").join(game).join("Defs")
+        self.root
+            .join("external")
+            .join("paramdex")
+            .join(game)
+            .join("Defs")
     }
     pub fn archives(&self) -> PathBuf {
         self.json().join("archives")
@@ -47,7 +51,11 @@ impl Paths {
         self.json().join("_tuning.json")
     }
     pub fn generated(&self) -> PathBuf {
-        self.root.join("crates").join("acvd-data").join("src").join("generated")
+        self.root
+            .join("crates")
+            .join("acvd-data")
+            .join("src")
+            .join("generated")
     }
 }
 
@@ -126,7 +134,8 @@ pub struct TargetRow {
 }
 
 pub fn read_csv<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
-    let mut rdr = csv::Reader::from_path(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut rdr =
+        csv::Reader::from_path(path).with_context(|| format!("opening {}", path.display()))?;
     rdr.deserialize()
         .enumerate()
         .map(|(i, r)| r.with_context(|| format!("{} data row {}", path.display(), i + 1)))
@@ -538,12 +547,18 @@ pub struct AcPartCategoryRow {
 
 impl AcPartCategoryRow {
     pub fn prefixes(&self) -> impl Iterator<Item = &str> {
-        self.prefixes.split(';').map(str::trim).filter(|p| !p.is_empty())
+        self.prefixes
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
     }
 
     pub fn model_path(&self, prefix: &str, model_id: u16) -> String {
         let code = format!("{prefix}{model_id:04}");
-        format!("model/ac/parts/{}/{code}/{code}_m.bnd.dcx|{code}.flv", self.model_dir)
+        format!(
+            "model/ac/parts/{}/{code}/{code}_m.bnd.dcx|{code}.flv",
+            self.model_dir
+        )
     }
 }
 
@@ -576,7 +591,11 @@ impl AssemblySlotRow {
     /// `m` for `*`. The first lands on the socket; a booster's second root uses dummy 25 or 26.
     pub fn roots<'a>(&'a self, m: &'a ModelSheet) -> Vec<&'a str> {
         if self.root.trim() == ALL_ROOTS {
-            m.skeleton.iter().filter(|b| b.parent < 0).map(|b| b.name.as_str()).collect()
+            m.skeleton
+                .iter()
+                .filter(|b| b.parent < 0)
+                .map(|b| b.name.as_str())
+                .collect()
         } else {
             self.root.split(';').map(str::trim).collect()
         }
@@ -752,7 +771,8 @@ pub struct TextureFormatRow {
 }
 
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -760,14 +780,21 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(value)?).with_context(|| format!("writing {}", path.display()))
+    std::fs::write(path, serde_json::to_string_pretty(value)?)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 pub fn load_groups(paths: &Paths) -> Result<Vec<GroupSheet>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(paths.json()).context("no private/sheets/json; run `extract` first")? {
+    for entry in
+        std::fs::read_dir(paths.json()).context("no private/sheets/json; run `extract` first")?
+    {
         let path = entry?.path();
-        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('_')) {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('_'))
+        {
             continue;
         }
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -780,20 +807,36 @@ pub fn load_groups(paths: &Paths) -> Result<Vec<GroupSheet>> {
 
 pub fn load_archive_groups(paths: &Paths) -> Result<Vec<ArchiveGroup>> {
     let index: ArchiveIndex = read_json(&paths.json().join("_archives.json"))?;
-    index.groups.iter().map(|g| read_json(&paths.archives().join(format!("{g}.json")))).collect()
+    index
+        .groups
+        .iter()
+        .map(|g| read_json(&paths.archives().join(format!("{g}.json"))))
+        .collect()
 }
 
 pub fn load_texture_groups(paths: &Paths) -> Result<Vec<TextureGroup>> {
     let index: ArchiveIndex = read_json(&paths.json().join("_archives.json"))?;
-    index.texture_groups.iter().map(|g| read_json(&paths.textures().join(format!("{g}.json")))).collect()
+    index
+        .texture_groups
+        .iter()
+        .map(|g| read_json(&paths.textures().join(format!("{g}.json"))))
+        .collect()
 }
 
 pub fn load_model_groups(paths: &Paths) -> Result<Vec<ModelGroup>> {
     let index: ArchiveIndex = read_json(&paths.json().join("_archives.json"))?;
-    index.model_groups.iter().map(|g| read_json(&paths.models().join(format!("{g}.json")))).collect()
+    index
+        .model_groups
+        .iter()
+        .map(|g| read_json(&paths.models().join(format!("{g}.json"))))
+        .collect()
 }
 
 pub fn load_motion_groups(paths: &Paths) -> Result<Vec<MotionGroup>> {
     let index: ArchiveIndex = read_json(&paths.json().join("_archives.json"))?;
-    index.motion_groups.iter().map(|g| read_json(&paths.motions().join(format!("{g}.json")))).collect()
+    index
+        .motion_groups
+        .iter()
+        .map(|g| read_json(&paths.motions().join(format!("{g}.json"))))
+        .collect()
 }

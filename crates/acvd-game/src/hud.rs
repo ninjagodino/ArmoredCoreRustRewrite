@@ -36,6 +36,7 @@ use acvd_formats::vfs::Disc;
 use acvd_render::app::ShotMark;
 use acvd_render::menu::{self, Layout, MenuGauge, MenuObject, MenuRoot, MenuSprite, MenuText};
 use acvd_render::Packs;
+use bevy::camera::primitives::{Aabb, MeshAabb};
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::ui::{px, UiTransform};
@@ -43,8 +44,9 @@ use bevy::window::PrimaryWindow;
 
 use crate::control::Pilot;
 use crate::damage::PlayerHealth;
-use crate::fcs::Fcs;
+use crate::fcs::{Fcs, LockedTarget};
 use crate::scan::{ReconUnit, ScanPortrait, ScanState, MAX_RECON_SLOTS};
+use crate::targets::TargetHealth;
 use crate::weapons::{Armament, Gun, Kind, OwPhase};
 
 const LAYOUT: &str = "lang/en/menu/sortie.drb.dcx";
@@ -161,6 +163,10 @@ pub struct Sortie {
     /// Cached Scan Mode enemy thumbnails (`image/enethumbnail/e%04d.tpf`, `0x827b29e0`) and AC
     /// emblems (`image/emblem/im%04d.tpf`, `0x823861d0`), with their texel `(width, height)`.
     scan_portraits: HashMap<ScanPortrait, Option<(Handle<Image>, Vec2)>>,
+    /// Lock-cursor `EnemyName` strings, keyed by the enemy row id (the `EnemyCommonSt` id parsed
+    /// from the model, e.g. `e1020` -> 1020). Source: `lang/en/text/menu/enemyname.fmg`, the bank
+    /// the lock HUD fills `EnemyName` from (1020 = `T-106E Slon`, 2030 = `F49 ROGERSI`).
+    enemy_names: HashMap<u32, String>,
 }
 
 impl Sortie {
@@ -203,6 +209,20 @@ impl Sortie {
 }
 
 pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
+    let enemy_names = match disc
+        .asset("lang/en/text/menu/enemyname.fmg")
+        .and_then(|b| Ok(acvd_formats::fmg::read(&b)?))
+    {
+        Ok(fmg) => fmg
+            .entries
+            .into_iter()
+            .filter_map(|(id, text)| (id >= 0).then_some((id as u32, text?)))
+            .collect(),
+        Err(e) => {
+            warn!("lang/en/text/menu/enemyname.fmg: {e:#}");
+            HashMap::new()
+        }
+    };
     Ok(Sortie {
         layout: menu::load(disc, LAYOUT, images)?,
         size: Vec2::ZERO,
@@ -212,6 +232,7 @@ pub fn load(disc: &Disc, images: &mut Assets<Image>) -> anyhow::Result<Sortie> {
         low: [0.0; 5],
         ap_effect: ApEffectState::default(),
         scan_portraits: HashMap::new(),
+        enemy_names,
     })
 }
 
@@ -273,42 +294,69 @@ impl Status {
 #[derive(Component)]
 pub struct Panel(usize);
 
-/// One 128x64 quadrant of the target lock-on cursor from `sortie.drb`. The four dialogs tile a
-/// 256x128 box centered on the target; each `CursorLine` tip is the quadrant's outer corner
-/// (`R` (0,0), `L` (128,0), `T` (0,64), `E` (128,64)).
+/// One 128x64 wing of the target lock-on cursor from `sortie.drb`. `0x829d3218` switches on
+/// `wing+0x15c`: E=0 top-left, T=1 top-right, L=2 bottom-left, R=3 bottom-right (the type values
+/// assigned by `0x829d4b88`). The four roots surround the `ACV_OutLine_LockCursor_Target` rect,
+/// which `0x829d3b38` scales by the lock-sight distance factor.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub enum LockCursorWing {
-    /// `ACV_OutLine_LockCursor_E` (bottom-right: `CursorLine`, `EnemyName`, `EnemyAP`).
+    /// `ACV_OutLine_LockCursor_E` (type 0, top-left: `CursorLine`, `EnemyName`, `EnemyAP`).
     Enemy,
-    /// `ACV_OutLine_LockCursor_R` (top-left: Right-arm `CursorLine`, `LockOnText`, `ReloadBar`).
+    /// `ACV_OutLine_LockCursor_R` (type 3, bottom-right: Right-arm `CursorLine`, `LockOnText`,
+    /// `ReloadBar`).
     RightArm,
-    /// `ACV_OutLine_LockCursor_L` (top-right: Left-arm `CursorLine`, `LockOnText`, `ReloadBar`).
+    /// `ACV_OutLine_LockCursor_L` (type 2, bottom-left: Left-arm `CursorLine`, `LockOnText`,
+    /// `ReloadBar`).
     LeftArm,
-    /// `ACV_OutLine_LockCursor_T` (bottom-left: Shoulder `CursorLine`, `LockOnText`, `ReloadBar`,
-    /// `MissileLock1..6` pips).
+    /// `ACV_OutLine_LockCursor_T` (type 1, top-right: Shoulder `CursorLine`, `LockOnText`,
+    /// `ReloadBar`, `MissileLock1..6` pips).
     Shoulder,
 }
 
-/// Simultaneous per-enemy lock cursor boxes: one 256x128 box per enemy in the FCS lock cone
-/// (retail reuses the `0x829d4b88` quadrant group as a draw command per candidate, `0x829d4e40`).
+/// Simultaneous per-enemy lock cursor groups: one four-wing group per enemy in the FCS lock cone
+/// (retail reuses the `0x829d4b88` group as a draw command per candidate, `0x829d4e40`).
 const MAX_LOCK_BOXES: usize = 8;
 
-/// One pooled lock cursor box: a root whose four [`LockBoxQuadrant`] dialogs tile a 256x128 box
-/// centred on the target. Only the FCS-selected target's box carries text, bars and missile pips.
+/// Authored size of every `ACV_OutLine_LockCursor_*` wing dialog in `sortie.drb`.
+const LOCK_WING_SIZE: Vec2 = Vec2::new(128.0, 64.0);
+
+/// Authored size of `ACV_OutLine_LockCursor_Target` in `sortie.drb`: the rect `0x829d3b38`
+/// reads through `0x82b7c5b0` and scales by the distance factor to place the four wing roots.
+/// The visible target frame is not this rect: `0x825a2e90` sizes the spot-info `Emblem` child to
+/// the target model's projected screen bounds, which is what `LockBoxFrame` draws.
+const LOCK_TARGET_SIZE: f32 = 32.0;
+
+/// Authored `ReloadBar` widths in `sortie.drb`: 53 px on the arm wings (`_L` `[44,29,97,32]`,
+/// `_R` `[31,29,84,32]`) and 52 px on the shoulder wing (`_T` `[31,40,83,43]`). `0x829d1ac0`
+/// fills the bar from the candidate record's `f32 +4` (lock progress clamped to `0..=1`), not
+/// from the weapon cooldown.
+const LOCK_RELOAD_BAR_ARM: f32 = 53.0;
+const LOCK_RELOAD_BAR_SHOULDER: f32 = 52.0;
+
+/// One pooled lock cursor group. `0x829d3b38` takes `rectOf(group+4)` through `0x82b7c5b0`
+/// (the authored 32x32 `ACV_OutLine_LockCursor_Target` node instantiated by `0x829d4dd8` /
+/// `0x824ab278` at `0x829d50ec`, not an enemy bounds rect), scales it by the `LockSight+0x2c`
+/// distance factor, centres it on the projected point and places the E/T/L/R wing roots on its
+/// corners. The `_Target` dialog only supplies `LockColor1st` / `LockColor2nd`; its `MonoRect`s
+/// are never painted. Only the FCS-selected target carries text/bars/pips.
 #[derive(Component)]
 pub struct LockBox(usize);
 
-/// One 128x64 quadrant dialog of a [`LockBox`] (`sortie.drb` `ACV_OutLine_LockCursor_*`).
+/// The enemy-sized frame over a lock target. `0x825a2e90` fills the `ACV_SPOT_ACInfo` record,
+/// then sets its `Emblem` child's rect to `{0, 0, model_screen_width, model_screen_height}`
+/// (`FUN_824aab80` -> vtable `+0xc`/`+0x10`). The rewrite uses the target's projected hit-sphere
+/// bounds for that rect, so the frame follows the enemy silhouette and distance. The authored
+/// 32x32 `_Target` rect remains the wing anchor only (`0x829d3b38`). Kept as a direct child of
+/// its [`LockBox`] so the group visibility hides it with the wings.
+#[derive(Component, Clone, Copy)]
+pub struct LockBoxFrame(usize);
+
+/// One wing dialog of a [`LockBox`] (`sortie.drb` `ACV_OutLine_LockCursor_*`).
 #[derive(Component, Clone, Copy)]
 pub struct LockBoxQuadrant {
     slot: usize,
     wing: LockCursorWing,
 }
-
-/// Per-target multi-lock marker from `sortie.drb` (`ACV_OutLine_LockCursor_Target`, 32x32:
-/// `LockColor1st` / `LockColor2nd`), indexed `0..6`.
-#[derive(Component)]
-pub struct MissileLockTarget(usize);
 
 /// Marker on the Combat Mode `ACV_LockSight_base` root (hidden while Scan Mode is active).
 #[derive(Component)]
@@ -371,6 +419,166 @@ pub fn place_centered(node: &mut Node, vp: Vec2, anchor: Vec2, scale: f32) {
     node.top = px(vp.y - anchor.y * scale);
 }
 
+/// `LockSight+0x2c` distance factor (`0x829d4828`): `1.0` up to `StaticDrawParam` index 57
+/// (50 m), easing to index 59 (0.3) at index 58 (100 m). The config pointer `0x82330c38` is four
+/// bytes into the file record, so the 360 reads +0xe0/+0xe4/+0xe8 for those three fields.
+/// `0x829d3b38` multiplies the enemy's projected rect by it.
+fn lock_cursor_scale(distance: f32) -> f32 {
+    let near = tuning(57).max(1.0);
+    let far = tuning(58).max(near + 1.0);
+    let final_scale = tuning(59).clamp(0.0, 1.0);
+    let t = ((distance - near) / (far - near)).clamp(0.0, 1.0);
+    1.0 + (final_scale - 1.0) * t
+}
+
+/// Lock target rect built by `0x829d3b38`: `rectOf(group+4)` (`0x82b7c5b0`, the authored 32x32
+/// `ACV_OutLine_LockCursor_Target` node used as a colour source) times the `LockSight+0x2c`
+/// distance factor, centred on the projected point. Values are physical viewport pixels.
+#[derive(Clone, Copy, Debug)]
+struct LockTargetRect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl LockTargetRect {
+    fn from_center_size(center: Vec2, size: Vec2) -> Self {
+        let half = size * 0.5;
+        Self {
+            left: center.x - half.x,
+            top: center.y - half.y,
+            right: center.x + half.x,
+            bottom: center.y + half.y,
+        }
+    }
+}
+
+fn push_projected(points: &mut Vec<Vec2>, cam: &Camera, cam_gt: &GlobalTransform, p: Vec3) {
+    if let Ok(v) = cam.world_to_viewport(cam_gt, p) {
+        if v.is_finite() {
+            points.push(v);
+        }
+    }
+}
+
+fn union_rect(points: Vec<Vec2>) -> Option<LockTargetRect> {
+    let mut min = Vec2::splat(f32::INFINITY);
+    let mut max = Vec2::splat(f32::NEG_INFINITY);
+    for p in points {
+        min = min.min(p);
+        max = max.max(p);
+    }
+    (max.x > min.x && max.y > min.y).then_some(LockTargetRect {
+        left: min.x,
+        top: min.y,
+        right: max.x,
+        bottom: max.y,
+    })
+}
+
+/// Screen-space union of the mesh bounds under a target root. `0x825a2e90` sizes the
+/// `ACV_SPOT_ACInfo` `Emblem` child to the target model's screen width/height
+/// (`FUN_824aab80` -> vtable `+0xc`/`+0x10`); the descendant mesh AABBs (bind pose) are the
+/// rewrite's model-bounds equivalent, so the frame tracks enemy size and distance. The mesh
+/// AABBs are computed once per handle because the enemy meshes are `NoFrustumCulling` and
+/// therefore never get Bevy's automatic `Aabb`.
+fn model_screen_rect(
+    cam: &Camera,
+    cam_gt: &GlobalTransform,
+    root: Entity,
+    children: &Query<&Children>,
+    mesh_q: &Query<(&Mesh3d, &GlobalTransform)>,
+    meshes: &Assets<Mesh>,
+    bounds: &mut HashMap<AssetId<Mesh>, Aabb>,
+) -> Option<LockTargetRect> {
+    let mut points = Vec::new();
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    while let Some(entity) = stack.pop() {
+        if visited >= 512 {
+            break;
+        }
+        visited += 1;
+        if let Ok((mesh, gt)) = mesh_q.get(entity) {
+            let aabb = *bounds.entry(mesh.id()).or_insert_with(|| {
+                meshes
+                    .get(mesh)
+                    .and_then(MeshAabb::compute_aabb)
+                    .unwrap_or_default()
+            });
+            let half = Vec3::from(aabb.half_extents);
+            let center = Vec3::from(aabb.center);
+            for corner in 0..8 {
+                let sign = Vec3::new(
+                    if corner & 1 == 0 { -1.0 } else { 1.0 },
+                    if corner & 2 == 0 { -1.0 } else { 1.0 },
+                    if corner & 4 == 0 { -1.0 } else { 1.0 },
+                );
+                push_projected(
+                    &mut points,
+                    cam,
+                    cam_gt,
+                    gt.transform_point(center + half * sign),
+                );
+            }
+        }
+        if let Ok(kids) = children.get(entity) {
+            stack.extend(kids.iter());
+        }
+    }
+    union_rect(points)
+}
+
+/// Screen-space bounds of a target's hit spheres: the union of each sphere's projected centre
+/// and its camera-facing radius extents. Fallback when the target model has no render AABBs.
+fn target_screen_rect(
+    cam: &Camera,
+    cam_gt: &GlobalTransform,
+    target_gt: &GlobalTransform,
+    health: &TargetHealth,
+    fallback_center: Vec3,
+) -> Option<LockTargetRect> {
+    let right = cam_gt.rotation() * Vec3::X;
+    let up = cam_gt.rotation() * Vec3::Y;
+    let model_scale = target_gt.scale().max_element().max(0.01);
+    let mut points = Vec::new();
+    for sphere in &health.spheres {
+        let center = target_gt.transform_point(Vec3::new(0.0, sphere.offset_y, 0.0));
+        if cam.world_to_viewport(cam_gt, center).is_err() {
+            continue;
+        }
+        let r = (sphere.radius * model_scale).max(0.01);
+        push_projected(&mut points, cam, cam_gt, center);
+        push_projected(&mut points, cam, cam_gt, center + right * r);
+        push_projected(&mut points, cam, cam_gt, center - right * r);
+        push_projected(&mut points, cam, cam_gt, center + up * r);
+        push_projected(&mut points, cam, cam_gt, center - up * r);
+    }
+    if points.is_empty() && cam.world_to_viewport(cam_gt, fallback_center).is_ok() {
+        let r = 1.5;
+        push_projected(&mut points, cam, cam_gt, fallback_center);
+        push_projected(&mut points, cam, cam_gt, fallback_center + right * r);
+        push_projected(&mut points, cam, cam_gt, fallback_center - right * r);
+        push_projected(&mut points, cam, cam_gt, fallback_center + up * r);
+        push_projected(&mut points, cam, cam_gt, fallback_center - up * r);
+    }
+    union_rect(points)
+}
+
+/// Root origin for a wing in `0x829d3218` (before its `CursorLine` local-rect offset). The switch
+/// maps E=0 to the top-left corner, T=1 to top-right, L=2 to bottom-left and R=3 to bottom-right.
+fn lock_wing_origin(wing: LockCursorWing, target: LockTargetRect, scale: f32) -> Vec2 {
+    let width = LOCK_WING_SIZE.x * scale;
+    let height = LOCK_WING_SIZE.y * scale;
+    match wing {
+        LockCursorWing::Enemy => Vec2::new(target.left - width, target.top - height),
+        LockCursorWing::Shoulder => Vec2::new(target.right, target.top - height),
+        LockCursorWing::LeftArm => Vec2::new(target.left - width, target.bottom),
+        LockCursorWing::RightArm => Vec2::new(target.right, target.bottom),
+    }
+}
+
 /// Marker on the Scan Mode `ACV_ScanModeLockSight` root (`0x825a26a0`, 1280×720 centered).
 #[derive(Component)]
 pub struct ScanSightRoot;
@@ -429,17 +637,6 @@ const MAX_RECON_ENEMY_MARKERS: usize = 12;
 
 fn tuning(index: usize) -> f32 {
     acvd_data::tuning(STATIC_DRAW, index).unwrap_or_default() as f32
-}
-
-/// Primary (1st) or secondary (2nd) lock overlay color (`StaticDrawParam` indices 9..12 / 17..20).
-fn lock_color(secondary: bool) -> Color {
-    let base = if secondary { 17 } else { 9 };
-    Color::srgba(
-        tuning(base).clamp(0.0, 1.0),
-        tuning(base + 1).clamp(0.0, 1.0),
-        tuning(base + 2).clamp(0.0, 1.0),
-        tuning(base + 3).clamp(0.5, 1.0),
-    )
 }
 
 /// `gauge_low_r..a` (StaticDrawParam +0x444).
@@ -745,32 +942,15 @@ pub fn layout(
                 .insert((ReconEnemyMarker(slot), Visibility::Hidden));
         }
     }
-    // In-game `sortie.drb` multi-target lock cursor: one 256x128 box per enemy in the FCS cone,
-    // built from the four quadrant dialogs `_E` (bottom-right: enemy name/AP), `_R` (top-left:
-    // right arm), `_L` (top-right: left arm), `_T` (bottom-left: shoulder + `MissileLock1..6`
-    // pips). The 360 finds these as one group (`0x829d4b88`) and draws it per candidate
-    // (`0x829d4558`), so a pool of groups matches retail; see `hud::lock_cursor`.
-    const QUADRANTS: [(&str, LockCursorWing, Vec2); 4] = [
-        (
-            "ACV_OutLine_LockCursor_R",
-            LockCursorWing::RightArm,
-            Vec2::new(0.0, 0.0),
-        ),
-        (
-            "ACV_OutLine_LockCursor_L",
-            LockCursorWing::LeftArm,
-            Vec2::new(128.0, 0.0),
-        ),
-        (
-            "ACV_OutLine_LockCursor_T",
-            LockCursorWing::Shoulder,
-            Vec2::new(0.0, 64.0),
-        ),
-        (
-            "ACV_OutLine_LockCursor_E",
-            LockCursorWing::Enemy,
-            Vec2::new(128.0, 64.0),
-        ),
+    // In-game `sortie.drb` multi-target lock cursor: one four-wing group per enemy in the FCS
+    // cone. `0x829d4b88` attaches `_E` (top-left: enemy name/AP), `_T` (top-right: shoulder +
+    // `MissileLock1..6`), `_L` (bottom-left: left arm) and `_R` (bottom-right: right arm) to one
+    // group; `0x829d3218` positions each wing on the scaled `_Target` rect corners.
+    const WINGS: [(&str, LockCursorWing); 4] = [
+        ("ACV_OutLine_LockCursor_E", LockCursorWing::Enemy),
+        ("ACV_OutLine_LockCursor_T", LockCursorWing::Shoulder),
+        ("ACV_OutLine_LockCursor_L", LockCursorWing::LeftArm),
+        ("ACV_OutLine_LockCursor_R", LockCursorWing::RightArm),
     ];
     for slot in 0..MAX_LOCK_BOXES {
         let group = commands
@@ -784,24 +964,29 @@ pub fn layout(
                 Visibility::Hidden,
             ))
             .id();
-        for (name, wing, origin) in QUADRANTS {
+        // `0x825a2e90` sizes the spot-info `Emblem`/outline to the target model's screen bounds;
+        // `lock_cursor` uses the projected hit-sphere AABB for that enemy-sized frame.
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                border: UiRect::all(px(scale.max(1.0))),
+                ..Default::default()
+            },
+            MenuObject("LockBoxFrame".to_string()),
+            Visibility::Inherited,
+            BorderColor::all(Color::NONE),
+            LockBoxFrame(slot),
+            ChildOf(group),
+        ));
+        for (name, wing) in WINGS {
             if let Some(dlg) = dialog(name) {
-                let root = menu::spawn(&mut commands, &hud.layout, dlg, origin * scale, scale);
+                let root = menu::spawn(&mut commands, &hud.layout, dlg, Vec2::ZERO, scale);
                 commands.entity(root).remove::<MenuRoot>().insert((
                     ChildOf(group),
                     LockBoxQuadrant { slot, wing },
                     Visibility::Inherited,
                 ));
             }
-        }
-    }
-    // 32x32 per-target multi-lock markers `_Target` (`LockColor1st` / `LockColor2nd`).
-    if let Some(target_dlg) = dialog("ACV_OutLine_LockCursor_Target") {
-        for slot in 0..6 {
-            let root = menu::spawn(&mut commands, &hud.layout, target_dlg, Vec2::ZERO, scale);
-            commands
-                .entity(root)
-                .insert((MissileLockTarget(slot), Visibility::Hidden));
         }
     }
 }
@@ -906,8 +1091,14 @@ fn gun(arms: Option<&Armament>, which: Readout) -> Option<Gun> {
         _ => return None,
     };
     arms.map(|a| {
-        if a.weapon_arm {
-            a.hands[0]
+        let arm_deployed =
+            a.weapon_arm && a.weapon_arm_state.phase != acvd_sim::weapons::WeaponArmPhase::Stowed;
+        if arm_deployed {
+            if hand == 0 {
+                a.weapon_arm_gun
+            } else {
+                crate::weapons::silent()
+            }
         } else {
             a.hands[hand]
         }
@@ -961,6 +1152,13 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
         a.blue + (b.blue - a.blue) * t,
         a.alpha + (b.alpha - a.alpha) * t,
     )
+}
+
+/// Rebuilds `color` with a new alpha (used after [`mix`] with opaque low/damage colors so the
+/// Combat HUD Transparency setting keeps its strength in the red/low and AP-effect states).
+fn with_alpha(color: Color, alpha: f32) -> Color {
+    let c = color.to_srgba();
+    Color::srgba(c.red, c.green, c.blue, alpha)
 }
 
 /// Eases the show scale and the low-colour blends.
@@ -1038,6 +1236,10 @@ pub fn readouts(
 ) {
     let Some(hud) = hud else { return };
     let hud_rgb = settings.as_ref().map(|s| s.hud_color).unwrap_or(SIGHT);
+    let hud_opacity = settings
+        .as_ref()
+        .map_or(1.0, |s| s.hud_opacity.clamp(0.0, 1.0));
+
     // Only the lock-sight dialogs get the sight color: `ACV_FE_Normal` and other HUD dialogs also
     // use generic `piece*` / `object*` names, which keep their authored colors. The `BOOSTER`
     // plate hangs under the sight but keeps its authored orange text, dark plate and corner
@@ -1125,7 +1327,7 @@ pub fn readouts(
                 hud_rgb[0] as f32 / 255.0,
                 hud_rgb[1] as f32 / 255.0,
                 hud_rgb[2] as f32 / 255.0,
-                1.0,
+                hud_opacity,
             );
             if sprite.color != tinted {
                 sprite.color = tinted;
@@ -1143,11 +1345,12 @@ pub fn readouts(
                 color: authored_color,
             });
         }
+        let base_alpha = authored_color.to_srgba().alpha * hud_opacity;
         let color = Color::srgba(
             hud_rgb[0] as f32 / 255.0,
             hud_rgb[1] as f32 / 255.0,
             hud_rgb[2] as f32 / 255.0,
-            authored_color.to_srgba().alpha,
+            base_alpha,
         );
         let value = reading(which, status, arms_for_hud);
         visibility.set_if_neq(if value.is_some() {
@@ -1167,7 +1370,7 @@ pub fn readouts(
         } else {
             (value, color)
         };
-        let color = mix(base_color, low, hud.low[slot(which)]);
+        let color = with_alpha(mix(base_color, low, hud.low[slot(which)]), base_alpha);
         if sprite.color != color {
             sprite.color = color;
         }
@@ -1194,17 +1397,18 @@ pub fn readouts(
                 color: authored_color,
             });
         }
+        let base_alpha = authored_color.to_srgba().alpha * hud_opacity;
         let color = Color::srgba(
             hud_rgb[0] as f32 / 255.0,
             hud_rgb[1] as f32 / 255.0,
             hud_rgb[2] as f32 / 255.0,
-            authored_color.to_srgba().alpha,
+            base_alpha,
         );
         let value = reading(which, status, arms_for_hud);
         if object.0 == "Gauge_APEffect" {
             // `0x829d0c6c..0x829d0d24`: trailing damage bar fills to `lag_ap / ap_max * show`
             // and blinks at `ap_damage_blink_hz` when `(lag_ap - cur_ap) / ap_max >= ap_double_gauge_threshold`.
-            let alpha = hud.ap_effect.effect_alpha;
+            let alpha = hud.ap_effect.effect_alpha * hud_opacity;
             let shown = value.is_some() && alpha > 0.0;
             visibility.set_if_neq(if shown {
                 Visibility::Inherited
@@ -1232,7 +1436,7 @@ pub fn readouts(
             continue;
         };
         let fill = fraction.clamp(0.0, 1.0) * hud.show;
-        let color = mix(color, low, hud.low[slot(which)]);
+        let color = with_alpha(mix(color, low, hud.low[slot(which)]), base_alpha);
         if g.fill != fill || g.color != color {
             g.fill = fill;
             g.color = color;
@@ -1688,14 +1892,13 @@ pub fn scan_hud(
             continue;
         };
         vis.set_if_neq(Visibility::Inherited);
-        // `CursorLine` sits at [247, 154, 300, 187]; clamp so EnemyName (-129..240) and
-        // EnemyParam (127..249) stay fully readable inside the window.
-        let min_x = 140.0 * scale;
-        let max_x = (size.x - 310.0 * scale).max(min_x);
-        let min_y = 16.0 * scale;
-        let max_y = (size.y - 200.0 * scale).max(min_y);
-        node.left = px((vp.x - 305.0 * scale).clamp(min_x, max_x));
-        node.top = px((vp.y - 205.0 * scale).clamp(min_y, max_y));
+        // `0x829d3218` type 0 (`FUN_825a5438` -> `0x829d4680(..., 0)`): the EnemyParamInfo root
+        // lands at (centerRect.x0 - 300s, centerRect.y0 - 187s). `centerRect` is the 70x70
+        // `ACV_Scan_Cur_Center` dialog placed at `vp - (20, 20)s` (CenterFrame [-30,-30,70,70]),
+        // so the anchor is `vp - (320, 207)s`. The 360 code does not clamp to the screen.
+        node.left = px(vp.x - 320.0 * scale);
+        node.top = px(vp.y - 207.0 * scale);
+        let display = enemy_display_name(&hud, &info.model).unwrap_or_else(|| info.model.clone());
         let loaded_portrait = info.portrait.and_then(|p| {
             let g = garage.as_deref()?;
             hud.scan_portrait(p, &g.disc, &mut images)
@@ -1708,8 +1911,8 @@ pub fn scan_hud(
             match obj.0.as_str() {
                 "EnemyName" => {
                     if let Some(mut t) = text {
-                        if t.text != info.model {
-                            t.text = info.model.clone();
+                        if t.text != display {
+                            t.text = display.clone();
                         }
                     }
                 }
@@ -2017,19 +2220,24 @@ pub fn recon_hud(
     }
 }
 
-/// Projects the FCS lock candidates onto the viewport and updates the actual `sortie.drb`
-/// lock-on dialogs: one 256x128 box per candidate enemy, each tiled from the four quadrants
-/// - `ACV_OutLine_LockCursor_E` (bottom-right: `EnemyName`, `EnemyAP`)
-/// - `ACV_OutLine_LockCursor_R` / `_L` (top-left / top-right: per-arm `LockOnText`, `ReloadBar`)
-/// - `ACV_OutLine_LockCursor_T` (bottom-left: shoulder `LockOnText`, `ReloadBar`, `MissileLock1..6`)
-/// - `ACV_OutLine_LockCursor_Target` (32x32 `LockColor1st`/`LockColor2nd` per missile-locked target)
+/// Projects the FCS lock candidates onto the viewport and updates the `sortie.drb` lock cursor.
+/// Each candidate gets one `0x829d4b88` group whose four wings `0x829d3218` places on the corners
+/// of the enemy's projected rect scaled by `LockSight+0x2c`:
+/// - `_E` (type 0, top-left): `EnemyName`, `EnemyAP`
+/// - `_T` (type 1, top-right): shoulder `LockOnText`, `ReloadBar`, `MissileLock1..6`
+/// - `_L` (type 2, bottom-left): left-arm `LockOnText`, `ReloadBar`
+/// - `_R` (type 3, bottom-right): right-arm `LockOnText`, `ReloadBar`
 ///
-/// Only the FCS-selected target's box carries the readouts; every other candidate box shows the
-/// authored red `CursorLine` bracket. The 360 reuses one quadrant group per candidate
-/// (`0x829d4b88` group, `0x829d4558` per-candidate draw), so pooling groups is retail-faithful.
+/// Only the FCS-selected target carries text/bars/pips. Each wing selects its own
+/// `LockColor1st`/`LockColor2nd` swatch from its candidate record (`0x829d19f0` /
+/// `0x829d30e0`), not the player HUD tint. `ReloadBar` is that record's `f32 +4` lock progress
+/// (`0x829d1ac0`), while `CursorLine` stays at full fill. The authored 32x32 `_Target` rect is
+/// only the wing anchor; the enemy-sized frame over the target is the `ACV_SPOT_ACInfo` marker
+/// resized to the model's screen bounds (`0x825a2e90`), drawn here as [`LockBoxFrame`].
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn lock_cursor(
     hud: Option<Res<Sortie>>,
+    settings: Option<Res<crate::settings::GameSettings>>,
     mark: Option<Res<ShotMark>>,
     cameras: Query<
         (&Camera, &GlobalTransform),
@@ -2037,66 +2245,86 @@ pub fn lock_cursor(
     >,
     fcs_q: Query<&Fcs>,
     arms_q: Query<&Armament>,
-    mut boxes: Query<
-        (&LockBox, &mut Node, &mut Visibility),
-        (Without<LockBoxQuadrant>, Without<MissileLockTarget>),
-    >,
-    quadrants: Query<(Entity, &LockBoxQuadrant)>,
-    mut markers: Query<
-        (Entity, &MissileLockTarget, &mut Node, &mut Visibility),
-        (Without<LockBox>, Without<LockBoxQuadrant>),
-    >,
+    targets_q: Query<(&TargetHealth, &GlobalTransform)>,
+    mesh_q: Query<(&Mesh3d, &GlobalTransform)>,
+    meshes: Res<Assets<Mesh>>,
+    mut model_bounds: Local<HashMap<AssetId<Mesh>, Aabb>>,
+    mut boxes: Query<(&LockBox, &mut Visibility), Without<LockBoxQuadrant>>,
+    mut frames: Query<(&LockBoxFrame, Entity, &mut BorderColor)>,
+    mut quadrants: Query<(Entity, &LockBoxQuadrant, &mut Node), Without<LockBox>>,
     children: Query<&Children>,
     mut objects: Query<
         (
             &MenuObject,
+            &mut Node,
             &mut Visibility,
             Option<&mut MenuText>,
             Option<&mut MenuGauge>,
         ),
-        (
-            Without<LockBox>,
-            Without<LockBoxQuadrant>,
-            Without<MissileLockTarget>,
-        ),
+        (Without<LockBox>, Without<LockBoxQuadrant>),
     >,
     mut shot_logged: Local<bool>,
 ) {
     let Some(hud) = hud else { return };
     let scale = hud.scale;
+    let hud_opacity = settings
+        .as_ref()
+        .map_or(1.0, |s| s.hud_opacity.clamp(0.0, 1.0));
     let fcs = fcs_q.single().ok();
     let arms = arms_q.single().ok();
     let cam_pair = cameras.single().ok();
     let locked = fcs.and_then(|f| f.locked.as_ref());
+    let selected = locked.map(|lock| lock.entity);
 
-    // The FCS candidate list is already center-most first (`fcs::rank_candidates`).
-    let mut projected: Vec<(Entity, Vec2)> = fcs
+    // The FCS candidate list is already nearest first (`fcs::rank_candidates`, `0x8287c560`). Distance is
+    // measured from the camera (the matrix row `LockSight+8` reads at +0x4e0/+0x510 in
+    // `0x829d4828`) and drives the 1.0 -> 0.3 lock-cursor position factor.
+    let mut project = |entity, world_pos: Vec3| {
+        let (cam, cam_gt) = cam_pair?;
+        let vp = cam.world_to_viewport(cam_gt, world_pos).ok()?;
+        let distance = cam_gt.translation().distance(world_pos);
+        // `0x829d3b38`: 32x32 `_Target` rect (`0x82b7c5b0`) x `LockSight+0x2c` around the point.
+        let size = Vec2::splat(LOCK_TARGET_SIZE * scale * lock_cursor_scale(distance));
+        let target = LockTargetRect::from_center_size(vp, size);
+        // `0x825a2e90`: the visible frame is the spot-info `Emblem` rect set to the target
+        // model's screen bounds. Use the render AABBs under the target root, falling back to
+        // the damage hit spheres when no mesh bounds are available.
+        let screen = model_screen_rect(
+            cam,
+            cam_gt,
+            entity,
+            &children,
+            &mesh_q,
+            &meshes,
+            &mut model_bounds,
+        )
+        .or_else(|| {
+            targets_q.get(entity).ok().and_then(|(health, target_gt)| {
+                target_screen_rect(cam, cam_gt, target_gt, health, world_pos)
+            })
+        });
+        Some((entity, vp, distance, target, screen))
+    };
+    let mut projected: Vec<(Entity, Vec2, f32, LockTargetRect, Option<LockTargetRect>)> = fcs
         .map(|f| f.candidates.as_slice())
         .unwrap_or_default()
         .iter()
-        .filter_map(|candidate| {
-            let (cam, cam_gt) = cam_pair?;
-            let vp = cam.world_to_viewport(cam_gt, candidate.world_pos).ok()?;
-            Some((candidate.entity, vp))
-        })
+        .filter_map(|candidate| project(candidate.entity, candidate.world_pos))
         .take(MAX_LOCK_BOXES)
         .collect();
-    let selected = locked.map(|lock| lock.entity);
     // The locked target can linger in the +2 deg outer cone; keep its box even when it did not
     // make this frame's candidate list.
     if let Some(lock) = locked {
-        if !projected.iter().any(|&(entity, _)| entity == lock.entity) {
-            if let Some((cam, cam_gt)) = cam_pair {
-                if let Ok(vp) = cam.world_to_viewport(cam_gt, lock.world_pos) {
-                    projected.push((lock.entity, vp));
-                }
+        if !projected.iter().any(|&(entity, ..)| entity == lock.entity) {
+            if let Some(box_) = project(lock.entity, lock.world_pos) {
+                projected.push(box_);
             }
         }
     }
     while projected.len() > MAX_LOCK_BOXES {
         let Some(pos) = projected
             .iter()
-            .rposition(|&(entity, _)| Some(entity) != selected)
+            .rposition(|&(entity, ..)| Some(entity) != selected)
         else {
             break;
         };
@@ -2104,37 +2332,62 @@ pub fn lock_cursor(
     }
     let assigned = projected.len();
 
-    for (slot, mut node, mut vis) in &mut boxes {
-        let Some(&(_, vp)) = projected.get(slot.0) else {
-            vis.set_if_neq(Visibility::Hidden);
-            continue;
-        };
-        vis.set_if_neq(Visibility::Inherited);
-        // The four 128x64 dialogs tile a 256x128 box centred on the target (each `CursorLine`
-        // tip is the quadrant's outer corner: R (0,0), L (128,0), T (0,64), E (128,64)).
-        place_centered(&mut node, vp, Vec2::new(128.0, 64.0), scale);
+    for (slot, mut vis) in &mut boxes {
+        vis.set_if_neq(if slot.0 < assigned {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
     }
 
-    for (root, quadrant) in &quadrants {
-        if quadrant.slot >= assigned {
+    // The thin-line box over each candidate/selected target: `0x829d3b38`'s target rect.
+    for (frame, entity, mut border) in &mut frames {
+        let Some(&(target_entity, _, _, target, screen)) = projected.get(frame.0) else {
             continue;
+        };
+        let rect = screen.unwrap_or(target);
+        let secondary =
+            Some(target_entity) == selected && locked.is_some_and(|lock| lock.any_secondary());
+        let candidate_lock = fcs.is_some_and(|f| f.missile_lock_count(target_entity) > 0);
+        border.set_if_neq(BorderColor::all(lock_cursor_color(
+            secondary || candidate_lock,
+            hud_opacity,
+        )));
+        if let Ok((_, mut node, ..)) = objects.get_mut(entity) {
+            node.left = px(rect.left);
+            node.top = px(rect.top);
+            node.width = px((rect.right - rect.left).max(1.0));
+            node.height = px((rect.bottom - rect.top).max(1.0));
         }
-        let is_selected = Some(projected[quadrant.slot].0) == selected;
+    }
+
+    for (root, quadrant, mut node) in &mut quadrants {
+        let Some(&(entity, _, _, target, _)) = projected.get(quadrant.slot) else {
+            continue;
+        };
+        let origin = lock_wing_origin(quadrant.wing, target, scale);
+        node.left = px(origin.x);
+        node.top = px(origin.y);
+
+        let is_selected = Some(entity) == selected;
+        let color = lock_cursor_color(
+            is_selected && locked.is_some_and(|lock| lock.any_secondary()),
+            hud_opacity,
+        );
         if !is_selected {
-            // Candidate: full authored-red bracket, no text/bars/pips.
+            // Candidate: full lock-color bracket, no text/bars/pips.
             for child in children.iter_descendants(root) {
-                let Ok((obj, mut cvis, _, gauge)) = objects.get_mut(child) else {
+                let Ok((obj, _node, mut cvis, _, gauge)) = objects.get_mut(child) else {
                     continue;
                 };
-                let show = match obj.0.as_str() {
-                    "CursorLine" => {
-                        if let Some(mut g) = gauge {
-                            g.fill = 1.0;
-                            g.color = lock_cursor_red();
-                        }
-                        true
+                let show = if obj.0 == "CursorLine" {
+                    if let Some(mut g) = gauge {
+                        g.fill = 1.0;
+                        g.color = color;
                     }
-                    _ => false,
+                    true
+                } else {
+                    false
                 };
                 cvis.set_if_neq(if show {
                     Visibility::Inherited
@@ -2147,37 +2400,39 @@ pub fn lock_cursor(
         let Some(lock) = locked else { continue };
         match quadrant.wing {
             LockCursorWing::Enemy => {
-                let col = lock_color(lock.any_secondary());
+                let display = lock_display_name(&hud, lock);
+                let ap = format!("{:.0}", lock.ap);
                 for child in children.iter_descendants(root) {
-                    let Ok((obj, mut cvis, text, gauge)) = objects.get_mut(child) else {
+                    let Ok((obj, _node, mut cvis, text, gauge)) = objects.get_mut(child) else {
                         continue;
                     };
                     let show = match obj.0.as_str() {
                         "CursorLine" => {
                             if let Some(mut g) = gauge {
                                 g.fill = 1.0;
-                                g.color = col;
+                                g.color = color;
                             }
                             true
                         }
                         "EnemyName" => {
                             if let Some(mut t) = text {
-                                if t.text != lock.model {
-                                    t.text = lock.model.clone();
+                                if t.text != display {
+                                    t.text = display.clone();
                                 }
+                                t.color = color;
                             }
                             true
                         }
                         "EnemyAP" => {
                             if let Some(mut t) = text {
-                                let s = format!("{:.0}", lock.ap);
-                                if t.text != s {
-                                    t.text = s;
+                                if t.text != ap {
+                                    t.text = ap.clone();
                                 }
+                                t.color = color;
                             }
                             true
                         }
-                        "EnemySquadNumber" => false,
+                        "EnemyInfo" | "EnemySquadNumber" => false,
                         _ => true,
                     };
                     cvis.set_if_neq(if show {
@@ -2188,23 +2443,47 @@ pub fn lock_cursor(
                 }
             }
             LockCursorWing::Shoulder => {
-                let col = lock_color(lock.any_secondary());
-                let pips = fcs.map_or(0, |f| f.missile_locks.len().min(6)) as u8;
-                let reloading = arms.is_some_and(|a| a.shoulder.cooldown > 0.0);
+                let pips = fcs.map_or(0, |f| f.missile_lock_count(lock.entity));
+                // `0x829d19f0`: this wing's own candidate record selects `LockColor2nd` once its
+                // missile locks are up; `0x829d30e0` keeps `LockOnText` while that record holds a
+                // lock (`i16 +2` missile count).
+                let wing_color = lock_cursor_color(pips > 0, hud_opacity);
+                // `0x829d1ac0`: the bar is the candidate record's `f32 +4` (lock progress),
+                // clamped to `0..=1`, not the shoulder weapon's cooldown.
+                let progress = fcs.map_or(0.0, |f| {
+                    let step = crate::fcs::missile_lock_time(
+                        arms.map_or(0.0, |a| a.shoulder.lock_time_ticks),
+                        f.spec.missile_lock_effective_rate,
+                    );
+                    if step > 0.0 {
+                        (f.missile_lock_timer / step).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                });
                 for child in children.iter_descendants(root) {
-                    let Ok((obj, mut cvis, _, gauge)) = objects.get_mut(child) else {
+                    let Ok((obj, mut cnode, mut cvis, text, gauge)) = objects.get_mut(child) else {
                         continue;
                     };
                     let show = match obj.0.as_str() {
                         "CursorLine" => {
                             if let Some(mut g) = gauge {
                                 g.fill = 1.0;
-                                g.color = col;
+                                g.color = wing_color;
                             }
                             true
                         }
-                        "LockOnText" => pips > 0,
-                        "ReloadBar" => reloading,
+                        "LockOnText" => {
+                            if let Some(mut t) = text {
+                                t.color = wing_color;
+                            }
+                            pips > 0
+                        }
+                        "ReloadBar" => {
+                            cnode.width = px(LOCK_RELOAD_BAR_SHOULDER * scale * progress);
+                            true
+                        }
+                        "ReloadBarFrame" => true,
                         name => name
                             .strip_prefix("MissileLock")
                             .and_then(|s| s.parse::<u8>().ok())
@@ -2219,24 +2498,40 @@ pub fn lock_cursor(
             }
             LockCursorWing::RightArm | LockCursorWing::LeftArm => {
                 let hand = usize::from(quadrant.wing == LockCursorWing::LeftArm);
-                let prog = lock.progress(hand);
-                let ready = lock.secondary[hand];
-                let col = lock_color(ready);
-                let reloading = arms.is_some_and(|a| a.hands[hand].cooldown > 0.0);
+                let has_secondary = lock.lock_time[hand] > 0.0;
+                let ready = has_secondary && lock.secondary[hand];
+                // `0x829d19f0` / `0x829d30e0`: this hand's own candidate record picks
+                // `LockColor2nd` when its secondary lock is complete (or needs no timer), so the
+                // two arm wings can be different colours.
+                let wing_color = lock_cursor_color(lock.secondary[hand], hud_opacity);
+                let progress = if arms.is_some_and(|a| a.hands[hand].kind == Kind::Skip) {
+                    0.0
+                } else {
+                    lock.progress(hand)
+                };
                 for child in children.iter_descendants(root) {
-                    let Ok((obj, mut cvis, _, gauge)) = objects.get_mut(child) else {
+                    let Ok((obj, mut cnode, mut cvis, text, gauge)) = objects.get_mut(child) else {
                         continue;
                     };
                     let show = match obj.0.as_str() {
                         "CursorLine" => {
                             if let Some(mut g) = gauge {
-                                g.fill = prog.max(0.05);
-                                g.color = col;
+                                g.fill = 1.0;
+                                g.color = wing_color;
                             }
                             true
                         }
-                        "LockOnText" => ready,
-                        "ReloadBar" => reloading,
+                        "LockOnText" => {
+                            if let Some(mut t) = text {
+                                t.color = wing_color;
+                            }
+                            ready
+                        }
+                        "ReloadBar" => {
+                            cnode.width = px(LOCK_RELOAD_BAR_ARM * scale * progress);
+                            true
+                        }
+                        "ReloadBarFrame" => true,
                         name if name.starts_with("MissileLock") => false,
                         _ => true,
                     };
@@ -2250,63 +2545,62 @@ pub fn lock_cursor(
         }
     }
 
-    // Per-target multi-lock markers (`ACV_OutLine_LockCursor_Target`, 32x32).
-    let msl_targets: Vec<(Entity, Vec2, u8)> = fcs
-        .into_iter()
-        .flat_map(Fcs::missile_targets)
-        .filter_map(|(entity, pos, count)| {
-            let (cam, cam_gt) = cam_pair?;
-            let vp = cam.world_to_viewport(cam_gt, pos).ok()?;
-            Some((entity, vp, count))
-        })
-        .take(6)
-        .collect();
-    for (root, marker, mut node, mut vis) in &mut markers {
-        let Some(&(_, vp, count)) = msl_targets.get(marker.0) else {
-            vis.set_if_neq(Visibility::Hidden);
-            continue;
-        };
-        vis.set_if_neq(Visibility::Inherited);
-        // 32x32 marker centered on the target; `LockColor1st` for the first missile on it,
-        // `LockColor2nd` once a second missile is locked onto the same target.
-        place_centered(&mut node, vp, Vec2::splat(16.0), scale);
-        let second = count > 1;
-        for child in children.iter_descendants(root) {
-            let Ok((obj, mut cvis, _, _)) = objects.get_mut(child) else {
-                continue;
-            };
-            let show = match obj.0.as_str() {
-                "LockColor1st" => !second,
-                "LockColor2nd" => second,
-                _ => false,
-            };
-            cvis.set_if_neq(if show {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            });
-        }
-    }
-
     if mark.is_some_and(|m| m.path.is_some()) && !*shot_logged {
         *shot_logged = true;
         eprintln!(
-            "SHOT lock_boxes={} selected={:?} vps=[{}]",
+            "SHOT lock_boxes={} selected={:?} model={:?} name={:?} vps=[{}]",
             assigned,
             selected,
+            locked.map(|lock| lock.model.as_str()),
+            locked.map(|lock| lock_display_name(&hud, lock)),
             projected
                 .iter()
-                .map(|(_, vp)| format!("{:.0},{:.0}", vp.x, vp.y))
+                .map(|(_, vp, distance, target, screen)| format!(
+                    "{:.0},{:.0} d={distance:.0} s={:.2} box={:.0}x{:.0} frame={:.0}x{:.0}",
+                    vp.x,
+                    vp.y,
+                    lock_cursor_scale(*distance),
+                    target.right - target.left,
+                    target.bottom - target.top,
+                    screen.map_or(0.0, |r| r.right - r.left),
+                    screen.map_or(0.0, |r| r.bottom - r.top)
+                ))
                 .collect::<Vec<_>>()
                 .join(" ")
         );
     }
 }
 
-/// `ACV_OutLine_LockCursor_*` `CursorLine` authored colour (`sortie.drb`: `0xff4000ff`, the same
-/// red as `ACV_OutLine_LockCursor_Target::LockColor2nd`); candidate boxes keep it.
-fn lock_cursor_red() -> Color {
-    Color::srgba_u8(0xFF, 0x40, 0x00, 0xFF)
+/// `EnemyName` display text from the model's `EnemyCommonSt` id -> `enemyname.fmg` row
+/// (`0x825a54b0` fills the scan panel's `EnemyName` from the target's name id, and
+/// `0x829d3d68` does the same for the lock cursor's `_E` wing).
+fn enemy_display_name(hud: &Sortie, model: &str) -> Option<String> {
+    crate::targets::enemy_param_id(model)
+        .and_then(|id| hud.enemy_names.get(&id))
+        .cloned()
+}
+
+/// `EnemyName` text: model id -> `enemyname.fmg` row, with the lock data's name/model as fallback.
+fn lock_display_name(hud: &Sortie, lock: &LockedTarget) -> String {
+    enemy_display_name(hud, &lock.model).unwrap_or_else(|| {
+        if lock.name.is_empty() || lock.name == lock.model {
+            lock.model.clone()
+        } else {
+            lock.name.clone()
+        }
+    })
+}
+
+/// `LockColor1st` (`0x006680ff`) / `LockColor2nd` (`0xff4000ff`) from
+/// `ACV_OutLine_LockCursor_Target`; `0x829d4a90` installs these defaults and `0x829d4b88` copies
+/// them from the dialog. `0x829d19f0` applies the selected swatch to CursorLine and the text.
+fn lock_cursor_color(secondary: bool, opacity: f32) -> Color {
+    let (r, g, b) = if secondary {
+        (0xFF, 0x40, 0x00)
+    } else {
+        (0x00, 0x66, 0x80)
+    };
+    Color::srgba_u8(r, g, b, (opacity.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
 /// Projects the Lock-Sight billboard 700 m along the AC's aim direction (`0x829d2120` via
@@ -2395,6 +2689,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hud_opacity_alpha_survives_low_color_mix() {
+        let low = Color::srgba(1.0, 0.0, 0.0, 1.0);
+        let base = Color::srgba(0.0, 0.65, 1.0, 0.4);
+        let mixed = with_alpha(mix(base, low, 0.75), 0.4);
+        assert!((mixed.to_srgba().alpha - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
     fn digit_names() {
         assert!(readout("LWep1000") == Some((Readout::LeftArm, 1000)));
         assert!(readout("RWep1") == Some((Readout::RightArm, 1)));
@@ -2479,6 +2781,28 @@ mod tests {
         let vp = Vec2::new(700.0, 380.0);
         assert_eq!(sight_root_origin(vp, Vec2::ZERO), vp);
         assert_eq!(sight_root_origin(vp, SCREEN * 0.5), Vec2::new(60.0, 20.0));
+    }
+
+    #[test]
+    fn lock_cursor_uses_decompiled_distance_and_wing_corners() {
+        assert!((lock_cursor_scale(25.0) - 1.0).abs() < 1e-6);
+        assert!((lock_cursor_scale(75.0) - 0.65).abs() < 1e-6);
+        assert!((lock_cursor_scale(200.0) - 0.3).abs() < 1e-6);
+
+        // 32x32 `_Target` rect x distance factor 0.5 -> 16x16 box.
+        let rect = LockTargetRect::from_center_size(
+            Vec2::new(640.0, 360.0),
+            Vec2::splat(LOCK_TARGET_SIZE * 0.5),
+        );
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (632.0, 352.0, 648.0, 368.0)
+        );
+        let origin = |wing| lock_wing_origin(wing, rect, 2.0);
+        assert_eq!(origin(LockCursorWing::Enemy), Vec2::new(376.0, 224.0));
+        assert_eq!(origin(LockCursorWing::Shoulder), Vec2::new(648.0, 224.0));
+        assert_eq!(origin(LockCursorWing::LeftArm), Vec2::new(376.0, 368.0));
+        assert_eq!(origin(LockCursorWing::RightArm), Vec2::new(648.0, 368.0));
     }
 
     #[test]

@@ -66,7 +66,9 @@ impl TextureRef {
 
 /// The `texture_formats.csv` row for a TPF format code.
 pub fn texture_format(code: u8) -> Option<&'static TextureFormat> {
-    generated::textures::TEXTURE_FORMATS.iter().find(|f| f.code == code)
+    generated::textures::TEXTURE_FORMATS
+        .iter()
+        .find(|f| f.code == code)
 }
 
 /// One FLVER model. `path` is its asset path; `triangles` counts each mesh's main face set
@@ -131,7 +133,10 @@ impl AcPart {
     }
 
     pub fn field(&self, name: &str) -> Option<f64> {
-        self.fields.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+        self.fields
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
     }
 }
 
@@ -151,7 +156,12 @@ pub fn ac_part(category: u8, id: u16) -> Option<&'static AcPart> {
 /// Field `name` of part `id` in `category`; 0 for an empty slot (id 0 or below), as the
 /// game's part parameter getter returns for one.
 pub fn part_field(id: i64, category: u8, name: &str) -> f32 {
-    u16::try_from(id).ok().filter(|&id| id > 0).and_then(|id| ac_part(category, id)).and_then(|p| p.field(name)).unwrap_or(0.0) as f32
+    u16::try_from(id)
+        .ok()
+        .filter(|&id| id > 0)
+        .and_then(|id| ac_part(category, id))
+        .and_then(|p| p.field(name))
+        .unwrap_or(0.0) as f32
 }
 
 /// Where a slot's root bone lands on its parent's model.
@@ -192,7 +202,9 @@ pub struct AcMotion {
 }
 
 pub fn ac_motion(category: u8, id: u16) -> Option<&'static AcMotion> {
-    generated::assembly::AC_MOTIONS.iter().find(|m| m.category == category && m.id == id)
+    generated::assembly::AC_MOTIONS
+        .iter()
+        .find(|m| m.category == category && m.id == id)
 }
 
 /// A locomotion state (`sheets/ac_states.csv`) and the `param/acmotion.bin` row that plays it.
@@ -235,7 +247,12 @@ pub struct TuningField {
 /// Field `index` (its `sheets/tuning_fields.csv` index) of the tuning file named `name`
 /// (`system/paramlist.xml`'s `<Bin>` stem, e.g. `StaticDrawParam`).
 pub fn tuning(name: &str, index: usize) -> Option<f64> {
-    generated::tuning::TUNING.iter().find(|f| f.name == name)?.fields.get(index).map(|f| f.value)
+    generated::tuning::TUNING
+        .iter()
+        .find(|f| f.name == name)?
+        .fields
+        .get(index)
+        .map(|f| f.value)
 }
 
 /// The model at asset path `path`.
@@ -264,7 +281,11 @@ pub fn models_named(name: &str) -> impl Iterator<Item = &'static ModelRef> + '_ 
         m
     });
     let key = name.to_ascii_lowercase();
-    map.get(&key).map(Vec::as_slice).unwrap_or(&[]).iter().copied()
+    map.get(&key)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
 }
 
 /// Every texture whose name equals `name` (ASCII case-insensitive), in disc order.
@@ -273,12 +294,18 @@ pub fn textures_named(name: &str) -> impl Iterator<Item = &'static TextureRef> +
     let map = INDEX.get_or_init(|| {
         let mut m: HashMap<String, Vec<&'static TextureRef>> = HashMap::new();
         for tex in generated::textures::ALL.iter().flat_map(|g| g.iter()) {
-            m.entry(tex.name.to_ascii_lowercase()).or_default().push(tex);
+            m.entry(tex.name.to_ascii_lowercase())
+                .or_default()
+                .push(tex);
         }
         m
     });
     let key = name.to_ascii_lowercase();
-    map.get(&key).map(Vec::as_slice).unwrap_or(&[]).iter().copied()
+    map.get(&key)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
 }
 
 /// Every binder entry whose name equals `name` (ASCII case-insensitive), in disc order.
@@ -287,12 +314,18 @@ pub fn assets_named(name: &str) -> impl Iterator<Item = &'static Asset> + '_ {
     let map = INDEX.get_or_init(|| {
         let mut m: HashMap<String, Vec<&'static Asset>> = HashMap::new();
         for asset in generated::assets::ALL.iter().flat_map(|g| g.iter()) {
-            m.entry(asset.name.to_ascii_lowercase()).or_default().push(asset);
+            m.entry(asset.name.to_ascii_lowercase())
+                .or_default()
+                .push(asset);
         }
         m
     });
     let key = name.to_ascii_lowercase();
-    map.get(&key).map(Vec::as_slice).unwrap_or(&[]).iter().copied()
+    map.get(&key)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
 }
 
 /// Every entry inside `binder` (exact asset binder path), in disc order.
@@ -322,16 +355,35 @@ mod tests {
     fn preset_movement() {
         let mut seen = 0;
         let mut by_legs: Vec<((i64, i64), f32, f32)> = Vec::new();
-        for r in AC_ASSEMBLY_DESIGN_ST_FILES.iter().flat_map(|(_, rows)| rows.iter()) {
+        for r in AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+        {
             let legs = r.data.legs as i64;
-            let parts = [(0, r.data.head as i64), (1, r.data.core as i64), (3, legs), (6, r.data.booster as i64)];
-            if parts.iter().any(|&(category, id)| part_known(category, id).is_none()) {
+            let parts = [
+                (0, r.data.head as i64),
+                (1, r.data.core as i64),
+                (3, legs),
+                (6, r.data.booster as i64),
+            ];
+            if parts
+                .iter()
+                .any(|&(category, id)| part_known(category, id).is_none())
+            {
                 continue;
             }
             let c = AcCtrlParam::calculate(&r.data);
             seen += 1;
-            assert!(c.walk_speed >= 15.0 && c.boost_max_speed >= 20.0 && c.turn_speed >= 10.0, "{} {c:?}", r.id);
-            assert!(c.walk_acc_tick > 0.0 && c.boost_acc_tick > 0.0 && c.jump_rise_tick > 0.0, "{} {c:?}", r.id);
+            assert!(
+                c.walk_speed >= 15.0 && c.boost_max_speed >= 20.0 && c.turn_speed >= 10.0,
+                "{} {c:?}",
+                r.id
+            );
+            assert!(
+                c.walk_acc_tick > 0.0 && c.boost_acc_tick > 0.0 && c.jump_rise_tick > 0.0,
+                "{} {c:?}",
+                r.id
+            );
             by_legs.push(((legs, r.data.head as i64), c.leg_capability, c.walk_speed));
             if seen <= 6 {
                 println!(
@@ -371,17 +423,26 @@ mod tests {
         let g = crate::find(PARAM_GROWPARTSARMUNITPARAM_BIN, 1010).expect("grow 1010");
         assert_eq!(mg.field("magazine"), Some(35.0));
         assert_eq!(mg.field("damp_range"), Some(520.0));
-        assert_eq!(mg.field("no_decay_range"), Some(g.data.no_decay_range_org as f64));
+        assert_eq!(
+            mg.field("no_decay_range"),
+            Some(g.data.no_decay_range_org as f64)
+        );
         assert_eq!(mg.field("guarantee_rate"), Some(3.0));
         assert_eq!(mg.field("min_power_rate"), Some(3.0));
         assert_eq!(mg.field("reload_time"), Some(g.data.reload_time_org as f64));
         assert_eq!(mg.field("init_speed"), Some(g.data.init_speed_org as f64));
-        assert_eq!(mg.field("damage_power"), Some(g.data.damage_power_org as f64));
+        assert_eq!(
+            mg.field("damage_power"),
+            Some(g.data.damage_power_org as f64)
+        );
         assert_eq!(mg.field("bullet_id"), Some(10003.0));
         assert!(crate::find(BULLET_BULLETRIGID_BIN, 10003).is_some());
         let en = crate::ac_part(10, 810).expect("part 810");
         let ge = crate::find(PARAM_GROWPARTSARMUNITPARAM_BIN, 810).expect("grow 810");
-        assert_eq!(en.field("reload_time"), Some(ge.data.reload_time_org as f64));
+        assert_eq!(
+            en.field("reload_time"),
+            Some(ge.data.reload_time_org as f64)
+        );
         assert_eq!(en.field("en_drain"), Some(ge.data.en_drain_org as f64));
         assert_eq!(en.field("bullet_id"), Some(10006.0));
         assert!(crate::find(BULLET_BULLETENERGY_BIN, 10006).is_some());

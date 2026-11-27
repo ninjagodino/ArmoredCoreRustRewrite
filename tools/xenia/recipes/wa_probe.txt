@@ -1,0 +1,44 @@
+# Boot -> AC Test (m4000) with the --loadout-arm override, then exercise the
+# weapon-arm combat-mode/stow/unfold/fire cycle for the FFX + frame probe.
+# The menu timing mirrors ac_test.txt (warm shader cache) but fires before the
+# probe's timed shot series instead of ending on a still frame.
+wait 25
+press START
+wait 6
+press A
+wait 5
+press A
+wait 22
+press A
+wait 25
+press A
+wait 15
+press A
+wait 10
+press DOWN
+press DOWN
+press DOWN
+press DOWN
+press DOWN
+press A
+wait 4
+press A
+wait 3
+press A
+wait 18
+# Sortie starts in combat mode; the 300-frame a00_004 unfold is already playing.
+trigger R 1 1.5
+wait 0.5
+trigger L 1 1.5
+wait 1
+trigger R 1 1.5
+wait 0.5
+# Scan mode toggles the weapon arm back to stow, then combat mode unfolds it.
+press RS
+wait 4
+press RS
+wait 4
+trigger R 1 1.5
+wait 1
+trigger R 1 1.5
+wait 2

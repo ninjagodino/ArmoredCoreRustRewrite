@@ -106,6 +106,13 @@ impl Shot {
         Self { path, ready: false, burst: 1, interval: 0.05, waited: 0.0, requested: 0 }
     }
 
+    /// Seconds until [`take_shot`] requests the screenshot. Before the shot is ready this reports
+    /// the full `SHOT_DELAY`, so callers can schedule a one-shot test hook relative to the exact
+    /// capture frame instead of the much earlier readiness flip.
+    pub fn seconds_until_capture(&self) -> f32 {
+        (SHOT_DELAY - self.waited).max(0.0)
+    }
+
     fn file(&self, i: u32) -> PathBuf {
         if self.burst <= 1 {
             return self.path.clone();

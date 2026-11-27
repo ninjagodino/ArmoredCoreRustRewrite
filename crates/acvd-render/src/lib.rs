@@ -17,9 +17,9 @@ use acvd_formats::{flver, tpf};
 use anyhow::{bail, ensure, Context, Result};
 use bevy::asset::{Assets, Handle, RenderAssetUsages};
 use bevy::color::Color;
-use bevy::pbr::StandardMaterial;
 use bevy::image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology, VertexAttributeValues};
+use bevy::pbr::StandardMaterial;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 pub struct LoadedMesh {
@@ -95,8 +95,18 @@ pub fn model(disc: &Disc, asset: &str) -> Result<Vec<LoadedMesh>> {
 
 /// Like [`model`], moving every vertex by `offset(root)` once it is in model space, in FLVER
 /// axes: `root` names the root bone above the vertex's bone, `None` when it has no bone.
-pub fn model_with_offsets(disc: &Disc, asset: &str, offset: &dyn Fn(Option<&str>) -> [f32; 3]) -> Result<Vec<LoadedMesh>> {
-    Ok(load(disc, asset, &|root| RootPlace::translate(offset(root)), false)?.0)
+pub fn model_with_offsets(
+    disc: &Disc,
+    asset: &str,
+    offset: &dyn Fn(Option<&str>) -> [f32; 3],
+) -> Result<Vec<LoadedMesh>> {
+    Ok(load(
+        disc,
+        asset,
+        &|root| RootPlace::translate(offset(root)),
+        false,
+    )?
+    .0)
 }
 
 /// Where one root bone of a part sits on the assembled AC, in FLVER axes. Columns are the
@@ -110,10 +120,18 @@ pub struct RootPlace {
 }
 
 impl RootPlace {
-    pub const IDENTITY: Self = Self { x: [1.0, 0.0, 0.0], y: [0.0, 1.0, 0.0], z: [0.0, 0.0, 1.0], t: [0.0; 3] };
+    pub const IDENTITY: Self = Self {
+        x: [1.0, 0.0, 0.0],
+        y: [0.0, 1.0, 0.0],
+        z: [0.0, 0.0, 1.0],
+        t: [0.0; 3],
+    };
 
     pub fn translate(t: [f32; 3]) -> Self {
-        Self { t, ..Self::IDENTITY }
+        Self {
+            t,
+            ..Self::IDENTITY
+        }
     }
 
     pub fn apply_point(&self, p: [f32; 3]) -> [f32; 3] {
@@ -184,7 +202,11 @@ pub struct RigEffect {
 
 /// Like [`model_with_offsets`], with joint indices and weights on every mesh for GPU skinning.
 /// `place(root)` is where that root sits on the assembled AC.
-pub fn rigged_model(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace) -> Result<(Vec<LoadedMesh>, Rig)> {
+pub fn rigged_model(
+    disc: &Disc,
+    asset: &str,
+    place: &dyn Fn(Option<&str>) -> RootPlace,
+) -> Result<(Vec<LoadedMesh>, Rig)> {
     let data = vfs::open(disc, asset)?;
     let f = flver::read(&data)?;
     let meshes = load_from_flver(&data, &f, place, true)?;
@@ -236,13 +258,27 @@ fn build_rig(f: &flver::Flver, place: &dyn Fn(Option<&str>) -> RootPlace) -> Res
         .enumerate()
         .map(|(i, b)| {
             let placed = place(Some(&f.bones[roots[i]].name)).then_bind(&world[i]);
-            RigBone { name: b.name.clone(), parent: usize::try_from(b.parent).ok().filter(|&p| p < f.bones.len()), bind: placed }
+            RigBone {
+                name: b.name.clone(),
+                parent: usize::try_from(b.parent)
+                    .ok()
+                    .filter(|&p| p < f.bones.len()),
+                bind: placed,
+            }
         })
         .collect();
     let bone_of = |d: &flver::Dummy| {
-        usize::try_from(d.parent_bone).ok().or(usize::try_from(d.attach_bone).ok()).filter(|&b| b < f.bones.len())
+        usize::try_from(d.parent_bone)
+            .ok()
+            .or(usize::try_from(d.attach_bone).ok())
+            .filter(|&b| b < f.bones.len())
     };
-    let sockets = f.dummies.iter().filter(|d| d.color[0] != 0).map(|d| (d.color[0], bone_of(d))).collect();
+    let sockets = f
+        .dummies
+        .iter()
+        .filter(|d| d.color[0] != 0)
+        .map(|d| (d.color[0], bone_of(d)))
+        .collect();
     let frames = f
         .dummies
         .iter()
@@ -250,8 +286,14 @@ fn build_rig(f: &flver::Flver, place: &dyn Fn(Option<&str>) -> RootPlace) -> Res
         .filter_map(|d| {
             let b = bone_of(d)?;
             let m = &world[b].m;
-            let forward = [0, 1, 2].map(|r| m[r][0] * d.forward[0] + m[r][1] * d.forward[1] + m[r][2] * d.forward[2]);
-            Some(SocketFrame { id: d.color[0], root: f.bones[roots[b]].name.clone(), position: world[b].apply(d.position), forward })
+            let forward = [0, 1, 2]
+                .map(|r| m[r][0] * d.forward[0] + m[r][1] * d.forward[1] + m[r][2] * d.forward[2]);
+            Some(SocketFrame {
+                id: d.color[0],
+                root: f.bones[roots[b]].name.clone(),
+                position: world[b].apply(d.position),
+                forward,
+            })
         })
         .collect();
     let effects = f
@@ -260,29 +302,52 @@ fn build_rig(f: &flver::Flver, place: &dyn Fn(Option<&str>) -> RootPlace) -> Res
         .filter(|d| d.color[1] != 0)
         .map(|d| RigEffect {
             id: d.color[1],
-            bone: usize::try_from(d.parent_bone).ok().filter(|&b| b < f.bones.len()),
+            bone: usize::try_from(d.parent_bone)
+                .ok()
+                .filter(|&b| b < f.bones.len()),
             position: d.position,
             forward: d.forward,
         })
         .collect();
-    Ok(Rig { bones, unboned: place(None).t, sockets, frames, effects })
+    Ok(Rig {
+        bones,
+        unboned: place(None).t,
+        sockets,
+        frames,
+        effects,
+    })
 }
 
-fn load(disc: &Disc, asset: &str, place: &dyn Fn(Option<&str>) -> RootPlace, rig: bool) -> Result<(Vec<LoadedMesh>, flver::Flver)> {
+fn load(
+    disc: &Disc,
+    asset: &str,
+    place: &dyn Fn(Option<&str>) -> RootPlace,
+    rig: bool,
+) -> Result<(Vec<LoadedMesh>, flver::Flver)> {
     let data = vfs::open(disc, asset)?;
     let f = flver::read(&data)?;
     let out = load_from_flver(&data, &f, place, rig)?;
     Ok((out, f))
 }
 
-fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -> RootPlace, rig: bool) -> Result<Vec<LoadedMesh>> {
+fn load_from_flver(
+    data: &[u8],
+    f: &flver::Flver,
+    place: &dyn Fn(Option<&str>) -> RootPlace,
+    rig: bool,
+) -> Result<Vec<LoadedMesh>> {
     let world = f.bone_transforms()?;
     let bone_roots = f.bone_roots();
-    let by_bone: Vec<RootPlace> = bone_roots.iter().map(|&r| place(Some(&f.bones[r].name))).collect();
+    let by_bone: Vec<RootPlace> = bone_roots
+        .iter()
+        .map(|&r| place(Some(&f.bones[r].name)))
+        .collect();
     let unboned = place(None);
     let mut out = Vec::new();
     for (i, m) in f.meshes.iter().enumerate() {
-        let Some(fs) = f.main_face_set(m) else { continue };
+        let Some(fs) = f.main_face_set(m) else {
+            continue;
+        };
         let tris = f.triangles(data, fs).with_context(|| format!("mesh {i}"))?;
         let mut v = f.vertices(data, m).with_context(|| format!("mesh {i}"))?;
         if tris.is_empty() || v.positions.is_empty() {
@@ -291,7 +356,13 @@ fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -
         let bones = f.vertex_bones(m, &v);
         let joints = rig.then(|| vertex_joints(&f, m, &v, &bones));
         f.to_model_space(m, &mut v, &bones, &world);
-        let placed_at = |i: usize| bones.get(i).and_then(|b| b.and_then(|b| by_bone.get(b))).copied().unwrap_or(unboned);
+        let placed_at = |i: usize| {
+            bones
+                .get(i)
+                .and_then(|b| b.and_then(|b| by_bone.get(b)))
+                .copied()
+                .unwrap_or(unboned)
+        };
         for (i, p) in v.positions.iter_mut().enumerate() {
             *p = placed_at(i).apply_point(*p);
         }
@@ -310,20 +381,36 @@ fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -
         }
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
         for &i in tris.iter().flatten() {
-            let p = v.positions.get(i as usize).copied().map(mirror).context("index past the mesh's vertices")?;
+            let p = v
+                .positions
+                .get(i as usize)
+                .copied()
+                .map(mirror)
+                .context("index past the mesh's vertices")?;
             for k in 0..3 {
                 min[k] = min[k].min(p[k]);
                 max[k] = max[k].max(p[k]);
             }
         }
-        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, v.positions.iter().copied().map(mirror).collect::<Vec<_>>());
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            v.positions.iter().copied().map(mirror).collect::<Vec<_>>(),
+        );
         if v.normals.len() == v.positions.len() {
-            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, v.normals.iter().copied().map(mirror).collect::<Vec<_>>());
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_NORMAL,
+                v.normals.iter().copied().map(mirror).collect::<Vec<_>>(),
+            );
         }
         match v.uvs.first().filter(|u| u.len() == v.positions.len()) {
             Some(uv) => mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv.clone()),
-            None => mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; v.positions.len()]),
+            None => {
+                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; v.positions.len()])
+            }
         }
         if let Some(uv1) = v.uvs.get(1).filter(|u| u.len() == v.positions.len()) {
             mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, uv1.clone());
@@ -336,7 +423,9 @@ fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -
             mesh.compute_smooth_normals();
         }
         let has_flver_tangents = v.normals.len() == v.positions.len()
-            && v.tangents.first().is_some_and(|t| t.len() == v.positions.len());
+            && v.tangents
+                .first()
+                .is_some_and(|t| t.len() == v.positions.len());
         if has_flver_tangents {
             let tangents: Vec<[f32; 4]> = v
                 .normals
@@ -347,7 +436,10 @@ fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -
             mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
         }
         if let Some((index, weight)) = joints {
-            mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_INDEX, VertexAttributeValues::Uint16x4(index));
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_JOINT_INDEX,
+                VertexAttributeValues::Uint16x4(index),
+            );
             mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, weight);
         }
         let mat = f.materials.get(m.material.max(0) as usize);
@@ -373,7 +465,9 @@ fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -
             if mesh.generate_tangents().is_ok() {
                 // MikkTSpace aligns bitangent with -dP/dv (OpenGL); flip w so B aligns with
                 // +dP/dv like FLVER tangents and every normal map uses flip_normal_map_y: false.
-                if let Some(VertexAttributeValues::Float32x4(ts)) = mesh.attribute_mut(Mesh::ATTRIBUTE_TANGENT) {
+                if let Some(VertexAttributeValues::Float32x4(ts)) =
+                    mesh.attribute_mut(Mesh::ATTRIBUTE_TANGENT)
+                {
                     for t in ts.iter_mut() {
                         t[3] = -t[3];
                     }
@@ -387,7 +481,19 @@ fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -
             .and_then(|&b| bone_roots.get(b))
             .and_then(|&r| f.bones.get(r))
             .map(|b| b.name.clone());
-        out.push(LoadedMesh { mesh, diffuse, diffuse2, bump, bump2, specular, emission, mtd, root, min, max });
+        out.push(LoadedMesh {
+            mesh,
+            diffuse,
+            diffuse2,
+            bump,
+            bump2,
+            specular,
+            emission,
+            mtd,
+            root,
+            min,
+            max,
+        });
     }
     Ok(out)
 }
@@ -395,11 +501,23 @@ fn load_from_flver(data: &[u8], f: &flver::Flver, place: &dyn Fn(Option<&str>) -
 /// Joint indices and weights per vertex. Dynamic meshes keep all four weighted bones (their
 /// vertices are already in model space); the others follow their single bone. Vertices without
 /// a bone use the extra joint `bones.len()`.
-fn vertex_joints(f: &flver::Flver, m: &flver::Mesh, v: &flver::Vertices, bones: &[Option<usize>]) -> (Vec<[u16; 4]>, Vec<[f32; 4]>) {
+fn vertex_joints(
+    f: &flver::Flver,
+    m: &flver::Mesh,
+    v: &flver::Vertices,
+    bones: &[Option<usize>],
+) -> (Vec<[u16; 4]>, Vec<[f32; 4]>) {
     let extra = f.bones.len() as u16;
     let global = |l: u8| -> Option<u16> {
-        let b = if m.bone_indices.is_empty() { i32::from(l) } else { *m.bone_indices.get(usize::from(l))? };
-        usize::try_from(b).ok().filter(|&b| b < f.bones.len()).map(|b| b as u16)
+        let b = if m.bone_indices.is_empty() {
+            i32::from(l)
+        } else {
+            *m.bone_indices.get(usize::from(l))?
+        };
+        usize::try_from(b)
+            .ok()
+            .filter(|&b| b < f.bones.len())
+            .map(|b| b as u16)
     };
     bones
         .iter()
@@ -419,7 +537,10 @@ fn vertex_joints(f: &flver::Flver, m: &flver::Mesh, v: &flver::Vertices, bones: 
                     }
                 }
             }
-            ([bone.map_or(extra, |b| b as u16), 0, 0, 0], [1.0, 0.0, 0.0, 0.0])
+            (
+                [bone.map_or(extra, |b| b as u16), 0, 0, 0],
+                [1.0, 0.0, 0.0, 0.0],
+            )
         })
         .unzip()
 }
@@ -464,7 +585,14 @@ pub fn best_texture_ref(name: &str) -> Option<&'static TextureRef> {
 ///
 /// Textures resolve by bare name; callers that know the model's own TPF use
 /// [`material_in_pack`] instead.
-pub fn material(disc: &Disc, part: &LoadedMesh, packs: &mut Packs, images: &mut Assets<Image>, flat: bool, missing: &mut usize) -> StandardMaterial {
+pub fn material(
+    disc: &Disc,
+    part: &LoadedMesh,
+    packs: &mut Packs,
+    images: &mut Assets<Image>,
+    flat: bool,
+    missing: &mut usize,
+) -> StandardMaterial {
     material_in_pack(disc, None, part, packs, images, flat, missing)
 }
 
@@ -481,21 +609,28 @@ pub fn material_in_pack(
     flat: bool,
     missing: &mut usize,
 ) -> StandardMaterial {
-    let texture = part.diffuse.as_deref().filter(|_| !flat).and_then(|name| {
-        match pack_image_handle(disc, pack, name, false, packs, images) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                *missing += 1;
-                eprintln!("{e:#}");
-                None
+    let texture =
+        part.diffuse.as_deref().filter(|_| !flat).and_then(|name| {
+            match pack_image_handle(disc, pack, name, false, packs, images) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    *missing += 1;
+                    eprintln!("{e:#}");
+                    None
+                }
             }
-        }
-    });
-    let normal_map = part.bump.as_deref().filter(|_| !flat).and_then(|name| {
-        pack_image_handle(disc, pack, name, true, packs, images).ok()
-    });
+        });
+    let normal_map = part
+        .bump
+        .as_deref()
+        .filter(|_| !flat)
+        .and_then(|name| pack_image_handle(disc, pack, name, true, packs, images).ok());
     StandardMaterial {
-        base_color: if texture.is_some() { Color::WHITE } else { Color::srgb(0.6, 0.6, 0.62) },
+        base_color: if texture.is_some() {
+            Color::WHITE
+        } else {
+            Color::srgb(0.6, 0.6, 0.62)
+        },
         base_color_texture: texture,
         normal_map_texture: normal_map,
         flip_normal_map_y: false,
@@ -538,7 +673,8 @@ pub struct Packs {
 
 impl Packs {
     pub fn image(&mut self, disc: &Disc, name: &str) -> Result<Image> {
-        let t: &TextureRef = best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
+        let t: &TextureRef =
+            best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
         self.texture(disc, t)
     }
 
@@ -550,14 +686,26 @@ impl Packs {
     }
 
     /// Cached GPU [`Handle<Image>`] for texture `name` (sRGB). Decodes/untiles once per `(pack, index, false)`.
-    pub fn image_handle(&mut self, disc: &Disc, images: &mut Assets<Image>, name: &str) -> Result<Handle<Image>> {
-        let t: &TextureRef = best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
+    pub fn image_handle(
+        &mut self,
+        disc: &Disc,
+        images: &mut Assets<Image>,
+        name: &str,
+    ) -> Result<Handle<Image>> {
+        let t: &TextureRef =
+            best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
         self.texture_handle_at(disc, images, t.pack, t.index, t.name, false)
     }
 
     /// Cached GPU [`Handle<Image>`] for texture `name` in linear (non-sRGB) format.
-    pub fn linear_image_handle(&mut self, disc: &Disc, images: &mut Assets<Image>, name: &str) -> Result<Handle<Image>> {
-        let t: &TextureRef = best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
+    pub fn linear_image_handle(
+        &mut self,
+        disc: &Disc,
+        images: &mut Assets<Image>,
+        name: &str,
+    ) -> Result<Handle<Image>> {
+        let t: &TextureRef =
+            best_texture_ref(name).with_context(|| format!("no texture named `{name}`"))?;
         self.texture_handle_at(disc, images, t.pack, t.index, t.name, true)
     }
 
@@ -605,7 +753,13 @@ impl Packs {
     }
 
     /// Like [`Packs::texture_at`], forcing a linear (non-sRGB) texture format.
-    pub fn linear_texture_at(&mut self, disc: &Disc, pack: &str, index: usize, name: &str) -> Result<Image> {
+    pub fn linear_texture_at(
+        &mut self,
+        disc: &Disc,
+        pack: &str,
+        index: usize,
+        name: &str,
+    ) -> Result<Image> {
         let mut img = self.texture_at(disc, pack, index, name)?;
         to_linear(&mut img);
         Ok(img)
@@ -628,7 +782,9 @@ impl Packs {
             }
             self.index_by_name.insert(pack.to_string(), map);
         }
-        Ok(self.index_by_name[pack].get(&name.to_ascii_lowercase()).copied())
+        Ok(self.index_by_name[pack]
+            .get(&name.to_ascii_lowercase())
+            .copied())
     }
 
     /// `t` comes from the extracted sheets; the format, size and levels are read from the pack on
@@ -638,10 +794,19 @@ impl Packs {
     }
 
     /// Texture `index` of the TPF at asset path `pack`, `name` only labelling errors.
-    pub fn texture_at(&mut self, disc: &Disc, pack: &str, index: usize, name: &str) -> Result<Image> {
+    pub fn texture_at(
+        &mut self,
+        disc: &Disc,
+        pack: &str,
+        index: usize,
+        name: &str,
+    ) -> Result<Image> {
         let pack = self.pack(disc, pack)?;
         let header = tpf::read(pack)?;
-        let tex = header.textures.get(index).context("texture index past the pack")?;
+        let tex = header
+            .textures
+            .get(index)
+            .context("texture index past the pack")?;
         let row = acvd_data::texture_format(tex.format);
         let is_ctx1 = matches!(row.map(|f| f.name), Some("ctx1"));
         // Format 33 (HT-BC3, `floats_unk == 1010`, `floats == [scale]`): normalized RGB * A *
@@ -664,7 +829,10 @@ impl Packs {
         };
         ensure!(tex.faces() == 1, "texture `{name}` is a cube map");
         let (width, height) = (tex.width, tex.height);
-        ensure!(width % 4 == 0 && height % 4 == 0, "texture `{name}` is {width}x{height}");
+        ensure!(
+            width % 4 == 0 && height % 4 == 0,
+            "texture `{name}` is {width}x{height}"
+        );
         let block = row.map_or(16, |f| f.block_bytes);
         let bytes = tex.linear(header.platform, pack, block)?;
         let mut levels = tex.levels();
@@ -673,7 +841,10 @@ impl Packs {
         if end > bytes.len() {
             levels = 1;
             end = tpf::block_level_span(width, height, 1, 0, 0, block).1 as usize;
-            ensure!(end <= bytes.len(), "texture `{name}` is shorter than its first level");
+            ensure!(
+                end <= bytes.len(),
+                "texture `{name}` is shorter than its first level"
+            );
         }
         let data = if is_ctx1 {
             tpf::decode_ctx1(&bytes[..end], width, height, levels, 1)?
@@ -684,7 +855,11 @@ impl Packs {
             bytes[..end].to_vec()
         };
         let mut image = Image::default();
-        image.texture_descriptor.size = Extent3d { width: width as u32, height: height as u32, depth_or_array_layers: 1 };
+        image.texture_descriptor.size = Extent3d {
+            width: width as u32,
+            height: height as u32,
+            depth_or_array_layers: 1,
+        };
         image.texture_descriptor.dimension = TextureDimension::D2;
         image.texture_descriptor.format = format;
         image.texture_descriptor.mip_level_count = levels;
@@ -717,8 +892,14 @@ mod tests {
             let t_xyz = [t[0], t[1], t[2]];
             let b_raw = cross(n_bevy, t_xyz);
             let b_bevy = [b_raw[0] * t[3], b_raw[1] * t[3], b_raw[2] * t[3]];
-            assert!((t_xyz[0] - w).abs() < 1e-5 && t_xyz[1].abs() < 1e-5 && t_xyz[2].abs() < 1e-5, "w={w} t={t:?}");
-            assert!(b_bevy[0].abs() < 1e-5 && (b_bevy[1] - 1.0).abs() < 1e-5 && b_bevy[2].abs() < 1e-5, "w={w} b={b_bevy:?}");
+            assert!(
+                (t_xyz[0] - w).abs() < 1e-5 && t_xyz[1].abs() < 1e-5 && t_xyz[2].abs() < 1e-5,
+                "w={w} t={t:?}"
+            );
+            assert!(
+                b_bevy[0].abs() < 1e-5 && (b_bevy[1] - 1.0).abs() < 1e-5 && b_bevy[2].abs() < 1e-5,
+                "w={w} b={b_bevy:?}"
+            );
         }
     }
 
@@ -729,25 +910,39 @@ mod tests {
             return;
         }
         let disc = Disc::open(&iso).unwrap();
-        let meshes = model(&disc, "model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv").unwrap();
+        let meshes = model(
+            &disc,
+            "model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv",
+        )
+        .unwrap();
         assert!(!meshes.is_empty());
         let first = &meshes[0];
         assert!(first.bump.is_some(), "am0010 should expose g_Bumpmap");
         assert!(first.specular.is_some(), "am0010 should expose g_Specular");
-        assert!(first.mesh.attribute(Mesh::ATTRIBUTE_TANGENT).is_some(), "am0010 should carry ATTRIBUTE_TANGENT");
+        assert!(
+            first.mesh.attribute(Mesh::ATTRIBUTE_TANGENT).is_some(),
+            "am0010 should carry ATTRIBUTE_TANGENT"
+        );
 
         let mut packs = Packs::default();
         // CTX1 (code 25) normal map -> Rg8Unorm
-        let ctx1_img = packs.linear_image(&disc, first.bump.as_deref().unwrap()).unwrap();
+        let ctx1_img = packs
+            .linear_image(&disc, first.bump.as_deref().unwrap())
+            .unwrap();
         assert_eq!(ctx1_img.texture_descriptor.format, TextureFormat::Rg8Unorm);
         assert!(ctx1_img.texture_descriptor.mip_level_count > 1);
         // DXN (code 23) normal map -> Bc5RgUnorm
         let dxn_img = packs.linear_image(&disc, "lg3041_n").unwrap();
         assert_eq!(dxn_img.texture_descriptor.format, TextureFormat::Bc5RgUnorm);
         // Specular map -> linear BC1/BC3
-        let spc_img = packs.linear_image(&disc, first.specular.as_deref().unwrap()).unwrap();
+        let spc_img = packs
+            .linear_image(&disc, first.specular.as_deref().unwrap())
+            .unwrap();
         assert!(
-            matches!(spc_img.texture_descriptor.format, TextureFormat::Bc1RgbaUnorm | TextureFormat::Bc3RgbaUnorm),
+            matches!(
+                spc_img.texture_descriptor.format,
+                TextureFormat::Bc1RgbaUnorm | TextureFormat::Bc3RgbaUnorm
+            ),
             "unexpected specular format {:?}",
             spc_img.texture_descriptor.format
         );
@@ -762,7 +957,10 @@ mod tests {
         let disc = Disc::open(&iso).unwrap();
         let mut packs = Packs::default();
         let (mut dxn_n, mut ctx24_n, mut ctx25_n) = (0usize, 0usize, 0usize);
-        for t in acvd_data::generated::textures::ALL.iter().flat_map(|g| g.iter()) {
+        for t in acvd_data::generated::textures::ALL
+            .iter()
+            .flat_map(|g| g.iter())
+        {
             if !matches!(t.format, 23 | 24 | 25) {
                 continue;
             }
@@ -819,7 +1017,9 @@ mod tests {
         };
         assert!(!colors.is_empty());
         // Big-endian D3DCOLOR [A, R, G, B] -> [R, G, B, A]: RGB should be ~1.0, alpha blends 0..1.
-        assert!(colors.iter().all(|c| c[0] > 0.99 && c[1] > 0.99 && c[2] > 0.99));
+        assert!(colors
+            .iter()
+            .all(|c| c[0] > 0.99 && c[1] > 0.99 && c[2] > 0.99));
         let min_a = colors.iter().map(|c| c[3]).fold(1.0f32, f32::min);
         let max_a = colors.iter().map(|c| c[3]).fold(0.0f32, f32::max);
         assert!(min_a < 0.1 && max_a > 0.9, "alpha range {min_a}..{max_a}");
@@ -854,6 +1054,9 @@ mod tests {
             min_r = min_r.min(px[0]);
             max_r = max_r.max(px[0]);
         }
-        assert!(max_r - min_r > 80, "HT-BC3 decoded hl0110 should have real panel contrast, got {min_r}..{max_r}");
+        assert!(
+            max_r - min_r > 80,
+            "HT-BC3 decoded hl0110 should have real panel contrast, got {min_r}..{max_r}"
+        );
     }
 }

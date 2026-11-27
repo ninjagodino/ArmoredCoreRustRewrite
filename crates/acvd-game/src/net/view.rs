@@ -32,6 +32,13 @@ pub struct RemotePlayer {
     pub net_id: u8,
 }
 
+/// Per-frame remote LOD gate: `active` is false for far/off-screen rigs so
+/// [`crate::pose::animate_npcs`] skips their skeletal updates.
+#[derive(Component)]
+pub struct RemoteLod {
+    pub active: bool,
+}
+
 /// Simple non-particle trail marker pacing for remote boosters.
 #[derive(Component, Default)]
 pub struct RemoteFx {
@@ -76,14 +83,14 @@ impl RemoteRack {
         for side in 0..2 {
             let active = self.active[side];
             for entity in &self.slots[side][0] {
-                commands.entity(*entity).insert(if active {
+                commands.entity(*entity).try_insert(if active {
                     Visibility::Hidden
                 } else {
                     Visibility::Visible
                 });
             }
             for entity in &self.slots[side][1] {
-                commands.entity(*entity).insert(if active {
+                commands.entity(*entity).try_insert(if active {
                     Visibility::Visible
                 } else {
                     Visibility::Hidden
@@ -98,14 +105,14 @@ impl RemoteRack {
         }
         self.active[side] = active;
         for entity in &self.slots[side][0] {
-            commands.entity(*entity).insert(if active {
+            commands.entity(*entity).try_insert(if active {
                 Visibility::Hidden
             } else {
                 Visibility::Visible
             });
         }
         for entity in &self.slots[side][1] {
-            commands.entity(*entity).insert(if active {
+            commands.entity(*entity).try_insert(if active {
                 Visibility::Visible
             } else {
                 Visibility::Hidden
@@ -179,6 +186,11 @@ pub fn sync(
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     runtime: Res<NetRuntime>,
     mut view: ResMut<NetView>,
+    mut rig_cache: ResMut<targets::AcRigCache>,
+    cams: Query<
+        (&Camera, &GlobalTransform),
+        (With<Camera3d>, Without<crate::env::WaterReflectionCamera>),
+    >,
     mut remotes: Query<(
         Entity,
         &RemotePlayer,
@@ -186,6 +198,7 @@ pub fn sync(
         Option<&mut NpcMotion>,
         Option<&mut RemoteFx>,
         Option<&mut RemoteRack>,
+        Option<&mut RemoteLod>,
     )>,
 ) {
     let session = &runtime.session;
@@ -205,7 +218,7 @@ pub fn sync(
         .map(|(id, entity)| (*id, *entity))
         .collect();
     for (id, entity) in stale {
-        commands.entity(entity).despawn();
+        commands.entity(entity).try_despawn();
         view.acs.remove(&id);
         view.dead.remove(&id);
     }
@@ -236,6 +249,7 @@ pub fn sync(
             &garage.disc,
             &mut packs,
             &mut missing,
+            &mut rig_cache,
             &design,
             &format!("remote AC {net_id}"),
             xf,
@@ -244,36 +258,71 @@ pub fn sync(
             warn!("net: could not assemble remote AC {net_id}");
             continue;
         };
-        commands.entity(rig.root).insert((
+        commands.entity(rig.root).try_insert((
             RemotePlayer {
                 net_id: net_id.get(),
             },
             RemoteFx::default(),
+            RemoteLod { active: true },
         ));
         let rack = RemoteRack::new(&rig.parts, sample.combat_flags);
         rack.apply_visibility(&mut commands);
-        commands.entity(rig.root).insert(rack);
+        commands.entity(rig.root).try_insert(rack);
         if let Some(npc) = rig.npc {
-            commands.entity(rig.root).insert(npc);
+            commands.entity(rig.root).try_insert(npc);
         }
         view.acs.insert(net_id.get(), rig.root);
     }
 
-    // Drive remote transforms, locomotion, bay swaps, and booster/glide effects.
+    // Drive remote transforms, locomotion, bay swaps, and booster/glide effects. Rigs farther
+    // than 250 m or outside the camera frustum are hidden and their skeletal animation is
+    // skipped; `pose::animate_npcs` also checks [`RemoteLod`] so far rigs cost only a transform
+    // write per frame.
     let dt = time.delta_secs();
+    let cam = cams.iter().next();
+    let cam_pos = cam.map_or(Vec3::ZERO, |(_, tf)| tf.translation());
+    let remote_active = |pos: Vec3| -> bool {
+        if cam_pos.distance_squared(pos) > 250.0 * 250.0 {
+            return false;
+        }
+        match cam {
+            Some((camera, tf)) => {
+                if (pos - cam_pos).dot(tf.forward().as_vec3()) <= 0.0 {
+                    return false;
+                }
+                camera.world_to_ndc(tf, pos).is_some_and(|p| {
+                    p.x.abs() <= 1.25 && p.y.abs() <= 1.25 && (0.0..=1.0).contains(&p.z)
+                })
+            }
+            None => true,
+        }
+    };
     let mut fx: Vec<(Vec3, i32)> = Vec::new();
-    for (root, player, mut transform, npc, marker, rack) in &mut remotes {
+    for (root, player, mut transform, npc, marker, rack, lod) in &mut remotes {
         let id = NetId::new(player.net_id).ok();
         let Some(view_sample) = id.and_then(|id| session.remote_view(id)) else {
             continue;
         };
-        if view.dead.contains(&player.net_id) || view_sample.flags & ac_flags::DESTROYED != 0 {
-            commands.entity(root).insert(Visibility::Hidden);
+        let dead =
+            view.dead.contains(&player.net_id) || view_sample.flags & ac_flags::DESTROYED != 0;
+        if dead {
+            if let Some(mut lod) = lod {
+                lod.active = false;
+            }
+            commands.entity(root).try_insert(Visibility::Hidden);
             continue;
         }
-        commands.entity(root).insert(Visibility::Visible);
         transform.translation = view_sample.pos;
         transform.rotation = Quat::from_rotation_y(view_sample.yaw);
+        let active = remote_active(view_sample.pos);
+        if let Some(mut lod) = lod {
+            lod.active = active;
+        }
+        if !active {
+            commands.entity(root).try_insert(Visibility::Hidden);
+            continue;
+        }
+        commands.entity(root).try_insert(Visibility::Visible);
         let speed_ms = view_sample.vel.length() * 60.0;
         let walk_max_ms = id
             .and_then(|id| session.loadouts.get(&id))

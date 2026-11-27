@@ -2,9 +2,14 @@
 //!
 //! Usage:
 //!   acvd-server [--bind 0.0.0.0:5000] [--max-clients 24] [--protocol-id N]
-//!               [--map m4000] [--disc <ACV2.pe>]
-//!   acvd-server --bots N --duration S --metrics <json>
+//!               [--map m4000] [--disc <ACV2.pe>] [--bots N]
+//!               [--distribution cluster|all-near] [--seed N]
+//!   acvd-server --bots N --soak [--duration S] [--metrics <json>]
 //!               [--distribution cluster|all-near] [--churn] [--seed N]
+//!
+//! `--bots N` in normal mode adds N real-time bot clients to the match and reserves one extra
+//! slot, so a human `--connect` joins as player N+1. `--soak` is the headless load gate; the
+//! phase-4 invocation (`--bots N --duration S --metrics <json>`) still selects it.
 //!
 //! The owned disc (and the generated tables compiled into `acvd-data`) is never bundled; pass
 //! `--disc` or set `ACVD_DISC`. Missing data fails fast with a clear message.
@@ -17,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acvd_server::bots::{Distribution, SoakOptions};
-use acvd_server::{run, Server, ServerConfig};
+use acvd_server::{run_with_bots, Server, ServerConfig};
 
 fn main() -> ExitCode {
     if let Err(err) = real_main() {
@@ -34,7 +39,10 @@ fn real_main() -> anyhow::Result<()> {
     let mut disc: Option<PathBuf> = None;
     let mut bots = 0usize;
     let mut duration = 60u64;
+    let mut duration_given = false;
     let mut metrics = PathBuf::from("private/soak/soak.json");
+    let mut metrics_given = false;
+    let mut soak = false;
     let mut distribution = Distribution::Cluster;
     let mut churn = false;
     let mut seed = acvd_sim::world::DEFAULT_MATCH_SEED;
@@ -81,13 +89,16 @@ fn real_main() -> anyhow::Result<()> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--duration needs seconds"))?
                     .parse()?;
+                duration_given = true;
             }
             "--metrics" => {
                 metrics = PathBuf::from(
                     args.next()
                         .ok_or_else(|| anyhow::anyhow!("--metrics needs a path"))?,
                 );
+                metrics_given = true;
             }
+            "--soak" | "--headless" => soak = true,
             "--distribution" => {
                 distribution = args
                     .next()
@@ -104,11 +115,14 @@ fn real_main() -> anyhow::Result<()> {
             "-h" | "--help" => {
                 println!(
                     "acvd-server [--bind 0.0.0.0:5000] [--max-clients 24] [--protocol-id N]\n\
-                     \x20            [--map m4000] [--disc <ACV2.pe>]\n\
-                     acvd-server --bots N --duration S --metrics <json>\n\
+                     \x20            [--map m4000] [--disc <ACV2.pe>] [--bots N]\n\
+                     \x20            [--distribution cluster|all-near] [--seed N]\n\
+                     acvd-server --bots N --soak [--duration S] [--metrics <json>]\n\
                      \x20            [--distribution cluster|all-near] [--churn] [--seed N]\n\n\
-                     Missing disc/generated data fails fast; the owned disc is never bundled.\n\
-                     Bot mode without --disc uses the synthetic arena for load generation."
+                     --bots N adds live bots to a real-time match and reserves one extra client\n\
+                     slot, so a human --connect joins as player N+1. --soak runs the headless\n\
+                     load gate. Missing disc/generated data fails fast; the owned disc is never\n\
+                     bundled. Bot soak without --disc uses the synthetic arena."
                 );
                 return Ok(());
             }
@@ -125,7 +139,15 @@ fn real_main() -> anyhow::Result<()> {
     })
     .map_err(|e| anyhow::anyhow!("install Ctrl-C handler: {e}"))?;
 
-    if bots > 0 {
+    // Live mode is the default: `--bots N` joins N real-time bots to a normal server that
+    // accepts `--connect` clients. The headless gate is explicit via `--soak`; the phase-4
+    // invocation (`--bots N --duration S --metrics <json>`) still selects it for compatibility.
+    let soak = soak || (bots > 0 && (duration_given || metrics_given));
+
+    if soak {
+        if bots == 0 {
+            anyhow::bail!("--soak needs --bots N");
+        }
         if bots > 64 {
             anyhow::bail!("at most 64 bots are supported");
         }
@@ -173,5 +195,5 @@ fn real_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    run(config, shutdown)
+    run_with_bots(config, bots, distribution, seed, shutdown)
 }

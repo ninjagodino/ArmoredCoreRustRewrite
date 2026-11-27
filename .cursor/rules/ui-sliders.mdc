@@ -1,0 +1,15 @@
+---
+description: UI sliders and adjustable bars must support hover-to-scroll and consume the mouse wheel
+alwaysApply: true
+---
+
+# UI sliders: hover-to-scroll & wheel consumption
+
+Whenever adding or modifying any slider, gauge bar, or stepper control in the game UI (Garage, Pause, Paint, Options, or any new menu):
+
+1. **Support hover-to-scroll**:
+   - Hovering over the slider row, gauge track, or `<` / `>` stepper buttons and scrolling the mouse wheel must step the value up on scroll-up (`AccumulatedMouseScroll.delta.y > 0.0`) and down on scroll-down (`delta.y < 0.0`), using `garage::wheel_step_direction`.
+   - For `UiAction`-based controls, add a mapping in `UiAction::wheel_adjust()`.
+   - For custom drag tracks (like `ColorPickerTrack`), handle hover-scroll in the track's input system using the cursor's hit test against the track's `ComputedNode` + `UiGlobalTransform`.
+2. **Consume the mouse wheel so the 3D camera never zooms**:
+   - Set `state.wheel_consumed = true` (reset at the start of `garage::handle_input`) whenever a UI slider/strip consumes the wheel. Because `garage::sync_ui` rebuilds UI entities before `garage::update_camera` runs in the same frame, checking only `Interaction::Hovered` in `update_camera` is not sufficient — the per-frame `wheel_consumed` flag guarantees the 3D mech camera never zooms while adjusting a UI slider.

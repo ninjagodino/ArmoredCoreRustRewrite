@@ -42,7 +42,7 @@ use acvd_data::generated::tuning::NEW_AC_BEHAVIOR;
 use acvd_data::{ac_state, find, part_field};
 use acvd_formats::reader::Be;
 use acvd_formats::vfs::{self, Disc};
-use acvd_formats::{acv_parts, ani, jcon};
+use acvd_formats::{acv_parts, ani, jcon, tae};
 use acvd_render::Rig;
 use acvd_sim::weapons as simw;
 use bevy::audio::AudioSource;
@@ -99,11 +99,27 @@ pub enum Hand {
 /// The two hand weapons, two bay weapons, shoulder unit, and optional Overed Weapon (`back_r`)
 /// of the shown design.
 /// `hands` / `bays` are `[right, left]`. When `weapon_arm` is true (`acvparts` cat-2 byte
-/// `+0x13c == 1`, `0x824793c8`), `hands[0]` holds the unified built-in weapon-arm record
-/// (`0x82479668` -> `0x8247e090`) and `hands[1]` / `bays` / `shoulder` are silent.
+/// `+0x13c == 1`, `0x824793c8`), the normal hand weapons stay equipped: while the arm is
+/// stowed they are the active guns, and while it deploys they fold on their own `a00_003`
+/// clip (no rack exists). Only `bays`, `shoulder`, and the Overed Weapon are suppressed.
+/// Verification only: inject one real Weapon Switch edge so a `--shot` run can capture the
+/// deploy in progress without holding the R modifier (which would suppress fire for the whole
+/// run). With `--shot`, the edge fires half a deploy before the screenshot, so the capture lands
+/// in `Deploying`; `--test-weapon-switch-stow` instead starts at readiness and adds the reverse
+/// edge once the arm reaches a deployed phase. Neither hook alters state directly.
+#[derive(Resource, Default)]
+pub struct TestWeaponSwitch {
+    pub deploy: bool,
+    pub stow_after_deploy: bool,
+}
+
 #[derive(Component)]
 pub struct Armament {
     pub hands: [Gun; 2],
+    /// Unified built-in category-10 weapon-arm record (`0x82479668` -> `0x8247e090`).
+    pub weapon_arm_gun: Gun,
+    /// Cat-2 arms part ID (`am7020`..`am7620`), selecting the model's FFX dummy sockets.
+    pub weapon_arm_part: u16,
     pub bays: [Gun; 2],
     pub shoulder: Gun,
     /// Equipped Overed Weapon (`AC_ASSEMBLY_DESIGN_ST.back_r`, category 11, slot 12) and its
@@ -111,6 +127,13 @@ pub struct Armament {
     pub overed: Option<OveredWeaponState>,
     /// True when the equipped arms are weapon arms (`0x824793c8`).
     pub weapon_arm: bool,
+    /// Authoritative 360 unfold/ready/fire lockout state (same type the server simulates).
+    pub weapon_arm_state: acvd_sim::weapons::WeaponArmState,
+    /// Rising-edge latch for the Weapon Switch / Bay Swap input.
+    pub prev_weapon_switch: bool,
+    /// Fractional 60 Hz accumulator so a high-refresh render loop does not run the arm
+    /// transform clips at 120/144 Hz.
+    pub weapon_arm_accum: f32,
     /// Queued shoulder salvo rounds (`Some(target)` for locked missiles, `None` for dumbfire/rockets).
     pub salvo: Vec<Option<Entity>>,
     /// Remaining 60 Hz ticks before the next missile/round leaves the shoulder pod.
@@ -981,14 +1004,17 @@ pub struct WeaponAnims {
     rigs: Vec<WeaponRig>,
     /// Arm `a00` clips, posed over locomotion while the weapon on that side is deployed.
     arms: Vec<WeaponRig>,
-    /// Weapon-arm `am*_a.bnd.dcx` player (`0x824793c8`, `0x82882d28`, `0x8284cecc`), driving all
-    /// non-root bones (`*_armwepunit_*`, `*_armroot`, `*_arm01..*_armhand`) for stowed, deploy,
-    /// combat-idle, ready, fire, and stow states.
+    /// Weapon-arm `am*_a.bnd.dcx` player (`0x824793c8`, `0x82882d28`, `0x8284cecc`), driving the
+    /// folded `*_armwepunit_*` bones while stowed and the whole non-root chain
+    /// (`*_armwepunit_*`, `*_armroot`, `*_arm01..*_armhand`) while deploying/deployed/ready/
+    /// firing/stowing.
     weapon_arm: Option<WeaponArmRig>,
     recoil_bones: Vec<RecoilBone>,
     /// Right, left.
     aim: [ArmAim; 2],
     sniper: SniperStance,
+    /// The hand weapons are playing their authored `a00_003` fold because a weapon arm is out.
+    hand_stowed: bool,
 }
 
 /// Raise blend of the weapon-arm aim: `f1` of every `0x8287f448` call from `0x8289e468`.
@@ -998,6 +1024,13 @@ const AIM_LOWER: f32 = 60.0;
 /// Frames the aim stays requested after fire is let go. The probe shows `AimArm` re-sent each
 /// frame from the trigger press until about 1 s after the last shot; the timer is not traced.
 const AIM_HOLD: f32 = 60.0;
+
+/// The ordinary hand-weapon arm raise/aim/recoil is only valid while the built-in weapon arm is
+/// fully stowed. During Deploying/Stowing the `am*_a` clip owns the main arm chain, and while
+/// Deployed/Ready/Firing that chain is the weapon arm itself.
+fn hand_aim_enabled(phase: acvd_sim::weapons::WeaponArmPhase) -> bool {
+    phase == acvd_sim::weapons::WeaponArmPhase::Stowed
+}
 
 /// The weapon-arm aim (AC vtable `0x82044fc0` +0x90 `0x8284a570`, sent every frame from the
 /// weapon method `0x828a2488` while firing, weight 1.0). It turns `*_arm01` so the barrel
@@ -1625,43 +1658,52 @@ pub(crate) struct Tracers {
 impl Armament {
     pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
         let ctrl = AcCtrlParam::calculate(design);
-        let overed = OveredWeaponSpec::from_design(design, &ctrl).map(OveredWeaponState::new);
         let weapon_arm = part_field(design.arms as i64, 2, "is_weapon_arm") != 0.0;
-        if weapon_arm {
-            // `0x824793c8` -> `0x82479668` -> `0x8247e090`: weapon arms embed a single unified
-            // category-10 weapon record (9020..9620) and disable hand/hanger/shoulder slots.
-            let wid = part_field(design.arms as i64, 2, "weapon_arm_id") as i64;
-            let mut wa = gun(wid);
-            wa.apply_reload_stability(&ctrl);
-            return Self {
-                hands: [wa, silent()],
-                bays: [silent(), silent()],
-                shoulder: silent(),
-                overed,
-                weapon_arm: true,
-                salvo: Vec::new(),
-                salvo_timer: 0.0,
-                salvo_index: 0,
-                arm_salvo: Vec::new(),
-                arm_salvo_timer: 0.0,
-                arm_salvo_index: 0,
-            };
-        }
-        let arms_mount =
-            (part_field(design.arms as i64, 2, "shoulder_mount_count").round() as u8).max(1);
+        let overed = if weapon_arm {
+            None
+        } else {
+            OveredWeaponSpec::from_design(design, &ctrl).map(OveredWeaponState::new)
+        };
+        // `0x824793c8` -> `0x82479668` -> `0x8247e090`: weapon arms embed one built-in
+        // category-10 weapon (9020..9620), but ACVD keeps the ordinary L/R hand weapons.
+        // Only hanger bays, shoulder units, and Overed Weapons are disabled.
         let mut hands = [gun(design.armwep_r as i64), gun(design.armwep_l as i64)];
-        let mut bays = [gun(design.hanger_r as i64), gun(design.hanger_l as i64)];
-        let mut shoulder = shoulder_gun(design.shoulder as i64, arms_mount);
-        for g in hands.iter_mut().chain(bays.iter_mut()) {
+        let mut bays = if weapon_arm {
+            [silent(), silent()]
+        } else {
+            [gun(design.hanger_r as i64), gun(design.hanger_l as i64)]
+        };
+        let mut shoulder = if weapon_arm {
+            silent()
+        } else {
+            let arms_mount =
+                (part_field(design.arms as i64, 2, "shoulder_mount_count").round() as u8).max(1);
+            shoulder_gun(design.shoulder as i64, arms_mount)
+        };
+        let mut weapon_arm_gun = silent();
+        if weapon_arm {
+            let wid = part_field(design.arms as i64, 2, "weapon_arm_id") as i64;
+            weapon_arm_gun = gun(wid);
+            weapon_arm_gun.apply_reload_stability(&ctrl);
+        }
+        for g in hands
+            .iter_mut()
+            .chain(bays.iter_mut())
+            .chain(std::iter::once(&mut shoulder))
+        {
             g.apply_reload_stability(&ctrl);
         }
-        shoulder.apply_reload_stability(&ctrl);
         Self {
             hands,
+            weapon_arm_gun,
+            weapon_arm_part: design.arms as u16,
             bays,
             shoulder,
             overed,
-            weapon_arm: false,
+            weapon_arm,
+            weapon_arm_state: acvd_sim::weapons::WeaponArmState::for_part(design.arms as u16),
+            prev_weapon_switch: false,
+            weapon_arm_accum: 0.0,
             salvo: Vec::new(),
             salvo_timer: 0.0,
             salvo_index: 0,
@@ -1669,6 +1711,52 @@ impl Armament {
             arm_salvo_timer: 0.0,
             arm_salvo_index: 0,
         }
+    }
+}
+
+const WEAPON_ARM_MUZZLES_2: &[u8] = &[101, 102];
+const WEAPON_ARM_MUZZLES_101_108: &[u8] = &[101, 102, 103, 104, 105, 106, 107, 108];
+const WEAPON_ARM_MUZZLES_101_116: &[u8] = &[
+    101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116,
+];
+const WEAPON_ARM_MUZZLES_101_106: &[u8] = &[101, 102, 103, 104, 105, 106];
+const WEAPON_ARM_MUZZLES_101_107: &[u8] = &[101, 107];
+const WEAPON_ARM_MUZZLES_101_108_SINGLE: &[u8] = &[101, 108];
+const WEAPON_ARM_CARTRIDGE_101_110: &[u8] = &[105, 106, 107, 108, 109, 110];
+const WEAPON_ARM_CARTRIDGE_108: &[u8] = &[108];
+const WEAPON_ARM_CARTRIDGE_109_110: &[u8] = &[109, 110];
+const WEAPON_ARM_CARTRIDGE_105_108: &[u8] = &[105, 106, 107, 108];
+const WEAPON_ARM_CARTRIDGE_111_116: &[u8] = &[111, 112, 113, 114, 115, 116];
+
+/// Primary muzzle dummies present on each weapon-arm FLVER (`flvdummies` on all 18
+/// `am7020..am7620` models). These are the sockets the muzzle FFX table uses; the secondary
+/// casing/vent and missile-tube sockets are [`weapon_arm_cartridge_ids`].
+fn weapon_arm_muzzle_ids(part: u16) -> &'static [u8] {
+    match part {
+        7020 => WEAPON_ARM_MUZZLES_2,
+        7110..=7140 => WEAPON_ARM_MUZZLES_101_108_SINGLE,
+        7210 => WEAPON_ARM_MUZZLES_101_108,
+        7220 | 7230 => WEAPON_ARM_MUZZLES_101_116,
+        7310 | 7320 | 7410 | 7420 => WEAPON_ARM_MUZZLES_2,
+        7510..=7540 => WEAPON_ARM_MUZZLES_101_107,
+        7610 => WEAPON_ARM_MUZZLES_101_106,
+        7620 => WEAPON_ARM_MUZZLES_101_108,
+        _ => WEAPON_ARM_MUZZLES_101_116,
+    }
+}
+
+/// Casing/vent/missile-tube dummies used by the cartridge and auxiliary FFX fields. When a
+/// model has no dedicated port the muzzle socket is the fallback.
+fn weapon_arm_cartridge_ids(part: u16) -> &'static [u8] {
+    match part {
+        7020 => WEAPON_ARM_CARTRIDGE_101_110,
+        7110..=7140 => WEAPON_ARM_CARTRIDGE_108,
+        7210 => WEAPON_ARM_CARTRIDGE_105_108,
+        7510..=7540 => WEAPON_ARM_CARTRIDGE_109_110,
+        7220 | 7230 => WEAPON_ARM_CARTRIDGE_111_116,
+        7610 => WEAPON_ARM_CARTRIDGE_105_108,
+        7620 => WEAPON_ARM_CARTRIDGE_105_108,
+        _ => &[],
     }
 }
 
@@ -1866,6 +1954,7 @@ pub fn fire(
     piloting: Res<Piloting>,
     assets: Res<Tracers>,
     pads: Query<&Gamepad>,
+    mut test_switch: Option<ResMut<TestWeaponSwitch>>,
     mut speaker: Speaker,
     mut commands: Commands,
     mut acs: Query<
@@ -1881,6 +1970,7 @@ pub fn fire(
     >,
     rigging: Rigging,
     points: Query<(Entity, &EffectPoint, &GlobalTransform)>,
+    shot: Option<Res<acvd_render::app::Shot>>,
     mut body: Body,
     mut posed: Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
 ) {
@@ -1916,6 +2006,47 @@ pub fn fire(
     let shift_mod = keys.pressed(KeyCode::KeyR)
         || held.0.contains(&KeyCode::KeyR)
         || pads.iter().any(|pad| pad.pressed(GamepadButton::North));
+    // Weapon Switch / Bay Swap is an edge on the shift modifier + either hand trigger.
+    // For a weapon-arm design it toggles hands-active (stowed) <-> arm-active (deployed).
+    let switch_down = shift_mod && (want[0] || want[1]);
+    let mut switch_request = arms.weapon_arm && switch_down && !arms.prev_weapon_switch;
+    arms.prev_weapon_switch = switch_down;
+    // A `--shot` verification hook must start relative to the capture frame, not the much
+    // earlier `Shot::ready` flip: deploy completes during `SHOT_DELAY`, so starting at
+    // readiness always captures `Deployed`. Start half a deploy before capture instead.
+    if let Some(test) = test_switch.as_deref_mut() {
+        if arms.weapon_arm {
+            let deploy_seconds = acvd_sim::weapons::WEAPON_ARM_CLIP_FRAMES
+                / acvd_sim::weapons::WEAPON_ARM_DEPLOY_SPEED
+                / acvd_sim::tick::TICK_HZ as f32;
+            // The stow verification needs the deploy to finish before the shot, so it keeps the
+            // old readiness gate and then folds once the arm reaches a deployed phase.
+            let deploy_lead = if test.stow_after_deploy {
+                f32::INFINITY
+            } else {
+                deploy_seconds * 0.5
+            };
+            let test_switch_ready = shot
+                .as_ref()
+                .is_none_or(|s| s.ready && s.seconds_until_capture() <= deploy_lead);
+            if test_switch_ready {
+                if test.deploy {
+                    test.deploy = false;
+                    switch_request = true;
+                } else if test.stow_after_deploy
+                    && matches!(
+                        arms.weapon_arm_state.phase,
+                        acvd_sim::weapons::WeaponArmPhase::Deployed
+                            | acvd_sim::weapons::WeaponArmPhase::Ready
+                            | acvd_sim::weapons::WeaponArmPhase::Firing
+                    )
+                {
+                    test.stow_after_deploy = false;
+                    switch_request = true;
+                }
+            }
+        }
+    }
     let ow_blocks = arms
         .overed
         .as_ref()
@@ -1939,13 +2070,21 @@ pub fn fire(
     let shifting = body.shift.as_ref().map_or([false, false], |s| {
         [s.is_active(Hand::Right), s.is_active(Hand::Left)]
     });
-    let sniper_hand = (0..2).find(|&i| arms.hands[i].stance && want[i]).map(|i| {
-        if i == 0 {
-            Hand::Right
-        } else {
-            Hand::Left
-        }
-    });
+    // A deployed/transforming weapon arm owns the arm chain; only while stowed do the
+    // ordinary hand weapons select their ready/sniper body stance.
+    let sniper_hand = if arms.weapon_arm
+        && arms.weapon_arm_state.phase != acvd_sim::weapons::WeaponArmPhase::Stowed
+    {
+        None
+    } else {
+        (0..2).find(|&i| arms.hands[i].stance && want[i]).map(|i| {
+            if i == 0 {
+                Hand::Right
+            } else {
+                Hand::Left
+            }
+        })
+    };
     let disc = body.garage.disc.clone();
     if body.shift.is_none() {
         if let Some(motion) = body.motion.as_mut() {
@@ -1966,8 +2105,12 @@ pub fn fire(
         } else {
             ReadyCamera::Deploying
         }
-    } else if arms.weapon_arm && arms.hands[0].stance && (want[0] || want[1]) {
-        let gun = &arms.hands[0];
+    } else if arms.weapon_arm
+        && arms.weapon_arm_state.phase != acvd_sim::weapons::WeaponArmPhase::Stowed
+        && arms.weapon_arm_gun.stance
+        && (want[0] || want[1])
+    {
+        let gun = &arms.weapon_arm_gun;
         if gun.snipe_fov > 0.0 {
             ReadyCamera::Zoomed {
                 fov_deg: gun.snipe_fov,
@@ -1981,13 +2124,30 @@ pub fn fire(
     };
     if arms.weapon_arm {
         let want_wa = want[0] || want[1];
+        let arm_stance = arms.weapon_arm_gun.stance;
+        // One clock for the whole sim: 60 Hz fixed steps driven from wall-clock seconds, so
+        // 60/144/240 FPS all reach the same clip frame at the same time.
+        let mut accum = arms.weapon_arm_accum;
+        acvd_sim::weapons::advance_weapon_arm_clock(
+            &mut arms.weapon_arm_state,
+            &mut accum,
+            dt,
+            !pilot.scan_mode,
+            switch_request,
+            want_wa,
+            arm_stance,
+        );
+        arms.weapon_arm_accum = accum;
+        let arm_engaged = !hand_aim_enabled(arms.weapon_arm_state.phase);
+        let arm_can_fire = arms.weapon_arm_state.can_fire(arm_stance);
         let mut wa_fired = false;
-        // Collect weapon-arm muzzle effect points (even IDs 102/104/106/108 = right arm,
-        // odd IDs 101/103/105/107 = left arm), interleaved right-then-left.
+        // Collect weapon-arm muzzle effect points (even IDs 102/104/.../116 = right arm,
+        // odd IDs 101/103/.../115 = left arm), interleaved right-then-left.
         let mut right_muzzles: Vec<(u8, Entity, Vec3)> = Vec::new();
         let mut left_muzzles: Vec<(u8, Entity, Vec3)> = Vec::new();
+        let muzzle_ids = weapon_arm_muzzle_ids(arms.weapon_arm_part);
         for (ent, pt, gt) in points.iter() {
-            if pt.column == "arms" && (101..=112).contains(&pt.id) {
+            if pt.column == "arms" && muzzle_ids.contains(&pt.id) {
                 if pt.id % 2 == 0 {
                     right_muzzles.push((pt.id, ent, gt.translation()));
                 } else {
@@ -2013,367 +2173,364 @@ pub fn fire(
             .next()
             .map_or(ac_tf.translation + Vec3::Y * 4.5, |(_, t)| t.translation());
 
-        arms.hands[0].cooldown = (arms.hands[0].cooldown - frames).max(0.0);
-        if arms.hands[0].kind == Kind::Blade {
-            let gun = &mut arms.hands[0];
-            if let Some(blade) = gun.blade {
-                let has_ammo = blade.infinite_ammo || gun.remaining > 0;
-                if want_wa
-                    && has_ammo
-                    && gun.cooldown <= 0.0
-                    && !pilot.in_blade()
-                    && !pilot.in_kick()
-                    && pilot.en >= gun.en_drain
-                {
-                    let target = fcs
-                        .as_deref()
-                        .and_then(|f| f.locked.as_ref())
-                        .map(|l| (l.entity.to_bits(), l.world_pos));
-                    let launch = BladeLaunch {
-                        hand_idx: 0,
-                        physical: blade.physical,
-                        target,
-                        hit_radius: blade.hit_radius,
-                        blade_radius: blade.blade_radius,
-                        max_hits: blade.max_hits,
-                        decay_power: blade.decay_power,
-                        decay_recoil: blade.decay_recoil,
-                        damage_type: gun.damage_type,
-                        damage_power: gun.damage_power,
-                        damage_recoil: gun.damage_recoil,
-                        trail_fx: gun.fx.bullet,
-                        hit_low_fx: gun.fx.hit_low,
-                        hit_hi_fx: gun.fx.hit_hi,
-                        hit_low_se: gun.hit_se.low,
-                        hit_hi_se: gun.hit_se.hi,
-                    };
-                    if pilot.start_blade(launch) {
-                        wa_fired = true;
-                        let _ = pilot.try_drain_en(gun.en_drain);
-                        if !blade.infinite_ammo {
-                            gun.remaining = gun.remaining.saturating_sub(1);
+        if arm_engaged {
+            arms.weapon_arm_gun.cooldown = (arms.weapon_arm_gun.cooldown - frames).max(0.0);
+            if arms.weapon_arm_gun.kind == Kind::Blade {
+                let gun = &mut arms.weapon_arm_gun;
+                if let Some(blade) = gun.blade {
+                    let has_ammo = blade.infinite_ammo || gun.remaining > 0;
+                    if want_wa
+                        && arm_can_fire
+                        && has_ammo
+                        && gun.cooldown <= 0.0
+                        && !pilot.in_blade()
+                        && !pilot.in_kick()
+                        && pilot.en >= gun.en_drain
+                    {
+                        let target = fcs
+                            .as_deref()
+                            .and_then(|f| f.locked.as_ref())
+                            .map(|l| (l.entity.to_bits(), l.world_pos));
+                        let launch = BladeLaunch {
+                            hand_idx: 0,
+                            physical: blade.physical,
+                            target,
+                            hit_radius: blade.hit_radius,
+                            blade_radius: blade.blade_radius,
+                            max_hits: blade.max_hits,
+                            decay_power: blade.decay_power,
+                            decay_recoil: blade.decay_recoil,
+                            damage_type: gun.damage_type,
+                            damage_power: gun.damage_power,
+                            damage_recoil: gun.damage_recoil,
+                            trail_fx: gun.fx.bullet,
+                            hit_low_fx: gun.fx.hit_low,
+                            hit_hi_fx: gun.fx.hit_hi,
+                            hit_low_se: gun.hit_se.low,
+                            hit_hi_se: gun.hit_se.hi,
+                        };
+                        if pilot.start_blade(launch) {
+                            wa_fired = true;
+                            let _ = pilot.try_drain_en(gun.en_drain);
+                            if !blade.infinite_ammo {
+                                gun.remaining = gun.remaining.saturating_sub(1);
+                            }
+                            gun.cooldown = gun.reload_time.max(1.0);
+                            if let Some(status) = status.as_deref_mut() {
+                                status.en = pilot.en;
+                                status.en_max = pilot.en_max;
+                            }
+                            sound::shot(
+                                &mut commands,
+                                &mut speaker.cues,
+                                &mut speaker.sources,
+                                gun.shoot,
+                                fallback_origin,
+                            );
                         }
-                        gun.cooldown = gun.reload_time.max(1.0);
-                        if let Some(status) = status.as_deref_mut() {
-                            status.en = pilot.en;
-                            status.en_max = pilot.en_max;
-                        }
-                        sound::shot(
-                            &mut commands,
-                            &mut speaker.cues,
-                            &mut speaker.sources,
-                            gun.shoot,
-                            fallback_origin,
-                        );
                     }
                 }
-            }
-        } else if arms.hands[0].kind == Kind::Missile {
-            if arms.arm_salvo.is_empty()
-                && want_wa
-                && arms.hands[0].remaining > 0
-                && arms.hands[0].cooldown <= 0.0
-                && pilot.en >= arms.hands[0].en_drain
-            {
-                let burst = arms.hands[0].burst_count.max(1) as usize;
-                let rem = arms.hands[0].remaining as usize;
-                if arms.hands[0].is_missile {
-                    let locks = fcs
-                        .as_deref_mut()
-                        .map_or_else(Vec::new, crate::fcs::Fcs::take_missile_locks);
-                    if locks.is_empty() {
-                        for _ in 0..burst.min(rem) {
-                            arms.arm_salvo.push(None);
-                        }
-                    } else {
-                        for target in locks {
-                            for _ in 0..burst {
-                                if arms.arm_salvo.len() >= rem {
-                                    break;
+            } else if arms.weapon_arm_gun.kind == Kind::Missile {
+                if arms.arm_salvo.is_empty()
+                    && want_wa
+                    && arm_can_fire
+                    && arms.weapon_arm_gun.remaining > 0
+                    && arms.weapon_arm_gun.cooldown <= 0.0
+                    && pilot.en >= arms.weapon_arm_gun.en_drain
+                {
+                    let burst = arms.weapon_arm_gun.burst_count.max(1) as usize;
+                    let rem = arms.weapon_arm_gun.remaining as usize;
+                    if arms.weapon_arm_gun.is_missile {
+                        let locks = fcs
+                            .as_deref_mut()
+                            .map_or_else(Vec::new, crate::fcs::Fcs::take_missile_locks);
+                        if locks.is_empty() {
+                            for _ in 0..burst.min(rem) {
+                                arms.arm_salvo.push(None);
+                            }
+                        } else {
+                            for target in locks {
+                                for _ in 0..burst {
+                                    if arms.arm_salvo.len() >= rem {
+                                        break;
+                                    }
+                                    arms.arm_salvo.push(Some(target));
                                 }
-                                arms.arm_salvo.push(Some(target));
                             }
                         }
+                    } else {
+                        // Rocket / dumbfire weapon arm (e.g. am7230 wep 9230: burst_count=2, lock_once=8).
+                        let salvo_count =
+                            (burst * arms.weapon_arm_gun.weapon_lock_max.max(1) as usize).min(rem);
+                        for _ in 0..salvo_count {
+                            arms.arm_salvo.push(None);
+                        }
                     }
-                } else {
-                    // Rocket / dumbfire weapon arm (e.g. am7230 wep 9230: burst_count=2, lock_once=8).
-                    let salvo_count =
-                        (burst * arms.hands[0].weapon_lock_max.max(1) as usize).min(rem);
-                    for _ in 0..salvo_count {
-                        arms.arm_salvo.push(None);
+                    if !arms.arm_salvo.is_empty() {
+                        wa_fired = true;
+                        arms.arm_salvo_timer = 0.0;
+                        arms.arm_salvo_index = 0;
+                        arms.weapon_arm_gun.cooldown = arms.weapon_arm_gun.reload_time.max(1.0);
                     }
                 }
                 if !arms.arm_salvo.is_empty() {
-                    wa_fired = true;
-                    arms.arm_salvo_timer = 0.0;
-                    arms.arm_salvo_index = 0;
-                    arms.hands[0].cooldown = arms.hands[0].reload_time.max(1.0);
-                }
-            }
-            if !arms.arm_salvo.is_empty() {
-                arms.arm_salvo_timer = (arms.arm_salvo_timer - frames).max(0.0);
-                if arms.arm_salvo_timer <= 0.0 {
-                    let target_opt = arms.arm_salvo.remove(0);
-                    if arms.hands[0].remaining > 0 && pilot.try_drain_en(arms.hands[0].en_drain) {
-                        if let Some(status) = status.as_deref_mut() {
-                            status.en = pilot.en;
-                            status.en_max = pilot.en_max;
-                        }
-                        let (muzzle_ent, origin) = if muzzles.is_empty() {
-                            (None, fallback_origin)
-                        } else {
-                            let (e, p) = muzzles[(arms.arm_salvo_index as usize) % muzzles.len()];
-                            (Some(e), p)
-                        };
-                        arms.hands[0].remaining = arms.hands[0].remaining.saturating_sub(1);
-                        sound::shot(
-                            &mut commands,
-                            &mut speaker.cues,
-                            &mut speaker.sources,
-                            arms.hands[0].shoot,
-                            origin,
-                        );
-                        if arms.hands[0].fx.muzzle > 0 {
-                            if let Some(point) = muzzle_ent {
+                    arms.arm_salvo_timer = (arms.arm_salvo_timer - frames).max(0.0);
+                    if arms.arm_salvo_timer <= 0.0 {
+                        let target_opt = arms.arm_salvo.remove(0);
+                        if arms.weapon_arm_gun.remaining > 0
+                            && pilot.try_drain_en(arms.weapon_arm_gun.en_drain)
+                        {
+                            if let Some(status) = status.as_deref_mut() {
+                                status.en = pilot.en;
+                                status.en_max = pilot.en_max;
+                            }
+                            let (muzzle_ent, origin) = if muzzles.is_empty() {
+                                (None, fallback_origin)
+                            } else {
+                                let (e, p) =
+                                    muzzles[(arms.arm_salvo_index as usize) % muzzles.len()];
+                                (Some(e), p)
+                            };
+                            arms.weapon_arm_gun.remaining =
+                                arms.weapon_arm_gun.remaining.saturating_sub(1);
+                            sound::shot(
+                                &mut commands,
+                                &mut speaker.cues,
+                                &mut speaker.sources,
+                                arms.weapon_arm_gun.shoot,
+                                origin,
+                            );
+                            if arms.weapon_arm_gun.fx.muzzle > 0 {
+                                if let Some(point) = muzzle_ent {
+                                    commands.spawn((
+                                        Sfx::new(arms.weapon_arm_gun.fx.muzzle),
+                                        Transform::from_scale(Vec3::splat(MUZZLE_SCALE)),
+                                        Visibility::default(),
+                                        ChildOf(point),
+                                    ));
+                                } else {
+                                    commands.spawn((
+                                        Sfx::new(arms.weapon_arm_gun.fx.muzzle),
+                                        Transform::from_translation(origin)
+                                            .looking_to(-aim, Vec3::Y)
+                                            .with_scale(Vec3::splat(MUZZLE_SCALE)),
+                                    ));
+                                }
+                            }
+                            let wa_aim = if target_opt.is_none() {
+                                fcs.as_deref()
+                                    .and_then(|f| f.locked.as_ref())
+                                    .map(|l| (l.world_pos - origin).normalize_or_zero())
+                                    .filter(|&d| d != Vec3::ZERO)
+                                    .unwrap_or(aim)
+                            } else {
+                                aim
+                            };
+                            let right = wa_aim.cross(Vec3::Y).normalize_or_zero();
+                            let side = if arms.arm_salvo_index % 2 == 0 {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            let launch_dir = if target_opt.is_some() {
+                                (wa_aim + Vec3::Y * 0.25 + right * (0.22 * side))
+                                    .normalize_or(wa_aim)
+                            } else {
+                                wa_aim
+                            };
+                            arms.arm_salvo_index = arms.arm_salvo_index.wrapping_add(1);
+                            let missile =
+                                Missile::from_gun(&arms.weapon_arm_gun, launch_dir, target_opt);
+                            let tf =
+                                Transform::from_translation(origin).looking_to(launch_dir, Vec3::Y);
+                            if arms.weapon_arm_gun.fx.bullet > 0 {
+                                commands
+                                    .spawn((
+                                        tf,
+                                        missile,
+                                        Visibility::default(),
+                                        Mesh3d(assets.mesh.clone()),
+                                        MeshMaterial3d(assets.missile.clone()),
+                                    ))
+                                    .with_child((
+                                        Sfx::new(arms.weapon_arm_gun.fx.bullet),
+                                        Transform::default(),
+                                    ));
+                            } else {
                                 commands.spawn((
-                                    Sfx::new(arms.hands[0].fx.muzzle),
+                                    Mesh3d(assets.mesh.clone()),
+                                    MeshMaterial3d(assets.missile.clone()),
+                                    tf,
+                                    missile,
+                                ));
+                            }
+                        }
+                        arms.arm_salvo_timer = arms.weapon_arm_gun.burst_interval.max(3.0);
+                    }
+                }
+            } else {
+                let weapon_arm_part = arms.weapon_arm_part;
+                let gun = &mut arms.weapon_arm_gun;
+                let can = gun.kind != Kind::Skip
+                    && gun.remaining > 0
+                    && gun.cooldown <= 0.0
+                    && pilot.en >= gun.en_drain;
+                if want_wa && arm_can_fire && can && pilot.try_drain_en(gun.en_drain) {
+                    wa_fired = true;
+                    if gun.stance {
+                        pilot.trigger_impact_shake(220.0);
+                        pilot.trigger_rumble_shake(
+                            0.14,
+                            Vec2::new(0.06, 0.12),
+                            Vec2::new(0.02, 0.02),
+                        );
+                    }
+                    if let Some(anims) = body.anims.as_mut() {
+                        anims.kick(Hand::Right, gun.sniper);
+                        anims.kick(Hand::Left, gun.sniper);
+                    }
+                    if let Some(status) = status.as_deref_mut() {
+                        status.en = pilot.en;
+                        status.en_max = pilot.en_max;
+                    }
+                    let shots = (gun.burst_count.max(1) as usize).min(gun.remaining as usize);
+                    gun.remaining = gun.remaining.saturating_sub(shots as u16);
+                    gun.cooldown = gun.reload_time.max(1.0);
+                    sound::shot(
+                        &mut commands,
+                        &mut speaker.cues,
+                        &mut speaker.sources,
+                        gun.shoot,
+                        muzzles.first().map_or(fallback_origin, |&(_, p)| p),
+                    );
+                    // Spawn muzzle flash once per active barrel (up to `shots`).
+                    let barrel_count = muzzles.len().min(shots);
+                    if gun.fx.muzzle > 0 {
+                        if barrel_count > 0 {
+                            for &(point, _) in muzzles.iter().take(barrel_count) {
+                                commands.spawn((
+                                    Sfx::new(gun.fx.muzzle),
                                     Transform::from_scale(Vec3::splat(MUZZLE_SCALE)),
                                     Visibility::default(),
                                     ChildOf(point),
                                 ));
-                            } else {
-                                commands.spawn((
-                                    Sfx::new(arms.hands[0].fx.muzzle),
-                                    Transform::from_translation(origin)
-                                        .looking_to(-aim, Vec3::Y)
-                                        .with_scale(Vec3::splat(MUZZLE_SCALE)),
-                                ));
                             }
-                        }
-                        let wa_aim = if target_opt.is_none() {
-                            fcs.as_deref()
-                                .and_then(|f| f.locked.as_ref())
-                                .map(|l| (l.world_pos - origin).normalize_or_zero())
-                                .filter(|&d| d != Vec3::ZERO)
-                                .unwrap_or(aim)
                         } else {
-                            aim
-                        };
-                        let right = wa_aim.cross(Vec3::Y).normalize_or_zero();
-                        let side = if arms.arm_salvo_index % 2 == 0 {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        let launch_dir = if target_opt.is_some() {
-                            (wa_aim + Vec3::Y * 0.25 + right * (0.22 * side)).normalize_or(wa_aim)
-                        } else {
-                            wa_aim
-                        };
-                        arms.arm_salvo_index = arms.arm_salvo_index.wrapping_add(1);
-                        let missile = Missile::from_gun(&arms.hands[0], launch_dir, target_opt);
-                        let tf =
-                            Transform::from_translation(origin).looking_to(launch_dir, Vec3::Y);
-                        if arms.hands[0].fx.bullet > 0 {
-                            commands
-                                .spawn((
-                                    tf,
-                                    missile,
-                                    Visibility::default(),
-                                    Mesh3d(assets.mesh.clone()),
-                                    MeshMaterial3d(assets.missile.clone()),
-                                ))
-                                .with_child((
-                                    Sfx::new(arms.hands[0].fx.bullet),
-                                    Transform::default(),
-                                ));
-                        } else {
-                            commands.spawn((
-                                Mesh3d(assets.mesh.clone()),
-                                MeshMaterial3d(assets.missile.clone()),
-                                tf,
-                                missile,
-                            ));
-                        }
-                    }
-                    arms.arm_salvo_timer = arms.hands[0].burst_interval.max(3.0);
-                }
-            }
-        } else {
-            let gun = &mut arms.hands[0];
-            let can = gun.kind != Kind::Skip
-                && gun.remaining > 0
-                && gun.cooldown <= 0.0
-                && pilot.en >= gun.en_drain;
-            if want_wa && can && pilot.try_drain_en(gun.en_drain) {
-                wa_fired = true;
-                if gun.stance {
-                    pilot.trigger_impact_shake(220.0);
-                    pilot.trigger_rumble_shake(0.14, Vec2::new(0.06, 0.12), Vec2::new(0.02, 0.02));
-                }
-                if let Some(anims) = body.anims.as_mut() {
-                    anims.kick(Hand::Right, gun.sniper);
-                    anims.kick(Hand::Left, gun.sniper);
-                }
-                if let Some(status) = status.as_deref_mut() {
-                    status.en = pilot.en;
-                    status.en_max = pilot.en_max;
-                }
-                let shots = (gun.burst_count.max(1) as usize).min(gun.remaining as usize);
-                gun.remaining = gun.remaining.saturating_sub(shots as u16);
-                gun.cooldown = gun.reload_time.max(1.0);
-                sound::shot(
-                    &mut commands,
-                    &mut speaker.cues,
-                    &mut speaker.sources,
-                    gun.shoot,
-                    muzzles.first().map_or(fallback_origin, |&(_, p)| p),
-                );
-                // Spawn muzzle flash once per active barrel (up to `shots`).
-                let barrel_count = muzzles.len().min(shots);
-                if gun.fx.muzzle > 0 {
-                    if barrel_count > 0 {
-                        for &(point, _) in muzzles.iter().take(barrel_count) {
                             commands.spawn((
                                 Sfx::new(gun.fx.muzzle),
-                                Transform::from_scale(Vec3::splat(MUZZLE_SCALE)),
-                                Visibility::default(),
-                                ChildOf(point),
+                                Transform::from_translation(fallback_origin)
+                                    .looking_to(-aim, Vec3::Y)
+                                    .with_scale(Vec3::splat(MUZZLE_SCALE)),
                             ));
                         }
-                    } else {
-                        commands.spawn((
-                            Sfx::new(gun.fx.muzzle),
-                            Transform::from_translation(fallback_origin)
-                                .looking_to(-aim, Vec3::Y)
-                                .with_scale(Vec3::splat(MUZZLE_SCALE)),
-                        ));
                     }
-                }
-                if gun.fx.cartridge > 0 {
-                    let carts: Vec<Entity> = points
-                        .iter()
-                        .filter(|(_, p, _)| {
-                            (p.column == "arms" || p.column == "armwep_r" || p.column == "armwep_l")
-                                && p.id == CARTRIDGE_POINT
-                        })
-                        .map(|(e, _, _)| e)
-                        .collect();
-                    if !carts.is_empty() {
-                        for &point in carts.iter().take(shots) {
+                    if gun.fx.cartridge > 0 {
+                        let cartridge_ids = weapon_arm_cartridge_ids(weapon_arm_part);
+                        let carts: Vec<Entity> = points
+                            .iter()
+                            .filter(|(_, p, _)| p.column == "arms" && cartridge_ids.contains(&p.id))
+                            .map(|(e, _, _)| e)
+                            .collect();
+                        if !carts.is_empty() {
+                            for &point in carts.iter().take(barrel_count.max(1)) {
+                                commands.spawn((
+                                    Sfx::new(gun.fx.cartridge),
+                                    Transform::default(),
+                                    Visibility::default(),
+                                    ChildOf(point),
+                                ));
+                            }
+                        } else if barrel_count > 0 {
+                            for &(point, _) in muzzles.iter().take(barrel_count) {
+                                commands.spawn((
+                                    Sfx::new(gun.fx.cartridge),
+                                    Transform::default(),
+                                    Visibility::default(),
+                                    ChildOf(point),
+                                ));
+                            }
+                        } else {
                             commands.spawn((
                                 Sfx::new(gun.fx.cartridge),
-                                Transform::default(),
-                                Visibility::default(),
-                                ChildOf(point),
+                                Transform::from_translation(fallback_origin)
+                                    .looking_to(-aim, Vec3::Y),
                             ));
                         }
-                    } else if barrel_count > 0 {
-                        for &(point, _) in muzzles.iter().take(barrel_count) {
-                            commands.spawn((
-                                Sfx::new(gun.fx.cartridge),
-                                Transform::default(),
-                                Visibility::default(),
-                                ChildOf(point),
-                            ));
-                        }
-                    } else {
-                        commands.spawn((
-                            Sfx::new(gun.fx.cartridge),
-                            Transform::from_translation(fallback_origin).looking_to(-aim, Vec3::Y),
-                        ));
                     }
-                }
-                let pellets_per_barrel = if muzzles.is_empty() {
-                    shots
-                } else {
-                    shots.div_ceil(muzzles.len())
-                };
-                for k in 0..shots {
-                    let origin = if muzzles.is_empty() {
-                        fallback_origin
+                    let pellets_per_barrel = if muzzles.is_empty() {
+                        shots
                     } else {
-                        muzzles[k % muzzles.len()].1
+                        shots.div_ceil(muzzles.len())
                     };
-                    let base_aim = fcs
-                        .as_deref()
-                        .map_or(aim, |f| f.aim_for_hand(0, origin, gun.init_speed, aim));
-                    let shot_aim = if pellets_per_barrel > 1 {
-                        // Scatter/shotgun weapon arm (e.g. am7410/7420): slight deterministic pellet cone.
-                        let right = base_aim.cross(Vec3::Y).normalize_or(Vec3::X);
-                        let up = right.cross(base_aim).normalize_or(Vec3::Y);
-                        let az = std::f32::consts::TAU * (k as f32) / (shots as f32);
-                        let spread = 0.035;
-                        (base_aim + (right * az.cos() + up * az.sin()) * spread)
-                            .normalize_or(base_aim)
-                    } else {
-                        base_aim
-                    };
-                    let shot = (
-                        Transform::from_translation(origin).looking_to(shot_aim, Vec3::Y),
-                        Projectile::from_gun(gun, shot_aim),
-                    );
-                    if gun.fx.bullet > 0 {
-                        commands
-                            .spawn((shot, Visibility::default()))
-                            .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
-                    } else {
-                        let material = match gun.kind {
-                            Kind::Energy => assets.energy.clone(),
-                            _ => assets.rigid.clone(),
+                    for k in 0..shots {
+                        let origin = if muzzles.is_empty() {
+                            fallback_origin
+                        } else {
+                            muzzles[k % muzzles.len()].1
                         };
-                        commands.spawn((
-                            Mesh3d(assets.mesh.clone()),
-                            MeshMaterial3d(material),
-                            shot,
-                        ));
+                        let base_aim = fcs
+                            .as_deref()
+                            .map_or(aim, |f| f.aim_for_hand(0, origin, gun.init_speed, aim));
+                        let shot_aim = if pellets_per_barrel > 1 {
+                            // Scatter/shotgun weapon arm (e.g. am7410/7420): slight deterministic pellet cone.
+                            let right = base_aim.cross(Vec3::Y).normalize_or(Vec3::X);
+                            let up = right.cross(base_aim).normalize_or(Vec3::Y);
+                            let az = std::f32::consts::TAU * (k as f32) / (shots as f32);
+                            let spread = 0.035;
+                            (base_aim + (right * az.cos() + up * az.sin()) * spread)
+                                .normalize_or(base_aim)
+                        } else {
+                            base_aim
+                        };
+                        let shot = (
+                            Transform::from_translation(origin).looking_to(shot_aim, Vec3::Y),
+                            Projectile::from_gun(gun, shot_aim),
+                        );
+                        if gun.fx.bullet > 0 {
+                            commands
+                                .spawn((shot, Visibility::default()))
+                                .with_child((Sfx::new(gun.fx.bullet), Transform::default()));
+                        } else {
+                            let material = match gun.kind {
+                                Kind::Energy => assets.energy.clone(),
+                                _ => assets.rigid.clone(),
+                            };
+                            commands.spawn((
+                                Mesh3d(assets.mesh.clone()),
+                                MeshMaterial3d(material),
+                                shot,
+                            ));
+                        }
                     }
                 }
+            }
+            if wa_fired {
+                arms.weapon_arm_state.on_fired();
             }
         }
         if let Some(anims) = body.anims.as_mut() {
+            anims.sync_weapon_arm_hand_weapons(arm_engaged, frames);
             if let Some(wa) = anims.weapon_arm.as_mut() {
-                wa.tick(!pilot.scan_mode, want_wa, wa_fired, frames);
+                let tae_events = wa.sync_state(&arms.weapon_arm_state, frames);
                 wa.apply(&mut posed);
-            }
-            for (i, hand) in [Hand::Right, Hand::Left].into_iter().enumerate() {
-                let muzzle = if hand == Hand::Right {
-                    right_muzzles
-                        .first()
-                        .or_else(|| left_muzzles.first())
-                        .map(|m| m.1)
-                } else {
-                    left_muzzles
-                        .first()
-                        .or_else(|| right_muzzles.first())
-                        .map(|m| m.1)
-                };
-                let origin = rigging
-                    .hardpoints
-                    .iter()
-                    .find(|(h, _)| h.hand == hand)
-                    .map_or(fallback_origin, |(_, t)| t.translation());
-                let hand_aim = fcs.as_deref().map_or(aim, |f| {
-                    f.aim_for_hand(0, origin, arms.hands[0].init_speed, aim)
-                });
-                if shifting[i] {
-                    continue;
-                }
-                let arm = &mut anims.aim[i];
-                arm.sniper = arms.hands[0].sniper;
-                arm.step(
-                    want_wa
-                        && arms.hands[0].kind != Kind::Skip
-                        && arms.hands[0].kind != Kind::Blade,
-                    frames,
+                play_weapon_arm_tae(
+                    &tae_events,
+                    &mut commands,
+                    &mut speaker.cues,
+                    &mut speaker.sources,
+                    &points,
                 );
-                arm.frame = arm
-                    .shoulder
-                    .and_then(|s| rigging.aim_frame(s, hand, muzzle, hand_aim));
             }
-            anims.apply_recoil(frames, shifting, &mut posed);
+            // The built-in weapon arm owns the arm chain only while deployed/transforming.
+            // The ordinary hand weapons (and their arm-raise IK) stay off until Stowed again;
+            // clear any held aim/recoil so stowing cannot resume a stale raised pose.
+            if arm_engaged {
+                anims.clear_hand_aim();
+            }
         }
-        return;
+        if arm_engaged {
+            return;
+        }
     }
 
     let mut hand_deploy = [false; 2];
@@ -4987,9 +5144,10 @@ enum WeaponArmPhase {
 }
 
 /// Dedicated animation rig for weapon arms (`acvparts` cat-2 `+0x13c == 1`, 360 `0x824793c8`).
-/// Unlike standard arms (whose `*_arm01..*_armhand` follow the body locomotion clip), weapon arms
-/// drive ALL non-root bones (`*_armwepunit_*`, `*_armroot`, `*_arm01..*_armhand`, `*_armhandu*`)
-/// directly from `am*_a.bnd.dcx`, leaving only the shoulder roots (`l_kata`, `r_kata`) on the core.
+/// While active it drives every non-root bone (`*_armwepunit_*`, `*_armroot`,
+/// `*_arm01..*_armhand`, `*_armhandu*`) from `am*_a.bnd.dcx`, leaving only the shoulder roots
+/// (`l_kata`, `r_kata`) on the core. In `Stowed`, only the folded weapon-unit bones are written;
+/// the main arm chain stays on the body `acmotion` clip for normal hand-weapon raise/aim.
 struct WeaponArmRig {
     joints: Vec<(Entity, usize)>,
     skeleton: ani::Anim,
@@ -4999,8 +5157,18 @@ struct WeaponArmRig {
     deployed: Option<ani::Anim>,
     fire: Option<ani::Anim>,
     ready: Option<ani::Anim>,
+    /// Melee/swing clip (`base+6`, e.g. `am7020` `a00_006`); absent on ranged weapon arms.
+    attack: Option<ani::Anim>,
+    base: u32,
+    /// Part-local TAE (`tae/ac/arm/own00<part>.tae`), whose animation IDs equal the clip IDs.
+    tae: Option<tae::Tae>,
+    tae_anim: Option<u32>,
+    tae_frame: f32,
+    tae_events: Vec<pose::TaeFired>,
     phase: WeaponArmPhase,
     frame: f32,
+    /// 60 Hz accumulator for the Garage View path (sortie uses the sim accumulator).
+    accum: f32,
 }
 
 impl WeaponArmRig {
@@ -5038,6 +5206,13 @@ impl WeaponArmRig {
         let ready = load_clip(base + 3, Some(3));
         let deploy = load_clip(base + 4, Some(4));
         let stow = load_clip(base + 5, Some(5));
+        // Blade weapon arms have a part-local attack/swing clip (`am7020` `a00_006`,
+        // 40 frames; `a00_036` on tank legs). It is not the ranged `base+2` fire clip.
+        let attack = load_clip(base + 6, None);
+        let tae_path = format!("tae/ac/arm/own{:06}.tae", placement.part);
+        let part_tae = vfs::open(disc, &tae_path)
+            .ok()
+            .and_then(|data| tae::read(&data).ok());
 
         // Bind every non-root FLVER bone (`l_kata` and `r_kata` stay mounted on `core`).
         let mut pairs = Vec::new();
@@ -5067,8 +5242,15 @@ impl WeaponArmRig {
             deployed,
             fire,
             ready,
+            attack,
+            base,
+            tae: part_tae,
+            tae_anim: None,
+            tae_frame: 0.0,
+            tae_events: Vec::new(),
             phase: WeaponArmPhase::Stowed,
             frame: 0.0,
+            accum: 0.0,
         })
     }
 
@@ -5083,8 +5265,9 @@ impl WeaponArmRig {
                 .or(self.deployed.as_ref())
                 .unwrap_or(&self.stowed),
             WeaponArmPhase::Firing => self
-                .fire
+                .attack
                 .as_ref()
+                .or(self.fire.as_ref())
                 .or(self.ready.as_ref())
                 .or(self.deployed.as_ref())
                 .unwrap_or(&self.stowed),
@@ -5092,20 +5275,57 @@ impl WeaponArmRig {
         }
     }
 
-    /// Advances the weapon arm state machine by `frames` 60 Hz ticks.
+    /// Last valid frame of a clip. `ani::Track` clamps past the last key, but the TAE and
+    /// blend bookkeeping must not see an out-of-range frame.
+    fn last_frame(clip: &ani::Anim) -> f32 {
+        clip.frames.saturating_sub(1) as f32
+    }
+
+    /// Final authored frame of the deployed idle clip. `a00_004` ends on this pose and
+    /// `a00_005` starts on it, so entering `Deployed` here prevents the blade arm from
+    /// snapping back to the beginning of `a00_001` at the deploy boundary.
+    fn deployed_end(&self) -> f32 {
+        self.deployed
+            .as_ref()
+            .map_or(0.0, |clip| Self::last_frame(clip))
+    }
+
+    /// Advances the Garage View weapon arm from render-rate ticks through the same fixed
+    /// 60 Hz cadence as the sortie sim.
     fn tick(&mut self, combat_mode: bool, want_fire: bool, fired: bool, frames: f32) {
+        self.accum = (self.accum + frames.max(0.0)).clamp(0.0, 4.0);
+        let mut stepped = 0u8;
+        loop {
+            let edge = stepped == 0
+                && (fired
+                    || (combat_mode
+                        && matches!(self.phase, WeaponArmPhase::Stowed | WeaponArmPhase::Stowing))
+                    || (!combat_mode && !matches!(self.phase, WeaponArmPhase::Stowed)));
+            if self.accum < 1.0 && !edge {
+                break;
+            }
+            self.tick_step(combat_mode, want_fire, fired && stepped == 0, 1.0);
+            self.accum = (self.accum - 1.0).max(0.0);
+            stepped = stepped.saturating_add(1);
+            if stepped >= 4 {
+                break;
+            }
+        }
+    }
+
+    /// Advances the weapon arm state machine by `frames` 60 Hz ticks.
+    fn tick_step(&mut self, combat_mode: bool, want_fire: bool, fired: bool, frames: f32) {
         if !combat_mode {
             match self.phase {
-                WeaponArmPhase::Stowed => {
-                    let len = self.stowed.frames.max(1) as f32;
-                    self.frame = (self.frame + frames) % len;
-                }
+                WeaponArmPhase::Stowed => self.frame = 0.0,
                 WeaponArmPhase::Stowing => {
-                    let len = self.stow.as_ref().map_or(1, |c| c.frames.max(1)) as f32;
-                    self.frame += frames * 2.0;
-                    if self.frame >= len - 1.0 {
+                    let last = self.active_clip().frames.saturating_sub(1) as f32;
+                    self.frame += frames * acvd_sim::weapons::WEAPON_ARM_STOW_SPEED;
+                    if self.frame >= last {
                         self.phase = WeaponArmPhase::Stowed;
                         self.frame = 0.0;
+                    } else {
+                        self.frame = self.frame.clamp(0.0, last);
                     }
                 }
                 _ => {
@@ -5121,7 +5341,9 @@ impl WeaponArmRig {
             return;
         }
 
-        // Combat mode: unfold via `base+4`, then hold `base+1`, ready `base+3`, fire `base+2`.
+        // Combat mode: unfold via `base+4`, then hold the authored end of `base+1`.
+        // `base+1`/`base+3` are short one-shot transitions (request speed 30, 60 frames),
+        // not 1 s loops.
         if fired && !matches!(self.phase, WeaponArmPhase::Deploying) {
             if self.fire.is_some() {
                 self.phase = WeaponArmPhase::Firing;
@@ -5138,36 +5360,44 @@ impl WeaponArmRig {
                     self.frame = 0.0;
                 } else {
                     self.phase = WeaponArmPhase::Deployed;
-                    self.frame = 0.0;
+                    self.frame = self.deployed_end();
                 }
             }
             WeaponArmPhase::Deploying => {
-                let len = self.deploy.as_ref().map_or(1, |c| c.frames.max(1)) as f32;
-                let speed = if want_fire || fired { 3.0 } else { 2.0 };
-                self.frame += frames * speed;
-                if self.frame >= len - 1.0 {
+                let last = self.active_clip().frames.saturating_sub(1) as f32;
+                self.frame += frames * acvd_sim::weapons::WEAPON_ARM_DEPLOY_SPEED;
+                if self.frame >= last {
                     self.phase = WeaponArmPhase::Deployed;
-                    self.frame = 0.0;
+                    self.frame = self.deployed_end();
+                } else {
+                    self.frame = self.frame.clamp(0.0, last);
                 }
             }
             WeaponArmPhase::Firing => {
-                let len = self.active_clip().frames.max(1) as f32;
+                let last = self.active_clip().frames.saturating_sub(1) as f32;
                 self.frame += frames;
-                if self.frame >= len - 1.0 {
+                if self.frame >= last {
                     self.phase = if want_fire && self.ready.is_some() {
                         WeaponArmPhase::Ready
                     } else {
                         WeaponArmPhase::Deployed
                     };
-                    self.frame = 0.0;
+                    self.frame = if self.phase == WeaponArmPhase::Ready {
+                        0.0
+                    } else {
+                        self.deployed_end()
+                    };
+                } else {
+                    self.frame = self.frame.clamp(0.0, last);
                 }
             }
             WeaponArmPhase::Ready => {
-                let len = self.active_clip().frames.max(1) as f32;
-                self.frame = (self.frame + frames).min(len - 1.0);
+                let last = self.active_clip().frames.saturating_sub(1) as f32;
+                self.frame += frames * acvd_sim::weapons::WEAPON_ARM_READY_SPEED;
+                self.frame = self.frame.clamp(0.0, last);
                 if !want_fire {
                     self.phase = WeaponArmPhase::Deployed;
-                    self.frame = 0.0;
+                    self.frame = self.deployed_end();
                 }
             }
             WeaponArmPhase::Deployed => {
@@ -5175,31 +5405,146 @@ impl WeaponArmRig {
                     self.phase = WeaponArmPhase::Ready;
                     self.frame = 0.0;
                 } else {
-                    let len = self.active_clip().frames.max(1) as f32;
-                    self.frame = (self.frame + frames) % len;
+                    // The authored deployed clip settles from its first key to its last
+                    // key once, then holds. Looping it produced a visible wrap every second.
+                    self.frame = self.deployed_end();
                 }
             }
         }
     }
 
+    /// TAE timeline id for a phase: the part-local TAE file uses the same animation IDs as
+    /// the `am*_a.bnd.dcx` clips (`base+0..5`; blade attack `base+6`). 360 `0x8289ac40`
+    /// creates the part TAE player and `0x8289acd0` dispatches its events.
+    fn tae_anim_for(&self, phase: WeaponArmPhase) -> u32 {
+        match phase {
+            WeaponArmPhase::Stowed => self.base,
+            WeaponArmPhase::Deployed => self.base + 1,
+            WeaponArmPhase::Firing => {
+                if self.attack.is_some() {
+                    self.base + 6
+                } else {
+                    self.base + 2
+                }
+            }
+            WeaponArmPhase::Ready => self.base + 3,
+            WeaponArmPhase::Deploying => self.base + 4,
+            WeaponArmPhase::Stowing => self.base + 5,
+        }
+    }
+
+    fn emit_tae(&mut self, anim_id: u32, prev: f32, curr: f32, frames: f32, looping: bool) {
+        let Some(tae) = self.tae.as_ref() else { return };
+        let Some(anim) = tae.animation(anim_id) else {
+            return;
+        };
+        self.tae_events
+            .extend(pose::crossed_events(anim, prev, curr, frames, looping));
+    }
+
+    fn drain_tae_events(&mut self) -> Vec<pose::TaeFired> {
+        std::mem::take(&mut self.tae_events)
+    }
+
+    /// Drives the presentation rig from the authoritative sim state. Deployed/stowed idle
+    /// clips still advance here; all transition frames come from the sim.
+    fn sync_state(
+        &mut self,
+        state: &acvd_sim::weapons::WeaponArmState,
+        frames: f32,
+    ) -> Vec<pose::TaeFired> {
+        use acvd_sim::weapons::WeaponArmPhase as SimPhase;
+        let old_phase = self.phase;
+        let old_len = self.active_clip().frames.max(1) as f32;
+        let old_anim = self.tae_anim_for(old_phase);
+        let old_frame = self.tae_frame;
+        let phase = match state.phase {
+            SimPhase::Stowed => WeaponArmPhase::Stowed,
+            SimPhase::Deploying => WeaponArmPhase::Deploying,
+            SimPhase::Deployed => WeaponArmPhase::Deployed,
+            SimPhase::Ready => WeaponArmPhase::Ready,
+            SimPhase::Firing => WeaponArmPhase::Firing,
+            SimPhase::Stowing => WeaponArmPhase::Stowing,
+        };
+        if phase != old_phase {
+            // The sim resets `frame` when a transition ends. Finish the previous TAE
+            // timeline before switching so late deploy/stow events are not lost.
+            self.emit_tae(old_anim, old_frame, old_len, old_len, false);
+            self.tae_anim = None;
+            self.tae_frame = 0.0;
+        }
+        self.phase = phase;
+        let anim = self.tae_anim_for(self.phase);
+        if self.tae_anim != Some(anim) {
+            self.tae_anim = Some(anim);
+            self.tae_frame = 0.0;
+        }
+        let len = self.active_clip().frames.max(1) as f32;
+        let last = len - 1.0;
+        let frame = match self.phase {
+            WeaponArmPhase::Stowed => {
+                if old_phase != WeaponArmPhase::Stowed {
+                    self.frame = 0.0;
+                }
+                self.frame
+            }
+            WeaponArmPhase::Deploying | WeaponArmPhase::Stowing => {
+                self.frame = state.frame.clamp(0.0, last);
+                self.frame
+            }
+            WeaponArmPhase::Deployed => {
+                if old_phase == WeaponArmPhase::Deploying {
+                    // `a00_004` ends on the last key of `a00_001`; start there instead of
+                    // snapping back to frame 0 at the deploy boundary.
+                    self.frame = last;
+                } else if old_phase != WeaponArmPhase::Deployed {
+                    // Entering from ready/fire: run the deployed settle from its start.
+                    self.frame = 0.0;
+                }
+                self.frame =
+                    (self.frame + frames * acvd_sim::weapons::WEAPON_ARM_DEPLOYED_SPEED).min(last);
+                self.frame
+            }
+            WeaponArmPhase::Ready | WeaponArmPhase::Firing => {
+                self.frame = state.frame.clamp(0.0, last);
+                self.frame
+            }
+        };
+        let prev = self.tae_frame;
+        self.emit_tae(anim, prev, frame, len, false);
+        self.tae_frame = frame;
+        self.drain_tae_events()
+    }
+
     fn sample_joint(&self, clip: &ani::Anim, bone: usize) -> Transform {
+        let frame = self.frame.clamp(0.0, clip.frames.saturating_sub(1) as f32);
         let rest = self.skeleton.bones.get(bone).and_then(|b| b.rest.as_ref());
         let track = clip.bones.get(bone).map(|b| &b.track);
         let rotation = track
-            .and_then(|t| t.rotation(self.frame))
+            .and_then(|t| t.rotation(frame))
             .or_else(|| rest.map(|r| ani::euler_quat(r.euler)))
             .unwrap_or([0.0, 0.0, 0.0, 1.0]);
         let translation = track
-            .and_then(|t| t.translation(self.frame))
+            .and_then(|t| t.translation(frame))
             .unwrap_or(rest.map(|r| r.translation).unwrap_or([0.0; 3]));
         let scale = track
-            .and_then(|t| t.scale(self.frame))
+            .and_then(|t| t.scale(frame))
             .unwrap_or(rest.map(|r| r.scale).unwrap_or([1.0; 3]));
         pose::to_transform(
             Vec3::from(translation),
             Quat::from_array(rotation),
             Vec3::from(scale),
         )
+    }
+
+    /// Folded weapon-unit bones (`*_armwepunit_*` / `*_armwepunitp_*`). These have no
+    /// body-clip counterpart, so the stowed clip must keep writing them every frame.
+    fn is_weapon_unit(&self, bone: usize) -> bool {
+        self.skeleton
+            .bones
+            .get(bone)
+            .and_then(|b| b.rest.as_ref())
+            .is_some_and(|r| r.name.contains("_armwepunit"))
     }
 
     fn sample(&self) -> Vec<(Entity, Transform)> {
@@ -5212,10 +5557,61 @@ impl WeaponArmRig {
 
     fn apply(&self, posed: &mut Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>) {
         let clip = self.active_clip();
+        let stowed = self.phase == WeaponArmPhase::Stowed;
         for &(entity, bone) in &self.joints {
+            if stowed && !self.is_weapon_unit(bone) {
+                continue;
+            }
             if let Ok((mut current, _)) = posed.get_mut(entity) {
                 *current = self.sample_joint(clip, bone);
             }
+        }
+    }
+}
+
+/// Plays the part-local TAE FX/SFX emitted by the weapon-arm rig. The 360 weapon object
+/// creates its TAE player at `0x8289ac40` (from `0x8288e9f8`) and dispatches kinds at
+/// `0x8289acd0`; weapon-arm deploy/stow timelines are `tae/ac/arm/own00<part>.tae` anims
+/// `base+4`/`base+5` (e.g. `am7420` anim 4: FFX 4109 on 201/202 at f0, FFX 98 at f20,
+/// kind-204 sound `[1,0x38]` -> `c00000056` at f0, more FFX at f173/f187/f270/f280/f283;
+/// anim 5: FFX 98 and kind-204 `[1,0x39]` -> `c00000057` at f0). Kind 1 `[10/11,50]` is
+/// a part-animation selector; the FEV weapon-arm cues are the kind-204 events.
+fn play_weapon_arm_tae(
+    events: &[pose::TaeFired],
+    commands: &mut Commands,
+    cues: &mut Cues,
+    sources: &mut Assets<AudioSource>,
+    points: &Query<(Entity, &EffectPoint, &GlobalTransform)>,
+) {
+    for ev in events {
+        match ev {
+            pose::TaeFired::Ffx {
+                ffx_id,
+                dummy_id,
+                scale,
+            } if *ffx_id > 0 => {
+                let target = points
+                    .iter()
+                    .find(|(_, p, _)| p.column == "arms" && p.id == *dummy_id)
+                    .or_else(|| points.iter().find(|(_, p, _)| p.id == *dummy_id));
+                if let Some((entity, _, _)) = target {
+                    commands.spawn((
+                        Sfx::new(*ffx_id),
+                        Transform::from_scale(Vec3::splat(*scale)),
+                        Visibility::default(),
+                        ChildOf(entity),
+                    ));
+                }
+            }
+            pose::TaeFired::Sound { cue } => {
+                // The 360 TAE sound handler (`0x8284b690` -> `0x8284a040` ->
+                // `0x82854060`) forwards only the event's bank/id/flags; it has no emitter
+                // position argument. These part-TAE cues are 2D, so do not attenuate them
+                // against the camera (that shortened/faded the deploy/stow servo sounds
+                // whenever the moving arm point was far from the listener).
+                sound::cue(commands, cues, sources, cue);
+            }
+            _ => {}
         }
     }
 }
@@ -5366,7 +5762,20 @@ impl WeaponAnims {
         leg_type: u8,
     ) {
         let arm = placement.column == "arms";
+        let controls = if arm {
+            vfs::open(disc, "param/jcondata.bin")
+                .and_then(|d| jcon::read(&d))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if arm && part_field(placement.part as i64, 2, "is_weapon_arm") != 0.0 {
+            // The weapon arm owns the arm chain while deployed, but the hand weapons are
+            // still active while it is stowed. Hook the same `gun_$(LR)` shoulder/fire
+            // controls so their raise, aim turn, and recoil apply to the main arm bones.
+            for hand in [Hand::Right, Hand::Left] {
+                self.note_recoil(hand, &controls, rig, joints);
+            }
             self.weapon_arm = WeaponArmRig::load(disc, placement, rig, joints, leg_type);
             return;
         }
@@ -5384,9 +5793,6 @@ impl WeaponAnims {
         let bay = placed.is_some_and(|(_, bay)| bay);
         // `arm_l` and `arm_r` share one placement (assembly_slots.csv column `arms`).
         if arm {
-            let controls = vfs::open(disc, "param/jcondata.bin")
-                .and_then(|d| jcon::read(&d))
-                .unwrap_or_default();
             for &hand in hands {
                 self.note_recoil(hand, &controls, rig, joints);
             }
@@ -5547,6 +5953,46 @@ impl WeaponAnims {
         }
     }
 
+    /// 360 `0x8289db50` closes both hand-weapon slots through `0x82853660` when a weapon arm
+    /// starts deploying; the close is only the hand weapon's own `a00_003` clip (no reparent or
+    /// hide). Return the hands with their `a00_001` clip once the arm is fully stowed.
+    fn sync_weapon_arm_hand_weapons(&mut self, engaged: bool, frames: f32) {
+        if engaged {
+            if !self.hand_stowed {
+                self.hand_stowed = true;
+                for rig in &mut self.rigs {
+                    if !rig.bay && !rig.retired {
+                        rig.fold_for_weapon_arm();
+                    }
+                }
+            }
+            for rig in &mut self.rigs {
+                if !rig.bay && !rig.retired {
+                    rig.playback.advance(frames);
+                }
+            }
+        } else if self.hand_stowed {
+            self.hand_stowed = false;
+            for rig in &mut self.rigs {
+                if !rig.bay && !rig.retired {
+                    rig.open_after_weapon_arm();
+                }
+            }
+        }
+    }
+
+    /// Drops every dynamic hand-aim/recoil value without touching the loaded shoulder/limit
+    /// configuration. Called while the built-in weapon arm owns the main arm chain.
+    fn clear_hand_aim(&mut self) {
+        for aim in &mut self.aim {
+            aim.release();
+        }
+        for bone in &mut self.recoil_bones {
+            bone.kick.reset();
+            bone.written = None;
+        }
+    }
+
     fn apply_recoil(
         &mut self,
         frames: f32,
@@ -5668,6 +6114,7 @@ impl WeaponAnims {
         if let Some(wa) = self.weapon_arm.as_mut() {
             wa.phase = WeaponArmPhase::Stowed;
             wa.frame = 0.0;
+            wa.accum = 0.0;
             wa.apply(posed);
         }
         for aim in &mut self.aim {
@@ -5691,6 +6138,26 @@ impl WeaponAnims {
             bone.written = None;
         }
         self.sniper = SniperStance::default();
+    }
+
+    /// One-shot cues authored on the equipped weapon arm's deploy and stow TAE timelines
+    /// (`a00_{base+4}` / `a00_{base+5}`), for first-use sample preloading.
+    pub(crate) fn transition_cues(&self) -> Vec<String> {
+        let Some(wa) = self.weapon_arm.as_ref() else {
+            return Vec::new();
+        };
+        let Some(tae) = wa.tae.as_ref() else {
+            return Vec::new();
+        };
+        [wa.base + 4, wa.base + 5]
+            .into_iter()
+            .filter_map(|id| tae.animation(id))
+            .flat_map(|anim| anim.events.iter())
+            .filter_map(|ev| {
+                ev.as_sound()
+                    .and_then(|(cat, id)| tae::Event::format_cue(cat, id))
+            })
+            .collect()
     }
 
     /// Stowed pose, applied once at spawn so the first frame is not the bind pose.
@@ -5784,6 +6251,15 @@ impl RecoilBone {
 }
 
 impl ArmAim {
+    /// Drops the held aim and any resolved turn, but keeps the loaded shoulder/limit/sniper.
+    fn release(&mut self) {
+        self.hold = 0.0;
+        self.weight = 0.0;
+        self.frame = None;
+        self.err = 0.0;
+        self.turn_deg = 0.0;
+    }
+
     /// Advances `frames` 60 Hz frames; `want` is fire held on this side this frame.
     fn step(&mut self, want: bool, frames: f32) {
         self.hold = if want {
@@ -5843,6 +6319,16 @@ impl Kick {
     fn trigger(&mut self) {
         self.clock = Some(0.0);
         self.ramping = false;
+    }
+
+    /// Stops the kick and forgets its shown angle while another rig owns the joint.
+    fn reset(&mut self) {
+        self.clock = None;
+        self.ramping = false;
+        self.shown = 0.0;
+        self.from = 0.0;
+        self.blend = KICK_RETURN;
+        self.progress = KICK_RETURN;
     }
 
     fn ease(&mut self, frames: f32) {
@@ -5923,6 +6409,26 @@ impl WeaponRig {
                 .unwrap_or(rest.map(|r| r.scale).unwrap_or([1.0; 3]));
             *current =
                 pose::to_transform(translation, Quat::from_array(rotation), Vec3::from(scale));
+        }
+    }
+
+    /// Fold the hand weapon into its authored `a00_003` stow pose, as the 360 close does.
+    fn fold_for_weapon_arm(&mut self) {
+        if self.playback.has(3) {
+            self.playback.phase = Phase::Stow;
+            self.playback.play(3);
+        } else if self.playback.has(0) {
+            self.playback.hold(0, 0.0);
+        }
+    }
+
+    /// Re-open the hand weapon with its authored `a00_001` deploy pose after the arm stows.
+    fn open_after_weapon_arm(&mut self) {
+        if self.playback.has(1) {
+            self.playback.phase = Phase::Deploy;
+            self.playback.play(1);
+        } else if self.playback.has(0) {
+            self.playback.hold(0, 0.0);
         }
     }
 
@@ -6172,6 +6678,70 @@ mod tests {
         );
         arm.step(false, 30.0);
         assert_eq!(arm.weight, 0.0);
+    }
+
+    #[test]
+    fn hand_aim_runs_only_while_the_weapon_arm_is_stowed() {
+        use acvd_sim::weapons::WeaponArmPhase as Phase;
+        assert!(hand_aim_enabled(Phase::Stowed));
+        for phase in [
+            Phase::Deploying,
+            Phase::Deployed,
+            Phase::Ready,
+            Phase::Firing,
+            Phase::Stowing,
+        ] {
+            assert!(
+                !hand_aim_enabled(phase),
+                "hand arm raise/aim must be off in {phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_hand_aim_keeps_the_joint_spec_and_drops_stale_motion() {
+        let mut anims = WeaponAnims::default();
+        anims.aim[Hand::Right as usize] = ArmAim {
+            shoulder: Some(Entity::PLACEHOLDER),
+            limit: 85.0,
+            sniper: true,
+            hold: AIM_HOLD,
+            weight: 1.0,
+            frame: Some(AimFrame {
+                parent: Quat::IDENTITY,
+                barrel: Vec3::NEG_Z,
+                aim: Vec3::X,
+            }),
+            err: 4.0,
+            turn_deg: 3.0,
+        };
+        let mut kick = Kick::new(-8.0, 2.0, 6.0);
+        kick.trigger();
+        kick.step(3.0);
+        anims.recoil_bones.push(RecoilBone {
+            entity: Entity::PLACEHOLDER,
+            hand: Hand::Right,
+            sniper: false,
+            kick,
+            base: Quat::IDENTITY,
+            written: Some(Quat::from_rotation_x(0.2)),
+        });
+
+        anims.clear_hand_aim();
+
+        let aim = &anims.aim[Hand::Right as usize];
+        assert_eq!(aim.shoulder, Some(Entity::PLACEHOLDER));
+        assert_eq!(aim.limit, 85.0);
+        assert!(aim.sniper, "the joint/sniper selection is configuration");
+        assert_eq!(aim.hold, 0.0);
+        assert_eq!(aim.weight, 0.0);
+        assert!(aim.frame.is_none());
+        assert_eq!(aim.err, 0.0);
+        assert_eq!(aim.turn_deg, 0.0);
+        let bone = &anims.recoil_bones[0];
+        assert!(bone.kick.clock.is_none());
+        assert_eq!(bone.kick.shown, 0.0);
+        assert!(bone.written.is_none());
     }
 
     #[test]
@@ -6718,54 +7288,67 @@ mod tests {
         };
 
         // 6001: am7020 dual blade weapon arms -> wep10 9020 (KE physical blade, infinite ammo).
+        // The design has no hand weapons, so both hand slots stay silent.
         let a6001 = Armament::from_design(&get(6001));
         assert!(a6001.weapon_arm);
-        assert_eq!(a6001.hands[0].kind, Kind::Blade);
-        assert_eq!(a6001.hands[0].damage_type, DamageType::Ke);
-        assert_eq!(a6001.hands[0].damage_power, 7735.0);
-        assert!(a6001.hands[0].blade.unwrap().infinite_ammo);
+        assert_eq!(a6001.weapon_arm_gun.kind, Kind::Blade);
+        assert_eq!(a6001.weapon_arm_gun.damage_type, DamageType::Ke);
+        assert_eq!(a6001.weapon_arm_gun.damage_power, 7735.0);
+        assert!(a6001.weapon_arm_gun.blade.unwrap().infinite_ammo);
+        assert_eq!(a6001.hands[0].kind, Kind::Skip);
         assert_eq!(a6001.hands[1].kind, Kind::Skip);
         assert_eq!(a6001.shoulder.kind, Kind::Skip);
+        assert!(a6001.overed.is_none());
 
-        // 6009: am7420 scatter cannon arms -> wep10 9420 (CE rigid, burst 8, mag 192; ignores stale hand slots).
+        // 6009: am7420 scatter cannon arms -> wep10 9420 (CE rigid, burst 8, mag 192).
+        // The normal hand weapons 1150/7020 remain equipped and fire while stowed.
         let a6009 = Armament::from_design(&get(6009));
         assert!(a6009.weapon_arm);
-        assert_eq!(a6009.hands[0].kind, Kind::Rigid);
-        assert_eq!(a6009.hands[0].damage_type, DamageType::Ce);
-        assert_eq!(a6009.hands[0].burst_count, 8);
-        assert_eq!(a6009.hands[0].magazine, 192);
-        assert_eq!(a6009.hands[1].kind, Kind::Skip);
+        assert_eq!(a6009.weapon_arm_gun.kind, Kind::Rigid);
+        assert_eq!(a6009.weapon_arm_gun.damage_type, DamageType::Ce);
+        assert_eq!(a6009.weapon_arm_gun.burst_count, 8);
+        assert_eq!(a6009.weapon_arm_gun.magazine, 192);
+        assert!(
+            a6009.hands[0].kind != Kind::Skip,
+            "right hand weapon survives"
+        );
+        assert!(
+            a6009.hands[1].kind != Kind::Skip,
+            "left hand weapon survives"
+        );
 
         // 6120: am7230 rocket weapon arms -> wep10 9230 (Missile, mag 480, burst 2).
         let a6120 = Armament::from_design(&get(6120));
         assert!(a6120.weapon_arm);
-        assert_eq!(a6120.hands[0].kind, Kind::Missile);
-        assert_eq!(a6120.hands[0].magazine, 480);
-        assert_eq!(a6120.hands[0].burst_count, 2);
+        assert_eq!(a6120.weapon_arm_gun.kind, Kind::Missile);
+        assert_eq!(a6120.weapon_arm_gun.magazine, 480);
+        assert_eq!(a6120.weapon_arm_gun.burst_count, 2);
+        assert!(a6120.hands[0].kind != Kind::Skip);
 
         // 6260: am7110 sniper cannon weapon arms -> wep10 9110 (Rigid, 1036 m/s, 9865 dmg).
         let a6260 = Armament::from_design(&get(6260));
         assert!(a6260.weapon_arm);
-        assert_eq!(a6260.hands[0].kind, Kind::Rigid);
-        assert_eq!(a6260.hands[0].init_speed, 1036.0);
-        assert_eq!(a6260.hands[0].damage_power, 9865.0);
+        assert_eq!(a6260.weapon_arm_gun.kind, Kind::Rigid);
+        assert_eq!(a6260.weapon_arm_gun.init_speed, 1036.0);
+        assert_eq!(a6260.weapon_arm_gun.damage_power, 9865.0);
 
         // 6302: am7510 laser cannon weapon arms -> wep10 9510 (Energy TE, EN drain 25369, mag 40).
         let a6302 = Armament::from_design(&get(6302));
         assert!(a6302.weapon_arm);
-        assert_eq!(a6302.hands[0].kind, Kind::Energy);
-        assert_eq!(a6302.hands[0].damage_type, DamageType::Te);
-        assert_eq!(a6302.hands[0].en_drain, 25369.0);
-        assert_eq!(a6302.hands[0].magazine, 40);
+        assert_eq!(a6302.weapon_arm_gun.kind, Kind::Energy);
+        assert_eq!(a6302.weapon_arm_gun.damage_type, DamageType::Te);
+        assert_eq!(a6302.weapon_arm_gun.en_drain, 25369.0);
+        assert_eq!(a6302.weapon_arm_gun.magazine, 40);
+        assert!(a6302.hands[0].kind != Kind::Skip);
 
         // Homing missile weapon arm am7210 -> wep10 9210 (is_missile = true, multi-lock).
         let mut d7210 = get(6001);
         d7210.arms = 7210;
         let a7210 = Armament::from_design(&d7210);
         assert!(a7210.weapon_arm);
-        assert_eq!(a7210.hands[0].kind, Kind::Missile);
-        assert!(a7210.hands[0].is_missile);
-        assert_eq!(a7210.hands[0].magazine, 160);
+        assert_eq!(a7210.weapon_arm_gun.kind, Kind::Missile);
+        assert!(a7210.weapon_arm_gun.is_missile);
+        assert_eq!(a7210.weapon_arm_gun.magazine, 160);
     }
 
     #[test]
@@ -6939,7 +7522,7 @@ mod tests {
             rifle.step_trigger(true, true, true, 1.0),
             TriggerAction::Fire {
                 power_scale: 1.0,
-                pellets: 1,
+                pellets: 1
             }
         );
 
@@ -6951,7 +7534,7 @@ mod tests {
             shotgun.step_trigger(true, true, true, 1.0),
             TriggerAction::Fire {
                 power_scale: 1.0,
-                pellets: 12,
+                pellets: 12
             }
         );
 
@@ -7022,7 +7605,7 @@ mod tests {
             laser.step_trigger(false, true, true, 1.0),
             TriggerAction::Fire {
                 power_scale: 1.0,
-                pellets: 1,
+                pellets: 1
             }
         );
     }
@@ -7099,9 +7682,15 @@ mod tests {
             "weapon arm must not load normal-arm rigs"
         );
         assert!(
-            anims.recoil_bones.is_empty(),
-            "weapon arm must not hook normal-arm recoil"
+            !anims.recoil_bones.is_empty(),
+            "weapon arm must hook the main-arm hand-weapon recoil for its stowed state"
         );
+        for hand in [Hand::Right, Hand::Left] {
+            assert!(
+                anims.aim[hand as usize].shoulder.is_some(),
+                "{hand:?} hand aim must still target the weapon-arm *_arm01 when stowed"
+            );
+        }
         let wa = anims.weapon_arm.as_ref().expect("weapon_arm rig loaded");
         assert_eq!(wa.phase, WeaponArmPhase::Stowed);
         let joint_count = wa.joints.len();
@@ -7118,10 +7707,17 @@ mod tests {
         let wa = anims.weapon_arm.as_mut().unwrap();
         wa.tick(true, false, false, 1.0);
         assert_eq!(wa.phase, WeaponArmPhase::Deploying);
-        for _ in 0..200 {
+        for _ in 0..300 {
             wa.tick(true, false, false, 1.0);
         }
         assert_eq!(wa.phase, WeaponArmPhase::Deployed);
+        assert_eq!(
+            wa.frame,
+            wa.deployed
+                .as_ref()
+                .map_or(0, |c| c.frames.saturating_sub(1)) as f32,
+            "deploy must end on the deployed clip's last frame, not frame 0"
+        );
         wa.tick(true, true, true, 1.0);
         assert_eq!(wa.phase, WeaponArmPhase::Firing);
         for _ in 0..70 {
@@ -7131,10 +7727,540 @@ mod tests {
         // Scan mode: Deployed -> Stowing -> Stowed.
         wa.tick(false, false, false, 1.0);
         assert_eq!(wa.phase, WeaponArmPhase::Stowing);
-        for _ in 0..200 {
+        for _ in 0..300 {
             wa.tick(false, false, false, 1.0);
         }
         assert_eq!(wa.phase, WeaponArmPhase::Stowed);
+    }
+
+    /// `am7420`'s deploy/stow TAE has exactly one kind-204 sound each, both active on frames
+    /// 0..3: deploy `[1,0x38]` -> `c00000056`, stow `[1,0x39]` -> `c00000057`. The sound is
+    /// a one-shot triggered on its start frame; the event's end frame is not a stop time.
+    #[test]
+    fn weapon_arm_deploy_stow_sound_spans_are_exact() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&acvd_formats::vfs::default_disc(&root)) else {
+            return;
+        };
+        let data = vfs::open(&disc, "tae/ac/arm/own007420.tae").expect("am7420 part TAE");
+        let tae = tae::read(&data).expect("parse am7420 TAE");
+        let sounds = |anim_id: u32| -> Vec<(u32, u32, String)> {
+            tae.animation(anim_id)
+                .expect("part TAE animation")
+                .events
+                .iter()
+                .filter_map(|ev| {
+                    ev.as_sound().map(|(cat, id)| {
+                        (
+                            ev.start_frame,
+                            ev.end_frame,
+                            tae::Event::format_cue(cat, id).expect("formatted cue"),
+                        )
+                    })
+                })
+                .collect()
+        };
+        assert_eq!(
+            sounds(4),
+            vec![(0, 3, "c00000056".to_string())],
+            "a00_004 deploy sound must start at frame 0 and never stop early"
+        );
+        assert_eq!(
+            sounds(5),
+            vec![(0, 3, "c00000057".to_string())],
+            "a00_005 stow sound must start at frame 0 and never stop early"
+        );
+    }
+
+    /// Deterministic version of the deploy path: step the authoritative sim tick by tick and
+    /// check the exact phase/frame progression plus the TAE FFX events at deploy frames 0 and
+    /// 20. The earlier `--shot` smoke runs captured only the completed `Deployed` phase.
+    #[test]
+    fn weapon_arm_deploy_tae_emits_f0_f20_and_steps_phases() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let design = &find(PARAM_ACASSEMBLYDRAWING_BIN, 6009)
+            .expect("design 6009")
+            .data;
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
+        let arms_pl = built
+            .placements
+            .iter()
+            .find(|p| p.column == "arms")
+            .expect("arms placement");
+        let (_, rig) = acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| {
+            assemble::place_of(&[], None)
+        })
+        .expect("rigged_model");
+        let mut world = World::new();
+        let joints: Vec<Entity> = (0..rig.bones.len())
+            .map(|_| world.spawn_empty().id())
+            .collect();
+        let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
+        let mut anims = WeaponAnims::default();
+        anims.load(&disc, arms_pl, &rig, &joints, leg_type);
+        let wa = anims.weapon_arm.as_mut().expect("weapon_arm rig loaded");
+        assert!(wa.tae.is_some(), "am7420 part TAE must load");
+
+        fn ffx(events: &[pose::TaeFired]) -> Vec<(i32, u8)> {
+            events
+                .iter()
+                .filter_map(|ev| match ev {
+                    pose::TaeFired::Ffx {
+                        ffx_id, dummy_id, ..
+                    } => Some((*ffx_id, *dummy_id)),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn sounds(events: &[pose::TaeFired]) -> Vec<&str> {
+            events
+                .iter()
+                .filter_map(|ev| match ev {
+                    pose::TaeFired::Sound { cue } => Some(cue.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut state = simw::WeaponArmState::default();
+        assert!(wa.sync_state(&state, 0.0).is_empty());
+        let mut deploy_cues = Vec::new();
+
+        // The switch enters `Deploying` at frame 0; the player advances one 60 Hz
+        // clip frame per tick (`0x82852408` -> `0x8289a928`). Request `+8` is the
+        // 10/80 blend, not the frame step.
+        state.step(true, true, false, false);
+        assert_eq!(state.phase, simw::WeaponArmPhase::Deploying);
+        assert_eq!(state.frame, 0.0);
+        assert!(
+            ffx(&wa.sync_state(&state, 1.0)).is_empty(),
+            "the request tick must not skip the frame-0 crossing"
+        );
+        state.step(true, false, false, false);
+        assert_eq!(state.frame, simw::WEAPON_ARM_DEPLOY_SPEED);
+        let deployed = wa.sync_state(&state, 1.0);
+        assert_eq!(
+            ffx(&deployed),
+            vec![(4109, 201), (4109, 202)],
+            "deploy frame 0 must emit 4109 on 201/202"
+        );
+        assert!(
+            sounds(&deployed).contains(&"c00000056"),
+            "am7420 deploy frame 0 must emit Arm_HShot_Open c00000056, got {:?}",
+            sounds(&deployed)
+        );
+        deploy_cues.extend(sounds(&deployed).into_iter().map(str::to_string));
+
+        let mut at_f20 = Vec::new();
+        for _ in 0..19 {
+            state.step(true, false, false, false);
+            let events = wa.sync_state(&state, 1.0);
+            deploy_cues.extend(sounds(&events).into_iter().map(str::to_string));
+            if state.frame == 20.0 {
+                at_f20 = events;
+            }
+        }
+        assert_eq!(state.phase, simw::WeaponArmPhase::Deploying);
+        assert_eq!(state.frame, 20.0);
+        assert_eq!(
+            ffx(&at_f20),
+            vec![(98, 201), (98, 202)],
+            "deploy frame 20 must emit 98 on 201/202"
+        );
+
+        for _ in 0..279 {
+            state.step(true, false, false, false);
+            let events = wa.sync_state(&state, 1.0);
+            deploy_cues.extend(sounds(&events).into_iter().map(str::to_string));
+        }
+        assert_eq!(state.phase, simw::WeaponArmPhase::Deployed);
+        assert_eq!(state.frame, 0.0);
+        assert_eq!(
+            deploy_cues
+                .iter()
+                .filter(|cue| cue.as_str() == "c00000056")
+                .count(),
+            1,
+            "deploy must fire Arm_HShot_Open exactly once across the full 300-frame clip, got {deploy_cues:?}"
+        );
+        assert!(
+            !deploy_cues.iter().any(|cue| cue == "c00000057"),
+            "stow sound must not fire during deploy, got {deploy_cues:?}"
+        );
+
+        state.step(true, false, true, false);
+        assert_eq!(state.phase, simw::WeaponArmPhase::Ready);
+        assert_eq!(state.frame, 0.0);
+        state.on_fired();
+        assert_eq!(state.phase, simw::WeaponArmPhase::Firing);
+        assert_eq!(state.frame, 0.0);
+        let _ = wa.sync_state(&state, 1.0);
+
+        for _ in 0..60 {
+            state.step(true, false, false, false);
+            let _ = wa.sync_state(&state, 1.0);
+        }
+        assert_eq!(state.phase, simw::WeaponArmPhase::Deployed);
+        assert_eq!(state.frame, 0.0);
+
+        state.step(true, true, false, true);
+        assert_eq!(state.phase, simw::WeaponArmPhase::Stowing);
+        assert!(wa.sync_state(&state, 1.0).is_empty());
+        state.step(true, false, false, false);
+        let stowing = wa.sync_state(&state, 1.0);
+        assert!(
+            sounds(&stowing).contains(&"c00000057"),
+            "am7420 stow frame 0 must emit Arm_HShot_close c00000057, got {:?}",
+            sounds(&stowing)
+        );
+        let mut stow_cues: Vec<String> = sounds(&stowing).into_iter().map(str::to_string).collect();
+        for _ in 0..299 {
+            state.step(true, false, false, false);
+            let events = wa.sync_state(&state, 1.0);
+            stow_cues.extend(sounds(&events).into_iter().map(str::to_string));
+        }
+        assert_eq!(state.phase, simw::WeaponArmPhase::Stowed);
+        assert_eq!(
+            stow_cues
+                .iter()
+                .filter(|cue| cue.as_str() == "c00000057")
+                .count(),
+            1,
+            "stow must fire Arm_HShot_close exactly once across the full 300-frame clip, got {stow_cues:?}"
+        );
+        assert!(
+            !stow_cues.iter().any(|cue| cue == "c00000056"),
+            "deploy sound must not fire during stow, got {stow_cues:?}"
+        );
+    }
+
+    /// `am7020` is the only melee weapon arm (`am7510..7540` are laser cannons, not blades).
+    /// It has no `a00_002` fire clip, so its `a00_006` 40-frame attack clip drives the
+    /// unfolded sub-rig while the standard `BladeState` supplies the body lunge and hit
+    /// window. Its part TAE anim 6 has no FFX; deploy anim 4 carries the 4109/98 effects.
+    #[test]
+    fn melee_weapon_arm_7020_attack_clip_and_blade_window() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+        use acvd_data::generated::ctrl::AcCtrlParam;
+        use acvd_sim::collision::Collision;
+        use acvd_sim::input::InputFrame;
+        use acvd_sim::motion::{step_tick, AcMotion, BladePhase};
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let design = &find(PARAM_ACASSEMBLYDRAWING_BIN, 6001)
+            .expect("design 6001")
+            .data;
+        let arm = Armament::from_design(design);
+        assert!(arm.weapon_arm, "design 6001 must use a weapon arm");
+        assert_eq!(arm.weapon_arm_gun.kind, Kind::Blade);
+        let blade = arm.weapon_arm_gun.blade.expect("am7020 blade spec");
+        assert_eq!(blade.hit_radius, 10.0);
+        assert_eq!(blade.blade_radius, 4.0);
+        assert_eq!(blade.max_hits, 1);
+        assert!(blade.physical, "am7020 is a KE physical blade");
+
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
+        let arms_pl = built
+            .placements
+            .iter()
+            .find(|p| p.column == "arms")
+            .expect("arms placement");
+        let (_, rig) = acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| {
+            assemble::place_of(&[], None)
+        })
+        .expect("rigged_model");
+        let mut world = World::new();
+        let joints: Vec<Entity> = (0..rig.bones.len())
+            .map(|_| world.spawn_empty().id())
+            .collect();
+        let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
+        let mut anims = WeaponAnims::default();
+        anims.load(&disc, arms_pl, &rig, &joints, leg_type);
+        let wa = anims.weapon_arm.as_mut().expect("weapon_arm rig loaded");
+        assert!(wa.fire.is_none(), "am7020_a has no a00_002 fire clip");
+        assert_eq!(
+            wa.attack.as_ref().map(|a| a.frames),
+            Some(40),
+            "am7020 attack clip a00_006 is 40 frames"
+        );
+
+        let mut state = simw::WeaponArmState {
+            phase: simw::WeaponArmPhase::Deployed,
+            frame: 0.0,
+            barrel: 0,
+            deploy_frames: 300.0,
+            stow_frames: 300.0,
+        };
+        state.on_fired();
+        let events = wa.sync_state(&state, 1.0);
+        assert_eq!(state.phase, simw::WeaponArmPhase::Firing);
+        assert_eq!(wa.phase, WeaponArmPhase::Firing);
+        assert_eq!(wa.active_clip().frames, 40);
+        assert_eq!(wa.tae_anim, Some(wa.base + 6));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, pose::TaeFired::Ffx { .. })),
+            "am7020 attack TAE anim 6 has no FFX; deploy anim 4 carries them"
+        );
+
+        let launch = BladeLaunch {
+            hand_idx: 0,
+            physical: blade.physical,
+            target: None,
+            hit_radius: blade.hit_radius,
+            blade_radius: blade.blade_radius,
+            max_hits: blade.max_hits,
+            decay_power: blade.decay_power,
+            decay_recoil: blade.decay_recoil,
+            damage_type: arm.weapon_arm_gun.damage_type,
+            damage_power: arm.weapon_arm_gun.damage_power,
+            damage_recoil: arm.weapon_arm_gun.damage_recoil,
+            trail_fx: arm.weapon_arm_gun.fx.bullet,
+            hit_low_fx: arm.weapon_arm_gun.fx.hit_low,
+            hit_hi_fx: arm.weapon_arm_gun.fx.hit_hi,
+            hit_low_se: arm.weapon_arm_gun.hit_se.low,
+            hit_hi_se: arm.weapon_arm_gun.hit_se.hi,
+        };
+        let mut motion = AcMotion::new(AcCtrlParam::calculate(design));
+        assert!(motion.start_blade(launch));
+        let mut pos = Vec3::ZERO;
+        let collision = Collision::default();
+        let mut saw_swing = false;
+        for _ in 0..120 {
+            step_tick(&mut motion, &InputFrame::default(), &mut pos, &collision);
+            if motion.blade.as_ref().map(|b| b.phase) == Some(BladePhase::Swing) {
+                saw_swing = true;
+                break;
+            }
+        }
+        assert!(
+            saw_swing,
+            "am7020 body BladeState must reach its swing hit window"
+        );
+    }
+
+    /// Garage View used to call `WeaponArmRig::tick` with a fractional render delta. It now
+    /// feeds the same 60 Hz accumulator, so 60/144/240 FPS reach `Deployed` within one tick.
+    #[test]
+    fn garage_weapon_arm_tick_is_frame_rate_independent() {
+        fn anim(frames: u32) -> ani::Anim {
+            ani::Anim {
+                magic: ani::NAMED,
+                frames,
+                quantized: false,
+                scale_quantized: false,
+                euler: false,
+                vectors: 0,
+                keys: 0,
+                bones: Vec::new(),
+            }
+        }
+        fn rig(frames: u32) -> WeaponArmRig {
+            WeaponArmRig {
+                joints: Vec::new(),
+                skeleton: anim(frames),
+                stowed: anim(5),
+                deploy: Some(anim(frames)),
+                stow: Some(anim(frames)),
+                deployed: Some(anim(60)),
+                fire: None,
+                ready: Some(anim(60)),
+                attack: None,
+                base: 0,
+                tae: None,
+                tae_anim: None,
+                tae_frame: 0.0,
+                tae_events: Vec::new(),
+                phase: WeaponArmPhase::Stowed,
+                frame: 0.0,
+                accum: 0.0,
+            }
+        }
+        fn duration(frames: u32, dt: f32) -> f32 {
+            let mut rig = rig(frames);
+            let mut elapsed = 0.0;
+            for _ in 0..10_000 {
+                rig.tick(true, false, false, dt * 60.0);
+                elapsed += dt;
+                if rig.phase == WeaponArmPhase::Deployed {
+                    return elapsed;
+                }
+            }
+            panic!("garage deploy did not finish for {frames} at dt {dt}");
+        }
+        for frames in [290, 300, 320] {
+            let expected = frames as f32 / 60.0;
+            for dt in [1.0 / 60.0, 1.0 / 144.0, 1.0 / 240.0] {
+                let got = duration(frames, dt);
+                assert!(
+                    (got - expected).abs() <= 1.0 / 60.0 + 1e-4,
+                    "garage {frames} frames at dt {dt}: {got} vs {expected}"
+                );
+            }
+        }
+    }
+
+    /// Deterministic sampling of `am7020` `a00_004`: the blade-hinge bones must not jump
+    /// when the stored quaternion crosses the 180-degree sign flip at f92/f93, and the deploy
+    /// end must meet `a00_001`'s last frame at the `Deploying -> Deployed` boundary.
+    #[test]
+    fn melee_weapon_arm_7020_deploy_clip_is_continuous() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let design = &find(PARAM_ACASSEMBLYDRAWING_BIN, 6001)
+            .expect("design 6001")
+            .data;
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
+        let arms_pl = built
+            .placements
+            .iter()
+            .find(|p| p.column == "arms")
+            .expect("arms placement");
+        let (_, rig) = acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| {
+            assemble::place_of(&[], None)
+        })
+        .expect("rigged_model");
+        let mut world = World::new();
+        let joints: Vec<Entity> = (0..rig.bones.len())
+            .map(|_| world.spawn_empty().id())
+            .collect();
+        let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
+        let mut anims = WeaponAnims::default();
+        anims.load(&disc, arms_pl, &rig, &joints, leg_type);
+        let wa = anims.weapon_arm.as_mut().expect("weapon_arm rig loaded");
+        let deploy = wa.deploy.as_ref().expect("am7020 deploy clip");
+        let deployed = wa.deployed.as_ref().expect("am7020 deployed clip");
+        assert_eq!(deploy.frames, 300, "am7020 a00_004");
+        assert_eq!(deployed.frames, 60, "am7020 a00_001");
+
+        let angle = |a: [f32; 4], b: [f32; 4]| {
+            let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3])
+                .abs()
+                .min(1.0);
+            2.0 * dot.acos().to_degrees()
+        };
+        for name in ["l_armwepunit_06", "r_armwepunit_06"] {
+            let bone = wa
+                .skeleton
+                .bones
+                .iter()
+                .position(|b| b.rest.as_ref().is_some_and(|r| r.name == name))
+                .unwrap_or_else(|| panic!("{name} in am7020 skeleton"));
+            let track = &deploy.bones[bone].track;
+            let mut prev_q = None;
+            let mut prev_t = None;
+            for half in 0..(deploy.frames * 2) {
+                let frame = half as f32 * 0.5;
+                let q = track.rotation(frame).expect("rotation");
+                let t = track.translation(frame).expect("translation");
+                if let (Some(pq), Some(pt)) = (prev_q, prev_t) {
+                    let step = angle(pq, q);
+                    assert!(step < 45.0, "{name} rotation snap at f{frame}: {step} deg");
+                    let dist = (Vec3::from(t) - Vec3::from(pt)).length();
+                    assert!(dist < 1.0, "{name} translation snap at f{frame}: {dist} m");
+                }
+                prev_q = Some(q);
+                prev_t = Some(t);
+            }
+
+            let last_deploy = deploy.frames.saturating_sub(1) as f32;
+            let last_deployed = deployed.frames.saturating_sub(1) as f32;
+            let qa = deploy.bones[bone].track.rotation(last_deploy).unwrap();
+            let qb = deployed.bones[bone].track.rotation(last_deployed).unwrap();
+            assert!(
+                angle(qa, qb) < 10.0,
+                "{name} deploy/deployed boundary rotation: {} deg",
+                angle(qa, qb)
+            );
+            let ta = deploy.bones[bone].track.translation(last_deploy).unwrap();
+            let tb = deployed.bones[bone]
+                .track
+                .translation(last_deployed)
+                .unwrap();
+            let boundary = (Vec3::from(ta) - Vec3::from(tb)).length();
+            assert!(
+                boundary < 0.05,
+                "{name} deploy/deployed boundary translation: {boundary} m"
+            );
+        }
+
+        // Drive the authoritative clock at 144 FPS and run the live presentation sync. The
+        // transition must land on `a00_001`'s last frame, not frame 0. The traced 60 Hz
+        // clip step makes the 300-frame clip take five seconds, independent of request +8.
+        let mut state = simw::WeaponArmState::for_part(7020);
+        let mut accum = 0.0;
+        let mut request = true;
+        let dt = 1.0 / 144.0;
+        let mut elapsed = 0.0;
+        for _ in 0..1000 {
+            simw::advance_weapon_arm_clock(&mut state, &mut accum, dt, true, request, false, false);
+            request = false;
+            elapsed += dt;
+            let _ = wa.sync_state(&state, dt * 60.0);
+            if state.phase == simw::WeaponArmPhase::Deployed {
+                break;
+            }
+        }
+        assert_eq!(state.phase, simw::WeaponArmPhase::Deployed);
+        assert_eq!(wa.phase, WeaponArmPhase::Deployed);
+        assert_eq!(
+            wa.frame,
+            wa.deployed
+                .as_ref()
+                .map_or(0, |c| c.frames.saturating_sub(1)) as f32
+        );
+        assert!(
+            (elapsed - 5.0).abs() <= 1.0 / 60.0,
+            "144 FPS deploy took {elapsed} s"
+        );
+    }
+
+    /// Ranged `am7420` uses the cat-10 9420 WEAPONSFX row: muzzle `f722` on the two primary
+    /// arm muzzles (`101/102`), cartridge `f1269`; that model has no dedicated casing
+    /// dummies, so the shot path falls back to those muzzles.
+    #[test]
+    fn ranged_weapon_arm_7420_muzzle_and_cartridge_path() {
+        let g = gun(9420);
+        assert_eq!(g.kind, Kind::Rigid);
+        assert_eq!(g.fx.muzzle, 722);
+        assert_eq!(g.fx.cartridge, 1269);
+        assert_eq!(weapon_arm_muzzle_ids(7420), &[101, 102]);
+        assert!(
+            weapon_arm_cartridge_ids(7420).is_empty(),
+            "am7420 has no dedicated casing dummies"
+        );
+        assert_eq!(
+            weapon_arm_cartridge_ids(7220),
+            &[111, 112, 113, 114, 115, 116],
+            "am7220 missile tubes have the 111..116 casing/tube dummies"
+        );
     }
 
     /// The hand-arm aim needs a `gun_$(LR)` `*_arm01` joint and its LockMin/MaxX from
@@ -7196,6 +8322,206 @@ mod tests {
             );
         }
     }
+
+    /// The 360 deploy switch closes the two hand slots through `0x82853660`, which only plays
+    /// the hand weapon's own `a00_003` clip; it never reparents or hides the weapon. Returning
+    /// to `Stowed` plays the authored `a00_001` clip again.
+    #[test]
+    fn weapon_arm_folds_and_reopens_hand_weapon_clips_in_place() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let design = &find(PARAM_ACASSEMBLYDRAWING_BIN, 6009)
+            .expect("design 6009")
+            .data;
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
+        let hand_pl = built
+            .placements
+            .iter()
+            .find(|p| p.column == "armwep_r")
+            .expect("right hand weapon placement");
+        let (_, rig) = acvd_render::rigged_model(&disc, hand_pl.model.path, &|_| {
+            assemble::place_of(&[], None)
+        })
+        .expect("rigged_model");
+        let mut world = World::new();
+        let joints: Vec<Entity> = (0..rig.bones.len())
+            .map(|_| world.spawn_empty().id())
+            .collect();
+        let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
+        let mut anims = WeaponAnims::default();
+        anims.load(&disc, hand_pl, &rig, &joints, leg_type);
+        let hand = anims
+            .rigs
+            .iter()
+            .find(|r| !r.bay)
+            .expect("right hand weapon rig");
+        assert_eq!(hand.playback.role, 0, "starts on a00_000");
+        assert!(hand.playback.has(1), "has authored a00_001 deploy");
+        assert!(hand.playback.has(3), "has authored a00_003 stow");
+
+        anims.sync_weapon_arm_hand_weapons(true, 0.0);
+        let hand = anims.rigs.iter().find(|r| !r.bay).unwrap();
+        assert_eq!(hand.playback.role, 3, "deploy folds with a00_003");
+        assert!(hand.playback.playing);
+
+        anims.sync_weapon_arm_hand_weapons(true, 1.0);
+        let hand = anims.rigs.iter().find(|r| !r.bay).unwrap();
+        assert!(hand.playback.frame >= 1.0, "the fold clip advances");
+        let end = hand.playback.frames[3] - 1.0;
+        let fold_frames = hand.playback.frames[3] as usize;
+        for _ in 0..fold_frames {
+            anims.sync_weapon_arm_hand_weapons(true, 1.0);
+        }
+        let hand = anims.rigs.iter().find(|r| !r.bay).unwrap();
+        assert!(!hand.playback.playing);
+        assert_eq!(hand.playback.frame, end, "holds the authored folded pose");
+
+        anims.sync_weapon_arm_hand_weapons(false, 0.0);
+        let hand = anims.rigs.iter().find(|r| !r.bay).unwrap();
+        assert_eq!(hand.playback.role, 1, "stow reopens with a00_001");
+        assert!(hand.playback.playing);
+        assert_eq!(hand.playback.frame, 0.0);
+    }
+
+    /// A stowed weapon arm must leave the main hand-arm chain to `pose::animate` and the
+    /// hand-weapon aim/recoil path. The folded weapon-unit bones are the only ones the
+    /// stowed `am*_a` clip still owns.
+    #[test]
+    fn stowed_weapon_arm_keeps_hand_arm_raise_and_aim() {
+        use crate::assemble;
+        use acvd_data::generated::ac_unit::PARAM_ACASSEMBLYDRAWING_BIN;
+        use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
+
+        fn step_stowed(
+            mut anims: ResMut<WeaponAnims>,
+            mut posed: Query<(&mut Transform, Option<&Driven>), With<ClipJoint>>,
+        ) {
+            if let Some(wa) = anims.weapon_arm.as_ref() {
+                wa.apply(&mut posed);
+            }
+            anims.apply_recoil(0.0, [false, false], &mut posed);
+        }
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+        let design = &find(PARAM_ACASSEMBLYDRAWING_BIN, 6009)
+            .expect("design 6009")
+            .data;
+        let built = assemble::assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, design);
+        let arms_pl = built
+            .placements
+            .iter()
+            .find(|p| p.column == "arms")
+            .expect("arms placement");
+        let (_, rig) = acvd_render::rigged_model(&disc, arms_pl.model.path, &|_| {
+            assemble::place_of(&[], None)
+        })
+        .expect("rigged_model");
+        let leg_type = part_field(design.legs as i64, 3, "leg_type") as u8;
+        let mut world = World::new();
+        let joints: Vec<Entity> = (0..rig.bones.len())
+            .map(|_| world.spawn_empty().id())
+            .collect();
+        let mut anims = WeaponAnims::default();
+        anims.load(&disc, arms_pl, &rig, &joints, leg_type);
+        let right_shoulder = anims.aim[Hand::Right as usize]
+            .shoulder
+            .expect("right gun shoulder");
+        assert!(
+            anims.aim[Hand::Left as usize].shoulder.is_some(),
+            "left gun shoulder"
+        );
+        assert_eq!(
+            anims
+                .weapon_arm
+                .as_ref()
+                .expect("weapon_arm rig")
+                .phase,
+            WeaponArmPhase::Stowed
+        );
+
+        let mut main = Vec::new();
+        let mut units = Vec::new();
+        for &(entity, bone) in &anims.weapon_arm.as_ref().unwrap().joints {
+            let name = anims.weapon_arm.as_ref().unwrap().skeleton.bones[bone]
+                .rest
+                .as_ref()
+                .expect("bone rest")
+                .name
+                .as_str();
+            if name.contains("_armwepunit") {
+                units.push((entity, name.to_string()));
+            } else if ["_arm01", "_arm02", "_arm03", "_arm04", "_arm05", "_armhand"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+            {
+                main.push((entity, name.to_string()));
+            }
+        }
+        assert_eq!(units.len(), 28, "am7420 folded unit bones");
+        assert_eq!(main.len(), 12, "both hand chains (arm01..armhand)");
+
+        let body_pose = Transform::from_rotation(Quat::from_rotation_z(0.37));
+        for &entity in &joints {
+            world.entity_mut(entity).insert((body_pose, ClipJoint));
+        }
+        // Synthetic body pose stands in for `pose::animate`; only the stowed weapon unit
+        // may replace it. The right shoulder is then aimed by the hand-weapon controller.
+        let before: Vec<_> = main
+            .iter()
+            .map(|(e, _)| (*e, *world.get::<Transform>(*e).unwrap()))
+            .collect();
+        let unit_before: Vec<_> = units
+            .iter()
+            .map(|(e, _)| (*e, *world.get::<Transform>(*e).unwrap()))
+            .collect();
+        let aim = &mut anims.aim[Hand::Right as usize];
+        aim.step(true, AIM_RAISE);
+        aim.frame = Some(AimFrame {
+            parent: Quat::IDENTITY,
+            barrel: Vec3::NEG_Z,
+            aim: Vec3::X,
+        });
+        anims.kick(Hand::Right, false);
+        world.insert_resource(anims);
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_stowed);
+        schedule.run(&mut world);
+
+        for (entity, before_tf) in &before {
+            let after = world.get::<Transform>(*entity).unwrap();
+            if *entity == right_shoulder {
+                assert_ne!(
+                    after, before_tf,
+                    "the right arm01 shoulder must take the hand-weapon aim turn"
+                );
+            } else {
+                assert_eq!(
+                    after, before_tf,
+                    "main arm chain must keep the body pose while the weapon arm is stowed"
+                );
+            }
+        }
+        assert!(
+            unit_before
+                .iter()
+                .all(|(entity, _)| *world.get::<Transform>(*entity).unwrap() != body_pose),
+            "the folded weapon-unit bones must keep their stowed clip pose"
+        );
+    }
 }
 
 /// Network visual projectile driven only by a server `FireEvent`; damage is authoritative on the
@@ -7212,6 +8538,8 @@ pub(crate) struct NetProjectile {
     pub delete_fx: i32,
     /// Sub-tick accumulator so visuals step at exactly 60 Hz regardless of render rate.
     pub acc: f32,
+    /// Retired by a server hit/expire this frame; `step_net_projectiles` must not despawn again.
+    pub dead: bool,
 }
 
 pub(crate) enum NetFlight {
@@ -7303,6 +8631,7 @@ pub(crate) fn spawn_net_projectile(
         target: None,
         gun: *gun,
         seed: event.seed,
+        barrel: event.barrel,
     };
     let owner = acvd_sim::ids::NetId(event.shooter.get());
     let (flight, material) = if gun.kind == simw::Kind::Missile {
@@ -7333,6 +8662,7 @@ pub(crate) fn spawn_net_projectile(
                     hit_se: gun.hit_se.hi.max(gun.hit_se.low),
                     delete_fx: gun.fx.delete_fx,
                     acc: 0.0,
+                    dead: false,
                 },
                 Mesh3d(assets.mesh.clone()),
                 MeshMaterial3d(material),
@@ -7351,6 +8681,7 @@ pub(crate) fn spawn_net_projectile(
                 hit_se: gun.hit_se.hi.max(gun.hit_se.low),
                 delete_fx: gun.fx.delete_fx,
                 acc: 0.0,
+                dead: false,
             },
             Mesh3d(assets.mesh.clone()),
             MeshMaterial3d(material),
@@ -7368,6 +8699,9 @@ pub(crate) fn step_net_projectiles(
 ) {
     let dt = time.delta_secs().min(0.25);
     for (entity, mut round, mut tf) in &mut rounds {
+        if round.dead {
+            continue;
+        }
         round.acc = (round.acc + dt).min(1.0);
         let mut alive = true;
         while round.acc >= acvd_sim::tick::TICK_DT {
@@ -7378,7 +8712,8 @@ pub(crate) fn step_net_projectiles(
             }
         }
         if !alive {
-            commands.entity(entity).despawn();
+            round.dead = true;
+            commands.entity(entity).try_despawn();
             continue;
         }
         let position = round.flight.position();

@@ -20,18 +20,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use acvd_formats::drb::{self, Drb, Shape, TextSource};
-use acvd_formats::vfs::Disc;
 use acvd_formats::fmg::Fmg;
+use acvd_formats::vfs::Disc;
 use anyhow::{Context, Result};
 use bevy::asset::{embedded_asset, Asset, Assets, Handle};
 use bevy::color::{Color, LinearRgba};
 use bevy::image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::math::{Rect, Rot2, Vec2, Vec4};
-use bevy::prelude::{App, BackgroundColor, BorderColor, Changed, ChildOf, Children, Commands, Component, Entity, ImageNode, IntoScheduleConfigs, Node, Plugin, PositionType, PostUpdate, Query, ResMut, TypePath};
-use bevy::render::render_resource::{AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, RenderPipelineDescriptor};
+use bevy::prelude::{
+    App, BackgroundColor, BorderColor, Changed, ChildOf, Children, Commands, Component, Entity,
+    ImageNode, IntoScheduleConfigs, Node, Plugin, PositionType, PostUpdate, Query, ResMut,
+    TypePath,
+};
+use bevy::render::render_resource::{
+    AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, RenderPipelineDescriptor,
+};
 use bevy::shader::ShaderRef;
-use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient, UiRect, UiTransform};
 use bevy::ui::widget::NodeImageMode;
+use bevy::ui::{px, BackgroundGradient, ColorStop, LinearGradient, UiRect, UiTransform};
 use bevy::ui_render::prelude::{MaterialNode, UiMaterial, UiMaterialPlugin};
 use bevy::ui_render::ui_material::UiMaterialKey;
 
@@ -57,7 +63,12 @@ pub fn load(disc: &Disc, path: &str, images: &mut Assets<Image>) -> Result<Layou
 /// Like [`load`], but takes the `menu.fmg` bank from `lang/<lang>/text/menu/menu.fmg` instead of
 /// the language in the layout's own path. The press-start layout only ships as
 /// `lang/jp/menu/gameboot.drb.dcx` while its text changes with the game language.
-pub fn load_in_lang(disc: &Disc, path: &str, lang: &str, images: &mut Assets<Image>) -> Result<Layout> {
+pub fn load_in_lang(
+    disc: &Disc,
+    path: &str,
+    lang: &str,
+    images: &mut Assets<Image>,
+) -> Result<Layout> {
     load_with_text(disc, path, Some(lang), images)
 }
 
@@ -68,7 +79,10 @@ fn load_with_text(
     images: &mut Assets<Image>,
 ) -> Result<Layout> {
     let drb = drb::read(&disc.asset(path)?).with_context(|| format!("reading {path}"))?;
-    let pack = path.strip_suffix(".drb.dcx").map(|p| format!("{p}.tpf.dcx")).with_context(|| format!("{path} is not a .drb.dcx"))?;
+    let pack = path
+        .strip_suffix(".drb.dcx")
+        .map(|p| format!("{p}.tpf.dcx"))
+        .with_context(|| format!("{path} is not a .drb.dcx"))?;
     let mut packs = Packs::default();
     let textures = drb
         .textures
@@ -76,7 +90,9 @@ fn load_with_text(
         .map(|t| {
             let stem = t.path.rsplit(['\\', '/']).next().unwrap_or_default();
             let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s);
-            let found = [t.name.as_str(), stem].into_iter().find_map(|n| acvd_data::textures_named(n).find(|r| r.pack.eq_ignore_ascii_case(&pack)));
+            let found = [t.name.as_str(), stem].into_iter().find_map(|n| {
+                acvd_data::textures_named(n).find(|r| r.pack.eq_ignore_ascii_case(&pack))
+            });
             let Some(r) = found else {
                 eprintln!("{path}: texture `{}` not in {pack}", t.name);
                 return None;
@@ -97,16 +113,23 @@ fn load_with_text(
             }
         })
         .collect();
-    let fontdefs = disc.asset("font/fontdef.xml").and_then(|d| acvd_formats::fontdef::read(&d, disc.platform()));
+    let fontdefs = disc
+        .asset("font/fontdef.xml")
+        .and_then(|d| acvd_formats::fontdef::read(&d, disc.platform()));
     let mut fonts = HashMap::new();
     match fontdefs {
         Ok(defs) => {
             for o in drb.dialogs.iter().flat_map(|d| &d.objects) {
-                let Shape::Text { font, .. } = o.shape else { continue };
+                let Shape::Text { font, .. } = o.shape else {
+                    continue;
+                };
                 if fonts.contains_key(&font) {
                     continue;
                 }
-                let loaded = defs.file(font as u32).with_context(|| format!("font {font} not in fontdef.xml")).and_then(|(name, file)| text::load_file(disc, name, file, images));
+                let loaded = defs
+                    .file(font as u32)
+                    .with_context(|| format!("font {font} not in fontdef.xml"))
+                    .and_then(|(name, file)| text::load_file(disc, name, file, images));
                 match loaded {
                     Ok(f) => {
                         fonts.insert(font, Arc::new(f));
@@ -119,21 +142,38 @@ fn load_with_text(
     }
     let menu_fmg = match lang {
         Some(lang) => Some(format!("lang/{lang}/text/menu/menu.fmg")),
-        None => path.split_once("/menu/").map(|(lang, _)| format!("{lang}/text/menu/menu.fmg")),
+        None => path
+            .split_once("/menu/")
+            .map(|(lang, _)| format!("{lang}/text/menu/menu.fmg")),
     };
-    let messages = menu_fmg.and_then(|p| match disc.asset(&p).and_then(|d| acvd_formats::fmg::read(&d)) {
-        Ok(f) => Some(f),
-        Err(e) => {
-            eprintln!("{p}: {e:#}");
-            None
-        }
-    });
-    let noise = if drb.dialogs.iter().flat_map(|d| &d.objects).any(|o| matches!(o.shape, Shape::NoiseSprite { .. })) {
+    let messages =
+        menu_fmg.and_then(
+            |p| match disc.asset(&p).and_then(|d| acvd_formats::fmg::read(&d)) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("{p}: {e:#}");
+                    None
+                }
+            },
+        );
+    let noise = if drb
+        .dialogs
+        .iter()
+        .flat_map(|d| &d.objects)
+        .any(|o| matches!(o.shape, Shape::NoiseSprite { .. }))
+    {
         noise_images(images)
     } else {
         Vec::new()
     };
-    Ok(Layout { drb, textures, fonts, messages, placeholders: false, noise })
+    Ok(Layout {
+        drb,
+        textures,
+        fonts,
+        messages,
+        placeholders: false,
+        noise,
+    })
 }
 
 /// Four 256x256 white-noise frames tinted by `ImageNode::color` when a layout's `NoiseSprite`
@@ -143,7 +183,11 @@ fn noise_images(images: &mut Assets<Image>) -> Vec<Handle<Image>> {
     (0..4)
         .map(|frame| {
             let mut image = Image::new(
-                bevy::render::render_resource::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 },
+                bevy::render::render_resource::Extent3d {
+                    width: 256,
+                    height: 256,
+                    depth_or_array_layers: 1,
+                },
                 bevy::render::render_resource::TextureDimension::D2,
                 vec![0; 256 * 256 * 4],
                 bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
@@ -217,7 +261,11 @@ pub struct AdditiveSprite {
 
 impl From<&MenuSprite> for AdditiveSprite {
     fn from(s: &MenuSprite) -> Self {
-        Self { tint: s.color.into(), rect: flipped(s.rect, s.flip_x, s.flip_y), image: s.image.clone() }
+        Self {
+            tint: s.color.into(),
+            rect: flipped(s.rect, s.flip_x, s.flip_y),
+            image: s.image.clone(),
+        }
     }
 }
 
@@ -234,7 +282,9 @@ impl UiMaterial for AdditiveSprite {
 /// An `AlphaAnimSprite` gauge: the sprite drawn where the mask texture's alpha (over
 /// `mask_rect`) is at least `1 - fill`. The masks are angular alpha ramps, so `fill` sweeps the
 /// arc. Game code sets `fill` (the object's +0x44, 1.0 at creation, ctor `0x824ced28`) and
-/// `color`; [`MenuPlugin`] redraws on change.
+/// `color`; [`MenuPlugin`] redraws on change. A zero `mask_uv` (`ACV_OutLine_LockCursor_*`
+/// CursorLines author `[0, 0, 0, 0]`) means the mask is sampled with the sprite's own normalized
+/// UVs, as the 360 `Sprite_AlphaRef.fpo` fetches both textures at the same texcoord.
 #[derive(Component, Clone)]
 pub struct MenuGauge {
     pub image: Handle<Image>,
@@ -279,7 +329,9 @@ pub struct GaugeKey {
 
 impl From<&GaugeSprite> for GaugeKey {
     fn from(g: &GaugeSprite) -> Self {
-        Self { additive: g.additive }
+        Self {
+            additive: g.additive,
+        }
     }
 }
 
@@ -296,7 +348,11 @@ fn flipped(r: Rect, flip_x: bool, flip_y: bool) -> Vec4 {
 
 impl From<&MenuGauge> for GaugeSprite {
     fn from(g: &MenuGauge) -> Self {
-        let mask_rect = if g.mirror { flipped(g.mask_rect, g.flip_x, g.flip_y) } else { flipped(g.mask_rect, false, false) };
+        let mask_rect = if g.mirror {
+            flipped(g.mask_rect, g.flip_x, g.flip_y)
+        } else {
+            flipped(g.mask_rect, false, false)
+        };
         Self {
             tint: g.color.into(),
             rect: flipped(g.rect, g.flip_x, g.flip_y),
@@ -310,8 +366,16 @@ impl From<&MenuGauge> for GaugeSprite {
 }
 
 const ADDITIVE: BlendState = BlendState {
-    color: BlendComponent { src_factor: BlendFactor::SrcAlpha, dst_factor: BlendFactor::One, operation: BlendOperation::Add },
-    alpha: BlendComponent { src_factor: BlendFactor::Zero, dst_factor: BlendFactor::One, operation: BlendOperation::Add },
+    color: BlendComponent {
+        src_factor: BlendFactor::SrcAlpha,
+        dst_factor: BlendFactor::One,
+        operation: BlendOperation::Add,
+    },
+    alpha: BlendComponent {
+        src_factor: BlendFactor::Zero,
+        dst_factor: BlendFactor::One,
+        operation: BlendOperation::Add,
+    },
 };
 
 fn set_blend(descriptor: &mut RenderPipelineDescriptor, blend: BlendState) {
@@ -387,11 +451,22 @@ impl Plugin for MenuPlugin {
             UiMaterialPlugin::<GlyphSprite>::default(),
             crate::ui_kit::UiAnimationPlugin,
         ))
-        .add_systems(PostUpdate, (draw_sprites, draw_gauges, (draw_texts, draw_glyphs).chain(), animate_noise));
+        .add_systems(
+            PostUpdate,
+            (
+                draw_sprites,
+                draw_gauges,
+                (draw_texts, draw_glyphs).chain(),
+                animate_noise,
+            ),
+        );
     }
 }
 
-fn animate_noise(time: bevy::prelude::Res<bevy::prelude::Time>, mut noise: Query<(&mut MenuNoise, &mut ImageNode)>) {
+fn animate_noise(
+    time: bevy::prelude::Res<bevy::prelude::Time>,
+    mut noise: Query<(&mut MenuNoise, &mut ImageNode)>,
+) {
     for (mut grain, mut image) in &mut noise {
         grain.timer += time.delta_secs();
         if grain.timer < 0.05 || grain.frames.len() < 2 {
@@ -413,31 +488,57 @@ fn draw_glyphs(
             *m = GlyphSprite::from(g);
             continue;
         }
-        commands.entity(e).insert(MaterialNode(materials.add(GlyphSprite::from(g))));
+        commands
+            .entity(e)
+            .insert(MaterialNode(materials.add(GlyphSprite::from(g))));
     }
 }
 
-fn draw_gauges(mut commands: Commands, mut materials: ResMut<Assets<GaugeSprite>>, gauges: Query<(Entity, &MenuGauge, Option<&MaterialNode<GaugeSprite>>), Changed<MenuGauge>>) {
+fn draw_gauges(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<GaugeSprite>>,
+    gauges: Query<(Entity, &MenuGauge, Option<&MaterialNode<GaugeSprite>>), Changed<MenuGauge>>,
+) {
     for (e, g, material) in &gauges {
         if let Some(mut m) = material.and_then(|m| materials.get_mut(&m.0)) {
             *m = GaugeSprite::from(g);
             continue;
         }
-        commands.entity(e).insert(MaterialNode(materials.add(GaugeSprite::from(g))));
+        commands
+            .entity(e)
+            .insert(MaterialNode(materials.add(GaugeSprite::from(g))));
     }
 }
 
 fn draw_texts(mut commands: Commands, texts: Query<(Entity, &MenuText), Changed<MenuText>>) {
     for (e, t) in &texts {
         commands.entity(e).despawn_related::<Children>();
-        write_glyphs(&mut commands, e, &t.font, &t.text, t.align, t.size, t.scale, t.color);
+        write_glyphs(
+            &mut commands,
+            e,
+            &t.font,
+            &t.text,
+            t.align,
+            t.size,
+            t.scale,
+            t.color,
+        );
     }
 }
 
 /// Lays `string` out in the `size` box per the DRB text `align` (low 2 bits: 0 left, 1 right,
 /// 2 centre; bits 2-3: 0 top, 1 bottom, 2 middle).
 #[allow(clippy::too_many_arguments)]
-fn write_glyphs(commands: &mut Commands, boxed: Entity, f: &Font, string: &str, align: u8, size: Vec2, scale: f32, color: Color) {
+fn write_glyphs(
+    commands: &mut Commands,
+    boxed: Entity,
+    f: &Font,
+    string: &str,
+    align: u8,
+    size: Vec2,
+    scale: f32,
+    color: Color,
+) {
     let (quads, extent) = text::layout(&f.ccm, &f.sheet_size, string, scale);
     let x = match align & 3 {
         1 => size.x - extent.x,
@@ -449,13 +550,23 @@ fn write_glyphs(commands: &mut Commands, boxed: Entity, f: &Font, string: &str, 
         4 => size.y - extent.y,
         _ => 0.0,
     };
-    text::spawn_glyphs(commands, f, &quads, Vec2::new(x.round(), y.round()), boxed, color);
+    text::spawn_glyphs(
+        commands,
+        f,
+        &quads,
+        Vec2::new(x.round(), y.round()),
+        boxed,
+        color,
+    );
 }
 
 fn draw_sprites(
     mut commands: Commands,
     mut materials: ResMut<Assets<AdditiveSprite>>,
-    sprites: Query<(Entity, &MenuSprite, Option<&MaterialNode<AdditiveSprite>>), Changed<MenuSprite>>,
+    sprites: Query<
+        (Entity, &MenuSprite, Option<&MaterialNode<AdditiveSprite>>),
+        Changed<MenuSprite>,
+    >,
 ) {
     for (e, s, material) in &sprites {
         if !s.additive {
@@ -474,14 +585,18 @@ fn draw_sprites(
             *m = AdditiveSprite::from(s);
             continue;
         }
-        commands.entity(e).insert(MaterialNode(materials.add(AdditiveSprite::from(s))));
+        commands
+            .entity(e)
+            .insert(MaterialNode(materials.add(AdditiveSprite::from(s))));
     }
 }
 
 /// RGBA `c` times `tint`, per channel (0xff = 1).
 fn modulate(c: u32, tint: u32) -> u32 {
     let (c, t) = (c.to_be_bytes(), tint.to_be_bytes());
-    u32::from_be_bytes(std::array::from_fn(|i| (c[i] as u32 * t[i] as u32 / 255) as u8))
+    u32::from_be_bytes(std::array::from_fn(|i| {
+        (c[i] as u32 * t[i] as u32 / 255) as u8
+    }))
 }
 
 fn node(rect: [i16; 4], scale: f32) -> Node {
@@ -523,8 +638,14 @@ fn sprite_node(rect: [i16; 4], flags: u16, scale: f32) -> (Node, UiTransform) {
         transform.rotation = Rot2::degrees(90.0 * turns as f32);
         if turns % 2 == 1 {
             // Lay the unrotated image out with swapped sides around the same center.
-            let (w, h) = ((rect[2] - rect[0]).abs() as f32 * scale, (rect[3] - rect[1]).abs() as f32 * scale);
-            let (x, y) = (rect[0].min(rect[2]) as f32 * scale, rect[1].min(rect[3]) as f32 * scale);
+            let (w, h) = (
+                (rect[2] - rect[0]).abs() as f32 * scale,
+                (rect[3] - rect[1]).abs() as f32 * scale,
+            );
+            let (x, y) = (
+                rect[0].min(rect[2]) as f32 * scale,
+                rect[1].min(rect[3]) as f32 * scale,
+            );
             n.left = px(x + (w - h) / 2.0);
             n.top = px(y + (h - w) / 2.0);
             n.width = px(h);
@@ -537,7 +658,13 @@ fn sprite_node(rect: [i16; 4], flags: u16, scale: f32) -> (Node, UiTransform) {
 /// Spawns dialog `index` with its layout origin at `origin` (logical pixels: the top-left for
 /// screen dialogs, the center for ones laid out around (0,0) like `ACV_FE_LockSightCenter`),
 /// layout pixels times `scale`. Returns the root, tagged [`MenuRoot`].
-pub fn spawn(commands: &mut Commands, layout: &Layout, index: usize, origin: Vec2, scale: f32) -> Entity {
+pub fn spawn(
+    commands: &mut Commands,
+    layout: &Layout,
+    index: usize,
+    origin: Vec2,
+    scale: f32,
+) -> Entity {
     let size = layout.drb.dialogs.get(index).map_or([0, 0], |d| d.size);
     let mut root = node([0, 0, size[0] as i16, size[1] as i16], scale);
     root.left = px(origin.x);
@@ -591,7 +718,9 @@ fn spawn_dialog(
     nine_slice: Option<(Vec2, Vec2)>,
     depth: usize,
 ) {
-    let Some(dialog) = layout.drb.dialogs.get(index) else { return };
+    let Some(dialog) = layout.drb.dialogs.get(index) else {
+        return;
+    };
     if depth > 16 {
         return;
     }
@@ -605,14 +734,43 @@ fn spawn_dialog(
     };
     for o in &dialog.objects {
         let spawned = match &o.shape {
-            &Shape::Sprite { rect, uv, texture: Some(t), flags, color } => {
-                let Some(Some(image)) = layout.textures.get(t as usize).cloned() else { continue };
+            &Shape::Sprite {
+                rect,
+                uv,
+                texture: Some(t),
+                flags,
+                color,
+            } => {
+                let Some(Some(image)) = layout.textures.get(t as usize).cloned() else {
+                    continue;
+                };
                 let (n, transform) = sprite_node(map(rect), flags, scale);
-                let sprite = MenuSprite { image, rect: texels(uv), color: rgba(color), flip_x: flags & 0x100 != 0, flip_y: flags & 0x200 != 0, additive: flags & 0xff == 2 };
+                let sprite = MenuSprite {
+                    image,
+                    rect: texels(uv),
+                    color: rgba(color),
+                    flip_x: flags & 0x100 != 0,
+                    flip_y: flags & 0x200 != 0,
+                    additive: flags & 0xff == 2,
+                };
                 commands.spawn((n, transform, sprite, ChildOf(parent))).id()
             }
-            &Shape::AlphaAnimSprite { rect, uv, texture: Some(t), flags, color, mask_uv, mask: Some(m), mirror } => {
-                let (Some(Some(image)), Some(Some(mask))) = (layout.textures.get(t as usize).cloned(), layout.textures.get(m as usize).cloned()) else { continue };
+            &Shape::AlphaAnimSprite {
+                rect,
+                uv,
+                texture: Some(t),
+                flags,
+                color,
+                mask_uv,
+                mask: Some(m),
+                mirror,
+            } => {
+                let (Some(Some(image)), Some(Some(mask))) = (
+                    layout.textures.get(t as usize).cloned(),
+                    layout.textures.get(m as usize).cloned(),
+                ) else {
+                    continue;
+                };
                 let (n, transform) = sprite_node(map(rect), flags, scale);
                 let gauge = MenuGauge {
                     image,
@@ -628,45 +786,115 @@ fn spawn_dialog(
                 };
                 commands.spawn((n, transform, gauge, ChildOf(parent))).id()
             }
-            &Shape::MonoRect { rect, color, .. } => commands.spawn((node(map(rect), scale), BackgroundColor(rgba(color)), ChildOf(parent))).id(),
+            &Shape::MonoRect { rect, color, .. } => commands
+                .spawn((
+                    node(map(rect), scale),
+                    BackgroundColor(rgba(color)),
+                    ChildOf(parent),
+                ))
+                .id(),
             &Shape::MonoFrame { rect, flags, color } => {
                 let mut n = node(map(rect), scale);
                 n.border = UiRect::all(px((flags & 0xff).max(1) as f32 * scale));
-                commands.spawn((n, BorderColor::all(rgba(color)), ChildOf(parent))).id()
+                commands
+                    .spawn((n, BorderColor::all(rgba(color)), ChildOf(parent)))
+                    .id()
             }
             &Shape::GouraudRect { rect, colors, .. } => {
-                let gradient = LinearGradient::to_bottom(vec![ColorStop::auto(rgba(colors[0])), ColorStop::auto(rgba(colors[2]))]);
-                commands.spawn((node(map(rect), scale), BackgroundGradient::from(gradient), ChildOf(parent))).id()
+                let gradient = LinearGradient::to_bottom(vec![
+                    ColorStop::auto(rgba(colors[0])),
+                    ColorStop::auto(rgba(colors[2])),
+                ]);
+                commands
+                    .spawn((
+                        node(map(rect), scale),
+                        BackgroundGradient::from(gradient),
+                        ChildOf(parent),
+                    ))
+                    .id()
             }
-            &Shape::GouraudFrame { rect, flags, colors } => {
+            &Shape::GouraudFrame {
+                rect,
+                flags,
+                colors,
+            } => {
                 let mut n = node(map(rect), scale);
                 n.border = UiRect::all(px((flags & 0xff).max(1) as f32 * scale));
-                commands.spawn((n, BorderColor::all(rgba(colors[0])), ChildOf(parent))).id()
+                commands
+                    .spawn((n, BorderColor::all(rgba(colors[0])), ChildOf(parent)))
+                    .id()
             }
-            Shape::Text { rect, color, font, align, source, .. } => {
-                let Some(f) = layout.fonts.get(font) else { continue };
+            Shape::Text {
+                rect,
+                color,
+                font,
+                align,
+                source,
+                ..
+            } => {
+                let Some(f) = layout.fonts.get(font) else {
+                    continue;
+                };
                 let rect = map(*rect);
-                let size = Vec2::new((rect[2] - rect[0]).abs() as f32, (rect[3] - rect[1]).abs() as f32) * scale;
+                let size = Vec2::new(
+                    (rect[2] - rect[0]).abs() as f32,
+                    (rect[3] - rect[1]).abs() as f32,
+                ) * scale;
                 let string = match source {
                     TextSource::Static(s) => Some(s.clone()),
-                    TextSource::Message { bank: 1, id } => layout.messages.as_ref().and_then(|m| m.get(*id as i32)).map(str::to_string),
+                    TextSource::Message { bank: 1, id } => layout
+                        .messages
+                        .as_ref()
+                        .and_then(|m| m.get(*id as i32))
+                        .map(str::to_string),
                     TextSource::Runtime { .. } => {
-                        let mut string = if layout.placeholders { o.name.clone() } else { String::new() };
-                        if layout.placeholders && string.encode_utf16().any(|c| f.ccm.glyph(c).is_none()) {
+                        let mut string = if layout.placeholders {
+                            o.name.clone()
+                        } else {
+                            String::new()
+                        };
+                        if layout.placeholders
+                            && string.encode_utf16().any(|c| f.ccm.glyph(c).is_none())
+                        {
                             string = "000".into();
                         }
-                        let text = MenuText { text: string, color: rgba(*color), font: f.clone(), align: *align, size, scale };
-                        commands.entity(parent).with_child((snapped_node(rect, scale), text, MenuObject(o.name.clone())));
+                        let text = MenuText {
+                            text: string,
+                            color: rgba(*color),
+                            font: f.clone(),
+                            align: *align,
+                            size,
+                            scale,
+                        };
+                        commands.entity(parent).with_child((
+                            snapped_node(rect, scale),
+                            text,
+                            MenuObject(o.name.clone()),
+                        ));
                         continue;
                     }
                     _ => layout.placeholders.then(|| o.name.clone()),
                 };
                 let Some(mut string) = string else { continue };
-                if layout.placeholders && string == o.name && string.encode_utf16().any(|c| f.ccm.glyph(c).is_none()) {
+                if layout.placeholders
+                    && string == o.name
+                    && string.encode_utf16().any(|c| f.ccm.glyph(c).is_none())
+                {
                     string = "000".into();
                 }
-                let boxed = commands.spawn((snapped_node(rect, scale), ChildOf(parent))).id();
-                write_glyphs(commands, boxed, f, &string, *align, size, scale, rgba(*color));
+                let boxed = commands
+                    .spawn((snapped_node(rect, scale), ChildOf(parent)))
+                    .id();
+                write_glyphs(
+                    commands,
+                    boxed,
+                    f,
+                    &string,
+                    *align,
+                    size,
+                    scale,
+                    rgba(*color),
+                );
                 boxed
             }
             &Shape::NoiseSprite { rect, color, .. } if !layout.noise.is_empty() => {
@@ -674,22 +902,50 @@ fn spawn_dialog(
                 n.overflow = bevy::ui::Overflow::visible();
                 let mut image = ImageNode::new(layout.noise[0].clone());
                 image.color = rgba(color);
-                image.image_mode = NodeImageMode::Tiled { tile_x: true, tile_y: true, stretch_value: 2.0 };
-                let noise = MenuNoise { frames: layout.noise.clone(), frame: 0, timer: 0.0 };
+                image.image_mode = NodeImageMode::Tiled {
+                    tile_x: true,
+                    tile_y: true,
+                    stretch_value: 2.0,
+                };
+                let noise = MenuNoise {
+                    frames: layout.noise.clone(),
+                    frame: 0,
+                    timer: 0.0,
+                };
                 commands.spawn((n, image, noise, ChildOf(parent))).id()
             }
-            &Shape::Dialog { rect, dialog: Some(d), flags, color } => {
+            &Shape::Dialog {
+                rect,
+                dialog: Some(d),
+                flags,
+                color,
+            } => {
                 let rect = map(rect);
-                let child = commands.spawn((snapped_node(rect, scale), ChildOf(parent))).id();
+                let child = commands
+                    .spawn((snapped_node(rect, scale), ChildOf(parent)))
+                    .id();
                 let child_nine_slice = (flags & 1 != 0)
                     .then(|| {
                         let sub = layout.drb.dialogs.get(d as usize)?;
                         let src = Vec2::new(sub.size[0] as f32, sub.size[1] as f32);
-                        let dst = Vec2::new((rect[2] - rect[0]).abs() as f32, (rect[3] - rect[1]).abs() as f32);
-                        (src.x > 0.0 && src.y > 0.0 && (dst.x != src.x || dst.y != src.y)).then_some((src, dst))
+                        let dst = Vec2::new(
+                            (rect[2] - rect[0]).abs() as f32,
+                            (rect[3] - rect[1]).abs() as f32,
+                        );
+                        (src.x > 0.0 && src.y > 0.0 && (dst.x != src.x || dst.y != src.y))
+                            .then_some((src, dst))
                     })
                     .flatten();
-                spawn_dialog(commands, layout, d as usize, child, scale, modulate(color, tint), child_nine_slice, depth + 1);
+                spawn_dialog(
+                    commands,
+                    layout,
+                    d as usize,
+                    child,
+                    scale,
+                    modulate(color, tint),
+                    child_nine_slice,
+                    depth + 1,
+                );
                 child
             }
             _ => continue,
@@ -712,18 +968,36 @@ mod tests {
         assert_eq!(remap_nine_slice([14, 0, 21, 7], src, dst), [127, 0, 134, 7]);
         assert_eq!(remap_nine_slice([0, 7, 7, 14], src, dst), [0, 7, 7, 127]);
         assert_eq!(remap_nine_slice([7, 7, 14, 14], src, dst), [7, 7, 127, 127]);
-        assert_eq!(remap_nine_slice([14, 7, 21, 14], src, dst), [127, 7, 134, 127]);
+        assert_eq!(
+            remap_nine_slice([14, 7, 21, 14], src, dst),
+            [127, 7, 134, 127]
+        );
         assert_eq!(remap_nine_slice([0, 14, 7, 21], src, dst), [0, 127, 7, 134]);
-        assert_eq!(remap_nine_slice([7, 14, 14, 21], src, dst), [7, 127, 127, 134]);
-        assert_eq!(remap_nine_slice([14, 14, 21, 21], src, dst), [127, 127, 134, 134]);
+        assert_eq!(
+            remap_nine_slice([7, 14, 14, 21], src, dst),
+            [7, 127, 127, 134]
+        );
+        assert_eq!(
+            remap_nine_slice([14, 14, 21, 21], src, dst),
+            [127, 127, 134, 134]
+        );
 
         // scan_enemy_name: [-9, 0, 378, 34] -> 387x34
         let dst_name = Vec2::new(387.0, 34.0);
-        assert_eq!(remap_nine_slice([14, 14, 21, 21], src, dst_name), [380, 27, 387, 34]);
-        assert_eq!(remap_nine_slice([7, 7, 14, 14], src, dst_name), [7, 7, 380, 27]);
+        assert_eq!(
+            remap_nine_slice([14, 14, 21, 21], src, dst_name),
+            [380, 27, 387, 34]
+        );
+        assert_eq!(
+            remap_nine_slice([7, 7, 14, 14], src, dst_name),
+            [7, 7, 380, 27]
+        );
 
         // Full-span child stretches to full target dimensions
-        assert_eq!(remap_nine_slice([0, 0, 21, 21], src, dst_name), [0, 0, 387, 34]);
+        assert_eq!(
+            remap_nine_slice([0, 0, 21, 21], src, dst_name),
+            [0, 0, 387, 34]
+        );
     }
 
     #[test]

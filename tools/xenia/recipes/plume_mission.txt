@@ -1,0 +1,32 @@
+wait 25
+press START
+wait 6
+press A
+wait 5
+press A
+wait 22
+press A
+wait 25
+press A
+wait 15
+press A
+wait 10
+press DOWN
+press DOWN
+press DOWN
+press DOWN
+press DOWN
+press A
+wait 4
+press A
+wait 3
+press A
+wait 25
+shot private/xenia/shots/plume_start.png
+wait 2
+stick L 0 1 1
+stick R 1 0 1
+press A
+stick R -1 0 1
+wait 8
+shot private/xenia/shots/plume_play.png

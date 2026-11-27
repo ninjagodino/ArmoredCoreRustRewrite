@@ -52,8 +52,8 @@ use bevy::window::{FileDragAndDrop, PrimaryWindow};
 use serde::{Deserialize, Serialize};
 
 use crate::garage::{
-    GarageEmblemBanner, GarageScreen, GarageState, Mode, PaintTab, CUE_CANCEL, CUE_EQUIP, CUE_ERROR,
-    CUE_MOVE, CUE_OK,
+    GarageEmblemBanner, GarageScreen, GarageState, Mode, PaintTab, CUE_CANCEL, CUE_EQUIP,
+    CUE_ERROR, CUE_MOVE, CUE_OK,
 };
 use crate::sound::{self, Cues};
 
@@ -364,9 +364,8 @@ pub fn build_shoulder_emblem_projector(
                     if t > 0.1 && t < best_t {
                         best_t = t;
                         let (u0, u1, u2) = (mesh.uv1[i0], mesh.uv1[i1], mesh.uv1[i2]);
-                        let area = ((u1.x - u0.x) * (u2.y - u0.y)
-                            - (u2.x - u0.x) * (u1.y - u0.y))
-                        .abs();
+                        let area =
+                            ((u1.x - u0.x) * (u2.y - u0.y) - (u2.x - u0.x) * (u1.y - u0.y)).abs();
                         hit_uv1 = area > 1e-6;
                     }
                 }
@@ -657,8 +656,7 @@ impl DecalState {
             return;
         }
         self.initialized = true;
-        self.slot_textures =
-            std::array::from_fn(|_| images.add(crate::paint::empty_decal_image()));
+        self.slot_textures = std::array::from_fn(|_| images.add(crate::paint::empty_decal_image()));
         self.emblem_texture = images.add(blank_emblem_image());
         self.emblem_texture_dirty = true;
         self.scan_user_dir(images);
@@ -793,11 +791,7 @@ impl DecalState {
 
     /// Imports an external image file (from file picker, drag-and-drop, or `--decal`), copies it
     /// into `decals/` so it persists across sessions, and selects it as the active brush.
-    pub fn import_image_file(
-        &mut self,
-        path: &Path,
-        images: &mut Assets<Image>,
-    ) -> Result<String> {
+    pub fn import_image_file(&mut self, path: &Path, images: &mut Assets<Image>) -> Result<String> {
         let key = self.load_custom_file_internal(path, true, images)?;
         self.active_image_key = Some(key.clone());
         self.library_tab = DecalLibraryTab::Custom;
@@ -822,12 +816,7 @@ impl DecalState {
             let scale = MAX_IMPORT_DIM as f32 / w.max(h) as f32;
             let nw = ((w as f32 * scale).round() as u32).max(1);
             let nh = ((h as f32 * scale).round() as u32).max(1);
-            rgba = image::imageops::resize(
-                &rgba,
-                nw,
-                nh,
-                image::imageops::FilterType::Triangle,
-            );
+            rgba = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
         }
 
         let file_name = path
@@ -1249,7 +1238,10 @@ pub(crate) fn pick_file_native_with_filter(dialog_title: &str, filter: &str) -> 
     if ok == 0 {
         return None;
     }
-    let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+    let len = file_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(file_buf.len());
     if len == 0 {
         return None;
     }
@@ -1487,7 +1479,8 @@ fn rasterize_projector_into_uv1(
                     let s = sample_bilinear(&asset.rgba, asset.width, asset.height, u, v);
                     // Smooth fade near grazing angles and projection depth cutoff.
                     let angle_fade = ((facing - 0.08) / 0.14).clamp(0.0, 1.0);
-                    let depth_fade = (1.0 - ((dz / depth - 0.85) / 0.15).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+                    let depth_fade =
+                        (1.0 - ((dz / depth - 0.85) / 0.15).clamp(0.0, 1.0)).clamp(0.0, 1.0);
                     let sa = s[3] * tint_f[3] * angle_fade * depth_fade;
                     if sa <= 1e-4 {
                         continue;
@@ -1553,7 +1546,8 @@ pub fn bake_slot_pixels(
         let half_h = (decal.scale * 0.5).max(0.02);
         let half_w = half_h * aspect;
         let origin = decal.pos_vec();
-        let (right, up, forward) = projector_basis(decal.norm_vec(), decal.tan_vec(), decal.rotation);
+        let (right, up, forward) =
+            projector_basis(decal.norm_vec(), decal.tan_vec(), decal.rotation);
 
         if direct {
             stamp_id = stamp_id.wrapping_add(1).max(1);
@@ -1742,7 +1736,8 @@ pub fn raycast_ac(
                 world_normal = -world_normal;
             }
             let world_pos = wp0 * w0 + wp1 * u + wp2 * v;
-            let rest_pos = mesh.positions[i0] * w0 + mesh.positions[i1] * u + mesh.positions[i2] * v;
+            let rest_pos =
+                mesh.positions[i0] * w0 + mesh.positions[i1] * u + mesh.positions[i2] * v;
             let rest_normal = (mesh.normals[i0] * w0 + mesh.normals[i1] * u + mesh.normals[i2] * v)
                 .normalize_or(Vec3::Z);
             let rest_tangent = stable_tangent(rest_normal, prev_rest_tangent);
@@ -1861,10 +1856,8 @@ pub fn handle_imports(
             Err(e) => {
                 warn!("decal import failed: {e:#}");
                 sound::cue(&mut commands, &mut cues, &mut audio_assets, CUE_ERROR);
-                garage_state.set_banner(
-                    format!("IMPORT FAILED: {e}"),
-                    Color::srgb(1.0, 0.42, 0.35),
-                );
+                garage_state
+                    .set_banner(format!("IMPORT FAILED: {e}"), Color::srgb(1.0, 0.42, 0.35));
             }
         }
     }
@@ -2182,12 +2175,7 @@ pub fn interact_and_gizmo(
                 .and_then(|k| decals.peek_asset(k))
                 .map(|a| a.aspect())
                 .unwrap_or(1.0);
-            (
-                decals.brush_scale,
-                0.0,
-                asp,
-                Color::srgb(0.32, 0.88, 1.0),
-            )
+            (decals.brush_scale, 0.0, asp, Color::srgb(0.32, 0.88, 1.0))
         };
         let (right, up, fwd) = projector_basis(h.world_normal, h.world_tangent, rotation);
         let c = h.world_pos + fwd * 0.03;
@@ -2254,7 +2242,10 @@ pub fn sync_bakes(
                 garage_state.ui_dirty = true;
             } else if let Some(emblem_name) = trimmed.strip_prefix("emblem:") {
                 let key = format!("emblem:{emblem_name}");
-                if decals.ensure_emblem(&garage.disc, &key, &mut images).is_some() {
+                if decals
+                    .ensure_emblem(&garage.disc, &key, &mut images)
+                    .is_some()
+                {
                     decals.set_ac_emblem(Some(key), false);
                     garage_state.ui_dirty = true;
                 } else {
@@ -2277,12 +2268,14 @@ pub fn sync_bakes(
     // Handle `--decal <path>` CLI auto-stamp onto the AC Core chest once meshes are ready.
     if let Some(cli_path) = decals.cli_decal.take() {
         if !cache.meshes.is_empty() {
-            let key_res = if let Some(emblem_name) = cli_path
-                .to_str()
-                .and_then(|s| s.strip_prefix("emblem:"))
+            let key_res = if let Some(emblem_name) =
+                cli_path.to_str().and_then(|s| s.strip_prefix("emblem:"))
             {
                 let key = format!("emblem:{emblem_name}");
-                if decals.ensure_emblem(&garage.disc, &key, &mut images).is_some() {
+                if decals
+                    .ensure_emblem(&garage.disc, &key, &mut images)
+                    .is_some()
+                {
                     decals.active_image_key = Some(key.clone());
                     Ok(key)
                 } else {
@@ -2568,8 +2561,14 @@ mod tests {
     #[test]
     fn delete_custom_asset_cleans_up_brush_emblem_and_layers() {
         let mut state = DecalState::new(None, None);
-        state.custom_assets.push(solid_asset("custom:test_nonexistent_a.png", [255, 0, 0, 255]));
-        state.custom_assets.push(solid_asset("custom:test_nonexistent_b.png", [0, 255, 0, 255]));
+        state.custom_assets.push(solid_asset(
+            "custom:test_nonexistent_a.png",
+            [255, 0, 0, 255],
+        ));
+        state.custom_assets.push(solid_asset(
+            "custom:test_nonexistent_b.png",
+            [0, 255, 0, 255],
+        ));
         state.active_image_key = Some("custom:test_nonexistent_a.png".into());
         state.ac_emblem_key = Some("custom:test_nonexistent_a.png".into());
         state.emblem_override = true;
@@ -2621,10 +2620,7 @@ mod tests {
             64,
             &cache,
             &[],
-            cache
-                .shoulder_emblem
-                .as_ref()
-                .map(|p| (p, &emblem)),
+            cache.shoulder_emblem.as_ref().map(|p| (p, &emblem)),
             &mut |_| None,
         );
         let mid = ((32 * 64 + 32) * 4) as usize;
@@ -2704,7 +2700,11 @@ mod tests {
             if slot != DecalSlot::LeftArm {
                 continue;
             }
-            let Some(uv1) = verts.uvs.get(1).filter(|u| u.len() == verts.positions.len()) else {
+            let Some(uv1) = verts
+                .uvs
+                .get(1)
+                .filter(|u| u.len() == verts.positions.len())
+            else {
                 continue;
             };
             let Some(&fs_idx) = mesh.face_sets.first() else {
@@ -2830,7 +2830,9 @@ mod tests {
     /// garage `menu1000` emblem UV0 V vs world Y.
     #[test]
     fn x360_disc_all_arms_shoulder_emblem_coverage() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
         let iso = acvd_formats::vfs::default_disc(&root);
         if !iso.is_file() {
             return;
@@ -2864,21 +2866,35 @@ mod tests {
                     ok_count += 1;
                 } else if opaque > 0 {
                     low_count += 1;
-                    println!("  LOW  arm={aid:4} wa={is_wa} design={:4} opaque={opaque:4} origin={:?}", r.id, proj.origin);
+                    println!(
+                        "  LOW  arm={aid:4} wa={is_wa} design={:4} opaque={opaque:4} origin={:?}",
+                        r.id, proj.origin
+                    );
                 } else {
                     zero_count += 1;
-                    println!("  ZERO arm={aid:4} wa={is_wa} design={:4} opaque=   0 origin={:?}", r.id, proj.origin);
+                    println!(
+                        "  ZERO arm={aid:4} wa={is_wa} design={:4} opaque=   0 origin={:?}",
+                        r.id, proj.origin
+                    );
                 }
             }
         }
         println!("ALL-ARMS SWEEP: ok(>=50)={ok_count} low(1..49)={low_count} zero={zero_count}");
-        assert_eq!(zero_count, 0, "every arm in preset designs should bake non-zero emblem coverage");
-        assert!(ok_count >= 50, "expected >=50 arms to bake >=50 emblem texels, got {ok_count}");
+        assert_eq!(
+            zero_count, 0,
+            "every arm in preset designs should bake non-zero emblem coverage"
+        );
+        assert!(
+            ok_count >= 50,
+            "expected >=50 arms to bake >=50 emblem texels, got {ok_count}"
+        );
     }
 
     #[test]
     fn probe_shoulder_emblem_orientation_on_real_arms() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
         let iso = acvd_formats::vfs::default_disc(&root);
         if !iso.is_file() {
             return;
@@ -2959,9 +2975,7 @@ mod tests {
                     "design {design_id}: expected −up control to be the upside-down case"
                 );
             } else {
-                println!(
-                    "  skip ±up assert (partial frustum coverage); am0410/5001 is the lock"
-                );
+                println!("  skip ±up assert (partial frustum coverage); am0410/5001 is the lock");
             }
         }
 
@@ -2980,7 +2994,10 @@ mod tests {
                         };
                         let bones = flver.vertex_bones(mesh, &verts);
                         flver.to_model_space(mesh, &mut verts, &bones, &world);
-                        let Some(uv0) = verts.uvs.first().filter(|u| u.len() == verts.positions.len())
+                        let Some(uv0) = verts
+                            .uvs
+                            .first()
+                            .filter(|u| u.len() == verts.positions.len())
                         else {
                             continue;
                         };
@@ -3072,10 +3089,18 @@ mod tests {
         });
         // Right side (x = +0.25 -> u = 0.75 -> px = 48, py = 32) should be red.
         let right_px = ((32 * 64 + 48) * 4) as usize;
-        assert!(buf[right_px] > 240 && buf[right_px + 3] > 240, "right {:?}", &buf[right_px..right_px + 4]);
+        assert!(
+            buf[right_px] > 240 && buf[right_px + 3] > 240,
+            "right {:?}",
+            &buf[right_px..right_px + 4]
+        );
         // Mirrored left side (x = -0.25 -> u = 0.25 -> px = 16, py = 32) should also be red!
         let left_px = ((32 * 64 + 16) * 4) as usize;
-        assert!(buf[left_px] > 240 && buf[left_px + 3] > 240, "left {:?}", &buf[left_px..left_px + 4]);
+        assert!(
+            buf[left_px] > 240 && buf[left_px + 3] > 240,
+            "left {:?}",
+            &buf[left_px..left_px + 4]
+        );
         // Center (x = 0 -> u = 0.5 -> px = 32, py = 32) should remain transparent!
         let mid_px = ((32 * 64 + 32) * 4) as usize;
         assert_eq!(buf[mid_px + 3], 0, "center {:?}", &buf[mid_px..mid_px + 4]);
@@ -3118,21 +3143,42 @@ mod tests {
                 flip_h: false,
             },
         ];
-        let buf = bake_slot_pixels(DecalSlot::Head, 32, &cache, &layers, None, &mut |k| match k {
-            "blue" => Some(blue.clone()),
-            "white" => Some(white_half.clone()),
-            _ => None,
-        });
+        let buf = bake_slot_pixels(
+            DecalSlot::Head,
+            32,
+            &cache,
+            &layers,
+            None,
+            &mut |k| match k {
+                "blue" => Some(blue.clone()),
+                "white" => Some(white_half.clone()),
+                _ => None,
+            },
+        );
         let mid = ((16 * 32 + 16) * 4) as usize;
         // 50% white over 100% blue -> ~[128, 128, 255, 255]
-        assert!((buf[mid] as i32 - 128).abs() <= 2, "{:?}", &buf[mid..mid + 4]);
-        assert!((buf[mid + 1] as i32 - 128).abs() <= 2, "{:?}", &buf[mid..mid + 4]);
-        assert!(buf[mid + 2] >= 253 && buf[mid + 3] >= 253, "{:?}", &buf[mid..mid + 4]);
+        assert!(
+            (buf[mid] as i32 - 128).abs() <= 2,
+            "{:?}",
+            &buf[mid..mid + 4]
+        );
+        assert!(
+            (buf[mid + 1] as i32 - 128).abs() <= 2,
+            "{:?}",
+            &buf[mid..mid + 4]
+        );
+        assert!(
+            buf[mid + 2] >= 253 && buf[mid + 3] >= 253,
+            "{:?}",
+            &buf[mid..mid + 4]
+        );
     }
 
     #[test]
     fn x360_disc_core_bakes_retail_emblem() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
         let iso = acvd_formats::vfs::default_disc(&root);
         if !iso.is_file() {
             return;
@@ -3236,7 +3282,9 @@ mod tests {
 
     #[test]
     fn x360_disc_left_arm_bakes_design_shoulder_emblem() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
         let iso = acvd_formats::vfs::default_disc(&root);
         if !iso.is_file() {
             return;
@@ -3299,7 +3347,11 @@ mod tests {
             if slot != DecalSlot::LeftArm {
                 continue;
             }
-            let Some(uv1) = verts.uvs.get(1).filter(|u| u.len() == verts.positions.len()) else {
+            let Some(uv1) = verts
+                .uvs
+                .get(1)
+                .filter(|u| u.len() == verts.positions.len())
+            else {
                 continue;
             };
             let Some(&fs_idx) = mesh.face_sets.first() else {
@@ -3380,7 +3432,9 @@ mod tests {
 
     #[test]
     fn probe_arm_shoulder_emblem_and_garage_emblem_meshes() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
         let iso = acvd_formats::vfs::default_disc(&root);
         if !iso.is_file() {
             return;
@@ -3403,7 +3457,8 @@ mod tests {
 
         // 2. Inspect acvparts.bin category 2 (Arms) shoulder emblem projector fields (+0x28..+0x40, +0x117..+0x118)
         let bytes = disc.asset("param/acvparts.bin").unwrap();
-        let parts = acvd_formats::acv_parts::read(&bytes, acvd_formats::acv_parts::record_size).unwrap();
+        let parts =
+            acvd_formats::acv_parts::read(&bytes, acvd_formats::acv_parts::record_size).unwrap();
         let mut shown = 0;
         for rec in parts.records.iter().filter(|r| r.category == 2) {
             let d = rec.data;
@@ -3494,19 +3549,30 @@ mod tests {
                 acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS,
                 &row.data,
             );
-            let arm_place = built.placements.iter().find(|p| p.column == "arms").unwrap();
+            let arm_place = built
+                .placements
+                .iter()
+                .find(|p| p.column == "arms")
+                .unwrap();
             let flv_bytes = acvd_formats::vfs::open(&disc, arm_place.model.path).unwrap();
             let flver = acvd_formats::flver::read(&flv_bytes).unwrap();
             println!("=== Design {did} arms ({}) ===", arm_place.model.path);
             for (bi, b) in flver.bones.iter().enumerate() {
                 if b.name.contains("kata") || bi < 4 {
-                    println!("  bone[{bi}] {:?} parent={} t={:?} r={:?}", b.name, b.parent, b.translation, b.rotation);
+                    println!(
+                        "  bone[{bi}] {:?} parent={} t={:?} r={:?}",
+                        b.name, b.parent, b.translation, b.rotation
+                    );
                 }
             }
             let mut min_v = Vec3::splat(f32::INFINITY);
             let mut max_v = Vec3::splat(f32::NEG_INFINITY);
             for mesh in &flver.meshes {
-                let root_name = flver.bones.get(mesh.default_bone as usize).map(|b| b.name.as_str()).unwrap_or("");
+                let root_name = flver
+                    .bones
+                    .get(mesh.default_bone as usize)
+                    .map(|b| b.name.as_str())
+                    .unwrap_or("");
                 if root_name.to_ascii_lowercase().starts_with("l_") {
                     if let Ok(verts) = flver.vertices(&flv_bytes, mesh) {
                         for p in &verts.positions {

@@ -133,9 +133,10 @@ impl SimAc {
     ) -> weapons::WeaponOutput {
         let blocked =
             self.motion.scan_mode || self.motion.kick.is_some() || self.motion.blade.is_some();
+        let combat_mode = !self.motion.scan_mode;
         let aim = input.aim_direction();
         let mut seq = self.shot_seq;
-        let out = self.armament.step_tick(
+        let out = self.armament.step_tick_mode(
             input,
             tick,
             self.id,
@@ -145,6 +146,7 @@ impl SimAc {
             input.lock_target,
             lock_pos,
             blocked,
+            combat_mode,
             &mut self.motion.en,
             next_projectile,
             &mut seq,
@@ -349,6 +351,7 @@ impl SimWorld {
                 muzzle: shot.position,
                 dir: shot.dir,
                 tick: tick.0,
+                barrel: shot.barrel,
                 hitscan,
             });
             if hitscan {
@@ -962,6 +965,7 @@ pub fn record_of(ac: &SimAc, quantizer: &acvd_proto::PosQuantizer) -> AcRecord {
         flags: flags_of(ac),
         pose_state: ac.pose,
         combat_flags: combat,
+        weapon_arm_ticks: ac.armament.weapon_arm_ticks(),
         ap: ((ac.ap / ac.max_ap.max(1.0)).clamp(0.0, 1.0) * 65535.0).round() as u16,
         en: ((ac.motion.en / ac.motion.en_max.max(1.0)).clamp(0.0, 1.0) * 255.0).round() as u8,
         reload: [right.reload_ticks(), left.reload_ticks()],
@@ -1418,6 +1422,7 @@ mod tests {
             target: None,
             gun,
             seed: 0,
+            barrel: 0,
         };
         world
             .projectiles

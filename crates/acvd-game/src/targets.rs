@@ -16,7 +16,9 @@
 //! (`a####`) carry their `AcAssemblyDesignSt` ID in `MODEL_PARAM_ST` `+0x18` (`0x82b91348` →
 //! `0x82b91470`) and assemble with `assemble`, `pose::spawn_static` and `paint`.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use acvd_data::generated::ac_unit::{AcAssemblyDesignSt, AC_ASSEMBLY_DESIGN_ST_FILES};
@@ -880,6 +882,7 @@ pub fn spawn(
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
     disc: &Disc,
     enemy_parts: &weapons::EnemyParts,
+    cache: &mut AcRigCache,
     map_id: &str,
     layout: &str,
     player_start: &map::Start,
@@ -965,6 +968,7 @@ pub fn spawn(
                 disc,
                 &mut packs,
                 &mut missing,
+                cache,
                 part,
                 &layer,
                 design_id,
@@ -1118,8 +1122,45 @@ pub struct SpawnedAcRig {
     pub parts: Vec<(&'static str, Entity)>,
 }
 
-/// Spawns a real assembled AC rig (all part meshes, NPC skeleton, booster nozzles) from a full
-/// `AcAssemblyDesignSt`. Shared by map-placed AC targets and multiplayer `NetView`.
+/// Shared AC render assets. 64-player matches share the same part models, so decoding and
+/// uploading one mesh/material set per player would duplicate the whole AC catalogue 63 times.
+#[derive(Resource, Default)]
+pub struct AcRigCache {
+    /// Decompressed + parsed FLVER headers keyed by model path.
+    pub flver: acvd_render::FlverCache,
+    pub meshes: HashMap<(&'static str, u64, usize), Handle<Mesh>>,
+    pub base_materials: HashMap<(&'static str, u64, usize, bool), Handle<StandardMaterial>>,
+    pub painted_materials:
+        HashMap<(&'static str, u64, usize, &'static str, u16), Handle<paint::AcPaintMaterial>>,
+    pub inverse_bindposes: HashMap<u64, Handle<SkinnedMeshInverseBindposes>>,
+}
+
+fn root_places_hash(places: &[(&'static str, acvd_render::RootPlace)]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for (name, p) in places {
+        name.hash(&mut h);
+        for v in p.x.iter().chain(&p.y).chain(&p.z).chain(&p.t) {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn binds_hash(binds: &[bevy::math::Mat4]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for m in binds {
+        for v in m.to_cols_array() {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+enum CachedMaterial {
+    Base(Handle<StandardMaterial>),
+    Painted(Handle<paint::AcPaintMaterial>),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_ac_rig(
     commands: &mut Commands,
@@ -1131,6 +1172,7 @@ pub fn spawn_ac_rig(
     disc: &Disc,
     packs: &mut Packs,
     missing: &mut usize,
+    cache: &mut AcRigCache,
     design: &AcAssemblyDesignSt,
     label: &str,
     xf: Transform,
@@ -1141,10 +1183,12 @@ pub fn spawn_ac_rig(
         .then(|| paint::load_accolor(disc, design.coloring_id))
         .flatten();
     let mut loaded = Vec::new();
+    let mut place_hashes = Vec::new();
     let mut known = vec![None; built.placements.len()];
     for (index, p) in built.placements.iter().enumerate() {
         let places = assemble::root_places(p, &built.placements, &known);
-        match acvd_render::rigged_model(disc, p.model.path, &|root| {
+        let place_hash = root_places_hash(&places);
+        match cache.flver.rigged_model(disc, p.model.path, &|root| {
             assemble::place_of(&places, root)
         }) {
             Ok((part_meshes, rig)) => {
@@ -1158,6 +1202,7 @@ pub fn spawn_ac_rig(
                     meshes: part_meshes,
                     rig,
                 });
+                place_hashes.push(place_hash);
             }
             Err(e) => warn!("{label} part {}: {e:#}", p.model.path),
         }
@@ -1174,25 +1219,76 @@ pub fn spawn_ac_rig(
         .id();
     let (npc_motion, _, skins) = pose::spawn_npc(commands, root, rig, &loaded);
     let mut parts = Vec::new();
-    for (part_loaded, (joints, binds)) in loaded.into_iter().zip(skins) {
+    for ((part_loaded, (joints, binds)), place_hash) in
+        loaded.into_iter().zip(skins).zip(place_hashes)
+    {
         boost::fold(commands, part_loaded.placement, &part_loaded.rig, &joints);
-        let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(binds));
-        for mesh in part_loaded.meshes {
-            let base = acvd_render::material(disc, &mesh, packs, images, flat, missing);
-            let painted = accolor.as_ref().and_then(|col| {
-                paint::material(
-                    disc,
-                    &base,
-                    &mesh,
-                    part_loaded.placement.column,
-                    col,
-                    None,
-                    packs,
-                    images,
-                )
-            });
+        let bind_key = binds_hash(&binds);
+        let inverse_bindposes = cache
+            .inverse_bindposes
+            .entry(bind_key)
+            .or_insert_with(|| bindposes.add(SkinnedMeshInverseBindposes::from(binds)))
+            .clone();
+        let model = part_loaded.placement.model.path;
+        for (mesh_index, mesh) in part_loaded.meshes.into_iter().enumerate() {
+            let painted_key = (
+                model,
+                place_hash,
+                mesh_index,
+                part_loaded.placement.column,
+                design.coloring_id,
+            );
+            let base_key = (model, place_hash, mesh_index, flat);
+            let material = match accolor.as_ref() {
+                Some(col) => match cache.painted_materials.get(&painted_key).cloned() {
+                    Some(h) => CachedMaterial::Painted(h),
+                    None => {
+                        let base = acvd_render::material(disc, &mesh, packs, images, flat, missing);
+                        let painted = paint::material(
+                            disc,
+                            &base,
+                            &mesh,
+                            part_loaded.placement.column,
+                            col,
+                            None,
+                            packs,
+                            images,
+                        );
+                        match painted {
+                            Some(painted) => {
+                                let h = paint_materials.add(painted);
+                                cache.painted_materials.insert(painted_key, h.clone());
+                                CachedMaterial::Painted(h)
+                            }
+                            None => {
+                                let h = materials.add(base);
+                                cache.base_materials.insert(base_key, h.clone());
+                                CachedMaterial::Base(h)
+                            }
+                        }
+                    }
+                },
+                None => match cache.base_materials.get(&base_key).cloned() {
+                    Some(h) => CachedMaterial::Base(h),
+                    None => {
+                        let base = acvd_render::material(disc, &mesh, packs, images, flat, missing);
+                        let h = materials.add(base);
+                        cache.base_materials.insert(base_key, h.clone());
+                        CachedMaterial::Base(h)
+                    }
+                },
+            };
+            let mesh_key = (model, place_hash, mesh_index);
+            let mesh_handle = match cache.meshes.get(&mesh_key).cloned() {
+                Some(h) => h,
+                None => {
+                    let h = meshes.add(mesh.mesh);
+                    cache.meshes.insert(mesh_key, h.clone());
+                    h
+                }
+            };
             let mut e = commands.spawn((
-                Mesh3d(meshes.add(mesh.mesh)),
+                Mesh3d(mesh_handle),
                 SkinnedMesh {
                     inverse_bindposes: inverse_bindposes.clone(),
                     joints: joints.clone(),
@@ -1202,12 +1298,12 @@ pub fn spawn_ac_rig(
                 ChildOf(root),
             ));
             parts.push((part_loaded.placement.column, e.id()));
-            match painted {
-                Some(mat) => {
-                    e.insert(MeshMaterial3d(paint_materials.add(mat)));
+            match material {
+                CachedMaterial::Painted(h) => {
+                    e.insert(MeshMaterial3d(h));
                 }
-                None => {
-                    e.insert(MeshMaterial3d(materials.add(base)));
+                CachedMaterial::Base(h) => {
+                    e.insert(MeshMaterial3d(h));
                 }
             }
         }
@@ -1230,6 +1326,7 @@ fn spawn_ac_target(
     disc: &Disc,
     packs: &mut Packs,
     missing: &mut usize,
+    cache: &mut AcRigCache,
     part: &msb::Part,
     layer: &str,
     design_id: u16,
@@ -1253,6 +1350,7 @@ fn spawn_ac_target(
         disc,
         packs,
         missing,
+        cache,
         design,
         &part.name,
         xf,

@@ -147,7 +147,7 @@ pub fn apply_combat(
         );
         if let Some((_, mut round)) = rounds
             .iter_mut()
-            .find(|(_, round)| round.id == correction.projectile_id)
+            .find(|(_, round)| round.id == correction.projectile_id && !round.dead)
         {
             if matches!(round.flight, weapons::NetFlight::Missile(_)) {
                 round.flight.set_state(position, velocity);
@@ -165,9 +165,9 @@ pub fn apply_combat(
             acvd_proto::dequantize_coord(hit.hit_pos[1]),
             acvd_proto::dequantize_coord(hit.hit_pos[2]),
         );
-        if let Some((_, round)) = rounds
-            .iter()
-            .find(|(_, round)| round.id == hit.projectile_id)
+        if let Some((_, mut round)) = rounds
+            .iter_mut()
+            .find(|(_, round)| round.id == hit.projectile_id && !round.dead)
         {
             let effect = if round.hit_fx > 0 {
                 round.hit_fx
@@ -188,6 +188,9 @@ pub fn apply_combat(
                     at,
                 );
             }
+            // Retire the visual immediately: `step_net_projectiles` runs in the same frame and
+            // must not queue a second despawn for the same hit/expired round.
+            round.dead = true;
         }
     }
     let expires = session.take_expires();
@@ -195,15 +198,20 @@ pub fn apply_combat(
     for expire in &expires {
         expire_ids.insert(expire.projectile_id);
     }
-    for (entity, round) in &rounds {
+    for (entity, mut round) in &mut rounds {
+        if round.dead {
+            continue;
+        }
         if expire_ids.contains(&round.id) {
             if round.delete_fx > 0 {
                 let at = round.flight.position();
                 commands.spawn((Sfx::new(round.delete_fx), Transform::from_translation(at)));
             }
-            commands.entity(entity).despawn();
+            round.dead = true;
+            commands.entity(entity).try_despawn();
         } else if hit_ids.contains(&round.id) {
-            commands.entity(entity).despawn();
+            round.dead = true;
+            commands.entity(entity).try_despawn();
         }
     }
 

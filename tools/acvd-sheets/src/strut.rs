@@ -26,10 +26,14 @@ pub fn run(paths: &Paths) -> Result<()> {
     let (mut structs, mut statics, mut struts) = (0, 0, 0);
     for g in &groups {
         let mut src = String::from(HEADER);
-        writeln!(src, "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::Row;\n")?;
+        writeln!(
+            src,
+            "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::Row;\n"
+        )?;
         let mut used = HashSet::new();
         for t in &g.tables {
-            let (n_statics, n_struts) = table(&mut src, t, &mut used).with_context(|| format!("{}/{}", g.group, t.param_type))?;
+            let (n_statics, n_struts) = table(&mut src, t, &mut used)
+                .with_context(|| format!("{}/{}", g.group, t.param_type))?;
             structs += 1;
             statics += n_statics;
             struts += n_struts;
@@ -58,23 +62,49 @@ pub fn run(paths: &Paths) -> Result<()> {
 fn ctrl(paths: &Paths, out: &std::path::Path, groups: &[GroupSheet]) -> Result<usize> {
     let mut scope = crate::calc::Scope::load(paths)?;
     let rows: Vec<AcCtrlRow> = read_csv(&paths.sheets().join("ac_ctrl_calc.csv"))?;
-    let table = scope.columns().first().map(|c| c.table.clone()).context("design_parts.csv is empty")?;
-    ensure!(scope.columns().iter().all(|c| c.table == table), "design_parts.csv names more than one table");
-    let group = groups.iter().find(|g| g.tables.iter().any(|t| t.param_type == table)).with_context(|| format!("no table {table}"))?;
+    let table = scope
+        .columns()
+        .first()
+        .map(|c| c.table.clone())
+        .context("design_parts.csv is empty")?;
+    ensure!(
+        scope.columns().iter().all(|c| c.table == table),
+        "design_parts.csv names more than one table"
+    );
+    let group = groups
+        .iter()
+        .find(|g| g.tables.iter().any(|t| t.param_type == table))
+        .with_context(|| format!("no table {table}"))?;
     let ty = pascal(&table);
     let mut src = String::from(HEADER);
     writeln!(src, "#![allow(clippy::all, clippy::pedantic, unused_parens)]\n\nuse crate::generated::{}::{ty};\n", group.group)?;
     writeln!(src, "/// An AC's control parameters (`sheets/ac_ctrl_calc.csv`), from its `{ty}` parts.\n#[derive(Debug, Clone, Copy, PartialEq)]\npub struct AcCtrlParam {{")?;
     let mut body = String::new();
     for r in &rows {
-        let code = scope.translate(&r.expr).map_err(|e| anyhow::anyhow!("ac_ctrl_calc.csv {}: {e}", r.name))?;
-        let param = if r.param == crate::preflight::NONE_PARAM { String::new() } else { format!(" (Scr_SetParam {})", r.param) };
-        writeln!(src, "    /// {}{param}: {}\n    pub {}: f32,", r.unit, doc(&r.evidence), r.name)?;
+        let code = scope
+            .translate(&r.expr)
+            .map_err(|e| anyhow::anyhow!("ac_ctrl_calc.csv {}: {e}", r.name))?;
+        let param = if r.param == crate::preflight::NONE_PARAM {
+            String::new()
+        } else {
+            format!(" (Scr_SetParam {})", r.param)
+        };
+        writeln!(
+            src,
+            "    /// {}{param}: {}\n    pub {}: f32,",
+            r.unit,
+            doc(&r.evidence),
+            r.name
+        )?;
         writeln!(body, "        let {}: f32 = {code};", r.name)?;
         scope.defined.push(r.name.clone());
     }
     let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-    let parts: Vec<String> = scope.columns().iter().map(|c| format!("(d.{} as i64, {})", c.column, c.category)).collect();
+    let parts: Vec<String> = scope
+        .columns()
+        .iter()
+        .map(|c| format!("(d.{} as i64, {})", c.column, c.category))
+        .collect();
     writeln!(
         src,
         "}}\n\nimpl AcCtrlParam {{\n    /// Whether every part `calculate` reads is catalogued (`sheets/unbuildable_designs.csv` lists the designs that are not).\n    pub fn buildable(d: &{ty}) -> bool {{\n        [{}].iter().all(|&(id, category)| id <= 0 || u16::try_from(id).is_ok_and(|id| crate::ac_part(category, id).is_some()))\n    }}\n\n    pub fn calculate(d: &{ty}) -> Self {{\n{body}        Self {{ {} }}\n    }}\n}}",
@@ -99,7 +129,11 @@ fn tuning_type(kind: &str) -> Result<&'static str> {
 }
 
 fn tuning_literal(kind: &str, v: f64) -> Result<String> {
-    Ok(if kind == "f32" { float_literal(&serde_json::json!(v as f32))? } else { format!("{}", v as i64) })
+    Ok(if kind == "f32" {
+        float_literal(&serde_json::json!(v as f32))?
+    } else {
+        format!("{}", v as i64)
+    })
 }
 
 /// `TUNING` (one `TuningField` strut per field of every paramlist tuning file) and, per file
@@ -108,15 +142,31 @@ fn tuning(paths: &Paths, out: &std::path::Path) -> Result<(usize, usize)> {
     let sheet: TuningSheet = read_json(&paths.tuning())?;
     let named: Vec<TuningFieldRow> = read_csv(&paths.sheets().join("tuning_fields.csv"))?;
     let mut src = String::from(HEADER);
-    writeln!(src, "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::{{TuningField, TuningFile}};\n")?;
+    writeln!(
+        src,
+        "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::{{TuningField, TuningFile}};\n"
+    )?;
     writeln!(src, "/// Every `<Bin>`/`<Dbp>` pair in `system/paramlist.xml`, fields in file order.\npub static TUNING: &[TuningFile] = &[")?;
     let mut count = 0;
     for f in &sheet.files {
         ensure!(f.error.is_none(), "{} was not decoded", f.bin);
-        writeln!(src, "    TuningFile {{ name: {:?}, desc: {:?}, bin: {:?}, fields: &[", f.name, f.desc, f.bin)?;
+        writeln!(
+            src,
+            "    TuningFile {{ name: {:?}, desc: {:?}, bin: {:?}, fields: &[",
+            f.name, f.desc, f.bin
+        )?;
         for v in &f.fields {
-            ensure!(v.value.is_finite(), "{} field `{}` is not finite", f.bin, v.label);
-            writeln!(src, "        TuningField {{ label: {:?}, format: {:?}, value: {:?} }},", v.label, v.format, v.value)?;
+            ensure!(
+                v.value.is_finite(),
+                "{} field `{}` is not finite",
+                f.bin,
+                v.label
+            );
+            writeln!(
+                src,
+                "        TuningField {{ label: {:?}, format: {:?}, value: {:?} }},",
+                v.label, v.format, v.value
+            )?;
             count += 1;
         }
         writeln!(src, "    ] }},")?;
@@ -131,11 +181,31 @@ fn tuning(paths: &Paths, out: &std::path::Path) -> Result<(usize, usize)> {
         writeln!(src, "/// Named fields of `{}` ({}).\n#[derive(Debug, Clone, Copy, PartialEq)]\npub struct {ty} {{", f.bin, f.desc)?;
         let mut values = Vec::new();
         for n in &rows {
-            let v = f.fields.get(n.index).with_context(|| format!("{} has no field {}", f.bin, n.index))?;
-            writeln!(src, "    /// #{} {} ({})\n    pub {}: {},", n.index, doc(&v.label), n.unit, n.ident, tuning_type(&v.kind)?)?;
-            values.push(format!("{}: {}", n.ident, tuning_literal(&v.kind, v.value)?));
+            let v = f
+                .fields
+                .get(n.index)
+                .with_context(|| format!("{} has no field {}", f.bin, n.index))?;
+            writeln!(
+                src,
+                "    /// #{} {} ({})\n    pub {}: {},",
+                n.index,
+                doc(&v.label),
+                n.unit,
+                n.ident,
+                tuning_type(&v.kind)?
+            )?;
+            values.push(format!(
+                "{}: {}",
+                n.ident,
+                tuning_literal(&v.kind, v.value)?
+            ));
         }
-        writeln!(src, "}}\n\npub static {}: {ty} = {ty} {{ {} }};\n", shouty(&f.name), values.join(", "))?;
+        writeln!(
+            src,
+            "}}\n\npub static {}: {ty} = {ty} {{ {} }};\n",
+            shouty(&f.name),
+            values.join(", ")
+        )?;
     }
     std::fs::write(out.join("tuning.rs"), src)?;
     Ok((count, named.len()))
@@ -146,7 +216,10 @@ const MAIN_FACE_SET_EXCLUDES: u32 = 0x0100_0000 | 0x0200_0000 | 0x8000_0000;
 /// One `ModelRef` strut per readable FLVER, one static per model group, plus `ALL`.
 fn models(groups: &[ModelGroup], out: &std::path::Path) -> Result<usize> {
     let mut src = String::from(HEADER);
-    writeln!(src, "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::{{Joint, ModelRef, Socket}};\n")?;
+    writeln!(
+        src,
+        "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::{{Joint, ModelRef, Socket}};\n"
+    )?;
     let mut statics = Vec::new();
     let mut count = 0;
     for g in groups {
@@ -157,7 +230,12 @@ fn models(groups: &[ModelGroup], out: &std::path::Path) -> Result<usize> {
             let triangles: usize = m
                 .meshes
                 .iter()
-                .filter_map(|mesh| mesh.face_sets.iter().find(|f| f.flags & MAIN_FACE_SET_EXCLUDES == 0).or(mesh.face_sets.first()))
+                .filter_map(|mesh| {
+                    mesh.face_sets
+                        .iter()
+                        .find(|f| f.flags & MAIN_FACE_SET_EXCLUDES == 0)
+                        .or(mesh.face_sets.first())
+                })
                 .map(|f| f.triangles)
                 .sum();
             let vertices: usize = m.meshes.iter().map(|x| x.vertices).sum();
@@ -181,8 +259,16 @@ fn models(groups: &[ModelGroup], out: &std::path::Path) -> Result<usize> {
                 .collect();
             let mut sockets = Vec::new();
             for s in m.sockets.iter().filter(|s| s.color[0] != 0) {
-                let root = usize::try_from(s.bone).ok().and_then(|b| m.root_of(b)).with_context(|| format!("{} socket {} has no root bone", m.path, s.color[0]))?;
-                sockets.push(format!("Socket {{ id: {}, root: {root:?}, position: {:?} }}", s.color[0], s.position));
+                let root = usize::try_from(s.bone)
+                    .ok()
+                    .and_then(|b| m.root_of(b))
+                    .with_context(|| {
+                        format!("{} socket {} has no root bone", m.path, s.color[0])
+                    })?;
+                sockets.push(format!(
+                    "Socket {{ id: {}, root: {root:?}, position: {:?} }}",
+                    s.color[0], s.position
+                ));
             }
             writeln!(
                 src,
@@ -201,41 +287,83 @@ fn models(groups: &[ModelGroup], out: &std::path::Path) -> Result<usize> {
         statics.push(name);
     }
     writeln!(src, "/// Every model group.")?;
-    writeln!(src, "pub static ALL: &[&[ModelRef]] = &[{}];", statics.join(", "))?;
+    writeln!(
+        src,
+        "pub static ALL: &[&[ModelRef]] = &[{}];",
+        statics.join(", ")
+    )?;
     std::fs::write(out.join("models.rs"), src)?;
     Ok(count)
 }
 
 /// `AC_PARTS` (one strut per `acvparts.bin` record, with the models it resolves to) and one
 /// `Slot` strut per `sheets/assembly_slots.csv` row.
-fn assembly(paths: &Paths, out: &std::path::Path, groups: &[GroupSheet], models: &[ModelGroup]) -> Result<(usize, usize)> {
-    let categories: Vec<AcPartCategoryRow> = read_csv(&paths.sheets().join("ac_part_categories.csv"))?;
+fn assembly(
+    paths: &Paths,
+    out: &std::path::Path,
+    groups: &[GroupSheet],
+    models: &[ModelGroup],
+) -> Result<(usize, usize)> {
+    let categories: Vec<AcPartCategoryRow> =
+        read_csv(&paths.sheets().join("ac_part_categories.csv"))?;
     let slots: Vec<AssemblySlotRow> = read_csv(&paths.sheets().join("assembly_slots.csv"))?;
     let parts: AcPartsSheet = read_json(&paths.ac_parts())?;
-    let readable: HashSet<&str> = models.iter().flat_map(|g| &g.models).filter(|m| m.error.is_none()).map(|m| m.path.as_str()).collect();
+    let readable: HashSet<&str> = models
+        .iter()
+        .flat_map(|g| &g.models)
+        .filter(|m| m.error.is_none())
+        .map(|m| m.path.as_str())
+        .collect();
 
     let mut src = String::from(HEADER);
     writeln!(src, "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::{{AcMotion, AcPart, AcState, Slot, SocketRef}};")?;
     let mut tables: Vec<(&GroupSheet, &TableSheet)> = Vec::new();
     for s in &slots {
-        let t = groups.iter().flat_map(|g| g.tables.iter().map(move |t| (g, t))).find(|(_, t)| t.param_type == s.table).with_context(|| format!("slot {}: no table {}", s.slot, s.table))?;
+        let t = groups
+            .iter()
+            .flat_map(|g| g.tables.iter().map(move |t| (g, t)))
+            .find(|(_, t)| t.param_type == s.table)
+            .with_context(|| format!("slot {}: no table {}", s.slot, s.table))?;
         if !tables.iter().any(|(_, x)| x.param_type == t.1.param_type) {
-            writeln!(src, "use crate::generated::{}::{};", t.0.group, pascal(&t.1.param_type))?;
+            writeln!(
+                src,
+                "use crate::generated::{}::{};",
+                t.0.group,
+                pascal(&t.1.param_type)
+            )?;
             tables.push(t);
         }
     }
 
-    writeln!(src, "\n/// `param/acvparts.bin`, in file order.\npub static AC_PARTS: &[AcPart] = &[")?;
+    writeln!(
+        src,
+        "\n/// `param/acvparts.bin`, in file order.\npub static AC_PARTS: &[AcPart] = &["
+    )?;
     for r in &parts.records {
-        let c = categories.iter().find(|c| c.category == r.category).with_context(|| format!("category {} has no sheet row", r.category))?;
+        let c = categories
+            .iter()
+            .find(|c| c.category == r.category)
+            .with_context(|| format!("category {} has no sheet row", r.category))?;
         let found: Vec<String> = c
             .prefixes()
             .map(|p| (p, c.model_path(p, r.model_id)))
             .filter(|(_, path)| readable.contains(path.as_str()))
             .map(|(p, path)| format!("({p:?}, {path:?})"))
             .collect();
-        let fields: Vec<String> = r.fields.iter().map(|(k, v)| format!("({k:?}, {v:?})")).collect();
-        writeln!(src, "    AcPart {{ category: {}, id: {}, model_id: {}, models: &[{}], fields: &[{}] }},", r.category, r.id, r.model_id, found.join(", "), fields.join(", "))?;
+        let fields: Vec<String> = r
+            .fields
+            .iter()
+            .map(|(k, v)| format!("({k:?}, {v:?})"))
+            .collect();
+        writeln!(
+            src,
+            "    AcPart {{ category: {}, id: {}, model_id: {}, models: &[{}], fields: &[{}] }},",
+            r.category,
+            r.id,
+            r.model_id,
+            found.join(", "),
+            fields.join(", ")
+        )?;
     }
     writeln!(src, "];\n")?;
 
@@ -243,17 +371,29 @@ fn assembly(paths: &Paths, out: &std::path::Path, groups: &[GroupSheet], models:
         let ty = pascal(&t.param_type);
         writeln!(src, "/// Where each `{ty}` column's part attaches, parents first.\npub static {}_SLOTS: &[Slot<{ty}>] = &[", shouty(&t.param_type))?;
         for s in slots.iter().filter(|s| s.table == t.param_type) {
-            let socket = match crate::preflight::socket_spec(&s.socket).with_context(|| format!("slot {}: bad socket", s.slot))? {
+            let socket = match crate::preflight::socket_spec(&s.socket)
+                .with_context(|| format!("slot {}: bad socket", s.slot))?
+            {
                 crate::preflight::SocketSpec::None => "SocketRef::None".to_owned(),
                 crate::preflight::SocketSpec::Dummy(id) => format!("SocketRef::Dummy({id})"),
                 crate::preflight::SocketSpec::Bone(b) => format!("SocketRef::Bone({b:?})"),
             };
-            let parent = if s.parent == crate::preflight::NONE { "None".to_owned() } else { format!("Some({:?})", s.parent) };
-            let roots: Vec<&str> = if s.root.trim() == ALL_ROOTS { Vec::new() } else { s.root.split(';').map(str::trim).collect() };
+            let parent = if s.parent == crate::preflight::NONE {
+                "None".to_owned()
+            } else {
+                format!("Some({:?})", s.parent)
+            };
+            let roots: Vec<&str> = if s.root.trim() == ALL_ROOTS {
+                Vec::new()
+            } else {
+                s.root.split(';').map(str::trim).collect()
+            };
             let orient = match s.orient.trim() {
                 "" | "none" => "None".to_owned(),
                 n => {
-                    let v: u8 = n.parse().with_context(|| format!("slot {}: orient `{n}` is not none or a flag byte", s.slot))?;
+                    let v: u8 = n.parse().with_context(|| {
+                        format!("slot {}: orient `{n}` is not none or a flag byte", s.slot)
+                    })?;
                     format!("Some({v})")
                 }
             };
@@ -269,15 +409,25 @@ fn assembly(paths: &Paths, out: &std::path::Path, groups: &[GroupSheet], models:
     writeln!(src, "/// The motion set each part of an `ac_motion.csv` slot selects.\npub static AC_MOTIONS: &[AcMotion] = &[")?;
     for p in crate::motions::part_motions(paths)? {
         let Ok((set, clip)) = p.set else { continue };
-        writeln!(src, "    AcMotion {{ category: {}, id: {}, set: {set:?}, skeleton: {clip:?} }},", p.category, p.id)?;
+        writeln!(
+            src,
+            "    AcMotion {{ category: {}, id: {}, set: {set:?}, skeleton: {clip:?} }},",
+            p.category, p.id
+        )?;
     }
     writeln!(src, "];\n")?;
 
     let states: Vec<AcStateRow> = read_csv(&paths.sheets().join("ac_states.csv"))?;
     writeln!(src, "/// Locomotion states and the `{}` row each plays (`sheets/ac_states.csv`).\npub static AC_STATES: &[AcState] = &[", crate::preflight::AC_MOTION_FILE)?;
     for s in &states {
-        let direction = s.direction.map_or("None".to_owned(), |d| format!("Some({d})"));
-        writeln!(src, "    AcState {{ state: {:?}, direction: {direction}, row: {} }},", s.state, s.row)?;
+        let direction = s
+            .direction
+            .map_or("None".to_owned(), |d| format!("Some({d})"));
+        writeln!(
+            src,
+            "    AcState {{ state: {:?}, direction: {direction}, row: {} }},",
+            s.state, s.row
+        )?;
     }
     writeln!(src, "];")?;
     std::fs::write(out.join("assembly.rs"), src)?;
@@ -287,12 +437,22 @@ fn assembly(paths: &Paths, out: &std::path::Path, groups: &[GroupSheet], models:
 /// `TEXTURE_FORMATS` from `sheets/texture_formats.csv`, then one `TextureRef` strut per TPF texture.
 fn textures(paths: &Paths, out: &std::path::Path) -> Result<usize> {
     let mut src = String::from(HEADER);
-    writeln!(src, "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::{{TextureFormat, TextureRef}};\n")?;
+    writeln!(
+        src,
+        "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::{{TextureFormat, TextureRef}};\n"
+    )?;
     let formats: Vec<TextureFormatRow> = read_csv(&paths.sheets().join("texture_formats.csv"))?;
-    writeln!(src, "/// TPF format codes on the disc (`sheets/texture_formats.csv`).")?;
+    writeln!(
+        src,
+        "/// TPF format codes on the disc (`sheets/texture_formats.csv`)."
+    )?;
     writeln!(src, "pub static TEXTURE_FORMATS: &[TextureFormat] = &[")?;
     for f in &formats {
-        writeln!(src, "    TextureFormat {{ code: {}, name: {:?}, block_bytes: {} }},", f.code, f.name, f.block_bytes)?;
+        writeln!(
+            src,
+            "    TextureFormat {{ code: {}, name: {:?}, block_bytes: {} }},",
+            f.code, f.name, f.block_bytes
+        )?;
     }
     writeln!(src, "];\n")?;
     let mut statics = Vec::new();
@@ -316,7 +476,11 @@ fn textures(paths: &Paths, out: &std::path::Path) -> Result<usize> {
         statics.push(name);
     }
     writeln!(src, "/// Every texture group.")?;
-    writeln!(src, "pub static ALL: &[&[TextureRef]] = &[{}];", statics.join(", "))?;
+    writeln!(
+        src,
+        "pub static ALL: &[&[TextureRef]] = &[{}];",
+        statics.join(", ")
+    )?;
     std::fs::write(out.join("textures.rs"), src)?;
     Ok(count)
 }
@@ -324,7 +488,10 @@ fn textures(paths: &Paths, out: &std::path::Path) -> Result<usize> {
 /// One `Asset` strut per binder entry, one static per archive group, plus `ALL`.
 fn assets(paths: &Paths, out: &std::path::Path) -> Result<usize> {
     let mut src = String::from(HEADER);
-    writeln!(src, "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::Asset;\n")?;
+    writeln!(
+        src,
+        "#![allow(clippy::all, clippy::pedantic)]\n\nuse crate::Asset;\n"
+    )?;
     let mut statics = Vec::new();
     let mut count = 0;
     for g in load_archive_groups(paths)? {
@@ -337,9 +504,16 @@ fn assets(paths: &Paths, out: &std::path::Path) -> Result<usize> {
                 *seen.entry(e.name.as_deref()).or_insert(0) += 1;
             }
             for e in &b.entries {
-                let entry_name = e.name.as_deref().with_context(|| format!("{} #{} has no name", b.path, e.index))?;
+                let entry_name = e
+                    .name
+                    .as_deref()
+                    .with_context(|| format!("{} #{} has no name", b.path, e.index))?;
                 ensure!(e.error.is_none(), "{} #{} was not decoded", b.path, e.index);
-                let entry = if seen[&e.name.as_deref()] > 1 { format!("#{}", e.index) } else { entry_name.to_owned() };
+                let entry = if seen[&e.name.as_deref()] > 1 {
+                    format!("#{}", e.index)
+                } else {
+                    entry_name.to_owned()
+                };
                 let id = e.id.map_or("None".into(), |v| format!("Some({v})"));
                 writeln!(
                     src,
@@ -353,13 +527,18 @@ fn assets(paths: &Paths, out: &std::path::Path) -> Result<usize> {
         statics.push(name);
     }
     writeln!(src, "/// Every archive group.")?;
-    writeln!(src, "pub static ALL: &[&[Asset]] = &[{}];", statics.join(", "))?;
+    writeln!(
+        src,
+        "pub static ALL: &[&[Asset]] = &[{}];",
+        statics.join(", ")
+    )?;
     std::fs::write(out.join("assets.rs"), src)?;
     Ok(count)
 }
 
 fn rust_type(c: &Column) -> Result<String> {
-    let prim = Prim::parse(c.prim.as_deref().unwrap_or_default()).with_context(|| format!("column #{} has no type", c.index))?;
+    let prim = Prim::parse(c.prim.as_deref().unwrap_or_default())
+        .with_context(|| format!("column #{} has no type", c.index))?;
     let scalar = match prim {
         Prim::U8 | Prim::Dummy8 => "u8",
         Prim::S8 => "i8",
@@ -370,23 +549,37 @@ fn rust_type(c: &Column) -> Result<String> {
         Prim::F32 | Prim::Angle32 => "f32",
         Prim::FixStr | Prim::FixStrW => return Ok("&'static str".into()),
     };
-    Ok(if c.bits.is_some() || (c.count == 1 && prim != Prim::Dummy8) { scalar.into() } else { format!("[{scalar}; {}]", c.count) })
+    Ok(
+        if c.bits.is_some() || (c.count == 1 && prim != Prim::Dummy8) {
+            scalar.into()
+        } else {
+            format!("[{scalar}; {}]", c.count)
+        },
+    )
 }
 
 fn float_literal(v: &Value) -> Result<String> {
     if let Some(bits) = v.as_str().and_then(|s| s.strip_prefix(NON_FINITE_PREFIX)) {
         return Ok(format!("f32::from_bits(0x{bits})"));
     }
-    let f = v.as_f64().with_context(|| format!("expected a float, got {v}"))? as f32;
+    let f = v
+        .as_f64()
+        .with_context(|| format!("expected a float, got {v}"))? as f32;
     let s = format!("{f:?}");
-    Ok(if s.contains(['.', 'e', 'E']) { s } else { format!("{s}.0") })
+    Ok(if s.contains(['.', 'e', 'E']) {
+        s
+    } else {
+        format!("{s}.0")
+    })
 }
 
 fn scalar_literal(prim: Prim, v: &Value) -> Result<String> {
     if prim.is_float() {
         return float_literal(v);
     }
-    let n = v.as_i64().with_context(|| format!("expected an integer, got {v}"))?;
+    let n = v
+        .as_i64()
+        .with_context(|| format!("expected an integer, got {v}"))?;
     Ok(n.to_string())
 }
 
@@ -396,35 +589,76 @@ fn literal(c: &Column, v: &Value) -> Result<String> {
         return scalar_literal(Prim::U32, v);
     }
     match prim {
-        Prim::FixStr | Prim::FixStrW => Ok(format!("{:?}", v.as_str().with_context(|| format!("expected text, got {v}"))?)),
+        Prim::FixStr | Prim::FixStrW => Ok(format!(
+            "{:?}",
+            v.as_str()
+                .with_context(|| format!("expected text, got {v}"))?
+        )),
         Prim::Dummy8 => {
-            let hex = v.as_str().with_context(|| format!("expected hex bytes, got {v}"))?;
+            let hex = v
+                .as_str()
+                .with_context(|| format!("expected hex bytes, got {v}"))?;
             let bytes: Vec<String> = hex.split_whitespace().map(|b| format!("0x{b}")).collect();
-            ensure!(bytes.len() == c.count, "dummy8 column #{} has {} bytes, sheet says {}", c.index, bytes.len(), c.count);
+            ensure!(
+                bytes.len() == c.count,
+                "dummy8 column #{} has {} bytes, sheet says {}",
+                c.index,
+                bytes.len(),
+                c.count
+            );
             Ok(format!("[{}]", bytes.join(", ")))
         }
         _ if c.count == 1 => scalar_literal(prim, v),
         _ => {
-            let items = v.as_array().with_context(|| format!("expected a list, got {v}"))?;
-            ensure!(items.len() == c.count, "column #{} has {} items, sheet says {}", c.index, items.len(), c.count);
-            Ok(format!("[{}]", items.iter().map(|x| scalar_literal(prim, x)).collect::<Result<Vec<_>>>()?.join(", ")))
+            let items = v
+                .as_array()
+                .with_context(|| format!("expected a list, got {v}"))?;
+            ensure!(
+                items.len() == c.count,
+                "column #{} has {} items, sheet says {}",
+                c.index,
+                items.len(),
+                c.count
+            );
+            Ok(format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(|x| scalar_literal(prim, x))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(", ")
+            ))
         }
     }
 }
 
 fn doc(s: &str) -> String {
-    s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn table(src: &mut String, t: &TableSheet, used: &mut HashSet<String>) -> Result<(usize, usize)> {
     let ty = pascal(&t.param_type);
     ensure!(used.insert(ty.clone()), "struct name `{ty}` collides");
 
-    writeln!(src, "/// `{}` from `{}` (PARAMDEF format {}).", t.param_type, t.def_file, t.def_format_version)?;
-    writeln!(src, "#[derive(Debug, Clone, Copy, PartialEq)]\npub struct {ty} {{")?;
+    writeln!(
+        src,
+        "/// `{}` from `{}` (PARAMDEF format {}).",
+        t.param_type, t.def_file, t.def_format_version
+    )?;
+    writeln!(
+        src,
+        "#[derive(Debug, Clone, Copy, PartialEq)]\npub struct {ty} {{"
+    )?;
     let mut fields = Vec::with_capacity(t.columns.len());
     for c in &t.columns {
-        let ident = c.ident.clone().with_context(|| format!("column #{} has no identifier", c.index))?;
+        let ident = c
+            .ident
+            .clone()
+            .with_context(|| format!("column #{} has no identifier", c.index))?;
         let label = doc(&c.display_name);
         if !label.is_empty() {
             writeln!(src, "    /// {label}")?;
@@ -444,11 +678,29 @@ fn table(src: &mut String, t: &TableSheet, used: &mut HashSet<String>) -> Result
         writeln!(src, "/// `{}`", inst.file)?;
         writeln!(src, "pub static {name}: &[Row<{ty}>] = &[")?;
         for r in &inst.rows {
-            let values = r.values.as_ref().with_context(|| format!("{} row {} was not decoded", inst.file, r.id))?;
-            ensure!(values.len() == t.columns.len(), "{} row {} has {} values", inst.file, r.id, values.len());
-            write!(src, "    Row {{ id: {}, name: {:?}, data: {ty} {{", r.id, r.name)?;
+            let values = r
+                .values
+                .as_ref()
+                .with_context(|| format!("{} row {} was not decoded", inst.file, r.id))?;
+            ensure!(
+                values.len() == t.columns.len(),
+                "{} row {} has {} values",
+                inst.file,
+                r.id,
+                values.len()
+            );
+            write!(
+                src,
+                "    Row {{ id: {}, name: {:?}, data: {ty} {{",
+                r.id, r.name
+            )?;
             for ((c, v), f) in t.columns.iter().zip(values).zip(&fields) {
-                write!(src, " {f}: {},", literal(c, v).with_context(|| format!("{} row {} column {f}", inst.file, r.id))?)?;
+                write!(
+                    src,
+                    " {f}: {},",
+                    literal(c, v)
+                        .with_context(|| format!("{} row {} column {f}", inst.file, r.id))?
+                )?;
             }
             writeln!(src, " }} }},")?;
             struts += 1;

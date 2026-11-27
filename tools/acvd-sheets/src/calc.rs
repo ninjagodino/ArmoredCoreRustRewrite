@@ -27,7 +27,13 @@ impl Scope {
         let named: Vec<TuningFieldRow> = read_csv(&paths.sheets().join("tuning_fields.csv"))?;
         let tuning = named
             .iter()
-            .filter_map(|n| sheet.files.iter().find(|f| f.bin == n.file).map(|f| (snake(&f.name), n.ident.clone(), shouty(&f.name))))
+            .filter_map(|n| {
+                sheet
+                    .files
+                    .iter()
+                    .find(|f| f.bin == n.file)
+                    .map(|f| (snake(&f.name), n.ident.clone(), shouty(&f.name)))
+            })
             .collect();
         Ok(Self {
             columns: read_csv(&paths.sheets().join("design_parts.csv"))?,
@@ -42,15 +48,30 @@ impl Scope {
     }
 
     fn part(&self, column: &str, field: &str) -> Result<String, String> {
-        let c = self.columns.iter().find(|c| c.column == column).ok_or_else(|| format!("`{column}` is not a design_parts.csv column"))?;
-        if !self.fields.iter().any(|f| f.category == c.category && f.name == field) {
-            return Err(format!("category {} has no ac_part_fields.csv field `{field}`", c.category));
+        let c = self
+            .columns
+            .iter()
+            .find(|c| c.column == column)
+            .ok_or_else(|| format!("`{column}` is not a design_parts.csv column"))?;
+        if !self
+            .fields
+            .iter()
+            .any(|f| f.category == c.category && f.name == field)
+        {
+            return Err(format!(
+                "category {} has no ac_part_fields.csv field `{field}`",
+                c.category
+            ));
         }
-        Ok(format!("crate::part_field(d.{column} as i64, {}, {field:?})", c.category))
+        Ok(format!(
+            "crate::part_field(d.{column} as i64, {}, {field:?})",
+            c.category
+        ))
     }
 
     fn is_prefix(&self, name: &str) -> bool {
-        self.columns.iter().any(|c| c.column == name) || self.tuning.iter().any(|(p, _, _)| p == name)
+        self.columns.iter().any(|c| c.column == name)
+            || self.tuning.iter().any(|(p, _, _)| p == name)
     }
 
     /// `expr` as generated Rust, or why it names something the sheets do not define.
@@ -61,12 +82,17 @@ impl Scope {
         while i < tokens.len() {
             let t = tokens[i].as_str();
             let ident = t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
-            let qualified = ident && tokens.get(i + 1).is_some_and(|d| d == ".") && self.is_prefix(t);
+            let qualified =
+                ident && tokens.get(i + 1).is_some_and(|d| d == ".") && self.is_prefix(t);
             if qualified {
-                let field = tokens.get(i + 2).ok_or_else(|| format!("`{t}.` lacks a field"))?;
+                let field = tokens
+                    .get(i + 2)
+                    .ok_or_else(|| format!("`{t}.` lacks a field"))?;
                 let code = match self.tuning.iter().find(|(p, f, _)| p == t && f == field) {
                     Some((_, f, s)) => format!("(crate::generated::tuning::{s}.{f} as f32)"),
-                    None if self.tuning.iter().any(|(p, _, _)| p == t) => return Err(format!("tuning_fields.csv names no `{field}` in `{t}`")),
+                    None if self.tuning.iter().any(|(p, _, _)| p == t) => {
+                        return Err(format!("tuning_fields.csv names no `{field}` in `{t}`"))
+                    }
                     None => self.part(t, field)?,
                 };
                 out.push(code);
@@ -75,19 +101,36 @@ impl Scope {
             }
             if ident {
                 let method = out.last().is_some_and(|p| p == ".");
-                let ok = if method { METHODS.contains(&t) } else { KEYWORDS.contains(&t) || self.defined.iter().any(|d| d == t) };
+                let ok = if method {
+                    METHODS.contains(&t)
+                } else {
+                    KEYWORDS.contains(&t) || self.defined.iter().any(|d| d == t)
+                };
                 if !ok {
-                    return Err(if method { format!("`.{t}` is not one of {METHODS:?}") } else { format!("`{t}` is not an earlier row") });
+                    return Err(if method {
+                        format!("`.{t}` is not one of {METHODS:?}")
+                    } else {
+                        format!("`{t}` is not an earlier row")
+                    });
                 }
                 out.push(t.to_owned());
             } else if t.starts_with(|c: char| c.is_ascii_digit()) {
-                out.push(if t.contains('.') { t.to_owned() } else { format!("{t}.0") });
+                out.push(if t.contains('.') {
+                    t.to_owned()
+                } else {
+                    format!("{t}.0")
+                });
             } else {
                 out.push(t.to_owned());
             }
             i += 1;
         }
-        Ok(out.join(" ").replace(" . ", ".").replace(" (", "(").replace("( ", "(").replace(" )", ")"))
+        Ok(out
+            .join(" ")
+            .replace(" . ", ".")
+            .replace(" (", "(")
+            .replace("( ", "(")
+            .replace(" )", ")"))
     }
 }
 
@@ -116,7 +159,10 @@ fn tokenize(expr: &str) -> Result<Vec<String>, String> {
                     i += 1;
                 }
             }
-        } else if ["==", "!=", "<=", ">=", "&&", "||"].iter().any(|op| expr[byte(&chars, i)..].starts_with(op)) {
+        } else if ["==", "!=", "<=", ">=", "&&", "||"]
+            .iter()
+            .any(|op| expr[byte(&chars, i)..].starts_with(op))
+        {
             i += 2;
         } else if "+-*/(){}<>,.!".contains(c) {
             i += 1;
@@ -138,9 +184,25 @@ mod tests {
 
     fn scope() -> Scope {
         Scope {
-            columns: vec![DesignPartRow { slot: 3, table: "T".into(), column: "legs".into(), category: 3, evidence: String::new() }],
-            fields: vec![AcPartFieldRow { category: 3, offset: 8, ty: "u16".into(), name: "weight".into(), evidence: String::new() }],
-            tuning: vec![("new_ac_behavior".into(), "gravity".into(), "NEW_AC_BEHAVIOR".into())],
+            columns: vec![DesignPartRow {
+                slot: 3,
+                table: "T".into(),
+                column: "legs".into(),
+                category: 3,
+                evidence: String::new(),
+            }],
+            fields: vec![AcPartFieldRow {
+                category: 3,
+                offset: 8,
+                ty: "u16".into(),
+                name: "weight".into(),
+                evidence: String::new(),
+            }],
+            tuning: vec![(
+                "new_ac_behavior".into(),
+                "gravity".into(),
+                "NEW_AC_BEHAVIOR".into(),
+            )],
             defined: vec!["total".into()],
         }
     }
@@ -152,8 +214,14 @@ mod tests {
             s.translate("(total - legs.weight / 10).max(new_ac_behavior.gravity)").unwrap(),
             "(total - crate::part_field(d.legs as i64, 3, \"weight\") / 10.0).max((crate::generated::tuning::NEW_AC_BEHAVIOR.gravity as f32))"
         );
-        assert_eq!(s.translate("if total < 1 { 0.5 } else { 2 }").unwrap(), "if total < 1.0 { 0.5 } else { 2.0 }");
-        assert_eq!(s.translate("legs.weight == 3").unwrap(), "crate::part_field(d.legs as i64, 3, \"weight\") == 3.0");
+        assert_eq!(
+            s.translate("if total < 1 { 0.5 } else { 2 }").unwrap(),
+            "if total < 1.0 { 0.5 } else { 2.0 }"
+        );
+        assert_eq!(
+            s.translate("legs.weight == 3").unwrap(),
+            "crate::part_field(d.legs as i64, 3, \"weight\") == 3.0"
+        );
     }
 
     #[test]

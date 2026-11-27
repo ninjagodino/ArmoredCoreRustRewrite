@@ -2025,9 +2025,7 @@ mod tests {
     fn imdct_matches_definition() {
         let t = tables();
         for (idx, n) in [128usize, 256, 512].into_iter().enumerate() {
-            let x: Vec<f32> = (0..n)
-                .map(|k| ((k * 37 + 13) % 97) as f32 - 48.0)
-                .collect();
+            let x: Vec<f32> = (0..n).map(|k| ((k * 37 + 13) % 97) as f32 - 48.0).collect();
             let mut out = vec![0f32; n];
             t.imdct[idx].run(&x, &mut out);
             let scale = -1.0 / (n as f64 / 2.0) / 32768.0;
@@ -2035,15 +2033,11 @@ mod tests {
                 let want: f64 = (0..n)
                     .map(|k| {
                         let phase = (2 * j + 2 * n + 1) * (2 * k + 1);
-                        x[k] as f64
-                            * (std::f64::consts::PI * phase as f64 / (4.0 * n as f64)).cos()
+                        x[k] as f64 * (std::f64::consts::PI * phase as f64 / (4.0 * n as f64)).cos()
                     })
                     .sum::<f64>()
                     * scale;
-                assert!(
-                    (v as f64 - want).abs() < 1e-6,
-                    "n={n} j={j}: {v} vs {want}"
-                );
+                assert!((v as f64 - want).abs() < 1e-6, "n={n} j={j}: {v} vs {want}");
             }
         }
     }

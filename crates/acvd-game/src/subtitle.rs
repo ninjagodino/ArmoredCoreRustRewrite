@@ -12,9 +12,7 @@
 
 use acvd_formats::fmg::Fmg;
 use acvd_formats::vfs::Disc;
-use acvd_render::ui_kit::{
-    palette, AcvdUiKit, FontRole, PanelStyle, UiClip,
-};
+use acvd_render::ui_kit::{palette, AcvdUiKit, FontRole, PanelStyle, UiClip};
 use bevy::prelude::*;
 use bevy::ui::px;
 use bevy::window::PrimaryWindow;
@@ -112,12 +110,7 @@ impl Plugin for ComSubtitlePlugin {
             .init_resource::<ComSubtitle>()
             .add_systems(
                 Update,
-                (
-                    clear_outside_sortie,
-                    receive_lines,
-                    rebuild,
-                    tick,
-                )
+                (clear_outside_sortie, receive_lines, rebuild, tick)
                     .chain()
                     .after(crate::voice::trigger_messages),
             );
@@ -320,11 +313,7 @@ fn rect_node(rect: [f32; 4], scale: f32) -> Node {
     }
 }
 
-fn tick(
-    mut commands: Commands,
-    time: Res<Time>,
-    mut state: ResMut<ComSubtitle>,
-) {
+fn tick(mut commands: Commands, time: Res<Time>, mut state: ResMut<ComSubtitle>) {
     let ComSubtitle {
         active: active_slot,
         built_for,
@@ -396,6 +385,9 @@ mod tests {
         assert_eq!(bank.line(1).as_deref(), Some("AP at 50%."));
         assert_eq!(bank.line(24).as_deref(), Some("Target sighted. Engaging."));
         assert_eq!(bank.line(19).as_deref(), Some("Beginning operation."));
-        assert_eq!(bank.line(44).as_deref(), Some("Test OK. Continuing operation."));
+        assert_eq!(
+            bank.line(44).as_deref(),
+            Some("Test OK. Continuing operation.")
+        );
     }
 }

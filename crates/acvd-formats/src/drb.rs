@@ -557,7 +557,14 @@ mod tests {
 
     #[test]
     fn reads_noise_sprite() {
-        let names = ["Root", "NoiseSprite", "Static", "Back", "c:\\Back_TM.tga", "BG"];
+        let names = [
+            "Root",
+            "NoiseSprite",
+            "Static",
+            "Back",
+            "c:\\Back_TM.tga",
+            "BG",
+        ];
         let mut off = Vec::new();
         let mut strings = Vec::new();
         for n in names {

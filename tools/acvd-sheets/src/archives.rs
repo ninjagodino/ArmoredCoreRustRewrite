@@ -38,7 +38,11 @@ pub fn run(paths: &Paths, disc: &Disc, files: &[String]) -> Result<Summary> {
             continue;
         }
         let head = disc.head(file, 4)?;
-        if !(dcx::is_dcx(&head) || bnd3::is_bnd3(&head) || tpf::is_tpf(&head) || head == b"FLVE"[..]) {
+        if !(dcx::is_dcx(&head)
+            || bnd3::is_bnd3(&head)
+            || tpf::is_tpf(&head)
+            || head == b"FLVE"[..])
+        {
             continue;
         }
         let data = disc.read(file)?;
@@ -79,13 +83,20 @@ pub fn run(paths: &Paths, disc: &Disc, files: &[String]) -> Result<Summary> {
         } else {
             data
         };
-        let group = file.split('/').next().unwrap_or_default().to_ascii_lowercase();
+        let group = file
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if bnd3::is_bnd3(&data) {
             walk.binder(&group, &file, &data);
         } else if tpf::is_tpf(&data) {
             walk.texture_pack(&group, &file, &data);
         } else if flver::is_flver(&data) {
-            walk.models.entry(group.clone()).or_default().push(crate::models::sheet(&file, &data));
+            walk.models
+                .entry(group.clone())
+                .or_default()
+                .push(crate::models::sheet(&file, &data));
         }
     }
 
@@ -96,7 +107,13 @@ pub fn run(paths: &Paths, disc: &Disc, files: &[String]) -> Result<Summary> {
     let mut models = 0;
     for (group, list) in walk.models {
         models += list.len();
-        write_json(&mdir.join(format!("{group}.json")), &ModelGroup { group: group.clone(), models: list })?;
+        write_json(
+            &mdir.join(format!("{group}.json")),
+            &ModelGroup {
+                group: group.clone(),
+                models: list,
+            },
+        )?;
         index.model_groups.push(group);
     }
 
@@ -107,7 +124,13 @@ pub fn run(paths: &Paths, disc: &Disc, files: &[String]) -> Result<Summary> {
     let mut clips = 0;
     for (group, sets) in walk.motions {
         clips += sets.iter().map(|s| s.clips.len()).sum::<usize>();
-        write_json(&adir.join(format!("{group}.json")), &MotionGroup { group: group.clone(), sets })?;
+        write_json(
+            &adir.join(format!("{group}.json")),
+            &MotionGroup {
+                group: group.clone(),
+                sets,
+            },
+        )?;
         index.motion_groups.push(group);
     }
 
@@ -117,7 +140,13 @@ pub fn run(paths: &Paths, disc: &Disc, files: &[String]) -> Result<Summary> {
     }
     let binders = walk.groups.values().map(Vec::len).sum();
     for (group, list) in walk.groups {
-        write_json(&dir.join(format!("{group}.json")), &ArchiveGroup { group: group.clone(), binders: list })?;
+        write_json(
+            &dir.join(format!("{group}.json")),
+            &ArchiveGroup {
+                group: group.clone(),
+                binders: list,
+            },
+        )?;
         index.groups.push(group);
     }
     index.entry_extensions = walk
@@ -127,7 +156,12 @@ pub fn run(paths: &Paths, disc: &Disc, files: &[String]) -> Result<Summary> {
             let mut magics: Vec<_> = magics.into_iter().collect();
             magics.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             magics.truncate(6);
-            ExtensionCount { extension, files, bytes, magics }
+            ExtensionCount {
+                extension,
+                files,
+                bytes,
+                magics,
+            }
         })
         .collect();
     let tdir = paths.textures();
@@ -137,10 +171,23 @@ pub fn run(paths: &Paths, disc: &Disc, files: &[String]) -> Result<Summary> {
     let mut textures = 0;
     for (group, packs) in walk.textures {
         textures += packs.iter().map(|p| p.textures.len()).sum::<usize>();
-        write_json(&tdir.join(format!("{group}.json")), &TextureGroup { group: group.clone(), packs })?;
+        write_json(
+            &tdir.join(format!("{group}.json")),
+            &TextureGroup {
+                group: group.clone(),
+                packs,
+            },
+        )?;
         index.texture_groups.push(group);
     }
-    let summary = Summary { dcx: index.dcx.len(), binders, entries: walk.entries, textures, models, clips };
+    let summary = Summary {
+        dcx: index.dcx.len(),
+        binders,
+        entries: walk.entries,
+        textures,
+        models,
+        clips,
+    };
     write_json(&paths.json().join("_archives.json"), &index)?;
     Ok(summary)
 }
@@ -179,9 +226,16 @@ impl Walk {
         }
 
         let mut nested = Vec::new();
-        let mut motions = MotionSet { path: path.to_owned(), clips: Vec::new() };
+        let mut motions = MotionSet {
+            path: path.to_owned(),
+            clips: Vec::new(),
+        };
         for (index, e) in b.entries.iter().enumerate() {
-            let ext = e.name.as_deref().map(|n| ext_of(Path::new(n))).unwrap_or_else(|| "(none)".into());
+            let ext = e
+                .name
+                .as_deref()
+                .map(|n| ext_of(Path::new(n)))
+                .unwrap_or_else(|| "(none)".into());
             let mut row = EntryRow {
                 index,
                 id: e.id,
@@ -219,7 +273,10 @@ impl Walk {
                         } else if tpf::is_tpf(&c) {
                             self.texture_pack(group, &inner, &c);
                         } else if flver::is_flver(&c) {
-                            self.models.entry(group.to_owned()).or_default().push(crate::models::sheet(&inner, &c));
+                            self.models
+                                .entry(group.to_owned())
+                                .or_default()
+                                .push(crate::models::sheet(&inner, &c));
                         } else if ext == ".ani" {
                             motions.clips.push(crate::motions::clip(name, &c));
                         }
@@ -232,7 +289,10 @@ impl Walk {
         }
         self.groups.entry(group.to_owned()).or_default().push(sheet);
         if !motions.clips.is_empty() {
-            self.motions.entry(group.to_owned()).or_default().push(motions);
+            self.motions
+                .entry(group.to_owned())
+                .or_default()
+                .push(motions);
         }
         for (inner, c) in nested {
             self.binder(group, &inner, &c);
@@ -240,7 +300,14 @@ impl Walk {
     }
 
     fn texture_pack(&mut self, group: &str, path: &str, data: &[u8]) {
-        let mut sheet = TpfSheet { path: path.to_owned(), platform: tpf::PLATFORM_X360, flag2: 0, encoding: 0, error: None, textures: Vec::new() };
+        let mut sheet = TpfSheet {
+            path: path.to_owned(),
+            platform: tpf::PLATFORM_X360,
+            flag2: 0,
+            encoding: 0,
+            error: None,
+            textures: Vec::new(),
+        };
         match tpf::read(data) {
             Ok(t) => {
                 sheet.platform = t.platform;
@@ -271,6 +338,9 @@ impl Walk {
             }
             Err(e) => sheet.error = Some(format!("{e:#}")),
         }
-        self.textures.entry(group.to_owned()).or_default().push(sheet);
+        self.textures
+            .entry(group.to_owned())
+            .or_default()
+            .push(sheet);
     }
 }

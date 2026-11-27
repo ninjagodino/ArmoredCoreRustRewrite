@@ -222,6 +222,321 @@ pub enum TriggerAction {
     Fire { power_scale: f32, pellets: usize },
 }
 
+/// Authored `param/acanimparam.bin` #3 = `10.0`, read by `0x82882c90` and stored by
+/// `0x82883198`/`0x82882a78` at request `+8`. The request field is a **transition**
+/// parameter, not clip speed: `0x82c41d30` copies it to slot `+0x5c`, and
+/// `0x82cab170` accumulates the crossfade weight until that value.
+pub const WEAPON_ARM_DEPLOY_BLEND_FRAMES: f32 = 10.0;
+/// Authored `param/acanimparam.bin` #4 = `80.0`, read by `0x82882cc0` and stored at
+/// request `+8` by `0x82883228`. It is the stow crossfade length, not a frame step.
+pub const WEAPON_ARM_STOW_BLEND_FRAMES: f32 = 80.0;
+/// `base+1` (`0x82883278`) and `base+3` (`0x828832b8`) also write `10.0` to request `+8`;
+/// `0x82882ad0`/`0x82882b58` use `30.0`. Those are blend/crossfade weights too.
+pub const WEAPON_ARM_DEPLOYED_BLEND_FRAMES: f32 = 10.0;
+pub const WEAPON_ARM_READY_BLEND_FRAMES: f32 = 10.0;
+/// The actual clip advance is [`WEAPON_ARM_FRAME_STEP`] per 60 Hz tick. Proof:
+/// `0x82852408` passes `dt * clip_speed(+0x68) * request_speed(+0x44)` to `0x8289a928`,
+/// which advances by `delta * 60`; request `+0x44` is the builder's `f3 = 1.0`, and
+/// `+0x68` initializes to `1.0` in `0x82c425f0`. The builder's `+8` (`10.0`/`80.0`)
+/// never reaches that multiply.
+pub const WEAPON_ARM_FRAME_STEP: f32 = 1.0;
+/// Fixed simulation tick rate used by the presentation accumulator.
+pub const WEAPON_ARM_TICK_HZ: f32 = 60.0;
+pub const WEAPON_ARM_DEPLOY_SPEED: f32 = WEAPON_ARM_FRAME_STEP;
+pub const WEAPON_ARM_STOW_SPEED: f32 = WEAPON_ARM_FRAME_STEP;
+pub const WEAPON_ARM_DEPLOYED_SPEED: f32 = WEAPON_ARM_FRAME_STEP;
+pub const WEAPON_ARM_READY_SPEED: f32 = WEAPON_ARM_FRAME_STEP;
+/// Default used only when a part has no dumped clip length.
+pub const WEAPON_ARM_CLIP_FRAMES: f32 = 300.0;
+/// Ranged fire and ready clips are 60 frames; blade weapon arms have a 40-frame attack clip
+/// (`am7020_a.bnd.dcx` `a00_006`) and are stepped separately by the presentation rig.
+pub const WEAPON_ARM_FIRE_FRAMES: f32 = 60.0;
+
+/// Deploy/stow clip length for a category-2 weapon-arm part.
+///
+/// Dumped from `am*_a.bnd.dcx` `a00_004`/`a00_005` (all four leg bases 0/10/20/30 have the
+/// same length within a part):
+/// - `am7110..am7140` (`a00_004`/`005`): 290 frames.
+/// - `am7510..am7540`: 320 frames.
+/// - every other weapon arm, including `am7020` and `am7420`: 300 frames.
+///
+/// The 360 clip base selector is `0x82882d28`; `0x82882fa8` adds 4/5 to it. Do not use one
+/// global 300 for gameplay: a 320-frame arm would switch to `base+1` twenty frames early and
+/// a 290-frame arm would hold the folded pose for ten ticks.
+pub const fn weapon_arm_clip_frames(part: u16) -> f32 {
+    match part {
+        7110..=7140 => 290.0,
+        7510..=7540 => 320.0,
+        _ => WEAPON_ARM_CLIP_FRAMES,
+    }
+}
+
+/// 360 `WeaponArmCtrl` phase (`0x820930e8`, `0x8289d890`, `0x8289d908`, `0x8289da68`,
+/// `0x8289dab8`). The low three bits of the replicated `combat_flags` byte carry this code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeaponArmPhase {
+    /// Folded / stowed (`base + 0`).
+    #[default]
+    Stowed = 0,
+    /// Unfolding (`base + 4`).
+    Deploying = 1,
+    /// Combat-ready idle (`base + 1`).
+    Deployed = 2,
+    /// Trigger held / aiming (`base + 3`).
+    Ready = 3,
+    /// Fire/recoil clip (`base + 2`).
+    Firing = 4,
+    /// Folding back (`base + 5`).
+    Stowing = 5,
+}
+
+impl WeaponArmPhase {
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Deploying,
+            2 => Self::Deployed,
+            3 => Self::Ready,
+            4 => Self::Firing,
+            5 => Self::Stowing,
+            _ => Self::Stowed,
+        }
+    }
+}
+
+/// Authoritative transform/fire state of a built-in weapon arm. Deploy and stow advance
+/// at the traced 60 Hz one-frame clip step; `busy` is the `0x8289d990` fire lockout while
+/// either the `base+4` deploy or `base+5` stow clip is active.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeaponArmState {
+    pub phase: WeaponArmPhase,
+    pub frame: f32,
+    /// Alternates the L/R FLVER muzzle (101/102 for the two primary barrels).
+    pub barrel: u8,
+    /// Authored `base+4` clip length (part-specific; see [`weapon_arm_clip_frames`]).
+    pub deploy_frames: f32,
+    /// Authored `base+5` clip length.
+    pub stow_frames: f32,
+}
+
+impl Default for WeaponArmState {
+    fn default() -> Self {
+        Self {
+            phase: WeaponArmPhase::Stowed,
+            frame: 0.0,
+            barrel: 0,
+            deploy_frames: WEAPON_ARM_CLIP_FRAMES,
+            stow_frames: WEAPON_ARM_CLIP_FRAMES,
+        }
+    }
+}
+
+impl WeaponArmState {
+    /// State initialized with the equipped part's authored deploy/stow clip length.
+    pub fn for_part(part: u16) -> Self {
+        let frames = weapon_arm_clip_frames(part);
+        Self {
+            deploy_frames: frames,
+            stow_frames: frames,
+            ..Self::default()
+        }
+    }
+
+    /// Overrides both transition lengths (used when the caller already loaded the clips).
+    pub fn set_clip_frames(&mut self, deploy_frames: f32, stow_frames: f32) {
+        self.deploy_frames = deploy_frames.max(1.0);
+        self.stow_frames = stow_frames.max(1.0);
+    }
+
+    pub fn busy(&self) -> bool {
+        matches!(
+            self.phase,
+            WeaponArmPhase::Deploying | WeaponArmPhase::Stowing
+        )
+    }
+
+    /// `0x8289d990`: the built-in gun may fire only after the unfold clip has reached a
+    /// combat-ready phase. Weapon arms never take the kneeling ready-position lock — firing
+    /// while moving is their signature mechanic — so `stance` is intentionally ignored.
+    pub fn can_fire(&self, _stance: bool) -> bool {
+        !self.busy()
+            && matches!(
+                self.phase,
+                WeaponArmPhase::Deployed | WeaponArmPhase::Ready | WeaponArmPhase::Firing
+            )
+    }
+
+    /// Remaining **30 Hz** ticks for the current deploy/stow/fire transition. The wire
+    /// field is a `u8`; a 300-frame clip is 5 s at the traced 60 Hz step, so 60 Hz ticks
+    /// would not fit. `apply_replicated` expands these back to clip frames at 60 Hz.
+    pub fn ticks_remaining(&self) -> u8 {
+        let (frames, speed) = match self.phase {
+            WeaponArmPhase::Deploying => (self.deploy_frames, WEAPON_ARM_DEPLOY_SPEED),
+            WeaponArmPhase::Stowing => (self.stow_frames, WEAPON_ARM_STOW_SPEED),
+            WeaponArmPhase::Firing => (WEAPON_ARM_FIRE_FRAMES, 1.0),
+            _ => return 0,
+        };
+        ((frames - self.frame).max(0.0) / (speed * 2.0))
+            .ceil()
+            .clamp(0.0, 255.0) as u8
+    }
+
+    fn advance(&mut self, speed: f32, frames: f32, done: WeaponArmPhase) {
+        self.frame += speed;
+        if self.frame >= frames - 1.0 {
+            self.phase = done;
+            self.frame = 0.0;
+        }
+    }
+
+    /// Advances one 60 Hz tick.
+    ///
+    /// `combat_mode` is false in Scan Mode (`0x8289d990` stows the arm). `request_toggle` is
+    /// the Weapon Switch / Bay Swap rising edge: stowed -> deploy (`0x828488b8`) and
+    /// ready/firing -> stow (`0x828488e0`). There is no automatic deploy; while stowed the
+    /// normal hand weapons are active. `want_fire` starts the ready/aim clip and sustains it.
+    /// `stance` is accepted for wire/API compatibility but never gates a weapon arm.
+    pub fn step(
+        &mut self,
+        combat_mode: bool,
+        request_toggle: bool,
+        want_fire: bool,
+        _stance: bool,
+    ) {
+        if !combat_mode {
+            match self.phase {
+                WeaponArmPhase::Stowed => {}
+                WeaponArmPhase::Stowing => self.advance(
+                    WEAPON_ARM_STOW_SPEED,
+                    self.stow_frames,
+                    WeaponArmPhase::Stowed,
+                ),
+                _ => {
+                    // Enter the fold clip at frame 0; the first 60 Hz clip step is applied on
+                    // the next animation update, not on the request tick.
+                    self.phase = WeaponArmPhase::Stowing;
+                    self.frame = 0.0;
+                }
+            }
+            return;
+        }
+
+        if request_toggle {
+            match self.phase {
+                WeaponArmPhase::Stowed => {
+                    self.phase = WeaponArmPhase::Deploying;
+                    self.frame = 0.0;
+                    return;
+                }
+                WeaponArmPhase::Deployed | WeaponArmPhase::Ready | WeaponArmPhase::Firing => {
+                    self.phase = WeaponArmPhase::Stowing;
+                    self.frame = 0.0;
+                    return;
+                }
+                WeaponArmPhase::Deploying | WeaponArmPhase::Stowing => {}
+            }
+        }
+
+        match self.phase {
+            WeaponArmPhase::Stowed => {}
+            WeaponArmPhase::Deploying => self.advance(
+                WEAPON_ARM_DEPLOY_SPEED,
+                self.deploy_frames,
+                WeaponArmPhase::Deployed,
+            ),
+            WeaponArmPhase::Stowing => self.advance(
+                WEAPON_ARM_STOW_SPEED,
+                self.stow_frames,
+                WeaponArmPhase::Stowed,
+            ),
+            WeaponArmPhase::Deployed => {
+                if want_fire {
+                    self.phase = WeaponArmPhase::Ready;
+                    self.frame = 0.0;
+                }
+            }
+            WeaponArmPhase::Ready => {
+                if want_fire {
+                    self.frame =
+                        (self.frame + WEAPON_ARM_READY_SPEED).min(WEAPON_ARM_FIRE_FRAMES - 1.0);
+                } else {
+                    self.phase = WeaponArmPhase::Deployed;
+                    self.frame = 0.0;
+                }
+            }
+            WeaponArmPhase::Firing => {
+                self.advance(1.0, WEAPON_ARM_FIRE_FRAMES, WeaponArmPhase::Deployed);
+                if self.phase == WeaponArmPhase::Deployed && want_fire {
+                    self.phase = WeaponArmPhase::Ready;
+                }
+            }
+        }
+    }
+
+    /// Call after a successful shot; alternates the two primary L/R muzzle dummies.
+    pub fn on_fired(&mut self) {
+        self.phase = WeaponArmPhase::Firing;
+        self.frame = 0.0;
+        self.barrel ^= 1;
+    }
+
+    /// Restores the compact replicated phase/ticks/barrel. `ticks` are 30 Hz wire ticks;
+    /// `frame` is reconstructed at the traced 60 Hz clip step.
+    pub fn apply_replicated(&mut self, phase: WeaponArmPhase, ticks: u8, barrel: u8) {
+        self.phase = phase;
+        self.barrel = barrel & 1;
+        self.frame = match phase {
+            WeaponArmPhase::Deploying => {
+                self.deploy_frames - f32::from(ticks) * WEAPON_ARM_DEPLOY_SPEED * 2.0
+            }
+            WeaponArmPhase::Stowing => {
+                self.stow_frames - f32::from(ticks) * WEAPON_ARM_STOW_SPEED * 2.0
+            }
+            WeaponArmPhase::Firing => WEAPON_ARM_FIRE_FRAMES - f32::from(ticks) * 2.0,
+            _ => 0.0,
+        }
+        .clamp(0.0, self.deploy_frames.max(self.stow_frames));
+    }
+}
+
+/// Advances a render-rate accumulator and steps the fixed 60 Hz weapon-arm state.
+///
+/// `dt` is wall-clock seconds. The accumulator is capped at four ticks so a long hitch cannot
+/// teleport the arm through an entire deploy, and the switch edge is allowed to start the
+/// state machine immediately even when the accumulator has not reached 1.0 yet.
+///
+/// Returns the number of 60 Hz state steps applied.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_weapon_arm_clock(
+    state: &mut WeaponArmState,
+    accum: &mut f32,
+    dt: f32,
+    combat_mode: bool,
+    request_toggle: bool,
+    want_fire: bool,
+    stance: bool,
+) -> u32 {
+    *accum = (*accum + dt.max(0.0) * WEAPON_ARM_TICK_HZ).clamp(0.0, 4.0);
+    let mut stepped = 0u32;
+    while *accum >= 1.0 || (request_toggle && stepped == 0) {
+        state.step(
+            combat_mode,
+            request_toggle && stepped == 0,
+            want_fire,
+            stance,
+        );
+        *accum = (*accum - 1.0).max(0.0);
+        stepped += 1;
+        if stepped >= 4 {
+            break;
+        }
+    }
+    stepped
+}
+
 /// One equipped weapon's deterministic state.
 #[derive(Clone, Copy, Debug)]
 pub struct Gun {
@@ -392,6 +707,8 @@ pub struct Shot {
     pub target: Option<NetId>,
     pub gun: Gun,
     pub seed: u8,
+    /// Weapon-arm barrel/muzzle index (alternates the two primary L/R dummies).
+    pub barrel: u8,
 }
 
 /// Output of one armament tick.
@@ -406,7 +723,13 @@ pub struct WeaponOutput {
 /// One per-AC armament: hand weapons, hanger/bay weapons, shoulder unit, and rack-swap state.
 #[derive(Clone, Debug)]
 pub struct Armament {
+    /// Normal L/R hand weapons. These remain equipped alongside a weapon arm and are the
+    /// active guns while the arm is stowed.
     pub hands: [Gun; 2],
+    /// Built-in category-10 weapon of a weapon arm (`acvparts` cat-2 `+0xf4`). Silent for
+    /// ordinary arms. Kept separate from `hands` because ACVD does not disable hand weapons
+    /// when a weapon arm is equipped.
+    pub weapon_arm_gun: Gun,
     pub bays: [Gun; 2],
     pub shoulder: Gun,
     /// `true` when the hanger/bay weapon is in the hand (the shoulder rack is empty).
@@ -420,6 +743,8 @@ pub struct Armament {
     /// Rising-edge latch for the one-shot bay buttons.
     pub prev_bay: [bool; 2],
     pub weapon_arm: bool,
+    /// Authoritative unfold/ready/fire lockout state for a built-in weapon arm.
+    pub weapon_arm_state: WeaponArmState,
 }
 
 impl Default for Armament {
@@ -427,6 +752,7 @@ impl Default for Armament {
         let silent = silent();
         Self {
             hands: [silent, silent],
+            weapon_arm_gun: silent,
             bays: [silent, silent],
             shoulder: silent,
             active_bay: [false; 2],
@@ -436,6 +762,7 @@ impl Default for Armament {
             salvo_index: 0,
             prev_bay: [false; 2],
             weapon_arm: false,
+            weapon_arm_state: WeaponArmState::default(),
         }
     }
 }
@@ -445,29 +772,42 @@ impl Armament {
     pub fn from_design(design: &AcAssemblyDesignSt) -> Self {
         let ctrl = AcCtrlParam::calculate(design);
         let weapon_arm = part_field(design.arms as i64, 2, "is_weapon_arm") != 0.0;
+        // ACVD keeps the L/R hand weapons on a weapon-arm design. Only the hanger bays,
+        // shoulder unit, and Overed Weapon are unavailable; those slots already resolve to
+        // `silent()` below because the game clears them when the arms are swapped.
+        let mut hands = [gun(design.armwep_r as i64), gun(design.armwep_l as i64)];
+        let mut bays = if weapon_arm {
+            [silent(), silent()]
+        } else {
+            [gun(design.hanger_r as i64), gun(design.hanger_l as i64)]
+        };
+        let mut shoulder = if weapon_arm {
+            silent()
+        } else {
+            let arms_mount =
+                (part_field(design.arms as i64, 2, "shoulder_mount_count").round() as u8).max(1);
+            shoulder_gun(design.shoulder as i64, arms_mount)
+        };
+        let mut weapon_arm_gun = silent();
         if weapon_arm {
             let wid = part_field(design.arms as i64, 2, "weapon_arm_id") as i64;
-            let mut wa = gun_from_category(wid, 10, 1);
-            wa.apply_reload_stability(&ctrl);
-            return Self {
-                hands: [wa, silent()],
-                weapon_arm: true,
-                ..Self::default()
-            };
+            weapon_arm_gun = gun_from_category(wid, 10, 1);
+            weapon_arm_gun.apply_reload_stability(&ctrl);
         }
-        let arms_mount =
-            (part_field(design.arms as i64, 2, "shoulder_mount_count").round() as u8).max(1);
-        let mut hands = [gun(design.armwep_r as i64), gun(design.armwep_l as i64)];
-        let mut bays = [gun(design.hanger_r as i64), gun(design.hanger_l as i64)];
-        let mut shoulder = shoulder_gun(design.shoulder as i64, arms_mount);
-        for g in hands.iter_mut().chain(bays.iter_mut()) {
+        for g in hands
+            .iter_mut()
+            .chain(bays.iter_mut())
+            .chain(std::iter::once(&mut shoulder))
+        {
             g.apply_reload_stability(&ctrl);
         }
-        shoulder.apply_reload_stability(&ctrl);
         Self {
             hands,
+            weapon_arm_gun,
             bays,
             shoulder,
+            weapon_arm,
+            weapon_arm_state: WeaponArmState::for_part(design.arms as u16),
             ..Self::default()
         }
     }
@@ -508,6 +848,11 @@ impl Armament {
         if self.swapping(1) {
             flags |= acvd_proto::combat_flags::LEFT_SWAPPING;
         }
+        if self.weapon_arm {
+            flags |= (self.weapon_arm_state.phase.code()
+                << acvd_proto::combat_flags::WEAPON_ARM_PHASE_SHIFT)
+                & acvd_proto::combat_flags::WEAPON_ARM_PHASE_MASK;
+        }
         flags
     }
 
@@ -516,6 +861,22 @@ impl Armament {
         self.active_bay[0] = flags & acvd_proto::combat_flags::RIGHT_BAY_ACTIVE != 0;
         self.active_bay[1] = flags & acvd_proto::combat_flags::LEFT_BAY_ACTIVE != 0;
         self.swap_ticks = swap_ticks;
+        if self.weapon_arm {
+            let phase = WeaponArmPhase::from_code(
+                (flags & acvd_proto::combat_flags::WEAPON_ARM_PHASE_MASK)
+                    >> acvd_proto::combat_flags::WEAPON_ARM_PHASE_SHIFT,
+            );
+            self.weapon_arm_state.phase = phase;
+        }
+    }
+
+    /// Compact weapon-arm deploy/stow/fire lockout timer and muzzle alternation state.
+    pub fn weapon_arm_ticks(&self) -> u8 {
+        if self.weapon_arm {
+            self.weapon_arm_state.ticks_remaining()
+        } else {
+            0
+        }
     }
 
     /// Full per-slot state used by `LocalPlayerState` (prediction replays fire validation).
@@ -533,10 +894,25 @@ impl Armament {
         out.shoulder_charge = self.shoulder.charge_ticks;
         out.burst_remaining = [self.hands[0].burst_remaining, self.hands[1].burst_remaining];
         out.burst_timer = [self.hands[0].burst_timer, self.hands[1].burst_timer];
+        out.weapon_arm_ticks = self.weapon_arm_ticks();
+        out.weapon_arm_barrel = self.weapon_arm_state.barrel;
+        out.weapon_arm_frame = self.weapon_arm_state.frame;
     }
 
     pub fn read_local_state(&mut self, state: &acvd_proto::LocalPlayerState) {
         self.apply_combat_state(state.combat_flags, state.swap_ticks);
+        if self.weapon_arm {
+            let phase = WeaponArmPhase::from_code(
+                (state.combat_flags & acvd_proto::combat_flags::WEAPON_ARM_PHASE_MASK)
+                    >> acvd_proto::combat_flags::WEAPON_ARM_PHASE_SHIFT,
+            );
+            self.weapon_arm_state.apply_replicated(
+                phase,
+                state.weapon_arm_ticks,
+                state.weapon_arm_barrel,
+            );
+            self.weapon_arm_state.frame = state.weapon_arm_frame;
+        }
         self.hands[0].remaining = state.hand_ammo[0];
         self.hands[1].remaining = state.hand_ammo[1];
         self.bays[0].remaining = state.bay_ammo[0];
@@ -563,11 +939,7 @@ impl Armament {
         *self = Self::from_design(design);
     }
 
-    /// Steps one fixed tick of cooldowns, swaps, triggers, and salvo release.
-    ///
-    /// `blocked` is the action restriction (`AcActRestrictionParamSt.b_shoot == 0`): scan mode,
-    /// kick, or blade. `lock_pos` is the server's interest hint only; damage is never trusted from
-    /// it.
+    /// Steps one fixed tick with the weapon arm assumed to be in combat mode.
     #[allow(clippy::too_many_arguments)]
     pub fn step_tick(
         &mut self,
@@ -584,10 +956,64 @@ impl Armament {
         next_projectile: &mut u32,
         shot_seq: &mut u32,
     ) -> WeaponOutput {
+        self.step_tick_mode(
+            input,
+            tick,
+            net_id,
+            match_seed,
+            position,
+            aim_dir,
+            lock_target,
+            lock_pos,
+            blocked,
+            true,
+            en,
+            next_projectile,
+            shot_seq,
+        )
+    }
+
+    /// Steps one fixed tick of cooldowns, swaps, triggers, and salvo release.
+    ///
+    /// `blocked` is the action restriction (`AcActRestrictionParamSt.b_shoot == 0`): scan mode,
+    /// kick, or blade. `combat_mode` is false in Scan Mode, which stows a weapon arm. `lock_pos`
+    /// is the server's interest hint only; damage is never trusted from it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_tick_mode(
+        &mut self,
+        input: &InputFrame,
+        tick: u32,
+        net_id: NetId,
+        match_seed: u64,
+        position: Vec3,
+        aim_dir: Vec3,
+        lock_target: NetId,
+        lock_pos: Option<Vec3>,
+        blocked: bool,
+        combat_mode: bool,
+        en: &mut f32,
+        next_projectile: &mut u32,
+        shot_seq: &mut u32,
+    ) -> WeaponOutput {
         let mut out = WeaponOutput::default();
+        let want_arm = input.fire_r || input.fire_l;
+        // A weapon-arm design has no bay carousel. Weapon Switch / Bay Swap is a single
+        // toggle between "hands active, arm stowed" and "hands racked, arm active".
+        let requests = [input.bay_r, input.bay_l];
+        let switch_edge = (requests[0] && !self.prev_bay[0]) || (requests[1] && !self.prev_bay[1]);
+        if self.weapon_arm {
+            self.weapon_arm_state.step(
+                combat_mode,
+                switch_edge,
+                want_arm,
+                self.weapon_arm_gun.stance,
+            );
+            self.prev_bay = requests;
+        }
         for gun in self
             .hands
             .iter_mut()
+            .chain(std::iter::once(&mut self.weapon_arm_gun))
             .chain(self.bays.iter_mut())
             .chain(std::iter::once(&mut self.shoulder))
         {
@@ -595,28 +1021,34 @@ impl Armament {
         }
 
         // Bay/rack swap: one 150-tick carousel, flipped at the grab.
-        let requests = [input.bay_r, input.bay_l];
-        for side in 0..2 {
-            if requests[side] && !self.prev_bay[side] && !self.swapping(side) {
-                // A rack swap needs an incoming hanger weapon; an empty bay is a no-op.
-                if self.bays[side].kind != Kind::Skip {
-                    self.swap_ticks[side] = BAY_SWAP_TICKS;
-                    out.swap_started[side] = true;
+        if !self.weapon_arm {
+            for side in 0..2 {
+                if requests[side] && !self.prev_bay[side] && !self.swapping(side) {
+                    // A rack swap needs an incoming hanger weapon; an empty bay is a no-op.
+                    if self.bays[side].kind != Kind::Skip {
+                        self.swap_ticks[side] = BAY_SWAP_TICKS;
+                        out.swap_started[side] = true;
+                    }
+                }
+                // The swap starts on this tick; its 150-tick carousel begins next tick.
+                if self.swap_ticks[side] > 0 && !out.swap_started[side] {
+                    self.swap_ticks[side] -= 1;
+                    if self.swap_ticks[side] == 0 {
+                        self.active_bay[side] = !self.active_bay[side];
+                        out.swap_finished[side] = true;
+                    }
                 }
             }
-            // The swap starts on this tick; its 150-tick carousel begins next tick.
-            if self.swap_ticks[side] > 0 && !out.swap_started[side] {
-                self.swap_ticks[side] -= 1;
-                if self.swap_ticks[side] == 0 {
-                    self.active_bay[side] = !self.active_bay[side];
-                    out.swap_finished[side] = true;
-                }
-            }
+            self.prev_bay = requests;
         }
-        self.prev_bay = requests;
 
         let right = aim_dir.cross(Vec3::Y).normalize_or(Vec3::X);
+        let hands_active =
+            !self.weapon_arm || matches!(self.weapon_arm_state.phase, WeaponArmPhase::Stowed);
         for side in 0..2 {
+            if !hands_active {
+                break;
+            }
             let want = if side == 0 {
                 input.fire_r
             } else {
@@ -629,6 +1061,7 @@ impl Armament {
                 let _ = gun.step_trigger(false, false, true);
                 continue;
             }
+            let barrel = 0;
             let gun = self.active_gun_mut(side);
             let has_ammo = gun
                 .blade
@@ -695,10 +1128,96 @@ impl Armament {
                         power_scale,
                         pellets,
                         right,
+                        barrel,
                         &mut out,
                     );
                 }
             }
+        }
+
+        // Built-in weapon arm: only while deployed/ready/firing. The normal hands above are
+        // locked during this phase, and firing does not require a kneeling stance.
+        let arm_active = self.weapon_arm
+            && matches!(
+                self.weapon_arm_state.phase,
+                WeaponArmPhase::Deployed | WeaponArmPhase::Ready | WeaponArmPhase::Firing
+            );
+        let mut wa_fired = false;
+        if arm_active {
+            let gun = &mut self.weapon_arm_gun;
+            let has_ammo = gun
+                .blade
+                .map_or(gun.remaining > 0, |b| b.infinite_ammo || gun.remaining > 0);
+            let can = !blocked
+                && !gun.is_silent()
+                && has_ammo
+                && gun.cooldown <= 0.0
+                && *en >= gun.en_drain;
+            if gun.kind == Kind::Blade {
+                if want_arm && can {
+                    let blade = gun.blade.unwrap_or_default();
+                    out.blades.push(BladeLaunch {
+                        hand_idx: 0,
+                        physical: blade.physical,
+                        target: lock_pos.map(|p| (0, p)),
+                        hit_radius: blade.hit_radius,
+                        blade_radius: blade.blade_radius,
+                        max_hits: blade.max_hits,
+                        decay_power: blade.decay_power,
+                        decay_recoil: blade.decay_recoil,
+                        damage_type: gun.damage_type,
+                        damage_power: gun.damage_power,
+                        damage_recoil: gun.damage_recoil,
+                        trail_fx: gun.fx.bullet,
+                        hit_low_fx: gun.fx.hit_low,
+                        hit_hi_fx: gun.fx.hit_hi,
+                        hit_low_se: gun.hit_se.low,
+                        hit_hi_se: gun.hit_se.hi,
+                    });
+                    *en = (*en - gun.en_drain).max(0.0);
+                    if !blade.infinite_ammo {
+                        gun.remaining = gun.remaining.saturating_sub(1);
+                    }
+                    gun.cooldown = gun.reload_time.max(1.0);
+                    wa_fired = true;
+                }
+            } else {
+                match gun.step_trigger(want_arm, can, true) {
+                    TriggerAction::None | TriggerAction::StartCharge => {}
+                    TriggerAction::Fire {
+                        power_scale,
+                        pellets,
+                    } => {
+                        *en = (*en - gun.en_drain).max(0.0);
+                        gun.remaining = gun.remaining.saturating_sub(1);
+                        if gun.burst_remaining == 0 {
+                            gun.cooldown = gun.reload_time.max(1.0);
+                        }
+                        let origin = position + Vec3::Y * 4.5 + aim_dir * 1.0;
+                        Self::emit_gun_shots(
+                            gun,
+                            WeaponSlot::RightHand,
+                            origin,
+                            aim_dir,
+                            lock_target,
+                            tick,
+                            net_id,
+                            match_seed,
+                            next_projectile,
+                            shot_seq,
+                            power_scale,
+                            pellets,
+                            right,
+                            self.weapon_arm_state.barrel,
+                            &mut out,
+                        );
+                        wa_fired = true;
+                    }
+                }
+            }
+        }
+        if wa_fired {
+            self.weapon_arm_state.on_fired();
         }
 
         // Shoulder unit: missiles queue a salvo, everything else fires directly.
@@ -750,6 +1269,7 @@ impl Armament {
                             target,
                             gun: *gun,
                             seed,
+                            barrel: 0,
                         });
                     }
                     self.salvo_timer = self.shoulder.burst_interval.max(3.0);
@@ -776,6 +1296,7 @@ impl Armament {
         power_scale: f32,
         pellets: usize,
         right: Vec3,
+        barrel: u8,
         out: &mut WeaponOutput,
     ) {
         debug_assert!(!gun.is_silent());
@@ -794,6 +1315,7 @@ impl Armament {
                 target: lock_target.is_some().then_some(lock_target),
                 gun: shot_gun,
                 seed,
+                barrel,
             });
             return;
         }
@@ -839,6 +1361,7 @@ impl Armament {
                 target: None,
                 gun: shot_gun,
                 seed,
+                barrel: barrel.wrapping_add(p as u8),
             });
         }
     }
@@ -1575,11 +2098,157 @@ mod tests {
 
     #[test]
     fn fast_rounds_are_classified_for_rewind() {
-        let mut arm = default_armament();
+        let arm = default_armament();
         let mut gun = arm.hands[0];
         gun.init_speed = FAST_PROJECTILE_MPS + 1.0;
         assert!(gun.is_hitscan());
         gun.init_speed = FAST_PROJECTILE_MPS - 1.0;
         assert!(!gun.is_hitscan());
+    }
+
+    #[test]
+    fn weapon_arm_deploy_stow_and_fire_lockout_match_360_speeds() {
+        assert_eq!(
+            acvd_data::generated::tuning::AC_ANIM_PARAM.weapon_arm_deploy_speed,
+            WEAPON_ARM_DEPLOY_BLEND_FRAMES
+        );
+        assert_eq!(
+            acvd_data::generated::tuning::AC_ANIM_PARAM.weapon_arm_stow_speed,
+            WEAPON_ARM_STOW_BLEND_FRAMES
+        );
+        assert_eq!(WEAPON_ARM_DEPLOY_SPEED, WEAPON_ARM_FRAME_STEP);
+        assert_eq!(WEAPON_ARM_STOW_SPEED, WEAPON_ARM_FRAME_STEP);
+        let mut state = WeaponArmState::default();
+        // Stowed is the initial combat state: the ordinary hand weapons are active.
+        state.step(true, false, false, false);
+        assert_eq!(state.phase, WeaponArmPhase::Stowed);
+        assert!(!state.busy());
+        assert!(!state.can_fire(false));
+
+        // Weapon Switch enters the unfold at frame 0. `0x82852408` advances the
+        // clip by one 60 Hz frame per tick; request `+8` is only the 10/80 blend.
+        state.step(true, true, false, false);
+        assert_eq!(state.phase, WeaponArmPhase::Deploying);
+        assert_eq!(state.frame, 0.0);
+        assert_eq!(state.ticks_remaining(), 150);
+        assert!(state.busy());
+        for _ in 0..300 {
+            state.step(true, false, false, false);
+        }
+        assert_eq!(state.phase, WeaponArmPhase::Deployed);
+        assert!(!state.busy());
+        assert!(state.can_fire(true));
+
+        state.on_fired();
+        assert_eq!(state.phase, WeaponArmPhase::Firing);
+        assert_eq!(state.barrel, 1);
+        for _ in 0..60 {
+            state.step(true, false, false, false);
+        }
+        assert_eq!(state.phase, WeaponArmPhase::Deployed);
+
+        // Weapon Switch enters the fold at frame 0; neither hands nor arm may fire while busy.
+        state.step(true, true, false, true);
+        assert_eq!(state.phase, WeaponArmPhase::Stowing);
+        assert_eq!(state.frame, 0.0);
+        assert!(state.busy());
+        assert!(!state.can_fire(true));
+        assert_eq!(state.ticks_remaining(), 150);
+        for _ in 0..300 {
+            state.step(true, false, false, false);
+        }
+        assert_eq!(state.phase, WeaponArmPhase::Stowed);
+        assert!(!state.can_fire(true));
+
+        state.phase = WeaponArmPhase::Deployed;
+        state.step(true, false, true, true);
+        assert_eq!(state.phase, WeaponArmPhase::Ready);
+        assert!(state.can_fire(true));
+
+        // Scan Mode folds the arm without a switch request.
+        state.step(false, false, false, false);
+        assert_eq!(state.phase, WeaponArmPhase::Stowing);
+        assert_eq!(state.frame, 0.0);
+        for _ in 0..300 {
+            state.step(false, false, false, false);
+        }
+        assert_eq!(state.phase, WeaponArmPhase::Stowed);
+    }
+
+    /// The authored `a00_004`/`a00_005` lengths differ by part: 290 for am7110..7140, 300 for
+    /// am7020/am7420, and 320 for am7510..7540. A single 300-frame timer cuts the long arms
+    /// 20 frames early and holds the short arms 10 ticks too long.
+    #[test]
+    fn weapon_arm_clip_lengths_match_the_dumped_arm_binders() {
+        assert_eq!(weapon_arm_clip_frames(7020), 300.0);
+        assert_eq!(weapon_arm_clip_frames(7420), 300.0);
+        assert_eq!(weapon_arm_clip_frames(7110), 290.0);
+        assert_eq!(weapon_arm_clip_frames(7140), 290.0);
+        assert_eq!(weapon_arm_clip_frames(7510), 320.0);
+        assert_eq!(weapon_arm_clip_frames(7540), 320.0);
+
+        let mut short = WeaponArmState::for_part(7110);
+        short.step(true, true, false, false);
+        for _ in 0..288 {
+            short.step(true, false, false, false);
+        }
+        assert_eq!(short.phase, WeaponArmPhase::Deploying);
+        short.step(true, false, false, false);
+        assert_eq!(short.phase, WeaponArmPhase::Deployed, "290 frames / 1");
+
+        let mut long = WeaponArmState::for_part(7510);
+        long.step(true, true, false, false);
+        for _ in 0..318 {
+            long.step(true, false, false, false);
+        }
+        assert_eq!(long.phase, WeaponArmPhase::Deploying);
+        long.step(true, false, false, false);
+        assert_eq!(long.phase, WeaponArmPhase::Deployed, "320 frames / 1");
+    }
+
+    /// A render-rate accumulator must produce the same wall-clock transition at 60, 144 and
+    /// 240 FPS (within one 60 Hz tick).
+    #[test]
+    fn weapon_arm_accumulator_is_frame_rate_independent() {
+        fn duration(part: u16, dt: f32) -> f32 {
+            let mut state = WeaponArmState::for_part(part);
+            let mut accum = 0.0;
+            let mut elapsed = 0.0;
+            let mut request = true;
+            for _ in 0..10_000 {
+                advance_weapon_arm_clock(&mut state, &mut accum, dt, true, request, false, false);
+                request = false;
+                elapsed += dt;
+                if state.phase == WeaponArmPhase::Deployed {
+                    return elapsed;
+                }
+            }
+            panic!("deploy did not finish for {part} at dt {dt}");
+        }
+
+        for part in [7020, 7110, 7510] {
+            let at_60 = duration(part, 1.0 / 60.0);
+            let at_144 = duration(part, 1.0 / 144.0);
+            let at_240 = duration(part, 1.0 / 240.0);
+            let expected = if part == 7110 {
+                290.0 / 60.0
+            } else if part == 7510 {
+                320.0 / 60.0
+            } else {
+                300.0 / 60.0
+            };
+            assert!(
+                (at_60 - expected).abs() < 1e-4,
+                "part {part} 60 Hz: {at_60} vs {expected}"
+            );
+            assert!(
+                (at_144 - expected).abs() <= 1.0 / 60.0 + 1e-4,
+                "part {part} 144 Hz: {at_144} vs {expected}"
+            );
+            assert!(
+                (at_240 - expected).abs() <= 1.0 / 60.0 + 1e-4,
+                "part {part} 240 Hz: {at_240} vs {expected}"
+            );
+        }
     }
 }

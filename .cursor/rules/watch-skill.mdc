@@ -1,0 +1,19 @@
+---
+description: Use the Watch Skill (watch-skill CLI) whenever viewing videos, recordings, or visual/game output
+alwaysApply: true
+---
+
+# Viewing and visual verification: use Watch Skill
+
+Whenever viewing or verifying anything visual — videos, URLs, screen recordings,
+running game/UI/animation output, or checking whether a visual change worked —
+use the installed Watch Skill (`watch` and `the-loop` skills) and the `watch-skill` CLI
+instead of guessing or relying only on static screenshots.
+
+- **First call per session**: run `watch-skill doctor --json` (proceed silently on exit 0).
+- **Videos / local recordings / URLs**: `watch-skill watch "<source>"` (then read the
+  listed frames in parallel). For follow-ups on already-indexed videos, use
+  `watch-skill ask <video_id> "<question>"` or `watch-skill search "<phrase>"`.
+- **Verifying the running game / UI / animations**: use `watch-skill loop game` or
+  `watch-skill loop start "<target>" "<pass criteria>"` (and `watch-skill loop iterate <loop_id>`
+  after applying fixes), or `watch-skill capture "<target>"` to record without critiquing.

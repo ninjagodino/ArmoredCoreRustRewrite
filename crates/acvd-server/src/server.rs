@@ -572,8 +572,11 @@ impl Server {
                     muzzle,
                     dir,
                     tick,
+                    barrel,
                     hitscan,
-                } => self.handle_fired(shooter, projectile, slot, muzzle, dir, tick, hitscan),
+                } => self.handle_fired(
+                    shooter, projectile, slot, muzzle, dir, tick, barrel, hitscan,
+                ),
                 other => self.record_event(other),
             }
         }
@@ -639,6 +642,7 @@ impl Server {
         muzzle: Vec3,
         dir: Vec3,
         tick: u32,
+        barrel: u8,
         hitscan: bool,
     ) {
         let fire = FireEvent {
@@ -653,6 +657,7 @@ impl Server {
             aim_dir: quantize_dir3(dir),
             fire_tick: tick,
             seed: (projectile.0 & 0xff) as u8,
+            barrel,
         };
         self.broadcast_fire(fire);
         if !hitscan {

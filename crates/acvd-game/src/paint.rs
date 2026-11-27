@@ -30,7 +30,9 @@ use bevy::asset::{embedded_asset, RenderAssetUsages};
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{
+    AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat,
+};
 use bevy::shader::ShaderRef;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -172,12 +174,7 @@ impl CustomCamoLibrary {
             let scale = MAX_CAMO_DIM as f32 / w.max(h) as f32;
             let nw = ((w as f32 * scale).round() as u32).max(1);
             let nh = ((h as f32 * scale).round() as u32).max(1);
-            rgba = image::imageops::resize(
-                &rgba,
-                nw,
-                nh,
-                image::imageops::FilterType::Triangle,
-            );
+            rgba = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
         }
 
         let file_name = path
@@ -313,16 +310,18 @@ pub fn update_ac_materials_in_place(
 ) {
     for (mat_h, group) in meshes {
         if let Some(mut mat) = paint_materials.get_mut(&mat_h.0) {
-            let cols =
-                accolor.overlay_cols(group.0, STATIC_DRAW_PARAM.color_min, STATIC_DRAW_PARAM.color_max);
+            let cols = accolor.overlay_cols(
+                group.0,
+                STATIC_DRAW_PARAM.color_min,
+                STATIC_DRAW_PARAM.color_max,
+            );
             mat.extension.params.overlay = cols.map(Vec4::from);
             if mat.extension.params.emission.w > 0.0 {
                 mat.extension.params.emission =
                     Vec4::from(accolor.emission_col(group.0, GLOW_INTENSITY));
             }
             if mat.extension.params.rim.w > 0.0 {
-                mat.extension.params.rim =
-                    Vec4::from(accolor.emission_col(group.0, RIM_INTENSITY));
+                mat.extension.params.rim = Vec4::from(accolor.emission_col(group.0, RIM_INTENSITY));
             }
         }
     }
@@ -507,7 +506,8 @@ pub fn load_color_map_handle(
     let mask_name = format!("{diffuse}_c");
     if let Some(d_ref) = acvd_render::best_texture_ref(diffuse) {
         if let Ok(Some(idx)) = packs.find(disc, d_ref.pack, &mask_name) {
-            if let Ok(h) = packs.texture_handle_at(disc, images, d_ref.pack, idx, &mask_name, true) {
+            if let Ok(h) = packs.texture_handle_at(disc, images, d_ref.pack, idx, &mask_name, true)
+            {
                 return Some(h);
             }
         }
@@ -542,7 +542,9 @@ pub fn material(
     packs: &mut Packs,
     images: &mut Assets<Image>,
 ) -> Option<AcPaintMaterial> {
-    material_with_custom_camo(disc, base, mesh, column, accolor, decal_map, None, 1.0, packs, images)
+    material_with_custom_camo(
+        disc, base, mesh, column, accolor, decal_map, None, 1.0, packs, images,
+    )
 }
 
 /// Same as [`material`], with an optional user-uploaded custom camouflage texture override.
@@ -579,14 +581,18 @@ pub fn material_with_custom_camo(
         })
         .unwrap_or(Vec2::ONE);
     let group = accolor::slot_group(column, mesh.root.as_deref());
-    let cols = accolor.overlay_cols(group, STATIC_DRAW_PARAM.color_min, STATIC_DRAW_PARAM.color_max);
+    let cols = accolor.overlay_cols(
+        group,
+        STATIC_DRAW_PARAM.color_min,
+        STATIC_DRAW_PARAM.color_max,
+    );
 
     // 360 `0x82ca9c70` (`0x82ca9e98..0x82ca9f14`) binds `ca{camo_id:04}` (`0x82460e58`) to `s15`
     // with `c190.xy = mask_size / camo_size` (`0x82461a98`), or binds `color_map` itself with
     // `c190 = (1, 1, 1, 1)` when `camo_id == 0`.
     let is_custom_camo = custom_camo.is_some();
-    let resolved_camo = custom_camo
-        .or_else(|| load_camo_map_handle(disc, packs, images, accolor.camo_id(group)));
+    let resolved_camo =
+        custom_camo.or_else(|| load_camo_map_handle(disc, packs, images, accolor.camo_id(group)));
     let (camo_map, camo_scale) = if let Some(camo_h) = resolved_camo {
         let (camo_w, camo_h_px) = images
             .get(&camo_h)
@@ -599,10 +605,8 @@ pub fn material_with_custom_camo(
             .unwrap_or((1.0, 1.0));
         let mut s = Vec2::new(mask_size.x / camo_w, mask_size.y / camo_h_px);
         if is_custom_camo {
-            s /= custom_camo_scale.clamp(
-                CustomCamoLibrary::SCALE_MIN,
-                CustomCamoLibrary::SCALE_MAX,
-            );
+            s /=
+                custom_camo_scale.clamp(CustomCamoLibrary::SCALE_MIN, CustomCamoLibrary::SCALE_MAX);
         }
         (camo_h, s)
     } else {
@@ -635,7 +639,10 @@ pub fn material_with_custom_camo(
 
     let (decal_map, has_decal) = match decal_map {
         Some(h) => (h, 1.0),
-        None => (packs.utility_handle(images, "empty_decal", empty_decal_image), 0.0),
+        None => (
+            packs.utility_handle(images, "empty_decal", empty_decal_image),
+            0.0,
+        ),
     };
 
     Some(AcPaintMaterial {
@@ -728,23 +735,59 @@ mod tests {
         }
         let disc = Disc::open(&iso).unwrap();
         let col = load_accolor(&disc, 5001).expect("color5001.bin");
-        let mut meshes = acvd_render::model(&disc, "model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv").unwrap();
+        let mut meshes = acvd_render::model(
+            &disc,
+            "model/ac/parts/arm/am0010/am0010_m.bnd.dcx|am0010.flv",
+        )
+        .unwrap();
         let mut packs = Packs::default();
         let mut images = Assets::<Image>::default();
         let mut missing = 0;
 
         // Standard AC armor mesh: binds normal map on base and specular map on AcPaint.
-        let base = acvd_render::material(&disc, &meshes[0], &mut packs, &mut images, false, &mut missing);
-        assert!(base.normal_map_texture.is_some(), "am0010 base should bind normal_map_texture");
-        let painted = material(&disc, &base, &meshes[0], "arms", &col, None, &mut packs, &mut images)
-            .expect("am0010 painted material");
+        let base = acvd_render::material(
+            &disc,
+            &meshes[0],
+            &mut packs,
+            &mut images,
+            false,
+            &mut missing,
+        );
+        assert!(
+            base.normal_map_texture.is_some(),
+            "am0010 base should bind normal_map_texture"
+        );
+        let painted = material(
+            &disc,
+            &base,
+            &meshes[0],
+            "arms",
+            &col,
+            None,
+            &mut packs,
+            &mut images,
+        )
+        .expect("am0010 painted material");
         assert_eq!(painted.extension.params.flags.x, 1.0, "specular map bound");
-        assert_eq!(painted.extension.params.rim, Vec4::ZERO, "non-rim mesh has zero rim");
+        assert_eq!(
+            painted.extension.params.rim,
+            Vec4::ZERO,
+            "non-rim mesh has zero rim"
+        );
 
         // Simulated `_Rim` MTD: uploads kojima * 10.0 (`RIM_INTENSITY`, 0x82008994 in 0x82bd8958).
         meshes[0].mtd = "ACParts_Rim_ex".into();
-        let rim_mat = material(&disc, &base, &meshes[0], "head", &col, None, &mut packs, &mut images)
-            .expect("rim painted material");
+        let rim_mat = material(
+            &disc,
+            &base,
+            &meshes[0],
+            "head",
+            &col,
+            None,
+            &mut packs,
+            &mut images,
+        )
+        .expect("rim painted material");
         let expected_rim = col.emission_col(0, RIM_INTENSITY);
         assert_eq!(rim_mat.extension.params.rim, Vec4::from(expected_rim));
         assert!((rim_mat.extension.params.rim.x - (251.0 / 255.0) * 10.0).abs() < 1e-4);

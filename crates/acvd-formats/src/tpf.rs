@@ -380,9 +380,24 @@ pub fn block_level_span(
 /// - bytes `0..4`: two 16-bit LE endpoint pairs `[y0, x0, y1, x1]` (`x` = R in high byte, `y` = G in low byte)
 /// - bytes `4..8`: `u32` LE of 16 two-bit selectors (`0 => e0`, `1 => e1`, `2 => (2*e0+e1)/3`, `3 => (e0+2*e1)/3`)
 pub fn decode_ctx1_block(block: &[u8; 8]) -> [[u8; 2]; 16] {
-    let (y0, x0, y1, x1) = (block[0] as u16, block[1] as u16, block[2] as u16, block[3] as u16);
-    let px = [x0 as u8, x1 as u8, ((2 * x0 + x1) / 3) as u8, ((x0 + 2 * x1) / 3) as u8];
-    let py = [y0 as u8, y1 as u8, ((2 * y0 + y1) / 3) as u8, ((y0 + 2 * y1) / 3) as u8];
+    let (y0, x0, y1, x1) = (
+        block[0] as u16,
+        block[1] as u16,
+        block[2] as u16,
+        block[3] as u16,
+    );
+    let px = [
+        x0 as u8,
+        x1 as u8,
+        ((2 * x0 + x1) / 3) as u8,
+        ((x0 + 2 * x1) / 3) as u8,
+    ];
+    let py = [
+        y0 as u8,
+        y1 as u8,
+        ((2 * y0 + y1) / 3) as u8,
+        ((y0 + 2 * y1) / 3) as u8,
+    ];
     let idx = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
     let mut out = [[0u8; 2]; 16];
     for (i, texel) in out.iter_mut().enumerate() {
@@ -459,7 +474,12 @@ fn rgb565_to_rgba(c: u16) -> [u8; 4] {
     let r = ((c >> 11) & 0x1f) as u8;
     let g = ((c >> 5) & 0x3f) as u8;
     let b = (c & 0x1f) as u8;
-    [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2), 255]
+    [
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
+        255,
+    ]
 }
 
 /// Decodes one 8-byte little-endian BC1 (DXT1) 4x4 block into 16 RGBA8 texels.
@@ -794,9 +814,14 @@ mod tests {
                     }
                     24 | 25 => {
                         let lin = tex.linear(t.platform, &data, 8).unwrap();
-                        let rg = decode_ctx1(&lin, tex.width, tex.height, tex.levels(), tex.faces()).unwrap();
+                        let rg =
+                            decode_ctx1(&lin, tex.width, tex.height, tex.levels(), tex.faces())
+                                .unwrap();
                         let expected_texels: usize = (0..tex.levels())
-                            .map(|m| ((tex.width as usize >> m).max(1)) * ((tex.height as usize >> m).max(1)))
+                            .map(|m| {
+                                ((tex.width as usize >> m).max(1))
+                                    * ((tex.height as usize >> m).max(1))
+                            })
                             .sum::<usize>()
                             * tex.faces() as usize;
                         assert_eq!(rg.len(), expected_texels * 2, "{}", tex.name);
@@ -804,7 +829,9 @@ mod tests {
                         let n0 = (tex.width as usize) * (tex.height as usize);
                         let (sum_r, sum_g) = rg[..n0 * 2]
                             .chunks_exact(2)
-                            .fold((0u64, 0u64), |(sr, sg), p| (sr + p[0] as u64, sg + p[1] as u64));
+                            .fold((0u64, 0u64), |(sr, sg), p| {
+                                (sr + p[0] as u64, sg + p[1] as u64)
+                            });
                         let mean_r = sum_r as f64 / n0 as f64;
                         let mean_g = sum_g as f64 / n0 as f64;
                         assert!(
@@ -822,7 +849,10 @@ mod tests {
                 }
             }
         }
-        assert!(dxn_n > 0 && ctx24_n > 0 && ctx25_n > 0, "dxn={dxn_n} ctx24={ctx24_n} ctx25={ctx25_n}");
+        assert!(
+            dxn_n > 0 && ctx24_n > 0 && ctx25_n > 0,
+            "dxn={dxn_n} ctx24={ctx24_n} ctx25={ctx25_n}"
+        );
     }
 
     #[test]
@@ -842,6 +872,9 @@ mod tests {
         assert_eq!(rgba.len(), 256 * 256 * 4);
         let opaque = rgba.chunks_exact(4).filter(|p| p[3] > 200).count();
         let transparent = rgba.chunks_exact(4).filter(|p| p[3] < 20).count();
-        assert!(opaque > 500 && transparent > 500, "opaque={opaque} transparent={transparent}");
+        assert!(
+            opaque > 500 && transparent > 500,
+            "opaque={opaque} transparent={transparent}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-# Status and task list
+﻿# Status and task list
 
 Each chat takes **one** open task, works it, and updates this file before ending: move it to
 `docs/archive.md` with a one-line summary, record findings (360 addresses, file layouts, dead ends)
@@ -19,7 +19,7 @@ replace the older "user at the controls" runs; ask the user only for states no r
 
 Rough priority order; reorder freely.
 
-- **Multiplayer netcode follow-ups (drop-in presentation, match orchestration)**: Phases 0-4 of `.kilo/plans/1795715079540-multiplayer-netcode-architecture.md` are done (see Done "Multiplayer netcode Phase 4 — headless 64-bot soak and budgets"); the dedicated server now has a deterministic 64-bot driver, JSON soak metrics, and passing cluster/all-near/churn budgets. Remaining is optional presentation/match-flow work: consume `net::combat::RespawnDropIn` for the helicopter drop-in spline, and matchmaking/orchestration outside the plan. Phase 4 gates: `acvd-server/src/bots.rs` + `tests/soak.rs`, `cargo test -p acvd-server --release -- --ignored soak --test-threads=1` 3/3, all workspace tests green, `tools/check-headless.ps1` PASS, `acvd-index audit` 1798 cited / 0 mismatches / 0 PS3.
+- **Multiplayer netcode follow-ups (drop-in presentation, match orchestration)**: Phases 0-4 of `.kilo/plans/1795715079540-multiplayer-netcode-architecture.md` are done (see Done "Multiplayer netcode Phase 4 â€” headless 64-bot soak and budgets"); the dedicated server now has a deterministic 64-bot driver, JSON soak metrics, and passing cluster/all-near/churn budgets. Remaining is optional presentation/match-flow work: consume `net::combat::RespawnDropIn` for the helicopter drop-in spline, and matchmaking/orchestration outside the plan. Phase 4 gates: `acvd-server/src/bots.rs` + `tests/soak.rs`, `cargo test -p acvd-server --release -- --ignored soak --test-threads=1` 3/3, all workspace tests green, `tools/check-headless.ps1` PASS, `acvd-index audit` 1798 cited / 0 mismatches / 0 PS3.
 
 
 **Goal: a playable AC test demo** (garage AC TEST: map m4000 + `m4000_actest.msb`, see Done
@@ -54,7 +54,7 @@ in order:
   - Done (sky look): there is no skybox cubemap; every map's sky is one of six hemisphere
     domes `o9700`-`o9705` (radius ~822 m, horizon to zenith, MSB part at the origin, scale 1).
     The 360 sky pass (`0x827f3d38`) draws it at (camera x, part y, camera z) scaled by the
-    type-101 scene sub-block `+0x1c` (debug name 天球スケール, `0x827ffa80` -> runtime +0x28;
+    type-101 scene sub-block `+0x1c` (debug name å¤©çƒã‚¹ã‚±ãƒ¼ãƒ«, `0x827ffa80` -> runtime +0x28;
     100 everywhere but m3710 = 5), with the projection's depth row zeroed and viewport MinZ = 1
     (`0x827d1d90`) so it sits on the far plane. Probes: `private/xenia/sky_obj.txt` (object
     matrix diag(100) at the camera X/Z), `sky_view.txt` (the zero-depth projection),
@@ -93,7 +93,7 @@ in order:
       `ATTRIBUTE_COLOR`. `acvd-game::map` passes `MapMeshMeta` to `env::relight`, and
       `env_lit.wgsl` samples `diffuse1` at `UV0` and `diffuse2` at `UV1` directly (so vertex alpha
       never zeroes `tex1.a`, and `env_sky.wgsl` samples `sky_tex` directly too), blending
-      `mix(t1, t2, 1 - vcol.a) * vcol.rgb` before squaring — `m4000` mountains (`m9000..m9017`)
+      `mix(t1, t2, 1 - vcol.a) * vcol.rgb` before squaring â€” `m4000` mountains (`m9000..m9017`)
       now blend naturally into rocky grey-brown/green slopes instead of flat orange-brown.
     - **`Water.spx` (`Normal/Flver_Water.vpo` / `.fpo`, `material/m4000_mtd.bnd` `Water.mtd`)**:
       `acvd-game::env` detects `Water` / `WaterRiver` / `WaterWave` MTDs (`m9100`/`m9101`, light
@@ -132,16 +132,16 @@ in order:
       read as world light beams, but they are **HUD gauge end-caps** (bit-identical at
       (460,365)/(530,365) and (189,364)/(273,364) in `ac_test_start`/`_move`/`_arena`, each pair
       joined by a dotted horizontal bar), so the pixel-derived `lens_flare::M4000_BEAMS` billboards
-      and the `beam.m4000.*` sheet rows were **deleted** — nothing world-space sat on those pixels.
+      and the `beam.m4000.*` sheet rows were **deleted** â€” nothing world-space sat on those pixels.
       Nearby `o2135` street-lamp
       heads (`Map_Diffuse _Grow` / `Simple_Grow` LODs) and `m0510` traffic strips share the
       `_Grow` emission path.
       `Flver_ColDifEmi.fpo` squares the emission texture; the display-referred boost is calibrated
       against the 360 shot because the lamp MTD keeps `g_EmissionCoef 0.3`, `signboardGrow.mtd`
       keeps `1.0`, and Bevy's bloom weights a bright pixel by screen area.
-    - **Map beams / light shafts — no authored data (done, 2026-11-25)**: `m4000` has **no beam
+    - **Map beams / light shafts â€” no authored data (done, 2026-11-25)**: `m4000` has **no beam
       geometry and no light record**. Every `POINT_PARAM_ST` in `m4000.msb` / `_map.msb` /
-      `_actest.msb` / `_aitest.msb` / `_env.msb` is kinds `50/100/101/102/200/850/1000/3000` — no
+      `_actest.msb` / `_aitest.msb` / `_env.msb` is kinds `50/100/101/102/200/850/1000/3000` â€” no
       `1300` and no `1310` spot lights; MODEL kinds are `0`/`1` (geometry), `2` (enemies, light
       set 20), `4` (AC); the only EVENT is the kind-101 tone-map block. All 1437 placed meshes
       (`private/tmp/m4000_all.txt`) carry only ground-glow `Map_Diffuse_Add` (`m0100_03`) and
@@ -163,10 +163,10 @@ in order:
       spawn an FFX id on a FLVER dummy (`dummy.color[1]` is the TAE dummy id, as on AC parts).
       `map::object_effects` now reads each placed `KIND_OBJECT` part's TAE, keeps the frame-0 FFX
       events, resolves the dummy through `Flver::bone_transforms`, and `map::spawn` attaches a
-      persistent `sfx::Sfx` at the mirrored dummy socket. `m4000` logs **12 object FFX** — its six
+      persistent `sfx::Sfx` at the mirrored dummy socket. `m4000` logs **12 object FFX** â€” its six
       `o0006` signboards each fire `ffx 197` (texture 226, 3 m warm-white `(1.0,0.78,0.70)` additive
       billboard, node life -1/60 s = infinite, action 59) on dummies `200`/`201`, the two lamp arms
-      at ±19.67, 18.47, -7.15 m. Test
+      at Â±19.67, 18.47, -7.15 m. Test
       `o0006_sign_tae_spawns_ffx_197_on_its_two_lamp_dummies`; dump any TAE with
       `cargo run --release -p acvd-formats --example taedump -- tae/obj/o0006/own000100.tae`
       (all 176 in `private/tmp/obj_tae_dump.txt`). Other object models' glows ride the same path.
@@ -282,12 +282,12 @@ in order:
 - **Camera leftovers**: impact / foot-step / rumble camera shake (`0x82bfab38` / `0x8285cf88` /
   `0x8285cfb0` / `0x82bf8f00` wired on landing, TAE kind 103 footsteps, incoming hits/stagger,
   heavy ready-weapon & OW fire, and Boost Charge Kick contact), ready-position zoom camera
-  (`accameraaction` row `40` `狙撃構え` -> row `49` `狙撃構え完了後` via `0x8285db68` / `0x8285d548`,
+  (`accameraaction` row `40` `ç‹™æ’ƒæ§‹ãˆ` -> row `49` `ç‹™æ’ƒæ§‹ãˆå®Œäº†å¾Œ` via `0x8285db68` / `0x8285d548`,
   `EyeDistance 6 m`, `FovMaxAngle` overridden by `cat-10 +0x168` `snipe_fov` via `0x8285e418` ->
   `0x8287a100` -> `0x828516b0` <- `0x82856c60` <- `0x8247b550`, aim turn speed scaled by
   `cat-10 +0x16c` `snipe_turn_scale` via `0x8287b658` <- `0x82478e00`), and 30 Hz speed-blur
   step rate (`BLUR_RATE = 30.0`, `FollowCam::blur_step` matching `0x82bfb748` -> `0x82bfa9f0`;
-  the probed `BlurRate == 2` row is row `19` `ドリフト`) are now implemented in `control.rs` /
+  the probed `BlurRate == 2` row is row `19` `ãƒ‰ãƒªãƒ•ãƒˆ`) are now implemented in `control.rs` /
   `weapons.rs` / `damage.rs`. Follow-camera wall clip (`CamFx_stateFollow` `0x82bfb238` ->
   `0x82bfaef0`: camera ray `0x82c4d680` filter `8`, sphere probe `0x82bf9a28`, distance blend
   `0x82bfa740`) is `FollowCam::clip` (`RayFilter::Camera`, `Hit::blocks_camera`), using a 0.3 m
@@ -324,7 +324,7 @@ in order:
     leaving a ledge after the ascent adds no further rise. On the ground: `glide_start` (acmotion row 217)
     then `glide` (row 218, 360-frame wheel, booster clip 1). In the air: one directional entry
     (rows 223-230, anims 63-70, 30 frames, sector `0x82825918` / builder `0x82883c80`) then
-    `glide_air` (row 222 空中浮遊, anim 62, 360-frame wheel, booster clip 3, builder
+    `glide_air` (row 222 ç©ºä¸­æµ®éŠ, anim 62, 360-frame wheel, booster clip 3, builder
     `0x82883d30`). Camera action 26, cue b00000006 (taken as the start). Glide EN drain and
     depletion end are in (see Done "Generator Energy (EN) drain & recharge"). The start/keep
     heading gate is in: `0x8281ea30` (state 4) and `0x8281e898` (state 5, via `0x8281f8c0`)
@@ -335,7 +335,7 @@ in order:
     acceleration from the thrust block `+0x2cc` (recomputed per tick here), while `+0x1e8` is
     copied from `+0x2dc`, the lift accumulator that `0x8281db00` advances and `0x8281dd28` stops
     at activation + 5.0 m (`glide_cap.jsonl` reads 0.00226 at the state-5 entry, then 0 at the
-    ceiling); after the ascent the air glide holds a flat height. Done: the glide quick boost —
+    ceiling); after the ascent the air glide holds a flat height. Done: the glide quick boost â€”
     a tapped Hi-Boost during a glide keeps the glide (the 360 glide top-level action vtable
     `0x82092318`, update `0x8283f240`, stays alive while `HighBoostState` replaces the movement
     substate; its `+0x1c` slot `0x8283f360` and `+0x24` slot `0x8283fcb8` start the glide
@@ -379,7 +379,7 @@ in order:
     cap (not reached); over-max decay and air drag per frame vs per tick; the boost/fall
     switch is decided per 1/30 s frame in the game, per tick here.
 - **Assembly gaps**: shoulder attach flag 5 (VMX `0x8288a058`; the parallel-to-+Y case
-  rotates the up hint by ±90° and that axis is still unread), recon mounts, character LOD
+  rotates the up hint by Â±90Â° and that axis is still unread), recon mounts, character LOD
   (`_l2` / `_l3`; map pieces are done, see Done);
   8 pending FLVERs (`0x20007` and FLVER0).
 - **Maps leftovers**: rest of MSB (MODEL/EVENT/POINT/ROUTE/LAYER/TREE), `.smd`, map FLVER
@@ -389,7 +389,7 @@ in order:
   selection"); the mission variants without their own `{map}_m.dcx.bnd` / `{map}_htdcx.bnd`
   (m3104, m3121, m3201, m3202, ...) still need the shared base-binder lookup before they can be
   listed.
-- **Armored Core V (base game) maps — started (2026-11-26)**: the ACV 360 disc reads through the
+- **Armored Core V (base game) maps â€” started (2026-11-26)**: the ACV 360 disc reads through the
   same VFS (`vfs::X360_ISO_V`); `X360::open` now picks the single `bind/dvdbnd5.bhd` +
   `bind/dvdbnd.bdt` layer when Verdict Day's `bind/dvdbnd5_layer0.bhd` is absent
   (`vfs::tests::acv_disc_reads_single_layer_archive`). ACV has no committed BHD5 name list, so
@@ -506,13 +506,164 @@ in order:
   `+0x4` as mode/lum/mul/key/white; m0300 `1/0/10/0.8/20`, m0600 `1/0/15/0.8/0`, lum 0 -> 1.0,
   bloom off; ACV's adaptive-luminance pass and bloom remain open) and the remaining unnamed
   sub-blocks (`+0x8/+0xc/+0x10/+0x18/+0x20/+0x2c`), HNAV/HTR and the `.mtd` binders.
-- **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), the per-enemy target lock-on HUD cursor (one four-wing `_E`/`_T`/`_L`/`_R` group per enemy in the FCS cone, up to 8, each wing placing its authored 128×64 corner dialog on the distance-scaled 32×32 target rect; text/bars/pips only on the FCS-selected target, `MissileLock1..6`), and Scan Mode / Target Scan / Recon Units (`ACV_ScanModeLockSight`, `ACV_Scan_Cur_EnemyParamInfo`, `ACV_MapScan_ReconInfo*`) are now in (see Done). Retail lock-cursor appearance/rule confirmed from the build instead of a sortie capture: `sortie.drb` authors every element (`LockOnText` msg 2313, `MissileLock1..6`, `EnemyName`/`EnemyAP`, and the 32x32 `_Target` with `LockColor1st` `0x006680ff` / `LockColor2nd` `0xff4000ff`); `0x829d4a90` bakes those color defaults and `0x829d4b88` overrides them from the dialog's named colors. `0x829d4558` -> `0x829d30e0` draws each wing only when the candidate's `+0` lock flag or `i16 +2` missile-lock count is set and `+1` or `f32 +4` >= 1.0; `0x829d1a10` shows `MissileLock1..n` from `i16 +2`, `0x829d1ac0` fills `ReloadBar` from `f32 +4` while `CursorLine` stays at full fill. The Xenia runs drew no cursor because the tanks sat outside the FCS sight cone (aim), not because of a missing code path; the 32×32 `_Target` is only the `LockColor1st`/`LockColor2nd` source (never painted), and its 1st/2nd selection is read through that candidate state. `0x829d3b38` builds the box from `rectOf(group+4)`; `0x829d4dd8` -> `0x824ab278` instantiates `ACV_OutLine_LockCursor_Target` (dialog name at `0x820c35f0`, call site `0x829d50ec`), so that rect is the dialog's authored 32×32, scaled by `LockSight+0x2c` and centred on the projected point. The four corner arms are the 128×64 wings' `CursorLine` sprites anchored on that rect; the enemy-sized frame over the target is a separate path: `0x825a2e90` (spot manager vtable `0x82046738` `+0x2c`, draw) looks up the target model with `FUN_824aab80` and sets the `ACV_SPOT_ACInfo` `Emblem` child (`0x82031a84`) rect to the model's screen width/height (model vtable `+0xc`/`+0x10`); the record also fills `ScanName` (`0x82046b04`) and `SquadNumber` (`0x82032560`) and projects through `0x82594b08`/`0x825940c8`. `hud.rs::LockBoxFrame` draws that rectangle from the target's projected mesh AABBs (bind pose; enemy meshes are `NoFrustumCulling`, so no Bevy `Aabb` — computed once per mesh handle and cached). The FCS remains live in Scan Mode: `AC + 0xdb0` is read by scan/control, not the `0x829d...` lock path, so `LOCK ON` and the enemy name stay visible while Scanning (matching the retail capture). `EnemyInfo` is a `Null` object in dialog 14 (no visible text). The retail `ACV_SPOT_ACInfo` emblem texture and `ScanName`/`SquadNumber` text are still not spawned; the frame is drawn as a thin border from the model bounds. Each wing now picks its own `LockColor1st`/`2nd` swatch from its candidate record (`0x829d19f0`) and the `ReloadBar` fills with clamp(`f32 +4`) (`0x829d1ac0`), not the weapon cooldown. The reference capture is the combat `ACV_LockSight_base` art (tick ring), not `ACV_ScanModeLockSight`. The two scan weapon panels are traced but not spawned: `ACV_Scan_Cur_EnemyWeaponInfo` (dialog 109 280×300, `0x829d3218` type 2 at `centerRect.x0 - 280s, centerRect.y1`; `EnemyWep0..4` are dialog 92 197×44 filled from the target struct `+8` count and `+0x20` array stride `0x1ac`: `WaponName +0`, `WeaponPlace +0x110`, `DamageType +0x15c`, `Damage +0x1a4`; `DamageType`/`Damage` hidden when damage `< 1`) and `ACV_Scan_Cur_WeaponInfo` (dialog 110 400×260, `0x829d3218` type 1 at `centerRect.x1, centerRect.y0 - 260s`; `ScanWeaponDlgItem0..4` are dialog 89 357×68, manager `0x825a60a0`/`0x825a5c90` over the five slots at `0x838c7fd0..0x838c7fe4`, 6×`0xc0` records, layout `0x825a49c0`). Normal-mode (Combat Mode) lock acquisition is now traced from the raw lock script: every candidate is accepted on the outer `sight + 2°` cone (bit 0 of `0x829d8850`; `0x829d8d58` accepts that bit alone and uses bit 1 only to mark the inner sight), `0x8287c560` records each candidate's 3D distance and `0x82876b40` keeps the current target while the slot tracker state is 2, re-feeding the candidate list only when it is not (`FUN_82877320`), so selection is nearest-distance with a sticky current target, and the old per-frame 0.85 keep-current bias is gone; the outer `+2°` cone is the hysteresis. Still open for exact 1:1: the shelter LOS sub-branch (`0x829d8d58` when lock-context `+0x124 != 0` and candidate `+0x18 == 0`, via `0x829e9380`/`0x829e87c8`/`0x829e8810`, with the range cap only when flag bit 2 is set). The mesh-AABB enemy frame is implemented and verified (`cargo check`, 264 tests, audit) but left uncommitted because `hud.rs` also carries unrelated uncommitted HUD work.
-- **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics, range-decay, shoulder weapons & homing missiles, melee blades / heat piles / Boost Charge Kick, arm firing-stability reload scaling, weapon arms, sub-munition split missiles, Overed Weapons, and hand-weapon firing modes done; see Done):
+- **FCS / lock-on leftovers**: terrain line-of-sight occlusion (`LockCheckRay` `0x829c5f20`). Core Lock-on / FCS, secondary lock-on timer, lead prediction, multi-target missile lock (`missile_lock_max`, `missileLockEffectiveRate`), the per-enemy target lock-on HUD cursor (one four-wing `_E`/`_T`/`_L`/`_R` group per enemy in the FCS cone, up to 8, each wing placing its authored 128Ã—64 corner dialog on the distance-scaled 32Ã—32 target rect; text/bars/pips only on the FCS-selected target, `MissileLock1..6`), and Scan Mode / Target Scan / Recon Units (`ACV_ScanModeLockSight`, `ACV_Scan_Cur_EnemyParamInfo`, `ACV_MapScan_ReconInfo*`) are now in (see Done). Retail lock-cursor appearance/rule confirmed from the build instead of a sortie capture: `sortie.drb` authors every element (`LockOnText` msg 2313, `MissileLock1..6`, `EnemyName`/`EnemyAP`, and the 32x32 `_Target` with `LockColor1st` `0x006680ff` / `LockColor2nd` `0xff4000ff`); `0x829d4a90` bakes those color defaults and `0x829d4b88` overrides them from the dialog's named colors. `0x829d4558` -> `0x829d30e0` draws each wing only when the candidate's `+0` lock flag or `i16 +2` missile-lock count is set and `+1` or `f32 +4` >= 1.0; `0x829d1a10` shows `MissileLock1..n` from `i16 +2`, `0x829d1ac0` fills `ReloadBar` from `f32 +4` while `CursorLine` stays at full fill. The Xenia runs drew no cursor because the tanks sat outside the FCS sight cone (aim), not because of a missing code path; the 32Ã—32 `_Target` is only the `LockColor1st`/`LockColor2nd` source (never painted), and its 1st/2nd selection is read through that candidate state. `0x829d3b38` builds the box from `rectOf(group+4)`; `0x829d4dd8` -> `0x824ab278` instantiates `ACV_OutLine_LockCursor_Target` (dialog name at `0x820c35f0`, call site `0x829d50ec`), so that rect is the dialog's authored 32Ã—32, scaled by `LockSight+0x2c` and centred on the projected point. The four corner arms are the 128Ã—64 wings' `CursorLine` sprites anchored on that rect; the enemy-sized frame over the target is a separate path: `0x825a2e90` (spot manager vtable `0x82046738` `+0x2c`, draw) looks up the target model with `FUN_824aab80` and sets the `ACV_SPOT_ACInfo` `Emblem` child (`0x82031a84`) rect to the model's screen width/height (model vtable `+0xc`/`+0x10`); the record also fills `ScanName` (`0x82046b04`) and `SquadNumber` (`0x82032560`) and projects through `0x82594b08`/`0x825940c8`. `hud.rs::LockBoxFrame` draws that rectangle from the target's projected mesh AABBs (bind pose; enemy meshes are `NoFrustumCulling`, so no Bevy `Aabb` â€” computed once per mesh handle and cached). The FCS remains live in Scan Mode: `AC + 0xdb0` is read by scan/control, not the `0x829d...` lock path, so `LOCK ON` and the enemy name stay visible while Scanning (matching the retail capture). `EnemyInfo` is a `Null` object in dialog 14 (no visible text). The retail `ACV_SPOT_ACInfo` emblem texture and `ScanName`/`SquadNumber` text are still not spawned; the frame is drawn as a thin border from the model bounds. Each wing now picks its own `LockColor1st`/`2nd` swatch from its candidate record (`0x829d19f0`) and the `ReloadBar` fills with clamp(`f32 +4`) (`0x829d1ac0`), not the weapon cooldown. The reference capture is the combat `ACV_LockSight_base` art (tick ring), not `ACV_ScanModeLockSight`. The two scan weapon panels are traced but not spawned: `ACV_Scan_Cur_EnemyWeaponInfo` (dialog 109 280Ã—300, `0x829d3218` type 2 at `centerRect.x0 - 280s, centerRect.y1`; `EnemyWep0..4` are dialog 92 197Ã—44 filled from the target struct `+8` count and `+0x20` array stride `0x1ac`: `WaponName +0`, `WeaponPlace +0x110`, `DamageType +0x15c`, `Damage +0x1a4`; `DamageType`/`Damage` hidden when damage `< 1`) and `ACV_Scan_Cur_WeaponInfo` (dialog 110 400Ã—260, `0x829d3218` type 1 at `centerRect.x1, centerRect.y0 - 260s`; `ScanWeaponDlgItem0..4` are dialog 89 357Ã—68, manager `0x825a60a0`/`0x825a5c90` over the five slots at `0x838c7fd0..0x838c7fe4`, 6Ã—`0xc0` records, layout `0x825a49c0`). Normal-mode (Combat Mode) lock acquisition is now traced from the raw lock script: every candidate is accepted on the outer `sight + 2Â°` cone (bit 0 of `0x829d8850`; `0x829d8d58` accepts that bit alone and uses bit 1 only to mark the inner sight), `0x8287c560` records each candidate's 3D distance and `0x82876b40` keeps the current target while the slot tracker state is 2, re-feeding the candidate list only when it is not (`FUN_82877320`), so selection is nearest-distance with a sticky current target, and the old per-frame 0.85 keep-current bias is gone; the outer `+2Â°` cone is the hysteresis. Still open for exact 1:1: the shelter LOS sub-branch (`0x829d8d58` when lock-context `+0x124 != 0` and candidate `+0x18 == 0`, via `0x829e9380`/`0x829e87c8`/`0x829e8810`, with the range cap only when flag bit 2 is set). The mesh-AABB enemy frame is implemented and verified (`cargo check`, 264 tests, audit) but left uncommitted because `hud.rs` also carries unrelated uncommitted HUD work.
+- **Weapons leftovers** (hand-weapon tracers, bullet units, ballistics, range-decay, shoulder weapons & homing missiles, melee blades / heat piles / Boost Charge Kick, arm firing-stability reload scaling, sub-munition split missiles, Overed Weapons, and hand-weapon firing modes done; see Done):
   - Bay shift & purge are up to 360 parity (`acvd-game::bay`, `hanger`, `pose`, `sfx`, `sound`, `sheets/ac_states.csv`, `sheets/hanger_anim.csv`, `sheets/sound_cues.csv`, see Done): per-arm overlay (`r_kata`/`l_kata`), explicit TAE `2000..2003` / `2010..2013` (sparks FFX `4109`, steam puff FFX `98` at scale `1.5`, sounds `c00000047` / `c00000045`, `kind=101` Reattach at f40/f150, `kind=102` Purge at f10), dual-prong rack carousel (`a00_011`/`a00_021` + `r_hg_f`/`r_hg_b`), and dynamic `hanger_pose` updates.
   - Not done: core aim for weapon fire (shots follow the
-    camera pitch, not a posed upper body). OW `motion_ow_equip` body animation bank switching (`0x8284e9d8`), dynamic re-attachment of OW root `60` onto arm dummy `60` (`acattachinfo` record 1) during deployment, Overed Weapons (`acvparts` cat-11 `110..6010`, `OwCtrl` `0x82885c40..0x82886948`, `ACV_OWLockSight` / `ACV_OW_ErrorLog`), hand-weapon firing modes (full-auto, simultaneous multi-pellet spread, sequential multi-round burst, hold-to-charge / release-to-fire `0x82475b00` / `0x8247d6e0`), arm firing-stability & attack-balance reload scaling (`0x8286bd00` / `0x8286adf8`), weapon arms (`acvparts` cat-2 `+0x13c == 1` / `+0xf4` -> cat-10 `9020..9620`), sub-munition split missiles (`close_act_id == 8` / `shoot_bullet_id` -> `BULLET_BULLETARISE_BIN`), energy weapon per-shot EN drain (`en_drain`,
+    camera pitch, not a posed upper body). OW `motion_ow_equip` body animation bank switching (`0x8284e9d8`), dynamic re-attachment of OW root `60` onto arm dummy `60` (`acattachinfo` record 1) during deployment, Overed Weapons (`acvparts` cat-11 `110..6010`, `OwCtrl` `0x82885c40..0x82886948`, `ACV_OWLockSight` / `ACV_OW_ErrorLog`), hand-weapon firing modes (full-auto, simultaneous multi-pellet spread, sequential multi-round burst, hold-to-charge / release-to-fire `0x82475b00` / `0x8247d6e0`), arm firing-stability & attack-balance reload scaling (`0x8286bd00` / `0x8286adf8`), sub-munition split missiles (`close_act_id == 8` / `shoot_bullet_id` -> `BULLET_BULLETARISE_BIN`), energy weapon per-shot EN drain (`en_drain`,
     `0x828a1820`), shoulder weapons & homing missiles (`bulletmissile`), melee blades & heat piles (`bulletblade`), Boost Charge Kick (`KickState`), and target hit shapes / defense mitigation are now wired. The lock-sight HUD shows AP, live energy, the
     `AlphaAnimSprite` gauges, hand-weapon / weapon-arm ammo counts, shoulder-weapon ammo (`SWep*` / `Gauge_SWeapon`), and OW lock-sight / overload error banners (`acvd-game::hud`).
+  - **Weapon-arm flow is implemented and its muzzle/cartridge FX are verified (2026-11-27).** ACVD keeps
+    normal L/R hand weapons when a cat-2 weapon arm is equipped; only L/R Bay/Hanger, Shoulder and
+    Overed are disabled. `Stowed` (`base+0`) = hands active; `Deployed` (`base+1`) = built-in
+    cat-10 weapon active; `Deploying` (`base+4`) / `Stowing` (`base+5`) lock both. Deployment is
+    an explicit Weapon Switch/Bay Swap edge: `0x828488b8` writes `this+4=1` and calls
+    `0x8289db50`; `0x828488e0` writes `0` and calls `0x8289dbc8`. `0x8289d990` is the fire
+    lockout predicate. Transition blend lengths are `0x82882c90` (`+0xc` deploy) and
+    `0x82882cc0` (`+0x10` stow), both through `0x82330c38(_, 0x10)`; they are not clip
+    frame steps (see the timing bullet below). Weapon arms never take the kneeling stance lock.
+    - **Implemented:** separate sim/game `weapon_arm_gun`; normal hand guns retained; explicit
+      toggle state machine (no auto-deploy; Scan Mode stows); one shared fixed 60 Hz clock in
+      sortie and Garage View; hands fire only while stowed and built-in only while deployed;
+      garage/assemble block only bays/shoulder/Overed; a weapon arm never spawns hanger racks
+      (`am7420`/the Core have no dummies `80`/`81`, and design 6009 has `hanger_r/l=0`), so the
+      hand weapons stay in their authored hand sockets and play their own `a00_003` fold /
+      `a00_001` open clips; FCS/HUD arm gating. Verification-only `--test-weapon-switch` and
+      `--test-weapon-switch-stow` inject real switch edges.
+    - **Timing/clip fix (2026-11-27, uncommitted pending live check):** the 360 request
+      builder `0x82882a78` stores `f1` at request `+8`, `f2` at `+0xc`, `f3` at `+0x10`.
+      The values `10.0`/`80.0` (`param/acanimparam.bin` #3/#4, read by `0x82882c90` /
+      `0x82882cc0`, called by `0x82883198` / `0x82883228`) are **transition/crossfade
+      lengths**, not playback speed: `0x82c41d30` copies `+8` to slot `+0x5c`, and
+      `0x82cab170` accumulates slot `+0x60` until `+0x5c` while advancing a 60 Hz weight.
+      `0x82852af8` does not read request `+8`.
+      - True clip advance: `0x82852408` multiplies `dt * clip_speed(+0x68) *
+        request_speed(+0x44)` and passes it to `0x8289a928`, which advances by
+        `delta * 60`. `0x82c41d30` writes `f3` to `+0x44`; `0x82882fa8` loads
+        `f3 = 0x82000fc4` (1.0) and `f2 = 0x82000fc0` (-1.0) before `0x82882d28`
+        (`0x82882fc4`/`0x82882fc8`), and the generic `0x82882ad0`/`0x82882b58`
+        builders also pass `f3 = 1.0`. `0x82c425f0` initializes `+0x68` to `1.0`.
+        Therefore the 360 frame step is **one clip frame per 60 Hz tick**, not 10/80
+        per tick. (The old `30.0` note at
+        `0x8210a498` belongs to `0x82882ad0`/`0x82882b58`, which are not the deploy/stow
+        requests `0x82883198`/`0x82883228`; both of those use `10.0`.)
+      - New wall-clock durations at the traced 1 frame/60 Hz step (same for deploy and
+        stow): `am7110..7140` **290/60 = 4.833 s**, `am7020`/`am7420` and most others
+        **300/60 = 5.000 s**, `am7510..7540` **320/60 = 5.333 s**. The old build produced
+        290 = 0.967 s, 300 = 1.000 s, 320 = 1.067 s deploy, and every 300-frame stow
+        finished in 8 ticks (0.133 s) because it treated `80.0` as a frame step.
+      - The raw `10.0`/`80.0` now only describe the crossfade: `10/60 = 0.167 s` deploy,
+        `80/60 = 1.333 s` stow. The wire `weapon_arm_ticks` is a `u8`; it now carries
+        **30 Hz** ticks (150 for a 300-frame transition), expanded back to 60 Hz frames by
+        `apply_replicated`.
+      - Dumped lengths: `am7110..7140` = **290**, `am7020`/`am7420` and most others =
+        **300**, `am7510..7540` = **320**; all four leg bases (0/10/20/30) match within a
+        part. `WeaponArmState` carries the part length and both sim/game `Armament`s use
+        `WeaponArmState::for_part`.
+      - `WeaponArmRig::sync_state` now enters Deployed on `a00_001`'s last frame (`a00_004`
+        ends there) and runs the settle once; Garage View uses the same 60 Hz accumulator.
+        Tests: `weapon_arm_accumulator_is_frame_rate_independent` (dt 1/60, 1/144, 1/240),
+        `garage_weapon_arm_tick_is_frame_rate_independent`, and
+        `weapon_arm_clip_lengths_match_the_dumped_arm_binders`.
+    - **Weapon-arm SFX (2026-11-27, same uncommitted batch):** the deploy/stow TAE sound
+      events are **kind 204** (`0x8284b690`, `own007420.tae` anim 4/5 params `[1,0x38]` /
+      `[1,0x39]`), not kind 1. `tae::KIND_SOUND_VARIANT` now maps them to
+      `c00000056`/`c00000057`; kind 1 `10:50`/`11:50` is a part-animation selector and is
+      no longer misread as `c050`/`c051`. Per-part deploy/stow cues: `am7020`
+      `c00000036`/`37`, `am7110..7140` `38`/`39`, `am7210/7220` `83`/`84`, `am7230`
+      `43`/`44`, `am7310/7320` `49`/`55`, `am7410/7420` `56`/`57`, `am7510..7540`
+      `71`/`72`, `am7610/7620` `77`/`78`. Bay shift/purge remain `c00000047`/`45` via the
+      arm-layer TAE; normal `sound::motion` already dispatches those. Test
+      `weapon_arm_and_bay_shift_sfx_resolve_real_samples` loads the FEV banks and asserts
+      decoded `AudioSource` handles for all of them; the deploy test also asserts
+      `c00000056` is emitted at frame 0.
+    - **Stowed hand-arm raise/aim (2026-11-27, same uncommitted batch):** while the
+      weapon arm was `Stowed`, `WeaponArmRig::apply` still overwrote the main
+      `*_armroot`/`*_arm01..*_armhand` chain with the folded `base+0` clip, and
+      `pose::build` had excluded that chain from the body clip for every equipped
+      weapon arm. The stowed rig now writes only the folded weapon-unit bones
+      (`*_armwepunit_*` / `*_armwepunitp_*`); the main chain stays on the body
+      `acmotion` clip, and `WeaponAnims::load` hooks the `gun_$(LR)` `_arm01`
+      shoulder/recoil controls for the retained hand weapons. `weapons::fire` is
+      explicitly ordered after `pose::animate`, and the weapon-arm aim and
+      ready/sniper body stance now run only while `phase != Stowed`; when stowed
+      the ordinary hand-weapon aim/recoil path runs once, not twice. While the arm is
+      out, `hand_aim_enabled` gates the hand-weapon raise off and `clear_hand_aim`
+      drops any held aim/kick so returning to `Stowed` cannot resume a raised pose.
+      Tests: `pose::tests::weapon_arm_unit_bones_stay_out_of_body_clip_but_main_arm_chain_does_not`,
+      `weapons::tests::stowed_weapon_arm_keeps_hand_arm_raise_and_aim` (synthetic
+      body pose + right-hand `arm01` aim turn, main chain untouched),
+      `weapons::tests::hand_aim_runs_only_while_the_weapon_arm_is_stowed`, and
+      `weapons::tests::clearing_hand_aim_keeps_the_joint_spec_and_drops_stale_motion`.
+    - **Hand-weapon fold & transition SFX (2026-11-27 live-test round 2, same uncommitted batch):**
+      the deploy TAE `a00_004` kind-1 `[11,50]`/`[10,50]` at frame 80 and stow `a00_005`
+      `[11,51]`/`[10,51]` at frame 100 select the hanger rack clips, but a weapon-arm design has
+      no rack: `am7420` and the Core expose no dummies `80`/`81`, design 6009 has
+      `hanger_r/l=0`, and `am7420_m` contains only the weapon-unit/arm chain. The actual hand
+      transition is `0x8289db50` (deploy), which calls `0x82853660` for hand slots `0xa`/`0xb`;
+      `0x82853660` -> `0x828535e0` -> `0x828525e8`/`0x82851ee8` only drives the hand weapon's
+      own animation slot, with no reparent, hide, or rack. The hand binders
+      (`hr1150`/`hl7020`) ship `a00_000/001/002/003`, so
+      `WeaponAnims::sync_weapon_arm_hand_weapons` plays `a00_003` when the arm starts deploying
+      and `a00_001` when it returns to `Stowed`; the synthetic `bay::WeaponArmStow` /
+      `CoreBackRack` path is removed. Test:
+      `weapons::tests::weapon_arm_folds_and_reopens_hand_weapon_clips_in_place`.
+      Transition SFX are one-shot FEV events (`SoundRef::loop_count=1`, flags 0), not sustained
+      to the TAE `end_frame`: c00000056 3.024 s, c00000057 1.988 s, c00000047 2.873 s,
+      c00000045 0.737 s. `0x8284b690` -> `0x8284a040` -> `0x82854060` has no emitter position,
+      so `play_weapon_arm_tae` now uses 2D `sound::cue` (the old `cue_at` distance gain faded
+      the servo as the moving arm point left the listener); `sound::motion` also plays the
+      bay-shift/purge `c00000047`/`c00000045` cues 2D for the same reason, while other
+      locomotion TAE sounds keep their pilot-position rolloff. The build queues the equipped
+      deploy/stow and bay cues in `sound::PreloadCues` so their first XMA decode happens before
+      the switch frame. Tests:
+      `weapons::tests::weapon_arm_deploy_stow_sound_spans_are_exact` (start 0/end 3, exact
+      cues) and `sound::tests::weapon_arm_and_bay_shift_transition_voices_play_full_samples`
+      (authored durations + non-looping one-shot). The deploy test now counts c00000056 and
+      c00000057 exactly once across the full 300-frame deploy/stow timelines.
+    - **Vendetta blade (`am7020`) fix:** `a00_004` is 300 frames/52 bones; `a00_006` is the
+      40-frame attack clip. `l/r_armwepunit_06` stores a 180-degree quaternion as `-1` at f92
+      and `+1` at f93 (w=0); linear xyz interpolation passed through identity at f92.5, snapping
+      the hinge. `ani::Track::rotation` now canonicalizes the next key/tangents into the same
+      hemisphere and nlerps when the dot is negative. Deterministic test
+      `melee_weapon_arm_7020_deploy_clip_is_continuous` samples both hinge bones at 0.5-frame
+      steps and asserts the deploy end matches `a00_001`'s last pose.
+    - **Mappings:** `sheets/weapon_arm_sfx.csv` covers all 18 actual models (`7020..7620`) with
+      cat-10 `WEAPONSFX_PARAM_ST` fields and model dummy sets. `0x8288a1f0` registers every
+      existing dummy in a range; `0x8288e9f8` uses `0x65..0xff` + `0xb4..0xff`, and
+      `0x8288f280` adds `111`/`101`. `0x82893ec0` is the generic part-effect slot builder
+      (it copies the part's ten `u16` ids and builds records whose selectors `0x1f..0x22` are
+      the generic group dummies `31..34`, as used by boosters); it is not the weapon-arm
+      muzzle/cartridge path. Weapon-arm fire uses the `WEAPONSFX_PARAM_ST` fields and the
+      `101`/`111` dummy ranges above, so no selector reconciliation is needed.
+    - **Verified:** the old mid-deploy `6009`/`am7420` capture used the removed synthetic rack
+      path. The deterministic hand-weapon test now loads design 6009's `armwep_r` binder and
+      asserts `a00_003` starts on deploy, advances to its authored end pose, and `a00_001`
+      restarts on `Stowed` (`weapons::tests::weapon_arm_folds_and_reopens_hand_weapon_clips_in_place`).
+      The deterministic tick-by-tick test (`weapon_arm_deploy_tae_emits_f0_f20_and_steps_phases`)
+      asserts the switch enters `Deploying` at frame `0` with no event on that request tick,
+      the next 60 Hz tick at frame `1` emits `4109` plus `c00000056`, frame `20` emits `98`
+      on dummies `201/202`, `Deployed` after `279` more ticks, `Ready`/`Firing`, and return
+      to `Deployed`. Full workspace tests pass (`acvd-game` 246 / `acvd-sim` 53 /
+      `acvd-formats` 84, plus the other workspace crates); `tools/check-headless.ps1` PASS
+      (`acvd-sim`/`acvd-server` free of render/runtime deps) and `acvd-index audit` reports
+      `1967` cited / `0` mismatches / `0` slot mismatches / `0` PS3. The change remains
+      uncommitted pending the final live look at the folded hand weapons.
+    - **FX mapping and draw:** action 95 is an empty 64-slot container; muzzle visuals live in
+      the effect-level `params1` node `2117` (five camera-distance LOD children, thresholds
+      `[3,100,1000,10000]`), while `f1269`'s cartridge root is state-0 node `2118` (thresholds
+      `[150,99999999,99999999,99999999]`). The loader now chains `params1` roots with the first
+      state's actions and resolves the LOD child from camera distance at spawn. Deployed
+      `6009`/`am7420` telemetry then shows `active_sfx f722` at both muzzles with
+      `nodes=4`, `particles=5`, `drawn=1` at age `0.63`, and `active_sfx f1269` with
+      `nodes=4`, `spawners=1`, `spawned=1`, `particles=13..63`, `drawn=1..2`
+      (`private/shots/wa_deployed_final_6009.png`, `private/tmp/wa_deployed_final.log`;
+      final state `phase=4`, `frame=39`, `arm_ammo=152`, `total_active_sfx=58`).
+      The part-local deploy/stow TAE is verified by the deterministic test above (parts
+      `own007420.tae` anims 4/5, FFX `4109`/`98` and kind-204 sounds `c00000056`/`57`).
+      Kind 1 `10:50`/`11:50` is a part-animation selector, not a sound. `am7020`'s
+      `a00_006` 40-frame attack clip is wired and the body reaches `BladePhase::Swing`, but
+      `own007020.tae` anim 6 has no FFX and the canonical 360 base+6 selector is unproven.
   - Firing clips: `ready_position` (+0x153) and `weapon_kind` (+0x0f) are on the sheet. The
     arm clip request is `AimArm` `0x8284a570` -> `0x8289e808` -> `0x82882ad0` (clip 1) for a held
     hand weapon, and the shoulder-slot branch of the part shoot handler `0x8289de30`
@@ -524,7 +675,7 @@ in order:
     Shots wait until the deploy clip ends; that timing is the clip, not a TAE event.
     Ready weapons (`ready_position`: cannons, sniper cannons, the other heavy classes) play
     acmotion 78/75 while fire is held and 79/76 on release (`sheets/ac_states.csv`; the blend
-    rows are キャノン構え / キャノン解除, b_apply_lower 1). Sniper rifles (kind 5) do not. The arm
+    rows are ã‚­ãƒ£ãƒŽãƒ³æ§‹ãˆ / ã‚­ãƒ£ãƒŽãƒ³è§£é™¤, b_apply_lower 1). Sniper rifles (kind 5) do not. The arm
     clip only overrides the bones it animates (the `r_shoul_p*` / `l_shoul_p*` pads), so it
     does not plant the rest of the arm back on the clip bind: those tracks are two identical
     identity keys, and writing them was erasing acmotion 78's `r_arm01` pose. The arm's
@@ -540,16 +691,16 @@ in order:
     releases slot 1 with 120. The rewrite holds the aim 60 frames after fire is let go, blends
     the weight up over 10 and down over 60, and turns `*_arm01` (parent space, over the clip
     and under the kick) so the barrel (weapon root to muzzle point 101) lies along the aim,
-    clamped to that joint's LockMin/MaxX (85°). Ready-stance weapons are left to their body
+    clamped to that joint's LockMin/MaxX (85Â°). Ready-stance weapons are left to their body
     clip. Open: the hold timer inside the `+0x184` caller (no static call site found; probe
-    `0x828a2488 lr` next run), and the solver's TraceAng→LockAng posture blend on the lower
+    `0x828a2488 lr` next run), and the solver's TraceAngâ†’LockAng posture blend on the lower
     joints (`r_arm02..05`), not reproduced. Chain found statically: AC vtable
-    `0x82044fc0` +0x90 = `0x8284a570(unit, target point, f1 weight)` → `0x8289e808` →
-    `0x8289e468` → `0x8287f448` (activates the control with blend time from tuning record
-    `0x82330c38` index 0x10 field +4, via `0x82bf1778`) → `0x82befb98` → `0x82bef6e0`
+    `0x82044fc0` +0x90 = `0x8284a570(unit, target point, f1 weight)` â†’ `0x8289e808` â†’
+    `0x8289e468` â†’ `0x8287f448` (activates the control with blend time from tuning record
+    `0x82330c38` index 0x10 field +4, via `0x82bf1778`) â†’ `0x82befb98` â†’ `0x82bef6e0`
     (control +0x28 = weight, +0x2c = dt, per-object target at runtime +0x80). Solver
-    `0x82cb4d98`: base angle = TraceAng + (LockAng − TraceAng) × weight, then aimed at the target
-    within LockMin/Max X/Y at LimitRotAngVel 180°/s. Next: the virtual `+0x90` caller that
+    `0x82cb4d98`: base angle = TraceAng + (LockAng âˆ’ TraceAng) Ã— weight, then aimed at the target
+    within LockMin/Max X/Y at LimitRotAngVel 180Â°/s. Next: the virtual `+0x90` caller that
     computes the weight and the lower-after-idle timer.
     - **Restored 2026-11-25**: `bay` now keeps a persistent `Shift` resource, so the old
       `if body.shift.is_none()` gate skipped the whole aim/recoil block on every frame and the

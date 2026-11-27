@@ -14,7 +14,11 @@ use crate::names::{self, DexDef, NameSpec};
 
 /// Lowercase extension; DCX containers keep their inner extension (`.tpf.dcx`).
 pub(crate) fn ext_of(p: &Path) -> String {
-    let ext = |p: &Path| p.extension().map(|e| format!(".{}", e.to_string_lossy().to_ascii_lowercase())).unwrap_or_default();
+    let ext = |p: &Path| {
+        p.extension()
+            .map(|e| format!(".{}", e.to_string_lossy().to_ascii_lowercase()))
+            .unwrap_or_default()
+    };
     let outer = ext(p);
     if outer.is_empty() {
         return "(none)".into();
@@ -28,7 +32,10 @@ pub(crate) fn ext_of(p: &Path) -> String {
 }
 
 pub(crate) fn magic_of(head: &[u8]) -> String {
-    head.iter().take(4).map(|&c| if c.is_ascii_graphic() { c as char } else { '.' }).collect()
+    head.iter()
+        .take(4)
+        .map(|&c| if c.is_ascii_graphic() { c as char } else { '.' })
+        .collect()
 }
 
 /// `foo (2).bin` -> `foo.bin`, for the duplicate copies present in the dump.
@@ -36,7 +43,12 @@ pub(crate) fn dup_original(file: &str) -> Option<String> {
     let p = Path::new(file);
     let stem = p.file_stem()?.to_str()?;
     let base = stem.strip_suffix(')')?.rsplit_once(" (")?.0;
-    let name = format!("{base}{}", p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default());
+    let name = format!(
+        "{base}{}",
+        p.extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default()
+    );
     Some(match file.rsplit_once('/') {
         Some((dir, _)) => format!("{dir}/{name}"),
         None => name,
@@ -64,7 +76,9 @@ pub fn run(paths: &Paths, disc: &Disc) -> Result<()> {
         names::load_paramdex(&mut dex, game, &paths.paramdex(game))?;
     }
     if dex.is_empty() {
-        println!("extract: no Paramdex snapshot under external/paramdex (run tools/fetch-paramdex.ps1)");
+        println!(
+            "extract: no Paramdex snapshot under external/paramdex (run tools/fetch-paramdex.ps1)"
+        );
     }
 
     let mut inv = Inventory::default();
@@ -85,11 +99,18 @@ pub fn run(paths: &Paths, disc: &Disc) -> Result<()> {
         if ext == ".def" {
             let data = disc.read(file)?;
             match paramdef::read(&data) {
-                Ok(def) => defs.entry(def.param_type.clone()).or_default().push(DefEntry {
-                    file: file.clone(),
-                    stem: path.file_stem().unwrap().to_string_lossy().to_ascii_lowercase(),
-                    def,
-                }),
+                Ok(def) => defs
+                    .entry(def.param_type.clone())
+                    .or_default()
+                    .push(DefEntry {
+                        file: file.clone(),
+                        stem: path
+                            .file_stem()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_ascii_lowercase(),
+                        def,
+                    }),
                 Err(e) => inv.def_errors.push(format!("{file}: {e:#}")),
             }
         } else if param::looks_like_param(&head) {
@@ -100,7 +121,11 @@ pub fn run(paths: &Paths, disc: &Disc) -> Result<()> {
             let data = disc.read(file)?;
             if let Some(orig) = dup_original(file).filter(|o| disc.exists(o)) {
                 let identical = disc.read(&orig)? == data;
-                inv.duplicates.push(Duplicate { file: file.clone(), original: orig, identical });
+                inv.duplicates.push(Duplicate {
+                    file: file.clone(),
+                    original: orig,
+                    identical,
+                });
                 if identical {
                     continue;
                 }
@@ -115,37 +140,55 @@ pub fn run(paths: &Paths, disc: &Disc) -> Result<()> {
             let mut magics: Vec<_> = magics.into_iter().collect();
             magics.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             magics.truncate(6);
-            ExtensionCount { extension, files, bytes, magics }
+            ExtensionCount {
+                extension,
+                files,
+                bytes,
+                magics,
+            }
         })
         .collect();
 
     let def_type_of = |ty: &str| -> String {
-        aliases.iter().find(|a| a.param_type == ty).map(|a| a.def_type.clone()).unwrap_or_else(|| ty.to_owned())
+        aliases
+            .iter()
+            .find(|a| a.param_type == ty)
+            .map(|a| a.def_type.clone())
+            .unwrap_or_else(|| ty.to_owned())
     };
 
     let mut groups: BTreeMap<String, Vec<TableSheet>> = BTreeMap::new();
     let mut by_type: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
     for (path, data) in params {
-        let ty = param::read(&data).map(|p| p.param_type).unwrap_or_else(|_| "<unreadable>".into());
+        let ty = param::read(&data)
+            .map(|p| p.param_type)
+            .unwrap_or_else(|_| "<unreadable>".into());
         by_type.entry(ty).or_default().push((path, data));
     }
 
-    let used_defs: std::collections::HashSet<String> = by_type.keys().map(|t| def_type_of(t)).collect();
+    let used_defs: std::collections::HashSet<String> =
+        by_type.keys().map(|t| def_type_of(t)).collect();
     for (ty, entries) in &defs {
         if !used_defs.contains(ty) {
-            inv.unused_defs.extend(entries.iter().map(|d| d.file.clone()));
+            inv.unused_defs
+                .extend(entries.iter().map(|d| d.file.clone()));
         }
     }
 
     let mut total_rows = 0usize;
     for (ty, files) in by_type {
         let Some(def_entry) = defs.get(&def_type_of(&ty)).and_then(|v| v.first()) else {
-            inv.orphan_params.extend(files.iter().map(|(p, _)| format!("{p} ({ty})")));
+            inv.orphan_params
+                .extend(files.iter().map(|(p, _)| format!("{p} ({ty})")));
             continue;
         };
         let group = rules
             .iter()
-            .find(|r| def_entry.stem.starts_with(&r.def_prefix.to_ascii_lowercase()))
+            .find(|r| {
+                def_entry
+                    .stem
+                    .starts_with(&r.def_prefix.to_ascii_lowercase())
+            })
             .map(|r| r.group.clone())
             .unwrap_or_else(|| "_unassigned".into());
         let candidates: Vec<&DexDef> = [ty.clone(), def_entry.def.param_type.clone()]
@@ -169,7 +212,13 @@ pub fn run(paths: &Paths, disc: &Disc) -> Result<()> {
         std::fs::remove_dir_all(&json_dir)?;
     }
     for (group, tables) in &groups {
-        write_json(&json_dir.join(format!("{group}.json")), &GroupSheet { group: group.clone(), tables: tables.clone() })?;
+        write_json(
+            &json_dir.join(format!("{group}.json")),
+            &GroupSheet {
+                group: group.clone(),
+                tables: tables.clone(),
+            },
+        )?;
     }
     write_json(&json_dir.join("_inventory.json"), &inv)?;
 
@@ -188,7 +237,11 @@ pub fn run(paths: &Paths, disc: &Disc) -> Result<()> {
         a.dcx, a.binders, a.entries, a.textures, a.models, a.clips
     );
     let parts = ac_parts(paths, disc)?;
-    println!("extract: {} AC part records{}", parts.records.len(), parts.error.map(|e| format!(" ({e})")).unwrap_or_default());
+    println!(
+        "extract: {} AC part records{}",
+        parts.records.len(),
+        parts.error.map(|e| format!(" ({e})")).unwrap_or_default()
+    );
     let tuning = tuning(paths, disc)?;
     println!(
         "extract: {} tuning files, {} fields{}",
@@ -204,27 +257,54 @@ const PARAM_LIST: &str = "system/paramlist.xml";
 /// Text of every `<tag>` element in `xml`, in order.
 fn elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-    xml.split(&open).skip(1).filter_map(|s| s.split_once(&close).map(|(text, _)| text.trim())).collect()
+    xml.split(&open)
+        .skip(1)
+        .filter_map(|s| s.split_once(&close).map(|(text, _)| text.trim()))
+        .collect()
 }
 
 /// Every `<Resource>` of `system/paramlist.xml` with a `<Dbp>`: the debug-menu layout and the
 /// tuning binary it describes, decoded together.
 fn tuning(paths: &Paths, disc: &Disc) -> Result<TuningSheet> {
     let roots: Vec<TuningRootRow> = read_csv(&paths.sheets().join("tuning_roots.csv"))?;
-    let mut sheet = TuningSheet { source: PARAM_LIST.into(), ..Default::default() };
+    let mut sheet = TuningSheet {
+        source: PARAM_LIST.into(),
+        ..Default::default()
+    };
     let raw = disc.read(PARAM_LIST)?;
     let Some(body) = raw.strip_prefix(&[0xff, 0xfe]) else {
         sheet.error = Some("not UTF-16LE with a byte-order mark".into());
         write_json(&paths.tuning(), &sheet)?;
         return Ok(sheet);
     };
-    let units: Vec<u16> = body.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    let units: Vec<u16> = body
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
     let xml = String::from_utf16_lossy(&units);
     for resource in elements(&xml, "Resource") {
-        let (Some(bin), Some(dbp)) = (elements(resource, "Bin").first().copied(), elements(resource, "Dbp").first().copied()) else { continue };
+        let (Some(bin), Some(dbp)) = (
+            elements(resource, "Bin").first().copied(),
+            elements(resource, "Dbp").first().copied(),
+        ) else {
+            continue;
+        };
         let mut file = TuningFile {
-            name: bin.rsplit('\\').next().unwrap_or(bin).split('.').next().unwrap_or_default().to_owned(),
-            desc: elements(resource, "Desc").first().copied().unwrap_or_default().to_owned(),
+            name: bin
+                .rsplit('\\')
+                .next()
+                .unwrap_or(bin)
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+            desc: elements(resource, "Desc")
+                .first()
+                .copied()
+                .unwrap_or_default()
+                .to_owned(),
             ..Default::default()
         };
         let mut resolve = |p: &str| -> Option<String> {
@@ -235,14 +315,21 @@ fn tuning(paths: &Paths, disc: &Disc) -> Result<TuningSheet> {
             }
             let dir = root.directory.trim_start_matches('.').trim_matches('/');
             let rel = rest.replace('\\', "/").to_ascii_lowercase();
-            Some(if dir.is_empty() { rel } else { format!("{dir}/{rel}") })
+            Some(if dir.is_empty() {
+                rel
+            } else {
+                format!("{dir}/{rel}")
+            })
         };
         let (bin_path, dbp_path) = (resolve(bin), resolve(dbp));
         file.bin = bin_path.clone().unwrap_or_else(|| bin.to_owned());
         file.dbp = dbp_path.clone().unwrap_or_else(|| dbp.to_owned());
         let decoded = (|| -> Result<()> {
-            let (Some(bin_path), Some(dbp_path)) = (bin_path, dbp_path) else { anyhow::bail!("a path variable has no tuning_roots.csv row") };
-            let layout = acvd_formats::dbp::read(&disc.read(&dbp_path).with_context(|| dbp_path.clone())?)?;
+            let (Some(bin_path), Some(dbp_path)) = (bin_path, dbp_path) else {
+                anyhow::bail!("a path variable has no tuning_roots.csv row")
+            };
+            let layout =
+                acvd_formats::dbp::read(&disc.read(&dbp_path).with_context(|| dbp_path.clone())?)?;
             let data = disc.read(&bin_path).with_context(|| bin_path.clone())?;
             let values = layout.values(&data)?;
             let tail = &data[layout.bin_size()..];
@@ -278,11 +365,21 @@ fn tuning(paths: &Paths, disc: &Disc) -> Result<TuningSheet> {
 const AC_PARTS_FILE: &str = "param/acvparts.bin";
 
 fn ac_parts(paths: &Paths, disc: &Disc) -> Result<AcPartsSheet> {
-    let categories: Vec<AcPartCategoryRow> = read_csv(&paths.sheets().join("ac_part_categories.csv"))?;
+    let categories: Vec<AcPartCategoryRow> =
+        read_csv(&paths.sheets().join("ac_part_categories.csv"))?;
     let fields: Vec<AcPartFieldRow> = read_csv(&paths.sheets().join("ac_part_fields.csv"))?;
     let data = disc.read(AC_PARTS_FILE)?;
-    let size = |c: usize| categories.iter().find(|r| r.category == c).map(|r| r.record_size);
-    let mut sheet = AcPartsSheet { path: AC_PARTS_FILE.into(), size: data.len(), ..Default::default() };
+    let size = |c: usize| {
+        categories
+            .iter()
+            .find(|r| r.category == c)
+            .map(|r| r.record_size)
+    };
+    let mut sheet = AcPartsSheet {
+        path: AC_PARTS_FILE.into(),
+        size: data.len(),
+        ..Default::default()
+    };
     match acvd_formats::acv_parts::read(&data, size) {
         Ok(p) => {
             sheet.counts = p.counts.to_vec();
@@ -292,9 +389,22 @@ fn ac_parts(paths: &Paths, disc: &Disc) -> Result<AcPartsSheet> {
                 .records
                 .iter()
                 .map(|r| {
-                    let record = size(r.category).and_then(|n| data.get(r.offset..r.offset + n)).unwrap_or_default();
-                    let fields = fields.iter().filter(|f| f.category == r.category).filter_map(|f| Some((f.name.clone(), f.read(record)?))).collect();
-                    AcPartRow { category: r.category, index: r.index, offset: r.offset, id: r.id, model_id: r.model_id, fields }
+                    let record = size(r.category)
+                        .and_then(|n| data.get(r.offset..r.offset + n))
+                        .unwrap_or_default();
+                    let fields = fields
+                        .iter()
+                        .filter(|f| f.category == r.category)
+                        .filter_map(|f| Some((f.name.clone(), f.read(record)?)))
+                        .collect();
+                    AcPartRow {
+                        category: r.category,
+                        index: r.index,
+                        offset: r.offset,
+                        id: r.id,
+                        model_id: r.model_id,
+                        fields,
+                    }
                 })
                 .collect();
         }
@@ -309,9 +419,16 @@ fn dex_type_matches(dex_ty: &str, disc_ty: &str) -> bool {
 }
 
 /// First Paramdex def (ACVD, then ACV, then ACFA) whose field count and every field type equal the disc def.
-fn pick_dex<'a>(def: &paramdef::ParamDef, candidates: &[&'a DexDef]) -> (Option<&'a DexDef>, Option<String>) {
+fn pick_dex<'a>(
+    def: &paramdef::ParamDef,
+    candidates: &[&'a DexDef],
+) -> (Option<&'a DexDef>, Option<String>) {
     let fits = |d: &DexDef| {
-        d.fields.len() == def.fields.len() && d.fields.iter().zip(&def.fields).all(|(x, f)| dex_type_matches(&x.ty, &f.display_type))
+        d.fields.len() == def.fields.len()
+            && d.fields
+                .iter()
+                .zip(&def.fields)
+                .all(|(x, f)| dex_type_matches(&x.ty, &f.display_type))
     };
     match candidates.iter().find(|d| fits(d)) {
         Some(d) => (Some(*d), None),
@@ -322,12 +439,23 @@ fn pick_dex<'a>(def: &paramdef::ParamDef, candidates: &[&'a DexDef]) -> (Option<
                 .map(|d| format!("{} ({} fields)", d.source, d.fields.len()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            (None, Some(format!("no Paramdex def matches the disc layout ({} fields): {why}", def.fields.len())))
+            (
+                None,
+                Some(format!(
+                    "no Paramdex def matches the disc layout ({} fields): {why}",
+                    def.fields.len()
+                )),
+            )
         }
     }
 }
 
-fn build_table(ty: &str, entry: &DefEntry, candidates: &[&DexDef], overrides: &[ColumnOverride]) -> TableSheet {
+fn build_table(
+    ty: &str,
+    entry: &DefEntry,
+    candidates: &[&DexDef],
+    overrides: &[ColumnOverride],
+) -> TableSheet {
     let def = &entry.def;
     let (dex, dex_mismatch) = pick_dex(def, candidates);
     let dex_fields = dex.map(|d| &d.fields);
@@ -336,17 +464,26 @@ fn build_table(ty: &str, entry: &DefEntry, candidates: &[&DexDef], overrides: &[
         .fields
         .iter()
         .enumerate()
-        .filter(|(i, _)| !overrides.iter().any(|o| o.param_type == ty && o.index == *i && o.drop))
+        .filter(|(i, _)| {
+            !overrides
+                .iter()
+                .any(|o| o.param_type == ty && o.index == *i && o.drop)
+        })
         .map(|(i, f)| {
             let prim = Prim::parse(&f.display_type);
-            let ov = overrides.iter().find(|o| o.param_type == ty && o.index == i && !o.name.is_empty());
+            let ov = overrides
+                .iter()
+                .find(|o| o.param_type == ty && o.index == i && !o.name.is_empty());
             let disc = f.internal_name.as_deref().and_then(names::parse_name);
             let dexf = dex_fields.and_then(|d| d.get(i));
             let (spec, source): (Option<NameSpec>, Option<&str>) = if let Some(o) = ov {
-                (names::parse_name(&o.name).map(|mut s| {
-                    s.bits = o.bits.or(s.bits);
-                    s
-                }), Some("sheet"))
+                (
+                    names::parse_name(&o.name).map(|mut s| {
+                        s.bits = o.bits.or(s.bits);
+                        s
+                    }),
+                    Some("sheet"),
+                )
             } else if let Some(d) = disc.clone() {
                 (Some(d), Some("disc"))
             } else if let Some(d) = dexf {
@@ -366,9 +503,17 @@ fn build_table(ty: &str, entry: &DefEntry, candidates: &[&DexDef], overrides: &[
                 Some(p) => {
                     let by_bytes = (f.byte_count.max(0) as usize) / p.size();
                     if !(f.byte_count as usize).is_multiple_of(p.size()) {
-                        problem = Some(format!("byte_count {} not a multiple of {}", f.byte_count, p.name()));
+                        problem = Some(format!(
+                            "byte_count {} not a multiple of {}",
+                            f.byte_count,
+                            p.name()
+                        ));
                     }
-                    if let Some(c) = spec.as_ref().and_then(|s| s.count).filter(|&c| c != by_bytes) {
+                    if let Some(c) = spec
+                        .as_ref()
+                        .and_then(|s| s.count)
+                        .filter(|&c| c != by_bytes)
+                    {
                         problem = Some(format!("name says [{c}] but byte_count gives {by_bytes}"));
                     }
                     by_bytes
@@ -384,7 +529,8 @@ fn build_table(ty: &str, entry: &DefEntry, candidates: &[&DexDef], overrides: &[
                 bits,
                 offset: None,
                 bit_offset: None,
-                enum_type: (f.internal_type != f.display_type && !f.internal_type.is_empty()).then(|| f.internal_type.clone()),
+                enum_type: (f.internal_type != f.display_type && !f.internal_type.is_empty())
+                    .then(|| f.internal_type.clone()),
                 display_name: f.display_name.clone(),
                 display_format: f.display_format.clone(),
                 default: f.default,
@@ -425,7 +571,13 @@ fn build_table(ty: &str, entry: &DefEntry, candidates: &[&DexDef], overrides: &[
 
 fn specs_from(cols: &[Column]) -> Option<Vec<ColumnSpec>> {
     cols.iter()
-        .map(|c| Some(ColumnSpec { prim: Prim::parse(c.prim.as_deref()?)?, count: c.count, bits: c.bits }))
+        .map(|c| {
+            Some(ColumnSpec {
+                prim: Prim::parse(c.prim.as_deref()?)?,
+                count: c.count,
+                bits: c.bits,
+            })
+        })
         .collect()
 }
 
@@ -435,36 +587,77 @@ fn specs_of(t: &TableSheet) -> Option<(Vec<ColumnSpec>, Vec<layout::Placement>, 
     Some((specs, placed, size))
 }
 
-fn decode_instance(file: &str, data: &[u8], specs: Option<&(Vec<ColumnSpec>, Vec<layout::Placement>, usize)>) -> Instance {
+fn decode_instance(
+    file: &str,
+    data: &[u8],
+    specs: Option<&(Vec<ColumnSpec>, Vec<layout::Placement>, usize)>,
+) -> Instance {
     let file = file.to_owned();
     let id = file.clone();
     let p = match param::read(data) {
         Ok(p) => p,
         Err(e) => {
-            return Instance { id, file, data_version: 0, flags: [0; 3], observed_stride: None, error: Some(format!("{e:#}")), rows: vec![] }
+            return Instance {
+                id,
+                file,
+                data_version: 0,
+                flags: [0; 3],
+                observed_stride: None,
+                error: Some(format!("{e:#}")),
+                rows: vec![],
+            }
         }
     };
     let rows = p
         .rows
         .iter()
         .map(|h| {
-            let decoded = specs.ok_or_else(|| anyhow::anyhow!("table layout unresolved")).and_then(|(s, placed, size)| {
-                let start = h.data_offset as usize;
-                let bytes = data.get(start..start + size).with_context(|| format!("row data {start:#x}+{size:#x} past end of file"))?;
-                let vals = layout::decode(s, placed, bytes)?;
-                let again = layout::encode(s, placed, *size, &vals)?;
-                if let Some(at) = again.iter().zip(bytes).position(|(a, b)| a != b) {
-                    anyhow::bail!("round-trip mismatch at row byte {at:#x}: disc {:02x}, sheet {:02x}", bytes[at], again[at]);
-                }
-                vals.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>().map_err(Into::into)
-            });
+            let decoded = specs
+                .ok_or_else(|| anyhow::anyhow!("table layout unresolved"))
+                .and_then(|(s, placed, size)| {
+                    let start = h.data_offset as usize;
+                    let bytes = data.get(start..start + size).with_context(|| {
+                        format!("row data {start:#x}+{size:#x} past end of file")
+                    })?;
+                    let vals = layout::decode(s, placed, bytes)?;
+                    let again = layout::encode(s, placed, *size, &vals)?;
+                    if let Some(at) = again.iter().zip(bytes).position(|(a, b)| a != b) {
+                        anyhow::bail!(
+                            "round-trip mismatch at row byte {at:#x}: disc {:02x}, sheet {:02x}",
+                            bytes[at],
+                            again[at]
+                        );
+                    }
+                    vals.iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(Into::into)
+                });
             match decoded {
-                Ok(v) => Row { id: h.id, name: h.name.clone(), values: Some(v), error: None },
-                Err(e) => Row { id: h.id, name: h.name.clone(), values: None, error: Some(format!("{e:#}")) },
+                Ok(v) => Row {
+                    id: h.id,
+                    name: h.name.clone(),
+                    values: Some(v),
+                    error: None,
+                },
+                Err(e) => Row {
+                    id: h.id,
+                    name: h.name.clone(),
+                    values: None,
+                    error: Some(format!("{e:#}")),
+                },
             }
         })
         .collect();
-    Instance { id, file, data_version: p.data_version, flags: p.flags, observed_stride: p.observed_stride(), error: None, rows }
+    Instance {
+        id,
+        file,
+        data_version: p.data_version,
+        flags: p.flags,
+        observed_stride: p.observed_stride(),
+        error: None,
+        rows,
+    }
 }
 
 pub fn cell(v: &serde_json::Value) -> String {
@@ -481,8 +674,21 @@ fn write_csvs(paths: &Paths, group: &str, t: &TableSheet) -> Result<()> {
     std::fs::create_dir_all(&schema)?;
     let mut w = csv::Writer::from_path(schema.join(format!("{}.csv", t.param_type)))?;
     w.write_record([
-        "index", "name", "name_source", "prim", "count", "bits", "offset", "bit_offset", "enum_type", "display_name", "default", "min", "max",
-        "description", "problem",
+        "index",
+        "name",
+        "name_source",
+        "prim",
+        "count",
+        "bits",
+        "offset",
+        "bit_offset",
+        "enum_type",
+        "display_name",
+        "default",
+        "min",
+        "max",
+        "description",
+        "problem",
     ])?;
     for c in &t.columns {
         let opt = |v: Option<String>| v.unwrap_or_default();
@@ -509,10 +715,14 @@ fn write_csvs(paths: &Paths, group: &str, t: &TableSheet) -> Result<()> {
     let dir = paths.private_sheets().join("csv").join(group);
     std::fs::create_dir_all(&dir)?;
     for inst in &t.instances {
-        let mut w = csv::Writer::from_path(dir.join(format!("{}.csv", inst.id.replace(['/', '\\'], "__"))))?;
-        let header = ["id".to_owned(), "name".to_owned()]
-            .into_iter()
-            .chain(t.columns.iter().map(|c| c.name.clone().unwrap_or_else(|| format!("#{}", c.index))));
+        let mut w = csv::Writer::from_path(
+            dir.join(format!("{}.csv", inst.id.replace(['/', '\\'], "__"))),
+        )?;
+        let header = ["id".to_owned(), "name".to_owned()].into_iter().chain(
+            t.columns
+                .iter()
+                .map(|c| c.name.clone().unwrap_or_else(|| format!("#{}", c.index))),
+        );
         w.write_record(header)?;
         for r in &inst.rows {
             let mut rec = vec![r.id.to_string(), r.name.clone()];

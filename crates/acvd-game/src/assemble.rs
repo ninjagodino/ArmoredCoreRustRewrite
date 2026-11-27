@@ -71,8 +71,14 @@ pub fn assemble<T>(slots: &[Slot<T>], design: &T) -> Assembly {
     let mut weapon_arm = false;
     for s in slots {
         // Weapon arms (`acvparts` cat-2 byte +0x13c == 1, 360 `0x824793c8` / `0x82457400` /
-        // `0x8288e218`) replace separate hand, hanger, and shoulder weapon slots.
-        if weapon_arm && matches!(s.name, "weapon_r" | "weapon_l" | "hanger_r" | "hanger_l" | "shoulder") {
+        // `0x8288e218`) replace only the hanger bays, shoulder unit, and Overed Weapon.
+        // Normal L/R hand weapons stay equipped and are active while the arm is stowed.
+        if weapon_arm
+            && matches!(
+                s.name,
+                "hanger_r" | "hanger_l" | "shoulder" | "overed_weapon"
+            )
+        {
             continue;
         }
         let id = (s.part)(design);
@@ -456,7 +462,10 @@ mod tests {
         use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
         use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
         let (mut hidden, mut mounted) = (0, 0);
-        for row in AC_ASSEMBLY_DESIGN_ST_FILES.iter().flat_map(|(_, r)| r.iter()) {
+        for row in AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, r)| r.iter())
+        {
             let built = assemble(AC_ASSEMBLY_DESIGN_ST_SLOTS, &row.data);
             let (Some(core), Some(booster)) = (
                 built.placements.iter().find(|p| p.column == "core"),
@@ -468,16 +477,27 @@ mod tests {
             let has = |root| booster.mounts.iter().any(|m| m.root == root);
             for root in ["l2_boost", "r2_boost"] {
                 assert_eq!(has(root), fronts, "design {} {root}", row.id);
-                assert_eq!(booster.hidden.contains(&root), !fronts, "design {} {root}", row.id);
+                assert_eq!(
+                    booster.hidden.contains(&root),
+                    !fronts,
+                    "design {} {root}",
+                    row.id
+                );
             }
             if fronts {
                 mounted += 1;
             } else {
                 hidden += 1;
-                println!("design {} core {} hides its front boosters", row.id, core.model.path);
+                println!(
+                    "design {} core {} hides its front boosters",
+                    row.id, core.model.path
+                );
             }
         }
-        assert!(hidden > 0 && mounted > 0, "hidden {hidden} mounted {mounted}");
+        assert!(
+            hidden > 0 && mounted > 0,
+            "hidden {hidden} mounted {mounted}"
+        );
     }
 
     #[test]
@@ -528,12 +548,15 @@ mod tests {
     }
 
     #[test]
-    fn weapon_arms_skip_separate_hand_and_hanger_slots() {
+    fn weapon_arms_keep_hand_slots_and_skip_hanger_shoulder_overed() {
         use acvd_data::generated::ac_unit::AC_ASSEMBLY_DESIGN_ST_FILES;
         use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
 
         let mut checked = 0;
-        for row in AC_ASSEMBLY_DESIGN_ST_FILES.iter().flat_map(|(_, r)| r.iter()) {
+        for row in AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, r)| r.iter())
+        {
             let is_wa = acvd_data::part_field(row.data.arms as i64, 2, "is_weapon_arm") != 0.0;
             if !is_wa {
                 continue;
@@ -553,16 +576,30 @@ mod tests {
                 .expect("arms placement");
             assert!(arms.mounts.iter().any(|m| m.root == "l_kata"));
             assert!(arms.mounts.iter().any(|m| m.root == "r_kata"));
-            for forbidden in ["armwep_r", "armwep_l", "hanger_r", "hanger_l", "rack_r", "rack_l"] {
+            for forbidden in ["hanger_r", "hanger_l", "rack_r", "rack_l", "back_r"] {
                 assert!(
                     !built.placements.iter().any(|p| p.column == forbidden),
                     "weapon-arm design {} must not mount {forbidden}",
                     row.id
                 );
             }
+            for (column, equipped) in [
+                ("armwep_r", row.data.armwep_r),
+                ("armwep_l", row.data.armwep_l),
+            ] {
+                assert_eq!(
+                    built.placements.iter().any(|p| p.column == column),
+                    equipped > 0,
+                    "weapon-arm design {} hand slot {column}",
+                    row.id
+                );
+            }
             checked += 1;
         }
-        assert!(checked >= 5, "expected weapon-arm designs on disc, checked {checked}");
+        assert!(
+            checked >= 5,
+            "expected weapon-arm designs on disc, checked {checked}"
+        );
     }
 
     #[test]
@@ -581,7 +618,10 @@ mod tests {
         use acvd_data::generated::assembly::AC_ASSEMBLY_DESIGN_ST_SLOTS;
 
         let mut checked = 0;
-        for row in AC_ASSEMBLY_DESIGN_ST_FILES.iter().flat_map(|(_, r)| r.iter()) {
+        for row in AC_ASSEMBLY_DESIGN_ST_FILES
+            .iter()
+            .flat_map(|(_, r)| r.iter())
+        {
             if row.data.back_r == 0 {
                 continue;
             }
@@ -618,6 +658,9 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked >= 4, "expected OW preset designs (9002/9003/9004/9999), checked {checked}");
+        assert!(
+            checked >= 4,
+            "expected OW preset designs (9002/9003/9004/9999), checked {checked}"
+        );
     }
 }

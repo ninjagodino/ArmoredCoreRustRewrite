@@ -136,19 +136,26 @@ impl ReconSpec {
         } else {
             0.0
         };
-        let (recon_type, effective_range, life_time_secs, gravity, brake, move_secs, brake_start_secs) =
-            match row {
-                Some(r) => (
-                    ReconType::from_raw(r.recon_type),
-                    f32::from(r.effective_range).max(1.0),
-                    (f32::from(r.life_time_frame) / TICK_RATE).max(1.0),
-                    r.gravity.max(0.0),
-                    r.brake.max(0.0),
-                    f32::from(r.move_frame) / TICK_RATE,
-                    f32::from(r.brake_start_frame) / TICK_RATE,
-                ),
-                None => (ReconType::Sticky, 100.0, 30.0, 0.6, 0.0, 0.0, 0.0),
-            };
+        let (
+            recon_type,
+            effective_range,
+            life_time_secs,
+            gravity,
+            brake,
+            move_secs,
+            brake_start_secs,
+        ) = match row {
+            Some(r) => (
+                ReconType::from_raw(r.recon_type),
+                f32::from(r.effective_range).max(1.0),
+                (f32::from(r.life_time_frame) / TICK_RATE).max(1.0),
+                r.gravity.max(0.0),
+                r.brake.max(0.0),
+                f32::from(r.move_frame) / TICK_RATE,
+                f32::from(r.brake_start_frame) / TICK_RATE,
+            ),
+            None => (ReconType::Sticky, 100.0, 30.0, 0.6, 0.0, 0.0, 0.0),
+        };
         Self {
             part_id,
             bullet_id,
@@ -230,7 +237,9 @@ impl ScanPortrait {
                 .filter(|&id| id > 0)?;
             return Some(Self::Emblem(emblem_id));
         }
-        let digits = model.strip_prefix('e').or_else(|| model.strip_prefix('E'))?;
+        let digits = model
+            .strip_prefix('e')
+            .or_else(|| model.strip_prefix('E'))?;
         let id = digits.parse::<u32>().ok()?;
         Some(Self::Enemy(id))
     }
@@ -336,13 +345,7 @@ pub struct ReconUnit {
 impl ReconUnit {
     /// Pure per-frame step of a deployed recon unit's flight/hover/follow motion and lifetime.
     /// Returns `false` once expired (`age_secs >= life_time_secs`).
-    pub fn step(
-        &mut self,
-        pos: &mut Vec3,
-        ac_pos: Vec3,
-        collision: &Collision,
-        dt: f32,
-    ) -> bool {
+    pub fn step(&mut self, pos: &mut Vec3, ac_pos: Vec3, collision: &Collision, dt: f32) -> bool {
         self.age_secs += dt;
         if self.age_secs >= self.life_time_secs {
             return false;
@@ -353,7 +356,8 @@ impl ReconUnit {
                     // `BulletReconSt.gravity` is in m/s per 60 Hz tick (same scale as rigid bullets).
                     self.velocity.y -= self.gravity * TICK_RATE * dt;
                     let next = *pos + self.velocity * dt;
-                    if let Some((_, hit, normal)) = collision.raycast(*pos, next, RayFilter::Bullet) {
+                    if let Some((_, hit, normal)) = collision.raycast(*pos, next, RayFilter::Bullet)
+                    {
                         *pos = hit + normal * 0.15;
                         self.velocity = Vec3::ZERO;
                         self.stuck = true;
@@ -533,7 +537,11 @@ pub fn update(
         );
         info!(
             "recon #{index} deployed (part {}, {:?}, range {:.0} m, life {:.1} s, rem {})",
-            spec.part_id, spec.recon_type, spec.effective_range, spec.life_time_secs, scan.recon_remaining
+            spec.part_id,
+            spec.recon_type,
+            spec.effective_range,
+            spec.life_time_secs,
+            scan.recon_remaining
         );
     }
 
@@ -596,20 +604,23 @@ pub fn update(
     let datum_back = pilot.ctrl.fcs_datum_back.max(0.0);
     let cur_entity = scan.candidate.as_ref().map(|c| c.entity);
 
-    let mut best: Option<(f32, Entity, String, String, Option<u16>, Vec3, f32, &TargetHealth)> = None;
+    let mut best: Option<(
+        f32,
+        Entity,
+        String,
+        String,
+        Option<u16>,
+        Vec3,
+        f32,
+        &TargetHealth,
+    )> = None;
     for (entity, target, health, t_tf) in &targets {
         if health.destroyed {
             continue;
         }
         let center = t_tf.translation + Vec3::Y * health.center_offset_y();
         let Some(ell) = fcs::in_lock_cone(
-            ac_pos,
-            aim_dir,
-            center,
-            scan_range,
-            scan_sight,
-            scan_sight,
-            datum_back,
+            ac_pos, aim_dir, center, scan_range, scan_sight, scan_sight, datum_back,
         ) else {
             continue;
         };
@@ -729,7 +740,10 @@ fn spawn_recon_entity(
                             garage.flat,
                             &mut missing,
                         );
-                        c.spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(materials.add(mat))));
+                        c.spawn((
+                            Mesh3d(meshes.add(m.mesh)),
+                            MeshMaterial3d(materials.add(mat)),
+                        ));
                     }
                 });
                 loaded_flver = true;
@@ -898,8 +912,16 @@ mod tests {
         assert!(pos.y <= 0.25 && pos.z < -5.0, "landed at {pos}");
 
         // Detection range check (270 m).
-        assert!(in_recon_range(pos, pos + Vec3::new(200.0, 0.0, 0.0), unit.effective_range));
-        assert!(!in_recon_range(pos, pos + Vec3::new(300.0, 0.0, 0.0), unit.effective_range));
+        assert!(in_recon_range(
+            pos,
+            pos + Vec3::new(200.0, 0.0, 0.0),
+            unit.effective_range
+        ));
+        assert!(!in_recon_range(
+            pos,
+            pos + Vec3::new(300.0, 0.0, 0.0),
+            unit.effective_range
+        ));
 
         // Lifetime expiry.
         assert!(!unit.step(&mut pos, Vec3::ZERO, &collision, 2.0));

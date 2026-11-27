@@ -739,7 +739,23 @@ pub(crate) fn probe_shot(
             )
         })
         .unwrap_or_else(|| "no_loadout".into());
-    let wep_arm = acs.single().map(|a| a.weapon_arm as u8).unwrap_or(9);
+    let wep_arm = acs
+        .single()
+        .map(|a| {
+            let hands_active = !a.weapon_arm
+                || a.weapon_arm_state.phase == acvd_sim::weapons::WeaponArmPhase::Stowed;
+            format!(
+                "{} phase={} frame={:.1} hands={} hand_ammo=[{},{}] arm_ammo={}",
+                a.weapon_arm as u8,
+                a.weapon_arm_state.phase.code(),
+                a.weapon_arm_state.frame,
+                hands_active as u8,
+                a.hands[0].remaining,
+                a.hands[1].remaining,
+                a.weapon_arm_gun.remaining
+            )
+        })
+        .unwrap_or_else(|_| "9".into());
     eprintln!(
         "SHOT {} bay {shift_info} {arm_info} {slots} wep_arm={wep_arm}",
         path.display()

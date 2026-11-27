@@ -277,6 +277,27 @@ maths is VMX128. The chain that answered it, in five runs of `ac_test.txt`:
 Pattern worth reusing: gate a hot per-draw probe on a once-per-pass probe so the first few
 hits are the draws you care about.
 
+## Comparing a guest shot with the rewrite
+
+A recipe `shot` is the visual reference. Capture the matching rewrite frame and diff the two
+instead of eyeballing:
+
+```powershell
+cargo run -p acvd-game -- --map m4000 --shot private\shots\check.png --wait 2
+cargo run -p acvd-shot -- diff private\xenia\shots\ac_test_start.png private\shots\check.png
+```
+
+`acvd-shot` resizes the candidate onto the reference canvas, reports mean error, over-threshold
+pixels, luma bias, gradient error and the worst tiles, and writes `<cand>_diff.png`,
+`<cand>_side.png` and `<cand>_compare.json`. It exits 1 when the defaults are exceeded, so it can
+gate a loop. Useful flags: `--crop X,Y,W,H` (detail), `--ignore X,Y,W,H` (HUD or a known-different
+region, repeatable), `--align N` (small camera offset), `--fit letterbox|crop` (aspect mismatch).
+`.\tools\shot-check.ps1 -Ref <ref.png> -Shot <out.png> -GameArgs '--map','m4000'` runs both steps.
+
+This is only the appearance check. Numeric values and layouts still come from the disc
+(`sheets/*.csv`, `acvd-index`), and menu/HUD ground truth is the DRB + TPF assets rendered by
+`acvd-menu`, not a screenshot.
+
 ## Known addresses
 
 | address | what | typical reads |
@@ -292,9 +313,9 @@ Device shader-constant shadow: `[[dev+0x384]+0x10]` + `0x780 + 16*n` is vertex c
 
 ## Generated caves (`tools/xenia-probe`)
 
-`tools/xenia-probe` generates a Xenia patch TOML with three leaf caves plus a fixed host ring
-(`0x83803400`, magic `AXPR`; header `0x70` bytes, data `+0x100`) and launches Xenia directly
-with `--apply_patches=true`. `run.ps1` also accepts `-ApplyPatches`; it stays off by default.
+`tools/xenia-probe` generates a Xenia patch TOML with up to four leaf caves (FFX, camera, map
+warp, and the optional loadout gate) plus a fixed host ring (`0x83803400`, magic `AXPR`; header
+`0x70` bytes, data `+0x100`) and launches Xenia directly with `--apply_patches=true`. `run.ps1` also accepts `-ApplyPatches`; it stays off by default.
 
 ```powershell
 # Static: PE hash, hook words, branch/cave ranges, patch shape. No Xenia.
@@ -326,6 +347,15 @@ py -3 tools\xenia-probe\xenia_probe.py --map m3120 --look-at o9341 --dump-ffx --
   The cave increments `warp_calls` / `warp_map` / `warp_msb` at header `0x60` / `0x64` /
   `0x68`. AC Test warp counters proved the string rewrite (`map=18`, `msb=4`), but the
   fallback mission itself is not playable.
+- **Loadout arm gate:** `--loadout-arm N` patches the arms slot only after the AC Test sortie
+  loader signals `0x825DCB68 actest_sortie_load`. The generated cave is gated by ring header
+  `+0x5C` (`0x8380345C`, boot word `0`, otherwise unused in non-warp mode); the host waits for
+  the probe label, then writes `1` with `WriteProcessMemory`. The cave is 304 B and rewrites
+  `0x824556F0` (`r3` = assembly, `r4` = slot, return descriptor at `+8`) to arm id `N`, mapping
+  `410 -> 7xxx` and suppressing category-10 slots. Do not combine `--loadout-arm` with
+  `--warp`/`--map` fallback warp; the gate deliberately shares the unused warp word and
+  `xenia_probe.py` rejects the combination. Verify without launching Xenia:
+  `py -3 tools\xenia-probe\xenia_probe.py --verify --loadout-arm 7420`.
 - **Animated look-at caveat:** `--look-at o9341` resolves its **MSB placement**
   (`o9341_1000` at `0,0,0`, `m3120_map.msb`). The m3120 bomber is TAE/ANI-animated (behavior
   `811` -> TAE `0x8c1` -> clip 221, speed 0.4): its root route starts ~24 km away at

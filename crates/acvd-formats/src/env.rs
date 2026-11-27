@@ -380,8 +380,8 @@ impl AcvAtmosphere {
     /// Applies the `0x8275e2c0` reorder and the `0x82b12930` monotonic fallback.
     pub fn runtime(&self) -> AcvAtmosphereRuntime {
         const DEFAULT: [f32; 17] = [
-            0.0, 150.0, 300.0, 500.0, 700.0, 0.0, 9999.0, -1.0, -0.1, 0.0, -0.0001, 0.0, 0.0,
-            0.0, 0.0, 1.0, 400.0,
+            0.0, 150.0, 300.0, 500.0, 700.0, 0.0, 9999.0, -1.0, -0.1, 0.0, -0.0001, 0.0, 0.0, 0.0,
+            0.0, 1.0, 400.0,
         ];
         let mut params = [
             self.head[0],
@@ -812,12 +812,7 @@ fn acv_lens_flare(r: &Be, s3: usize, len: usize) -> Result<LensFlare> {
     lens_flare_at(r, s3, len, ACV_LENS_FLARE)
 }
 
-fn lens_flare_at(
-    r: &Be,
-    s3: usize,
-    len: usize,
-    offsets: LensFlareOffsets,
-) -> Result<LensFlare> {
+fn lens_flare_at(r: &Be, s3: usize, len: usize, offsets: LensFlareOffsets) -> Result<LensFlare> {
     if s3 + offsets.dust + 4 > len {
         return Ok(LensFlare::default());
     }
@@ -887,7 +882,12 @@ fn lens_flare_at(
             tex_id: r.u32(p)? as i16,
             emitter_scale: r.f32(p + 4)?,
             emitter_depth_bias: r.f32(p + 8)?,
-            emitter_color: [r.u8(p + 0x0c)?, r.u8(p + 0x0d)?, r.u8(p + 0x0e)?, r.u8(p + 0x0f)?],
+            emitter_color: [
+                r.u8(p + 0x0c)?,
+                r.u8(p + 0x0d)?,
+                r.u8(p + 0x0e)?,
+                r.u8(p + 0x0f)?,
+            ],
             blur_params: [
                 r.f32(p + 0x10)?,
                 r.f32(p + 0x14)?,
@@ -897,7 +897,12 @@ fn lens_flare_at(
             merge_intensity: r.f32(p + 0x20)?,
             sample_mode: r.u16(p + 0x24)? as u8,
             merge_mode: r.u16(p + 0x26)? as u8,
-            merge_color: [r.u8(p + 0x28)?, r.u8(p + 0x29)?, r.u8(p + 0x2a)?, r.u8(p + 0x2b)?],
+            merge_color: [
+                r.u8(p + 0x28)?,
+                r.u8(p + 0x29)?,
+                r.u8(p + 0x2a)?,
+                r.u8(p + 0x2b)?,
+            ],
         }
     } else {
         GodRay::default()
@@ -909,7 +914,12 @@ fn lens_flare_at(
         LensDust {
             pos: [r.f32(p)?, r.f32(p + 4)?],
             size: [r.f32(p + 8)?, r.f32(p + 0x0c)?],
-            color: [r.u8(p + 0x10)?, r.u8(p + 0x11)?, r.u8(p + 0x12)?, r.u8(p + 0x13)?],
+            color: [
+                r.u8(p + 0x10)?,
+                r.u8(p + 0x11)?,
+                r.u8(p + 0x12)?,
+                r.u8(p + 0x13)?,
+            ],
         }
     } else {
         LensDust::default()
@@ -1204,11 +1214,9 @@ mod tests {
         data[f..f + 4].copy_from_slice(&1u32.to_be_bytes());
         data[f + 4..f + 8].copy_from_slice(&17.0f32.to_be_bytes());
         data[f + 8..f + 0xc].copy_from_slice(&29.0f32.to_be_bytes());
-        for (i, v) in [
-            255.0f32, 165.0, 115.0, 270.0, 154.0, 225.0, 255.0, 140.0,
-        ]
-        .into_iter()
-        .enumerate()
+        for (i, v) in [255.0f32, 165.0, 115.0, 270.0, 154.0, 225.0, 255.0, 140.0]
+            .into_iter()
+            .enumerate()
         {
             data[f + 0x0c + i * 4..f + 0x10 + i * 4].copy_from_slice(&v.to_be_bytes());
         }
@@ -1581,10 +1589,7 @@ mod tests {
         assert!(near(m0300_tm.key, 0.8));
         assert!(near(m0300_tm.white, 20.0));
         assert!(!m0300_tm.bloom.enabled);
-        assert_eq!(
-            env.acv_scenes[1].tonemap.mul,
-            env.acv_scenes[0].tonemap.mul
-        );
+        assert_eq!(env.acv_scenes[1].tonemap.mul, env.acv_scenes[0].tonemap.mul);
 
         // m0300's lightning and scene events carry byte-identical +0x30 records
         // (private/tmp/acv_type101_blocks.txt: 01 3c 00 00, 0.2, -0.13, 0.06).
@@ -1702,14 +1707,19 @@ mod tests {
         let Some(disc) = crate::vfs::test_disc() else {
             return;
         };
-        let tpf_bytes =
-            crate::vfs::open(&disc, "model/filter/lensflare/lensflare_t.bnd|lensflare.tpf")
-                .unwrap();
+        let tpf_bytes = crate::vfs::open(
+            &disc,
+            "model/filter/lensflare/lensflare_t.bnd|lensflare.tpf",
+        )
+        .unwrap();
         let tpf = crate::tpf::read(&tpf_bytes).unwrap();
         let names: Vec<&str> = tpf.textures.iter().map(|t| t.name.as_str()).collect();
         println!("lensflare.tpf ({} textures):", tpf.textures.len());
         for t in &tpf.textures {
-            println!("  {} ({}x{}, fmt={:#x})", t.name, t.width, t.height, t.format);
+            println!(
+                "  {} ({}x{}, fmt={:#x})",
+                t.name, t.width, t.height, t.format
+            );
         }
         for i in 0..=10 {
             let expected = format!("lf{i:02}");
@@ -1761,7 +1771,10 @@ mod tests {
         let yard_spot = &yard.spot_lights[0];
         let yd = yard_spot.direction();
         // Positioned at (+11.02, 12.79, 0.31), pointing down and toward the AC bay (-X, -Y).
-        assert!(yd[0] < -0.3 && yd[1] < -0.85, "unexpected yard spot dir: {yd:?}");
+        assert!(
+            yd[0] < -0.3 && yd[1] < -0.85,
+            "unexpected yard spot dir: {yd:?}"
+        );
         assert!(near(yard_spot.far, 22.0) && near(yard_spot.fov_y_deg, 70.0));
         let yard_tm = yard.scene.as_ref().unwrap().tonemap;
         assert_eq!(yard_tm.mode, 1);
@@ -1776,7 +1789,10 @@ mod tests {
         assert_eq!(wh.point_lights.iter().filter(|l| l.enabled).count(), 7);
         assert_eq!(wh.spot_lights.iter().filter(|l| l.enabled).count(), 1);
         let wd = wh.spot_lights[0].direction();
-        assert!(wd[1] < -0.99, "expected straight-down warehouse spot dir: {wd:?}");
+        assert!(
+            wd[1] < -0.99,
+            "expected straight-down warehouse spot dir: {wd:?}"
+        );
 
         // Underpass (`menu1000`): 9 active point lights, 0 spot lights.
         let up = read(

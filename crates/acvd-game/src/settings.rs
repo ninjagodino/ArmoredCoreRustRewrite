@@ -13,6 +13,9 @@ pub const SETTINGS_PATH: &str = "settings.json";
 /// Left/Right volume nudge in Options menus (5% steps).
 pub const VOLUME_STEP_PCT: i8 = 5;
 
+/// Left/Right combat HUD opacity nudge in Options menus (5% steps).
+pub const HUD_OPACITY_STEP_PCT: i8 = 5;
+
 /// Left/Right UI scale nudge in Options menus (5% steps).
 pub const UI_SCALE_STEP_PCT: i8 = 5;
 /// Minimum UI scale multiplier (50%).
@@ -90,8 +93,8 @@ impl ShadowDistance {
     }
 
     pub fn step(self, delta: i8) -> Self {
-        let next = (self.index() as i16 + i16::from(delta))
-            .clamp(0, (Self::ALL.len() - 1) as i16) as usize;
+        let next = (self.index() as i16 + i16::from(delta)).clamp(0, (Self::ALL.len() - 1) as i16)
+            as usize;
         Self::from_index(next)
     }
 
@@ -212,6 +215,7 @@ pub enum OptionRow {
     HudSway,
     DisplayParam(DisplayParam),
     ShadowDistance,
+    HudOpacity,
     Volume(AudioChannel),
     ComVoice,
 }
@@ -226,6 +230,7 @@ impl OptionRow {
             Self::DisplayParam(DisplayParam::Brightness) => 4,
             Self::DisplayParam(DisplayParam::Contrast) => 5,
             Self::ShadowDistance => 6,
+            Self::HudOpacity => 7,
             Self::Volume(AudioChannel::Master) => 0,
             Self::Volume(AudioChannel::Music) => 1,
             Self::Volume(AudioChannel::Sfx) => 2,
@@ -277,6 +282,8 @@ pub struct GameSettings {
     /// Combat HUD (lock-sight ring, digits, gauges) RGB color (default `#00A5FF`, the retail
     /// lock-sight cyan).
     pub hud_color: [u8; 3],
+    /// Combat HUD (lock-sight ring, digits, gauges) opacity in `0.0..=1.0` (0–100%, default 100%).
+    pub hud_opacity: f32,
     /// Display gamma multiplier in `0.50..=1.50` (50–150%, default 100%).
     pub gamma: f32,
     /// Display brightness multiplier in `0.50..=1.50` (50–150%, default 100%).
@@ -310,6 +317,7 @@ impl Default for GameSettings {
             ui_scale: 1.0,
             hud_sway: 1.0,
             hud_color: [0x00, 0xa5, 0xff],
+            hud_opacity: 1.0,
             gamma: 1.0,
             brightness: 1.0,
             contrast: 1.0,
@@ -337,6 +345,7 @@ impl GameSettings {
     pub fn clamp_all(&mut self) {
         self.ui_scale = self.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
         self.hud_sway = self.hud_sway.clamp(0.0, 1.0);
+        self.hud_opacity = self.hud_opacity.clamp(0.0, 1.0);
         self.gamma = self.gamma.clamp(DISPLAY_PARAM_MIN, DISPLAY_PARAM_MAX);
         self.brightness = self.brightness.clamp(DISPLAY_PARAM_MIN, DISPLAY_PARAM_MAX);
         self.contrast = self.contrast.clamp(DISPLAY_PARAM_MIN, DISPLAY_PARAM_MAX);
@@ -379,8 +388,8 @@ impl GameSettings {
     pub fn step_ui_scale(&mut self, delta_steps: i8) {
         let min_pct = (UI_SCALE_MIN * 100.0).round() as i16;
         let max_pct = (UI_SCALE_MAX * 100.0).round() as i16;
-        let pct = self.ui_scale_percent() as i16
-            + i16::from(delta_steps) * i16::from(UI_SCALE_STEP_PCT);
+        let pct =
+            self.ui_scale_percent() as i16 + i16::from(delta_steps) * i16::from(UI_SCALE_STEP_PCT);
         self.ui_scale = (pct.clamp(min_pct, max_pct) as f32) / 100.0;
     }
 
@@ -397,14 +406,29 @@ impl GameSettings {
     }
 
     pub fn step_hud_sway(&mut self, delta_steps: i8) {
-        let pct = self.hud_sway_percent() as i16
-            + i16::from(delta_steps) * i16::from(VOLUME_STEP_PCT);
+        let pct =
+            self.hud_sway_percent() as i16 + i16::from(delta_steps) * i16::from(VOLUME_STEP_PCT);
         self.hud_sway = (pct.clamp(0, 100) as f32) / 100.0;
     }
 
     pub fn set_hud_sway_from_fill(&mut self, fill: f32) {
         let pct = (fill.clamp(0.0, 1.0) * 100.0).round().clamp(0.0, 100.0) as u8;
         self.hud_sway = (pct as f32) / 100.0;
+    }
+
+    pub fn hud_opacity_percent(&self) -> u8 {
+        (self.hud_opacity.clamp(0.0, 1.0) * 100.0).round() as u8
+    }
+
+    pub fn step_hud_opacity(&mut self, delta_steps: i8) {
+        let pct = self.hud_opacity_percent() as i16
+            + i16::from(delta_steps) * i16::from(HUD_OPACITY_STEP_PCT);
+        self.hud_opacity = (pct.clamp(0, 100) as f32) / 100.0;
+    }
+
+    pub fn set_hud_opacity_from_fill(&mut self, fill: f32) {
+        let pct = (fill.clamp(0.0, 1.0) * 100.0).round().clamp(0.0, 100.0) as u8;
+        self.hud_opacity = (pct as f32) / 100.0;
     }
 
     pub fn display_param(&self, param: DisplayParam) -> f32 {
@@ -424,8 +448,7 @@ impl GameSettings {
 
     /// Normalized `0.0..=1.0` gauge fill across `DISPLAY_PARAM_MIN..=DISPLAY_PARAM_MAX`.
     pub fn display_param_fill(&self, param: DisplayParam) -> f32 {
-        ((self.display_param(param) - DISPLAY_PARAM_MIN)
-            / (DISPLAY_PARAM_MAX - DISPLAY_PARAM_MIN))
+        ((self.display_param(param) - DISPLAY_PARAM_MIN) / (DISPLAY_PARAM_MAX - DISPLAY_PARAM_MIN))
             .clamp(0.0, 1.0)
     }
 
@@ -697,6 +720,30 @@ mod tests {
         assert_eq!(parsed.display_param_percent(DisplayParam::Brightness), 100);
         assert_eq!(parsed.display_param_percent(DisplayParam::Contrast), 100);
         assert_eq!(parsed.shadow_distance, ShadowDistance::Medium);
+        assert_eq!(parsed.hud_opacity_percent(), 100);
+    }
+
+    #[test]
+    fn hud_opacity_steps_clamps_and_fill_roundtrip() {
+        let mut s = GameSettings::default();
+        assert_eq!(s.hud_opacity_percent(), 100);
+        s.step_hud_opacity(-2);
+        assert_eq!(s.hud_opacity_percent(), 90);
+        for _ in 0..30 {
+            s.step_hud_opacity(-1);
+        }
+        assert_eq!(s.hud_opacity_percent(), 0);
+        assert_eq!(s.hud_opacity, 0.0);
+        for _ in 0..30 {
+            s.step_hud_opacity(1);
+        }
+        assert_eq!(s.hud_opacity_percent(), 100);
+        assert_eq!(s.hud_opacity, 1.0);
+        s.set_hud_opacity_from_fill(0.42);
+        assert_eq!(s.hud_opacity_percent(), 42);
+        s.hud_opacity = 5.0;
+        s.clamp_all();
+        assert_eq!(s.hud_opacity, 1.0);
     }
 
     #[test]
@@ -713,19 +760,42 @@ mod tests {
         s.step_shadow_distance(1);
         assert_eq!(s.shadow_distance, ShadowDistance::Near);
         assert!(s.shadow_distance.shadows_enabled());
-        assert!((s.shadow_distance.cascade_config().bounds.last().copied().unwrap() - 150.0).abs() < 1e-2);
+        assert!(
+            (s.shadow_distance
+                .cascade_config()
+                .bounds
+                .last()
+                .copied()
+                .unwrap()
+                - 150.0)
+                .abs()
+                < 1e-2
+        );
 
         s.step_shadow_distance(10);
         assert_eq!(s.shadow_distance, ShadowDistance::FullMap);
         assert!(s.shadow_distance.shadows_enabled());
         assert_eq!(s.shadow_distance.fill(), 1.0);
-        assert!((s.shadow_distance.cascade_config().bounds.last().copied().unwrap() - 4000.0).abs() < 1e-1);
+        assert!(
+            (s.shadow_distance
+                .cascade_config()
+                .bounds
+                .last()
+                .copied()
+                .unwrap()
+                - 4000.0)
+                .abs()
+                < 1e-1
+        );
 
         for preset in ShadowDistance::ALL {
             s.set_shadow_distance_from_fill(preset.fill());
             assert_eq!(s.shadow_distance, preset);
         }
-        assert_eq!(ShadowDistance::from_cli("full"), Some(ShadowDistance::FullMap));
+        assert_eq!(
+            ShadowDistance::from_cli("full"),
+            Some(ShadowDistance::FullMap)
+        );
         assert_eq!(ShadowDistance::from_cli("near"), Some(ShadowDistance::Near));
         assert_eq!(ShadowDistance::from_cli("off"), Some(ShadowDistance::Off));
     }
@@ -756,7 +826,9 @@ mod tests {
         assert!(dl.shadow_maps_enabled);
         assert!((csc.bounds.last().copied().unwrap() - 400.0).abs() < 1e-1);
 
-        app.world_mut().resource_mut::<GameSettings>().shadow_distance = ShadowDistance::FullMap;
+        app.world_mut()
+            .resource_mut::<GameSettings>()
+            .shadow_distance = ShadowDistance::FullMap;
         app.update();
         let (dl, csc) = (
             app.world().get::<DirectionalLight>(light).unwrap(),
@@ -765,7 +837,9 @@ mod tests {
         assert!(dl.shadow_maps_enabled);
         assert!((csc.bounds.last().copied().unwrap() - 4000.0).abs() < 1e-1);
 
-        app.world_mut().resource_mut::<GameSettings>().shadow_distance = ShadowDistance::Off;
+        app.world_mut()
+            .resource_mut::<GameSettings>()
+            .shadow_distance = ShadowDistance::Off;
         app.update();
         let dl = app.world().get::<DirectionalLight>(light).unwrap();
         assert!(!dl.shadow_maps_enabled);
@@ -817,6 +891,7 @@ mod tests {
             5
         );
         assert_eq!(OptionRow::ShadowDistance.cursor_index(), 6);
+        assert_eq!(OptionRow::HudOpacity.cursor_index(), 7);
         assert_eq!(OptionRow::Volume(AudioChannel::Master).cursor_index(), 0);
         assert_eq!(OptionRow::Volume(AudioChannel::Music).cursor_index(), 1);
         assert_eq!(OptionRow::Volume(AudioChannel::Sfx).cursor_index(), 2);

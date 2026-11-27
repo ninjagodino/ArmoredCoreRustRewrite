@@ -1,0 +1,10 @@
+# Disc-derived and local-only state must never enter the image build context.
+target/
+private/
+armoredcoredumps/
+ACVD Unbound/
+external/
+crates/acvd-data/src/generated/
+settings.json
+**/.git/
+**/*.png
