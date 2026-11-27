@@ -789,6 +789,16 @@ struct FxSocket {
     forward: [f32; 3],
 }
 
+/// One intentionally added PC-only engine plume socket. `o9341`/`o9344` have no
+/// `KIND_FFX` events; these sockets borrow `e6010`'s authored `5320`/`5321` effects.
+#[derive(Clone, Debug)]
+struct PlumeSocket {
+    ffx_id: i32,
+    joint: usize,
+    position: [f32; 3],
+    forward: [f32; 3],
+}
+
 /// TAE kind-0 (`KIND_FFX`) timeline of an aircraft's current ANI clip. The 360 plays the
 /// `.tae` animation whose id equals the ANI clip id alongside the clip itself; its FFX events
 /// name an `sfx/acv_commoneffects.ffxbnd` effect and a dummy id (o9330 clip 210 fires
@@ -859,6 +869,7 @@ struct AnimatedModel {
     bank: Arc<EnemyAnimBank>,
     tae: Option<tae::Tae>,
     fx_sockets: Vec<FxSocket>,
+    plume_sockets: Vec<PlumeSocket>,
 }
 
 /// The TAE id and loop flag selected by a part's `+0x44` behavior row.
@@ -954,6 +965,121 @@ fn root_mesh_route(rig: &acvd_render::Rig, list: &[LoadedMesh]) -> Option<usize>
     (route > 0).then_some(route)
 }
 
+/// Eight rear-aperture centers of `o9341`'s four engine pods per wing, in FLVER
+/// coordinates. Core mesh 1's 41 m pod shells are components 46-53/68-75 (x centers
+/// ±67.83, ±91.34, ±113.73, ±139.00); each value is the center of the rear two metres
+/// of that pod at its maximum Z. The FLVER dummies 200..202 are not nozzles: they sit at
+/// z = 9041/9717, outside the airframe. Raw +X becomes Bevy left after the X mirror.
+const O9341_ENGINE_REAR: [[f32; 3]; 8] = [
+    [67.832, -4.814, 55.77],
+    [90.928, -4.747, 17.64],
+    [113.728, -4.814, 56.01],
+    [139.000, -4.814, 44.05],
+    [-67.832, -4.814, 55.77],
+    [-90.928, -4.747, 17.64],
+    [-113.728, -4.814, 56.01],
+    [-139.000, -4.814, 44.05],
+];
+
+/// `o9344`'s four body bones each drive an identical engine pod whose rear aperture
+/// center is this point in bone-local space (`o9344.flv` Core mesh 0, rear-two-metre
+/// centroid of the 3004 vertices weighted to each body bone). Its 200..203 dummies are
+/// engine mounts facing -Z and 220/221 are prop hubs; none is an aft exhaust socket.
+const O9344_ENGINE_REAR_LOCAL: [f32; 3] = [0.0, 9.367, 28.35];
+
+/// Engine sockets authored directly on a FLVER. `o9341`/`o9344` do not provide a usable
+/// eight-socket aft set, so this returns `None` for them and the map-specific tables below
+/// fill in. A real authored set must be eight +Z dummies inside the airframe.
+fn authored_engine_plume_sockets(rig: &acvd_render::Rig) -> Option<Vec<PlumeSocket>> {
+    let mut sockets = Vec::new();
+    for e in &rig.effects {
+        let Some(joint) = e.bone else { continue };
+        let inside_airframe = e.position.iter().map(|v| v * v).sum::<f32>().sqrt() < 1000.0;
+        if (200..=207).contains(&e.id) && e.forward[2] > 0.99 && inside_airframe {
+            // Raw +X is Bevy left: use 5320 for the left side and 5321 for the right.
+            let ffx_id = if e.position[0] > 0.0 { 5320 } else { 5321 };
+            sockets.push(PlumeSocket {
+                ffx_id,
+                joint,
+                position: e.position,
+                forward: e.forward,
+            });
+        }
+    }
+    (sockets.len() == 8).then_some(sockets)
+}
+
+/// PC visual enhancement: attach `e6010`'s authored 5320/5321 flames to the map bombers'
+/// own exhaust geometry. This is deliberately not presented as 360-authored map FX.
+fn map_engine_plume_sockets(model: &str, rig: &acvd_render::Rig) -> Vec<PlumeSocket> {
+    if let Some(sockets) = authored_engine_plume_sockets(rig) {
+        return sockets;
+    }
+    match model {
+        "o9341" => {
+            // o9341's visible meshes skin 100% to root `o9330`; the map ANI copies the
+            // body route onto that root, so root-local model positions follow the flight.
+            let Some(joint) = rig
+                .bones
+                .iter()
+                .position(|b| b.name.eq_ignore_ascii_case("o9330"))
+            else {
+                return Vec::new();
+            };
+            O9341_ENGINE_REAR
+                .iter()
+                .map(|&position| PlumeSocket {
+                    ffx_id: if position[0] > 0.0 { 5320 } else { 5321 },
+                    joint,
+                    position,
+                    forward: [0.0, 0.0, 1.0],
+                })
+                .collect()
+        }
+        "o9344" => ["body", "body001", "body002", "body003"]
+            .iter()
+            .filter_map(|name| {
+                let joint = rig
+                    .bones
+                    .iter()
+                    .position(|b| b.name.eq_ignore_ascii_case(name))?;
+                // Raw +X is Bevy left.
+                let ffx_id = if rig.bones[joint].bind.t[0] > 0.0 {
+                    5320
+                } else {
+                    5321
+                };
+                Some(PlumeSocket {
+                    ffx_id,
+                    joint,
+                    position: O9344_ENGINE_REAR_LOCAL,
+                    forward: [0.0, 0.0, 1.0],
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Spawns the persistent PC engine flames as children of the animated joints.
+fn spawn_engine_plumes(commands: &mut Commands, joints: &[Entity], sockets: &[PlumeSocket]) {
+    for socket in sockets {
+        let Some(&joint) = joints.get(socket.joint) else {
+            continue;
+        };
+        let position = Vec3::new(-socket.position[0], socket.position[1], socket.position[2]);
+        let forward = Vec3::new(-socket.forward[0], socket.forward[1], socket.forward[2])
+            .normalize_or(Vec3::Z);
+        commands.spawn((
+            sfx::Sfx::new(socket.ffx_id),
+            Transform::from_translation(position)
+                .with_rotation(Quat::from_rotation_arc(Vec3::Z, forward)),
+            Visibility::default(),
+            ChildOf(joint),
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_animated_model(
     cache: &mut HashMap<String, Option<AnimatedModel>>,
@@ -995,6 +1121,7 @@ fn load_animated_model(
                         })
                     })
                     .collect();
+                let plume_sockets = map_engine_plume_sockets(model, &rig);
                 if bank.clips.is_empty() {
                     None
                 } else {
@@ -1029,6 +1156,7 @@ fn load_animated_model(
                         bank,
                         tae,
                         fx_sockets,
+                        plume_sockets,
                     })
                 }
             }
@@ -1041,6 +1169,87 @@ fn load_animated_model(
     };
     cache.insert(model.to_string(), loaded.clone());
     loaded
+}
+
+/// Loads a map-object aircraft and spawns it in its rest pose at `xf`, without an ANI clip or
+/// MSB placement. Test-only (`targets --test o9341`) for close-up checks; it goes through the
+/// same [`Textures::material`] path the map uses (`Ene_Diffuse_Glow` additive cards).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_aircraft_showcase(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    disc: &Disc,
+    model: &str,
+    name: &str,
+    xf: Transform,
+) -> Option<Entity> {
+    let mut cache = HashMap::new();
+    let mut textures = Textures::default();
+    let pack = format!("model/obj/{model}/{model}.tpf.dcx");
+    let loaded = load_animated_model(
+        &mut cache,
+        &mut textures,
+        meshes,
+        materials,
+        images,
+        bindposes,
+        disc,
+        model,
+        disc.exists(&pack).then_some(pack).as_deref(),
+    )?;
+    for (i, (_, _, meta)) in loaded.meshes.iter().enumerate() {
+        info!(
+            "{name}: mesh {i} mtd={} diffuse2={}",
+            meta.mtd,
+            meta.diffuse2.is_some()
+        );
+    }
+    let root = commands
+        .spawn((
+            MapPart,
+            xf,
+            Visibility::default(),
+            Name::new(name.to_string()),
+        ))
+        .id();
+    let mut joint_entities: Vec<Entity> = Vec::with_capacity(loaded.bank.rest_locals.len());
+    for _ in 0..loaded.bank.rest_locals.len() {
+        joint_entities.push(
+            commands
+                .spawn((Transform::default(), Visibility::default()))
+                .id(),
+        );
+    }
+    for (i, &ent) in joint_entities.iter().enumerate() {
+        let parent_ent = loaded.bank.parents[i].map_or(root, |p| joint_entities[p]);
+        commands
+            .entity(ent)
+            .insert((loaded.bank.rest_locals[i], ChildOf(parent_ent)));
+    }
+    spawn_engine_plumes(commands, &joint_entities, &loaded.plume_sockets);
+    let extra_unboned = commands
+        .spawn((Transform::default(), Visibility::default(), ChildOf(root)))
+        .id();
+    let mut skin_joints = joint_entities.clone();
+    skin_joints.push(extra_unboned);
+    for (mesh, material, meta) in &loaded.meshes {
+        commands.spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            meta.clone(),
+            SkinnedMesh {
+                inverse_bindposes: loaded.inv_bindposes.clone(),
+                joints: skin_joints.clone(),
+            },
+            NoFrustumCulling,
+            Transform::default(),
+            ChildOf(root),
+        ));
+    }
+    Some(root)
 }
 
 /// Spawns the skinned meshes and joint hierarchy under a map part's world placement.
@@ -1066,6 +1275,7 @@ fn spawn_animated_part(
             .entity(ent)
             .insert((loaded.bank.rest_locals[i], ChildOf(parent_ent)));
     }
+    spawn_engine_plumes(commands, &joint_entities, &loaded.plume_sockets);
     let extra_unboned = commands
         .spawn((Transform::default(), Visibility::default(), ChildOf(root)))
         .id();
@@ -1142,11 +1352,7 @@ fn load_model(
     loaded
 }
 
-fn asset_has(
-    cache: &mut HashMap<String, HashSet<String>>,
-    disc: &Disc,
-    asset: &str,
-) -> bool {
+fn asset_has(cache: &mut HashMap<String, HashSet<String>>, disc: &Disc, asset: &str) -> bool {
     match asset.split_once('|') {
         Some((binder, file)) => binder_has(cache, disc, binder, file),
         None => disc.exists(asset),
@@ -2208,6 +2414,44 @@ mod tests {
             4,
             "o9341's behavior timelines select four ANI clips"
         );
+    }
+
+    #[test]
+    fn map_bombers_define_pc_engine_plume_sockets() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let Ok(disc) = Disc::open(&vfs::default_disc(&root)) else {
+            return;
+        };
+
+        let (_, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9341/o9341_m.bnd.dcx|o9341.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
+        let sockets = map_engine_plume_sockets("o9341", &rig);
+        assert_eq!(sockets.len(), 8, "o9341 has four engine pods per wing");
+        assert!(sockets.iter().all(|s| s.joint == 0));
+        assert!(sockets.iter().all(|s| s.forward == [0.0, 0.0, 1.0]));
+        assert_eq!(sockets.iter().filter(|s| s.ffx_id == 5320).count(), 4);
+        assert_eq!(sockets.iter().filter(|s| s.ffx_id == 5321).count(), 4);
+
+        let (_, rig) =
+            acvd_render::rigged_model(&disc, "model/obj/o9344/o9344_m.bnd.dcx|o9344.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
+        let sockets = map_engine_plume_sockets("o9344", &rig);
+        assert_eq!(sockets.len(), 4, "o9344 has four engine pods");
+        assert!(sockets.iter().all(|s| s.forward == [0.0, 0.0, 1.0]));
+        assert_eq!(sockets.iter().filter(|s| s.ffx_id == 5320).count(), 2);
+        assert_eq!(sockets.iter().filter(|s| s.ffx_id == 5321).count(), 2);
+        assert!(sockets.iter().all(|s| {
+            ["body", "body001", "body002", "body003"]
+                .iter()
+                .any(|name| rig.bones[s.joint].name.eq_ignore_ascii_case(name))
+        }));
     }
 
     #[test]

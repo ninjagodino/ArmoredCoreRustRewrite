@@ -14,12 +14,15 @@
 //!
 //! The map bombers `o9341`/`o9344` contain **no** `KIND_FFX` events in their
 //! `tae/obj/<model>/own000100.tae`; their authored look is the static `Ene_Diffuse_Glow`
-//! submesh (rendered with its additive emission), so no plume is invented for them.
+//! submesh (rendered with its additive emission). As an intentional, user-authorized
+//! PC-only visual enhancement, `map.rs` additionally attaches these same `5320`/`5321`
+//! effects to derived aft nozzle sockets on those map bombers. This is not 360-authored
+//! map FX; `o9341_map_bomber_has_no_authored_ffx` still pins the empty TAE.
 
 use bevy::prelude::*;
 
-use acvd_formats::vfs::{self, Disc};
 use acvd_formats::tae;
+use acvd_formats::vfs::{self, Disc};
 
 use crate::{pose, sfx, targets::EnemyAnim};
 
@@ -54,7 +57,8 @@ pub struct EnginePlumeFx {
 impl EnginePlumeFx {
     /// Loads `tae/enemy/<model>/own000100.tae` animation `timeline_id` and maps every
     /// `Rig::effects` dummy to its joint index. Returns `None` when the model has no such
-    /// timeline (the `o9341`/`o9344` map bombers are the known no-FFX cases).
+    /// timeline. The `o9341`/`o9344` map bombers stay on this no-FFX path; their PC-only
+    /// added flames are spawned by `map::spawn_engine_plumes`, not by this timeline.
     pub fn load(
         disc: &Disc,
         model: &str,
@@ -153,8 +157,8 @@ mod tests {
         let Some(disc) = disc() else {
             return;
         };
-        let bytes = vfs::open(&disc, "tae/enemy/e6010/own000100.tae")
-            .expect("e6010 enemy TAE exists");
+        let bytes =
+            vfs::open(&disc, "tae/enemy/e6010/own000100.tae").expect("e6010 enemy TAE exists");
         let tae = tae::read(&bytes).unwrap();
         let anim = tae
             .animations
@@ -197,15 +201,31 @@ mod tests {
         let Some(disc) = disc() else {
             return;
         };
-        let (_, rig) = acvd_render::rigged_model(
-            &disc,
-            "model/ene/e6010/e6010_m.bnd.dcx|e6010.flv",
-            &|_| acvd_render::RootPlace::IDENTITY,
-        )
-        .unwrap();
+        let (_, rig) =
+            acvd_render::rigged_model(&disc, "model/ene/e6010/e6010_m.bnd.dcx|e6010.flv", &|_| {
+                acvd_render::RootPlace::IDENTITY
+            })
+            .unwrap();
         let ids: Vec<u8> = rig.effects.iter().map(|e| e.id).collect();
         for id in 200..=207 {
-            assert!(ids.contains(&id), "e6010 effect point {id} missing: {ids:?}");
+            assert!(
+                ids.contains(&id),
+                "e6010 effect point {id} missing: {ids:?}"
+            );
+        }
+        let engines: Vec<_> = rig
+            .effects
+            .iter()
+            .filter(|e| (200..=207).contains(&e.id))
+            .collect();
+        assert_eq!(engines.len(), 8);
+        for e in engines {
+            assert!(
+                e.forward[2] > 0.99 && e.forward[0].abs() < 0.02 && e.forward[1].abs() < 0.02,
+                "engine {} forward {:?} must point aft (+Z), not into the wing",
+                e.id,
+                e.forward
+            );
         }
     }
 }

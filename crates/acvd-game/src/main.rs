@@ -42,7 +42,8 @@
 //! `{map}_{name}.msb` start point (`none`: the terrain MSB's), `--test <mode>` picks which
 //! `LAYER_PARAM_ST` target set to spawn from `{map}_{layout}.msb` (`0`/`none`/`actest1` empty,
 //! `1`/`light`/`actest2` tanks & helis [default], `2`/`mt`/`actest3` MTs, `3`..`5`/`7` test ACs
-//! `a0000`..`a0003`, `bomber`/`e6010` the flying-wing showcase, `all`), `--hits` draws the hit meshes
+//! `a0000`..`a0003`, `bomber`/`e6010` the online flying-wing showcase, `o9341` the map bomber
+//! showcase (hovering at `(0,300,0)`), `all`), `--hits` draws the hit meshes
 //! instead of the map models, `--plane` is the old infinite floor, `--water` adds a test water
 //! plane at that height. The lock-sight HUD (see `hud`) is drawn over gameplay.
 //! `--no-hud` leaves that HUD and the part-name overlay out, for looking at effects.
@@ -1246,6 +1247,7 @@ fn spawn_sortie_world(
     garage: &Garage,
     enemy_parts: &weapons::EnemyParts,
     collision: &Collision,
+    start: &map::Start,
     scene: &Scene,
 ) {
     let drawn = scene.map.as_deref().map_or(0, |id| {
@@ -1280,6 +1282,7 @@ fn spawn_sortie_world(
             enemy_parts,
             map_id,
             layout,
+            start,
             &scene.test,
             garage.flat,
         ) {
@@ -1532,6 +1535,7 @@ fn process_mode_switch(
                 &garage,
                 &sortie.enemy_parts,
                 &sortie.collision,
+                &sortie.start,
                 &sortie.scene,
             );
             if let Some(map_id) = sortie.scene.map.as_deref() {
@@ -1580,6 +1584,7 @@ fn setup(
     enemy_parts: Res<weapons::EnemyParts>,
     yaw: Res<StartYaw>,
     collision: Res<Collision>,
+    start: Res<map::Start>,
     scene: Res<Scene>,
     show_hud: Res<ShowHud>,
     settings: Res<settings::GameSettings>,
@@ -1623,6 +1628,7 @@ fn setup(
             &garage,
             &enemy_parts,
             &collision,
+            &start,
             &scene,
         );
     }

@@ -55,6 +55,9 @@ pub enum TestMode {
     /// Test-only flying-wing showcase: the `e6010` online bomber with its authored TAE
     /// engine plumes. Not placed in any map.
     Bomber,
+    /// Test-only map-object bomber (`o9341`) showcase, spawned through the map aircraft
+    /// material path so `Ene_Diffuse_Glow` engine cards can be inspected up close.
+    MapBomber,
 }
 
 impl Default for TestMode {
@@ -79,6 +82,7 @@ impl TestMode {
             "6" | "unac" | "actest7" => Self::Layer("actest7".into()),
             "7" | "eirik" | "erik" | "actest8" => Self::Layer("actest8".into()),
             "bomber" | "e6010" | "flying_wing" | "flying-wing" => Self::Bomber,
+            "o9341" | "map_bomber" | "map-bomber" => Self::MapBomber,
             "all" => Self::All,
             other => Self::Layer(other.to_string()),
         }
@@ -270,7 +274,7 @@ pub fn select<'a>(parts: &'a [msb::Part], mode: &TestMode) -> Vec<&'a msb::Part>
         .filter(|p| match mode {
             TestMode::None => false,
             TestMode::All => true,
-            TestMode::Bomber => false,
+            TestMode::Bomber | TestMode::MapBomber => false,
             TestMode::Layer(wanted) => p
                 .layer
                 .as_deref()
@@ -279,17 +283,41 @@ pub fn select<'a>(parts: &'a [msb::Part], mode: &TestMode) -> Vec<&'a msb::Part>
         .collect()
 }
 
-/// Test-only `e6010` placement: the online flying-wing bomber, 300 m up and ahead of the
-/// m4000 start, facing away so its eight engine effect points face the camera. This is a
-/// showcase target, not map traffic; no map MSB contains `e6010`.
-fn showcase_bomber_part() -> msb::Part {
+/// Test-only `e6010` placement: the online flying-wing bomber, placed along the player's
+/// facing and above the sortie start so the default follow camera frames its eight engine
+/// effect points. Nose-up pitch exposes the trailing-edge underside to the camera below.
+/// This is a showcase target, not map traffic; no map MSB contains `e6010`.
+fn showcase_bomber_part(start: &map::Start) -> msb::Part {
+    let forward = Quat::from_rotation_y(start.yaw) * Vec3::NEG_Z;
+    let at = start.position + forward * 360.0 + Vec3::Y * 65.0;
     msb::Part {
         name: "e6010_showcase".to_string(),
         model: crate::engine_trail::BOMBER_MODEL.to_string(),
         kind: KIND_TARGET,
         param_index: 0,
         behavior: None,
-        translation: [0.0, 300.0, -500.0],
+        translation: [-at.x, at.y, at.z],
+        rotation_deg: [10.0, -start.yaw.to_degrees(), 0.0],
+        scale: [1.0, 1.0, 1.0],
+        light_set: 0,
+        follow_camera_xz: false,
+        is_sky: false,
+        layer_index: None,
+        layer: Some("showcase".to_string()),
+        ac_design_id: None,
+    }
+}
+
+/// Test-only `o9341` map bomber placement, hovering at a fixed point above the arena origin so
+/// `--cam`/`--look` can frame its underside engine cards. Not map traffic.
+fn showcase_map_bomber_part() -> msb::Part {
+    msb::Part {
+        name: "o9341_showcase".to_string(),
+        model: "o9341".to_string(),
+        kind: map::KIND_OBJECT,
+        param_index: 0,
+        behavior: None,
+        translation: [0.0, 300.0, 0.0],
         rotation_deg: [0.0, 0.0, 0.0],
         scale: [1.0, 1.0, 1.0],
         light_set: 0,
@@ -854,11 +882,37 @@ pub fn spawn(
     enemy_parts: &weapons::EnemyParts,
     map_id: &str,
     layout: &str,
+    player_start: &map::Start,
     mode: &TestMode,
     flat: bool,
 ) -> Result<usize> {
     if matches!(mode, TestMode::None) {
         return Ok(0);
+    }
+    if matches!(mode, TestMode::MapBomber) {
+        let part = showcase_map_bomber_part();
+        let xf = map::bevy_transform(&map::xform(&part));
+        info!(
+            "o9341 showcase at Bevy ({:.1},{:.1},{:.1})",
+            xf.translation.x, xf.translation.y, xf.translation.z
+        );
+        let spawned = map::spawn_aircraft_showcase(
+            commands,
+            meshes,
+            materials,
+            images,
+            bindposes,
+            disc,
+            &part.model,
+            &part.name,
+            xf,
+        )
+        .is_some();
+        info!(
+            "targets (o9341 showcase): {} spawned",
+            if spawned { 1 } else { 0 }
+        );
+        return Ok(if spawned { 1 } else { 0 });
     }
     let showcase = matches!(mode, TestMode::Bomber);
     let path = if showcase {
@@ -867,7 +921,7 @@ pub fn spawn(
         format!("{}/{map_id}_{layout}.msb", map::folder(map_id))
     };
     let parts = if showcase {
-        vec![showcase_bomber_part()]
+        vec![showcase_bomber_part(player_start)]
     } else {
         if !disc.exists(&path) {
             return Ok(0);
@@ -1041,12 +1095,10 @@ pub fn spawn(
             anim.play(crate::engine_trail::BOMBER_CLIP, true, 1.0, 0.0);
         }
         commands.entity(root).insert(anim);
-        if showcase {
-            if let Some(fx) = cached.fx.clone() {
-                commands.entity(root).insert(fx);
-            } else {
-                warn!("{}: e6010 TAE plumes did not load", part.model);
-            }
+        if let Some(fx) = cached.fx.clone() {
+            commands.entity(root).insert(fx);
+        } else if part.model == crate::engine_trail::BOMBER_MODEL {
+            warn!("{}: e6010 TAE plumes did not load", part.model);
         }
         spawned += 1;
     }
