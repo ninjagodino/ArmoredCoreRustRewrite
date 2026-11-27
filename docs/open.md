@@ -530,7 +530,7 @@ in order:
       hand weapons stay in their authored hand sockets and play their own `a00_003` fold /
       `a00_001` open clips; FCS/HUD arm gating. Verification-only `--test-weapon-switch` and
       `--test-weapon-switch-stow` inject real switch edges.
-    - **Timing/clip fix (2026-11-27, uncommitted pending live check):** the 360 request
+    - **Timing/clip fix (2026-11-27, committed `ae2bc71`; live check pending):** the 360 request
       builder `0x82882a78` stores `f1` at request `+8`, `f2` at `+0xc`, `f3` at `+0x10`.
       The values `10.0`/`80.0` (`param/acanimparam.bin` #3/#4, read by `0x82882c90` /
       `0x82882cc0`, called by `0x82883198` / `0x82883228`) are **transition/crossfade
@@ -565,7 +565,7 @@ in order:
         Tests: `weapon_arm_accumulator_is_frame_rate_independent` (dt 1/60, 1/144, 1/240),
         `garage_weapon_arm_tick_is_frame_rate_independent`, and
         `weapon_arm_clip_lengths_match_the_dumped_arm_binders`.
-    - **Weapon-arm SFX (2026-11-27, same uncommitted batch):** the deploy/stow TAE sound
+    - **Weapon-arm SFX (2026-11-27, same batch, committed `ae2bc71`):** the deploy/stow TAE sound
       events are **kind 204** (`0x8284b690`, `own007420.tae` anim 4/5 params `[1,0x38]` /
       `[1,0x39]`), not kind 1. `tae::KIND_SOUND_VARIANT` now maps them to
       `c00000056`/`c00000057`; kind 1 `10:50`/`11:50` is a part-animation selector and is
@@ -577,7 +577,7 @@ in order:
       `weapon_arm_and_bay_shift_sfx_resolve_real_samples` loads the FEV banks and asserts
       decoded `AudioSource` handles for all of them; the deploy test also asserts
       `c00000056` is emitted at frame 0.
-    - **Stowed hand-arm raise/aim (2026-11-27, same uncommitted batch):** while the
+    - **Stowed hand-arm raise/aim (2026-11-27, same batch, committed `ae2bc71`):** while the
       weapon arm was `Stowed`, `WeaponArmRig::apply` still overwrote the main
       `*_armroot`/`*_arm01..*_armhand` chain with the folded `base+0` clip, and
       `pose::build` had excluded that chain from the body clip for every equipped
@@ -595,7 +595,7 @@ in order:
       body pose + right-hand `arm01` aim turn, main chain untouched),
       `weapons::tests::hand_aim_runs_only_while_the_weapon_arm_is_stowed`, and
       `weapons::tests::clearing_hand_aim_keeps_the_joint_spec_and_drops_stale_motion`.
-    - **Hand-weapon fold & transition SFX (2026-11-27 live-test round 2, same uncommitted batch):**
+    - **Hand-weapon fold & transition SFX (2026-11-27 live-test round 2, same batch, committed `ae2bc71`):**
       the deploy TAE `a00_004` kind-1 `[11,50]`/`[10,50]` at frame 80 and stow `a00_005`
       `[11,51]`/`[10,51]` at frame 100 select the hanger rack clips, but a weapon-arm design has
       no rack: `am7420` and the Core expose no dummies `80`/`81`, design 6009 has
@@ -647,8 +647,9 @@ in order:
       to `Deployed`. Full workspace tests pass (`acvd-game` 246 / `acvd-sim` 53 /
       `acvd-formats` 84, plus the other workspace crates); `tools/check-headless.ps1` PASS
       (`acvd-sim`/`acvd-server` free of render/runtime deps) and `acvd-index audit` reports
-      `1967` cited / `0` mismatches / `0` slot mismatches / `0` PS3. The change remains
-      uncommitted pending the final live look at the folded hand weapons.
+      `2004` cited / `0` mismatches / `0` slot mismatches / `0` PS3. The change is committed
+      in `ae2bc71`; the final live look at the folded hand weapons is still pending
+      (`private/shots/wa_fold_final.png`).
     - **FX mapping and draw:** action 95 is an empty 64-slot container; muzzle visuals live in
       the effect-level `params1` node `2117` (five camera-distance LOD children, thresholds
       `[3,100,1000,10000]`), while `f1269`'s cartridge root is state-0 node `2118` (thresholds
