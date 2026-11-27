@@ -97,13 +97,32 @@ Start-Process $g start -WindowStyle Hidden -RedirectStandardOutput private\tmp\b
 # Stop bridge before any headless Ghidra script: `& $g stop`
 ```
 
-- **VMX128 / "bad instruction data"**: Ghidra fails on VMX128. Immediately use `py tools\x360dis\x360dis.py --func 0xADDR [--refs|--trace|--stats]` (decoder: `tools\x360dis\ppc_vmx128.py`, table `vmx128.txt`); `--range LO HI` for arbitrary spans. `vmx128.txt` is generated from Xenia's `ppc-instructions.xml` by `tools\x360dis\gen_vmx128_table.py` and reproduces its LookupOpcode group order (primary 4/5/6 mix Altivec, VMX128 and VX128-only forms). Ghidra itself cannot be taught VMX128 with a language: SLEIGH token fields are one contiguous bit range (`slghparse.y` `fielddef`), while VMX128 scatters v0-v127 across the Altivec XO field. Use `& $g script run tools\ghidra\X360Vmx128.java -- tools\x360dis\vmx128.txt <func...> [--fix]` to write the correct text as comments and create READ/WRITE refs for `lv*128`/`st*128` constant pools (`--dump-refs` shows the `lis/addi` chain; refs are only made when the chain is lis-derived and Ghidra's scalar disassembly is 4-byte aligned).
+- **VMX128 / "bad instruction data"**: Ghidra fails on VMX128. Immediately use `py tools\x360dis\x360dis.py --func 0xADDR [--refs|--trace|--stats]` (decoder: `tools\x360dis\ppc_vmx128.py`, table `vmx128.txt`); `--range LO HI` for arbitrary spans. `vmx128.txt` is generated from Xenia's `ppc-instructions.xml` by `tools\x360dis\gen_vmx128_table.py` and reproduces its LookupOpcode group order (primary 4/5/6 mix Altivec, VMX128 and VX128-only forms). Ghidra itself cannot be taught VMX128 with a language: SLEIGH token fields are one contiguous bit range (`slghparse.y` `fielddef`), while VMX128 scatters v0-v127 across the Altivec XO field. Use `& $g script run tools\ghidra\X360Vmx128.java -- tools\x360dis\vmx128.txt <func...> [--fix]` to write the correct text as comments and create READ/WRITE refs for `lv*128`/`st*128` constant pools (`--dump-refs` shows the `lis/addi` chain; refs are only made when the chain is lis-derived and Ghidra's scalar disassembly is 4-byte aligned). **VMX128 is therefore a static-decode problem, never a reason to probe**: `x360dis` recovers the vector instruction stream and (with `--refs`) its `lis/addi` float/vector constants. What it cannot give is p-code or the live result, so reserve Xenia for "which branch ran / what value came out", not "what does this VMX code do".
 - **Xenos shaders** (`.vpo`/`.fpo`): Extract with `cargo run --release -q -p acvd-formats --example discls -- --members shader/flver_shader.bnd private\tmp\flvsh`, disassemble with `py private\tmp\xenosdis.py <file>`.
 - **Decompiled Lua 5.0**: Already in `private\lua360\` (Select-String there; rebuild via `.\tools\decompile-lua.ps1`).
 
-### 3. Runtime Truth on 360: Unattended Xenia Probes
+### 3. Xenia Probe Policy: Static-First, Xenia-Last (Hard Rule)
 
-Use ONLY when static RE cannot determine runtime values, units, call frequency, or VMX matrices.
+Xenia runs take 2+ minutes and share a single global emulator process/patch directory. **Do NOT default to launching Xenia when static analysis or local `acvd-game` runs can answer the question.** Always follow this strict 3-tier hierarchy:
+
+1. **Tier 1 — Static Disc & Binary Analysis FIRST (~1 second):**
+   - Before considering Xenia, query disc assets (`acvd-formats`, `PARAM`, `FLVER`, `TAE`, `ANI`, `MSB`, `MTD`) and static 360 code/data (`acvd-index`, `tools/x360dis/x360dis.py`, `ppc_vmx128.py`, and direct `ACV2.pe` `.rdata`/`.data` reads).
+   - If a constant sits in `.bss`, check its static initializer via `acvd-index q const <addr>` / `q callers` and `x360dis` first.
+   - **If a constant, formula, dummy rule, or state machine is determinable from `ACV2.pe` or disc files, launching Xenia is FORBIDDEN.**
+2. **Tier 2 — Existing Captures & Local `acvd-game --shot` SECOND (~2 seconds):**
+   - Check `private/xenia/` and `docs/xenia-probes.md` first to see if a probe log or 360 reference shot already exists.
+   - Use `cargo test` and `acvd-game --shot` for fast local visual/simulation verification.
+3. **Tier 3 — Live Xenia Probe LAST (Circuit-Breaker Rules):**
+   - Launch Xenia (`tools/xenia-probe/` or `tools/xenia/run.ps1`) **ONLY** when:
+     a) A runtime value cannot be resolved statically from `ACV2.pe` + disc files after checking with `acvd-index` and `x360dis`, OR
+     b) The user explicitly asks for a new live Xenia capture.
+   - **Hard cap: Maximum 1 Xenia run per task** unless the user explicitly approves another run.
+   - **No Xenia debugging loops:** If a Xenia run crashes, times out, misses the camera target, or fails a hook, **DO NOT immediately re-run Xenia or invent new hooks/scans in a loop.** Stop, fall back to static `x360dis`/`acvd-index` analysis, or ask the user.
+   - **Strictly forbidden in Xenia tooling:** OpenCV (`cv2`) / screenshot pixel-scraping for menu navigation, full-RAM float scans, or running `xenia_canary.exe` while another instance is already running.
+
+### 4. Runtime Truth on 360: Unattended Xenia Probes
+
+Use ONLY when static RE cannot determine live runtime state: which branch actually executed, the value after the whole pipeline, measured units, call frequency, or what was uploaded that frame. **VMX128 and "Ghidra has no p-code for this" are not such cases** — decode with `x360dis` / `X360Vmx128.java` first (step 2), and probe only to confirm the live value. In practice: static answers "what does this code do", a probe answers "did it run and what came out".
 
 Write the probe list to `private\xenia\TASK.txt` (1 probe per PC, gate sortie probes on `env_bgm`):
 
@@ -124,7 +143,7 @@ Recipes in `tools\xenia\recipes\`: `ac_test.txt`, `ac_test_walk.txt`, `boost_vfx
 
 Filter `private\xenia\TASK.jsonl` with PowerShell (`ConvertFrom-Json | Select-Object -First 20`), never dump huge logs raw. Cite the probe file in `sheets/*.csv`.
 
-### 4. Rust Rewrite Probing & Verification
+### 5. Rust Rewrite Probing & Verification
 
 Headless tests (fastest, works even while `acvd-game.exe` is open):
 
