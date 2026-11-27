@@ -14,10 +14,7 @@
 //!
 //! The map bombers `o9341`/`o9344` contain **no** `KIND_FFX` events in their
 //! `tae/obj/<model>/own000100.tae`; their authored look is the static `Ene_Diffuse_Glow`
-//! submesh (rendered with its additive emission). As an intentional, user-authorized
-//! PC-only visual enhancement, `map.rs` additionally attaches these same `5320`/`5321`
-//! effects to derived aft nozzle sockets on those map bombers. This is not 360-authored
-//! map FX; `o9341_map_bomber_has_no_authored_ffx` still pins the empty TAE.
+//! submesh (rendered with its additive emission), so no plume is invented for them.
 
 use bevy::prelude::*;
 
@@ -57,8 +54,7 @@ pub struct EnginePlumeFx {
 impl EnginePlumeFx {
     /// Loads `tae/enemy/<model>/own000100.tae` animation `timeline_id` and maps every
     /// `Rig::effects` dummy to its joint index. Returns `None` when the model has no such
-    /// timeline. The `o9341`/`o9344` map bombers stay on this no-FFX path; their PC-only
-    /// added flames are spawned by `map::spawn_engine_plumes`, not by this timeline.
+    /// timeline (the `o9341`/`o9344` map bombers are the known no-FFX cases).
     pub fn load(
         disc: &Disc,
         model: &str,

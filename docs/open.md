@@ -181,7 +181,7 @@ in order:
       variants have no authored FX. Verified live on m3330 (`9 animated aircraft, 2 with TAE FFX`;
       shot `private/shots/bomber_fx_m3330b.png`); test
       `map::tests::bomber_tae_effects_name_model_dummies` pins ids, sockets and crossing frame.
-    - **Flying-wing engine plumes (source found, user check pending, 2026-11-26)**: the map
+    - **Flying-wing engine plumes (e6010 source; map bombers stay no-FFX, 2026-11-27)**: the map
       bombers `o9341`/`o9344` carry no `KIND_FFX`, so their own TAE authors no plume. The
       blue-white multi-engine plume is authored on the online flying-wing bomber `e6010`
       (`model/ene/e6010/e6010_m.bnd.dcx`): `tae/enemy/e6010/own000100.tae` anim `0x64` (the
@@ -201,7 +201,10 @@ in order:
       `0x82894fc0`), and `0x828932A0` is the AC booster behavior, so 1188
       (`enemy_main_booster`) is the enemy AC booster. The e6010 TAE re-fires 5320/5321 at
       frames 600/1219/1932 and the FFX emitter is infinite, so repeated fires stack identical
-      overlays (overdraw only). Visual parity still needs the user's check against a 360
+      overlays (overdraw only). The PC-only attempt to attach these effects to `o9341`/`o9344` was
+      rejected after the flat-background visual check and removed on 2026-11-27: `map.rs` now
+      spawns no bomber plume and `--test o9341` is a mesh-only showcase. The `e6010` showcase
+      remains the only authored use. Visual parity still needs the user's check against a 360
       reference.
     - **Per-model map texture pack (`map.rs` `texture_pack` / `Textures::load_tex`)**: object
       models (`KIND_OBJECT`, e.g. the road fence `o2076`) resolved every texture name through the
